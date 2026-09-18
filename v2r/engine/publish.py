@@ -24,6 +24,10 @@ from v2r.sources import sheets
 
 DAILY_POOL_SOURCE = "랜덤일상"
 DEFAULT_CAFE = "고요한 아침"
+#: 모의 실행에서 카탈로그(가입 카페·게시판 권한)를 조회하지 않고 계정 결정을 미룰 때 쓰는 표시
+DEFERRED_ACCOUNT = "(실행 시 결정)"
+#: 명령이 카페를 지정했는데 그 카페 원고가 안 나올 때, 이만큼 훑고 나면 아무 원고나 쓴다
+CAFE_SCAN_LIMIT = 500
 RESTRICT_DAYS = 30
 RESTRICT_CODE = "27000"
 WAIT_WRITTEN_MAX_S = 120.0
@@ -311,6 +315,11 @@ def prepare_manuscripts(
     """발행할 원고를 고른다. 이미 발행됐거나 중복인 행은 건너뛴다."""
     skipped = skipped if skipped is not None else []
     picked: list[Manuscript] = []
+    # 명령이 카페를 지정하면 그 카페 원고를 먼저 쓴다(게시판이 카페와 맞아야 하므로).
+    # 한 건도 없으면 other의 원고로 되돌아간다.
+    other: list[Manuscript] = []
+    want_cafe = spec.cafe or ""
+    scanned = 0
     attempted = failed = 0
 
     if spec.manuscripts:
@@ -341,6 +350,9 @@ def prepare_manuscripts(
             for m in items:
                 if spec.count and spec.count > 0 and len(picked) >= spec.count:
                     break  # 필요한 수만 고르면 중단 (수천 행 전수 비교 방지)
+                if want_cafe and other and scanned >= CAFE_SCAN_LIMIT:
+                    break  # 지정 카페 원고가 안 보인다 → 모아둔 다른 카페 원고를 쓴다
+                scanned += 1
                 if m.content_hash in seen_hashes:
                     skipped.append({"source": name, "row": m.source_row, "reason": "중복(완전일치)"})
                     continue
@@ -358,11 +370,19 @@ def prepare_manuscripts(
                         )
                     skipped.append({"source": name, "row": m.source_row, "reason": reason})
                     continue
+                if want_cafe and not cafe_matches(want_cafe, m.cafe):
+                    other.append(m)
+                    continue
                 picked.append(m)
                 history.append(m)  # 같은 실행 안에서의 중복도 잡는다
                 seen_hashes.add(m.content_hash)
             if spec.count and spec.count > 0 and len(picked) >= spec.count:
                 break
+            if want_cafe and other and scanned >= CAFE_SCAN_LIMIT:
+                break
+
+    if not picked and other:
+        picked = other  # 지정 카페 원고가 없으면 아무 원고나 쓴다(게시판은 카페 기본값)
 
     rt.scratch["source_load"] = {"attempted": attempted, "failed": failed}
     if spec.count and spec.count > 0:
@@ -430,20 +450,93 @@ def _test_cafes(rt: Runtime) -> set[str]:
     return {_norm(k) for k in (rt.cafes_cfg.get("test") or {})}
 
 
+def cafe_matches(query: str, name: str) -> bool:
+    """`catalog.match_name`과 같은 규칙으로 카페 이름 두 개가 같은 카페인지 본다.
+
+    정규화(이모지·공백·기호 제거) 완전일치 → 한글만 완전일치 → 한쪽이 다른 쪽에
+    포함(줄임말) 순. 예: `태극` ↔ `태극마케팅센터`, `러브 인썸` ↔ `러브 인썸 (Love in Some)`.
+    """
+    from v2r.api.catalog import korean_only, normalize_name
+
+    q, n = normalize_name(query), normalize_name(name)
+    if not q or not n:
+        return False
+    if q == n:
+        return True
+    kq, kn = korean_only(query), korean_only(name)
+    if kq and kq == kn:
+        return True
+    return q in n or n in q
+
+
+def cafe_entries(cafes_cfg: dict) -> list[dict]:
+    """설정에 있는 모든 카페 항목(제휴 + 자사 + 테스트)을 같은 모양으로."""
+    out: list[dict] = []
+    for group in ("affiliate", "self_owned"):
+        for entry in (cafes_cfg or {}).get(group) or []:
+            if isinstance(entry, dict) and entry.get("name"):
+                out.append(dict(entry))
+    for name, value in ((cafes_cfg or {}).get("test") or {}).items():
+        entry = dict(value) if isinstance(value, dict) else {"cafe_id": value}
+        entry.setdefault("name", str(name))
+        out.append(entry)
+    return out
+
+
+def find_cafe_entry(cafe: str, cafes_cfg: dict) -> dict | None:
+    """카페 이름/별칭으로 설정 항목 1건을 찾는다(정규화·줄임말 허용)."""
+    if not cafe:
+        return None
+    for entry in cafe_entries(cafes_cfg):
+        names = [str(entry.get("name") or "")] + [
+            str(a) for a in (entry.get("aliases") or [])
+        ]
+        if any(cafe_matches(cafe, n) for n in names):
+            return entry
+    return None
+
+
+def canonical_board(cafes_cfg: dict, cafe: str, board: str) -> str:
+    """게시판 별칭(`board_aliases`)이면 그 카페의 정식 게시판 이름으로 바꾼다."""
+    entry = find_cafe_entry(cafe, cafes_cfg)
+    if not entry or not entry.get("board"):
+        return board
+    aliases = [str(a) for a in (entry.get("board_aliases") or [])]
+    from v2r.api.catalog import normalize_name
+
+    key = normalize_name(board)
+    if key and any(normalize_name(a) == key for a in aliases):
+        return str(entry["board"])
+    return board
+
+
+def cafe_default_board(cafes_cfg: dict, cafe: str) -> str:
+    """카페별 기본 게시판(`cafes.yaml`). 없으면 빈 문자열."""
+    entry = find_cafe_entry(cafe, cafes_cfg)
+    return str((entry or {}).get("board") or "")
+
+
 def resolve_cafe(rt: Runtime, m: Manuscript, spec: TaskSpec) -> str:
     """명령에 카페가 있으면 명령 우선, 없으면 원고 → 기본값."""
     return spec.cafe or m.cafe or DEFAULT_CAFE
 
 
 def resolve_board(rt: Runtime, m: Manuscript, spec: TaskSpec, cafe: str) -> str:
-    """명령 게시판 → (명령 카페가 없을 때만) 원고 게시판 → 제휴 지정 게시판 → 기본."""
+    """명령 게시판 → (카페가 맞는) 원고 게시판 → 제휴 지정 → 카페별 기본 → 전역 기본.
+
+    명령이 카페를 지정하면 원고 게시판은 그 카페 원고일 때만 쓴다. 다른 카페의
+    게시판 이름은 이 카페에 없기 때문이다(전역 기본 `자유게시판`도 대부분 없다).
+    """
     if spec.board:
         return spec.board
-    if m.board and not spec.cafe:
-        return m.board
+    if m.board and (not spec.cafe or (m.cafe and cafe_matches(cafe, m.cafe))):
+        return canonical_board(rt.cafes_cfg, cafe, m.board)
     entry = find_affiliate(cafe, rt.cafes_cfg)
     if entry and entry.get("board"):
         return str(entry["board"])
+    own = cafe_default_board(rt.cafes_cfg, cafe)
+    if own:
+        return own
     return str(rt.cafes_cfg.get("default_board") or "자유게시판")
 
 
@@ -548,6 +641,73 @@ def pick_images(rt: Runtime, m: Manuscript, spec: TaskSpec, need: int) -> list[P
 # --------------------------------------------------------------------
 # 계획
 # --------------------------------------------------------------------
+def _cafe_members(rt: Runtime, cafe_name: str) -> tuple[Any, list[str]]:
+    """카페 객체와 가입 계정 login_id 목록(탈퇴·활동중지 제외). 실행당 1회만 조회."""
+    from v2r.api.catalog import match_name
+
+    cache: dict = rt.scratch.setdefault("cafe_members", {})
+    key = _norm(cafe_name)
+    if key not in cache:
+        cafe = match_name(cafe_name, rt.catalog.cafes(), key=lambda c: c.name)
+        members = [ca.login_id for ca in rt.catalog.cafe_accounts(cafe.cafe_id)]
+        cache[key] = (cafe, members)
+    return cache[key]
+
+
+def writable_logins(
+    rt: Runtime, cafe_name: str, board: str, candidates: list[str]
+) -> set[str]:
+    """`cafe_name`의 `board`에 글을 쓸 수 있는 계정(casefold) 집합.
+
+    카페 가입 계정 ∩ `candidates` 로 조회 범위를 좁힌 뒤 게시판 권한을 본다.
+    결과는 실행 중 재사용한다(`rt.scratch`).
+    """
+    from v2r.api.catalog import match_name
+
+    cafe, members = _cafe_members(rt, cafe_name)
+    wanted = {c.casefold() for c in candidates}
+    logins = [m for m in members if m.casefold() in wanted] if candidates else list(members)
+    cache: dict = rt.scratch.setdefault("writable_logins", {})
+    key = (_norm(cafe_name), _norm(board), tuple(sorted(logins)))
+    if key not in cache:
+        menus = rt.catalog.menus(cafe.cafe_id, logins) if logins else []
+        if not menus:
+            cache[key] = set()
+        else:
+            menu = match_name(board, menus, key=lambda x: x.name)
+            cache[key] = {a.casefold() for a in menu.writable_accounts}
+    return cache[key]
+
+
+def _pool_for_cafe(
+    rt: Runtime, spec: TaskSpec, cafe_name: str, board: str, pool: list[Account]
+) -> tuple[list[Account], bool]:
+    """계정 풀을 '그 카페에 가입 + 그 게시판 쓰기 가능'으로 좁힌다.
+
+    반환: `(좁힌 풀, 보류 여부)`. 모의 실행에서 카탈로그를 아직 안 받았으면
+    네트워크를 쓰지 않고 `(원래 풀, True)`를 돌려준다(계정은 실행 시 결정).
+    """
+    ids = [a.login_id for a in pool]
+    members_cache = rt.scratch.get("cafe_members") or {}
+    if spec.dry_run and _norm(cafe_name) not in members_cache:
+        return pool, True  # 모의 실행은 네트워크를 쓰지 않는다 (계정은 실행 시 결정)
+    try:
+        allowed = writable_logins(rt, cafe_name, board, ids)
+    except Exception as exc:
+        if spec.dry_run:
+            return pool, True
+        raise AssignError(
+            f"'{cafe_name}' 카페의 '{board}' 게시판 권한을 확인하지 못했습니다: {exc}"
+        ) from exc
+    narrowed = [a for a in pool if a.login_id.casefold() in allowed]
+    if not narrowed:
+        raise AssignError(
+            f"'{cafe_name}' 카페의 '{board}' 게시판에 글을 쓸 수 있는 계정이 없습니다"
+            " (카페 가입 여부와 게시판 쓰기 권한을 확인하세요)"
+        )
+    return narrowed, False
+
+
 def plan(rt: Runtime, spec: TaskSpec, manuscripts: list[Manuscript]) -> list[Slot]:
     """원고 목록 → 슬롯 목록(계정·카페·시각·이미지 확정)."""
     if not manuscripts:
@@ -567,12 +727,21 @@ def plan(rt: Runtime, spec: TaskSpec, manuscripts: list[Manuscript]) -> list[Slo
     assigned: dict[int, str] = {}
     need_assign = [i for i, m in enumerate(manuscripts) if not m.account]
     if need_assign:
-        groups: dict[str, list[int]] = {}
+        # 카페·게시판마다 쓸 수 있는 계정이 다르다 → (work_type, 카페, 게시판)으로 묶는다
+        groups: dict[tuple[str, str, str], list[int]] = {}
         for i in need_assign:
             wt = work_type_for(spec.task, cafes[i], rt.cafes_cfg)
-            groups.setdefault(wt, []).append(i)
-        for work_type, idxs in groups.items():
+            groups.setdefault((wt, cafes[i], boards[i]), []).append(i)
+        for (work_type, cafe_name, board), idxs in groups.items():
             pool = eligible(pool_all, work_type, comment_only, restricted)
+            deferred = False
+            if pool:
+                pool, deferred = _pool_for_cafe(rt, spec, cafe_name, board, pool)
+            if deferred:
+                # 모의 실행: 카탈로그 없이 계정을 못 정한다 → 표시만 남긴다
+                for i in idxs:
+                    assigned[i] = DEFERRED_ACCOUNT
+                continue
             need = spec.account_count or len(idxs)
             if spec.account_mode == "manual":
                 if not pool:
@@ -1000,14 +1169,22 @@ def run_slot(
 
 
 __all__ = [
+    "DEFERRED_ACCOUNT",
     "PublishError",
     "RetryWithOtherAccount",
     "Slot",
+    "cafe_default_board",
+    "cafe_matches",
+    "canonical_board",
+    "find_cafe_entry",
     "load_accounts",
     "load_manuscripts",
     "plan",
     "prepare_manuscripts",
     "refresh_source",
+    "resolve_board",
+    "resolve_cafe",
     "run_slot",
     "select_source_entries",
+    "writable_logins",
 ]

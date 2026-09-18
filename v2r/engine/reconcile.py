@@ -46,7 +46,8 @@ def _cafe_id_for(rt: Runtime, cafe_name: str) -> Any:
                 return entry.get("cafe_id")
     for tname, cid in (cfg.get("test") or {}).items():
         if str(tname).strip() == name:
-            return cid
+            # 값은 cafe_id(정수) 또는 {cafe_id, board} 형태 둘 다 허용한다
+            return cid.get("cafe_id") if isinstance(cid, dict) else cid
     try:
         from v2r.api.catalog import match_name
 

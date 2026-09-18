@@ -24,27 +24,50 @@ affiliate:
     revision_delay_hours: 22
     aliases: [쌍둥이맘, 쌍둥이맘모여라, 쌍둥이맘 모여라]
 
+# board: 그 카페에서 활성화 단문(일상 글)을 올리는 기본 게시판.
+# v2r-post-patterns.md §2·§6의 관찰값 기준. `# 추정`은 패턴 문서에 뚜렷한 값이 없어
+# 실제 게시판 목록에서 가장 일반적인 수다/자유 게시판을 고른 것.
 self_owned:
   - name: 쌍둥이맘 모여라
     cafe_id: 10174516
+    board: 가족업체 자유게시판   # 추정 (제휴 설정과 동일 게시판)
+    board_aliases: [⭐가족업체 자유게시판, 자유게시판]
   - name: 고요한 아침
     cafe_id: 14567700
+    board: 반말일기   # 추정 (자유게시판 없음, 일상 단문에 가장 일반적)
+    board_aliases: [자유게시판]
   - name: 글로시 마이
     cafe_id: 15175096
+    board: 자유 톡
+    board_aliases: [자유톡, 자유게시판]
   - name: 웨딩 노트
     cafe_id: 15441090
+    board: 토크 수다
+    board_aliases: [수다, 자유게시판]
   - name: 송도포털
     cafe_id: 16149995
+    board: 친해지는 수다   # 추정 (자유게시판 없음)
+    board_aliases: [무엇이든 자유 Q&A, 자유게시판]
   - name: 헬씨 트리
     cafe_id: 23708088
+    board: 자유로운 건강 수다방
+    board_aliases: [건강 수다방, 자유게시판]
   - name: 러브 인썸
     cafe_id: 26616683
+    board: 🪻인썸 수다방
+    board_aliases: [인썸 수다방, 수다방, 자유게시판]
   - name: 마이 웨딩 드림
     cafe_id: 26680163
+    board: 💍톡톡 수다방
+    board_aliases: [톡톡 수다방, 수다방, 자유게시판]
 
 test:
-  태극: 31670254
-  소나무: 31670256
+  태극:
+    cafe_id: 31670254
+    board: 자유게시판
+  소나무:
+    cafe_id: 31670256
+    board: 자유게시판
 
 # 댓글 전용 계정(본문 작성에 쓰지 않는다)
 comment_accounts:

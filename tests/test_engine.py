@@ -598,3 +598,184 @@ def test_중지_요청이_있으면_남은_슬롯을_건너뛴다(tmp_path, monk
     assert len(calls) == 1
     assert out.get("stopped") is True and out["slots"] == 3
     rt.close()
+
+
+# --------------------------------------------------------------------
+# 게시판 해석 (결함 1) · 카페별 계정 제한 (결함 2) — 2026-09-19
+# --------------------------------------------------------------------
+def _m(**kwargs):
+    from v2r.content.manuscript import Manuscript
+
+    base = {"title": "t", "body": "b"}
+    base.update(kwargs)
+    return Manuscript(**base)
+
+
+def test_카페이름_줄임말과_이모지를_같은_카페로_본다():
+    assert publish_mod.cafe_matches("태극", "태극마케팅센터")
+    assert publish_mod.cafe_matches("러브 인썸", "러브 인썸 (Love in Some)")
+    assert publish_mod.cafe_matches("쌍둥이맘 모여라", "쌍둥이맘모여라")
+    assert not publish_mod.cafe_matches("태극", "소나무마케팅센터")
+    assert not publish_mod.cafe_matches("", "고요한 아침")
+
+
+def test_자사_테스트_카페_설정에_기본_게시판이_모두_있다(tmp_path):
+    rt = make_runtime(tmp_path)
+    entries = [
+        e
+        for e in publish_mod.cafe_entries(rt.cafes_cfg)
+        if e.get("name") not in {x.get("name") for x in rt.cafes_cfg.get("affiliate") or []}
+    ]
+    assert entries
+    for entry in entries:
+        assert entry.get("board"), f"{entry.get('name')}에 board가 없습니다"
+    rt.close()
+
+
+def test_명령_카페의_기본_게시판을_쓴다_다른_카페_원고여도(tmp_path):
+    """결함 1: 명령이 카페를 지정하면 다른 카페 원고의 게시판을 쓰지 않는다."""
+    rt = make_runtime(tmp_path)
+    spec = make_spec(cafe="러브 인썸", board="", manuscripts=[])
+    m = _m(cafe="고요한 아침", board="반말일기")
+    assert publish_mod.resolve_board(rt, m, spec, "러브 인썸") == "🪻인썸 수다방"
+    # 전역 기본값(자유게시판)으로 떨어지지 않는다
+    assert publish_mod.resolve_board(rt, m, spec, "웨딩 노트") == "토크 수다"
+    rt.close()
+
+
+def test_원고_카페가_맞으면_원고_게시판을_쓴다(tmp_path):
+    rt = make_runtime(tmp_path)
+    spec = make_spec(cafe="러브 인썸", board="", manuscripts=[])
+    m = _m(cafe="러브 인썸 (Love in Some)", board="🌸신혼 일기장")
+    assert publish_mod.resolve_board(rt, m, spec, "러브 인썸") == "🌸신혼 일기장"
+    rt.close()
+
+
+def test_게시판_별칭은_정식_이름으로_바뀐다(tmp_path):
+    rt = make_runtime(tmp_path)
+    spec = make_spec(cafe="마이 웨딩 드림", board="", manuscripts=[])
+    m = _m(cafe="마이 웨딩 드림", board="자유게시판")  # 별칭 → 정식 게시판
+    assert publish_mod.resolve_board(rt, m, spec, "마이 웨딩 드림") == "💍톡톡 수다방"
+    rt.close()
+
+
+def test_명령_게시판이_있으면_그대로_쓴다(tmp_path):
+    rt = make_runtime(tmp_path)
+    spec = make_spec(cafe="러브 인썸", board="커플 이야기", manuscripts=[])
+    m = _m(cafe="고요한 아침", board="반말일기")
+    assert publish_mod.resolve_board(rt, m, spec, "러브 인썸") == "커플 이야기"
+    rt.close()
+
+
+def test_명령_카페의_원고를_먼저_고른다(tmp_path, monkeypatch):
+    rt = make_runtime(tmp_path)
+    spec = make_spec(cafe="웨딩 노트", board="", manuscripts=[], count=1)
+    items = [
+        _m(title="다른 카페", body="b1", cafe="고요한 아침", board="반말일기", source="s", source_row=1),
+        _m(title="맞는 카페", body="b2", cafe="웨딩 노트", board="토크 수다", source="s", source_row=2),
+    ]
+    monkeypatch.setattr(publish_mod, "select_source_entries", lambda r, s: [{"name": "s"}])
+    monkeypatch.setattr(publish_mod, "load_manuscripts", lambda r, e, prefer_cache=False: items)
+    picked = publish_mod.prepare_manuscripts(rt, spec)
+    assert [p.title for p in picked] == ["맞는 카페"]
+    rt.close()
+
+
+def test_맞는_카페_원고가_없으면_아무_원고나_쓴다(tmp_path, monkeypatch):
+    rt = make_runtime(tmp_path)
+    spec = make_spec(cafe="웨딩 노트", board="", manuscripts=[], count=1)
+    items = [_m(title="다른 카페", body="b1", cafe="고요한 아침", source="s", source_row=1)]
+    monkeypatch.setattr(publish_mod, "select_source_entries", lambda r, s: [{"name": "s"}])
+    monkeypatch.setattr(publish_mod, "load_manuscripts", lambda r, e, prefer_cache=False: items)
+    picked = publish_mod.prepare_manuscripts(rt, spec)
+    assert [p.title for p in picked] == ["다른 카페"]
+    rt.close()
+
+
+# ---- 결함 2: 카페 가입 + 게시판 권한으로 계정 풀을 좁힌다 ----
+def _accounts(*ids):
+    from v2r.accounts.loader import Account
+
+    return [Account(login_id=i, work_type="자사 카페", linked="V2R") for i in ids]
+
+
+class _MemberCatalog(FakeCatalog):
+    """소나무처럼 가입 계정이 하나뿐인 카페 대역."""
+
+    def __init__(self, members, writable) -> None:
+        super().__init__()
+        self.members = members
+        self.writable = writable
+
+    def cafes(self):
+        return [Cafe(cafe_id=31670256, name="소나무마케팅센터")]
+
+    def cafe_accounts(self, cafe_id):
+        from v2r.api.catalog import CafeAccount
+
+        return [CafeAccount(login_id=i, member_key="k") for i in self.members]
+
+    def menus(self, cafe_id, login_ids):
+        return [
+            Menu(
+                menu_id=1,
+                name="자유게시판",
+                writable_accounts={i for i in login_ids if i in self.writable},
+            )
+        ]
+
+
+def test_카페에_가입한_계정만_후보로_남는다(tmp_path):
+    rt = make_runtime(tmp_path)
+    rt._catalog = _MemberCatalog(members=["qbneb"], writable={"qbneb"})
+    spec = make_spec(cafe="소나무", board="자유게시판", dry_run=False, manuscripts=[])
+    pool, deferred = publish_mod._pool_for_cafe(
+        rt, spec, "소나무", "자유게시판", _accounts("peecics", "qbneb", "polbbo")
+    )
+    assert deferred is False
+    assert [a.login_id for a in pool] == ["qbneb"]
+    rt.close()
+
+
+def test_쓸_수_있는_계정이_없으면_한국어로_알린다(tmp_path):
+    rt = make_runtime(tmp_path)
+    rt._catalog = _MemberCatalog(members=["qbneb"], writable=set())
+    spec = make_spec(cafe="소나무", board="자유게시판", dry_run=False, manuscripts=[])
+    with pytest.raises(publish_mod.AssignError) as err:
+        publish_mod._pool_for_cafe(rt, spec, "소나무", "자유게시판", _accounts("qbneb"))
+    assert "소나무" in str(err.value) and "자유게시판" in str(err.value)
+    rt.close()
+
+
+def test_카탈로그_조회는_실행당_한_번만_한다(tmp_path):
+    rt = make_runtime(tmp_path)
+    cat = _MemberCatalog(members=["qbneb", "peecics"], writable={"qbneb", "peecics"})
+    rt._catalog = cat
+    calls = []
+    original = cat.menus
+    cat.menus = lambda cafe_id, login_ids: (calls.append(1), original(cafe_id, login_ids))[1]
+    spec = make_spec(cafe="소나무", board="자유게시판", dry_run=False, manuscripts=[])
+    for _ in range(3):
+        publish_mod._pool_for_cafe(rt, spec, "소나무", "자유게시판", _accounts("qbneb", "peecics"))
+    assert len(calls) == 1
+    rt.close()
+
+
+def test_모의실행은_카탈로그_없이_계정을_보류한다(tmp_path, monkeypatch):
+    """네트워크를 쓰지 않고 '(실행 시 결정)'으로 계획한다."""
+    rt = make_runtime(tmp_path)
+
+    def boom(*a, **k):
+        raise AssertionError("모의 실행에서 카탈로그를 호출했습니다")
+
+    rt._catalog = _MemberCatalog(members=[], writable=set())
+    rt._catalog.cafes = boom
+    rt._catalog.cafe_accounts = boom
+    rt._catalog.menus = boom
+    monkeypatch.setattr(
+        publish_mod, "load_accounts", lambda r, prefer_cache=False: _accounts("qbneb")
+    )
+    spec = make_spec(cafe="소나무", board="자유게시판", manuscripts=[])
+    slots = publish_mod.plan(rt, spec, [_m(source="s", source_row=1, images_enabled=False)])
+    assert [s.account for s in slots] == [publish_mod.DEFERRED_ACCOUNT]
+    rt.close()
