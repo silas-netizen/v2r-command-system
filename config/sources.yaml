@@ -12,10 +12,6 @@ sources:
     kind: accounts
     spreadsheet_id: 1UgcAvHFCpC5N9joC9T5WCATK834F3XAtRrepFv6XbEs
     gid: 218285244
-  - name: 각색 전체
-    kind: sheet
-    spreadsheet_id: 1WlNgw9Jzr7dWYAabqVB3yn220--uucVb
-    gid: 21220889
   - name: 기존일상시트
     kind: sheet
     spreadsheet_id: 14N_Mjji4mWqi9ib_4T_AGI1ruYdHOeKT

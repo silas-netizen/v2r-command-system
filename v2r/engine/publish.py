@@ -334,14 +334,22 @@ def prepare_manuscripts(
                 failed += 1
                 skipped.append({"source": name, "reason": f"원본 적재 실패: {exc}"})
                 continue
-            history = _done_history(rt, name)
+            # 미리 만들어 둔 엑셀 일상 글은 사용자가 이미 중복 정리함 → 중복 검사 생략
+            skip_dup = str(entry.get("kind") or "") == "xlsx_daily"
+            history = [] if skip_dup else _done_history(rt, name)
+            seen_hashes = {h.content_hash for h in history if h.content_hash}
             for m in items:
+                if spec.count and spec.count > 0 and len(picked) >= spec.count:
+                    break  # 필요한 수만 고르면 중단 (수천 행 전수 비교 방지)
+                if m.content_hash in seen_hashes:
+                    skipped.append({"source": name, "row": m.source_row, "reason": "중복(완전일치)"})
+                    continue
                 if rt.publications.exists(name, m.source_row, m.content_hash):
                     skipped.append(
                         {"source": name, "row": m.source_row, "reason": "이미 발행됨"}
                     )
                     continue
-                verdict = duplicate.check_against_history(m, history)
+                verdict = None if skip_dup else duplicate.check_against_history(m, history)
                 if verdict:
                     reason = "중복(완전일치)" if verdict == "exact" else "중복(유사)"
                     if not spec.dry_run:  # 모의 실행은 DB를 바꾸지 않는다
@@ -352,6 +360,9 @@ def prepare_manuscripts(
                     continue
                 picked.append(m)
                 history.append(m)  # 같은 실행 안에서의 중복도 잡는다
+                seen_hashes.add(m.content_hash)
+            if spec.count and spec.count > 0 and len(picked) >= spec.count:
+                break
 
     rt.scratch["source_load"] = {"attempted": attempted, "failed": failed}
     if spec.count and spec.count > 0:
@@ -420,16 +431,16 @@ def _test_cafes(rt: Runtime) -> set[str]:
 
 
 def resolve_cafe(rt: Runtime, m: Manuscript, spec: TaskSpec) -> str:
-    """원고 → 명령 → 기본값 순."""
-    return m.cafe or spec.cafe or DEFAULT_CAFE
+    """명령에 카페가 있으면 명령 우선, 없으면 원고 → 기본값."""
+    return spec.cafe or m.cafe or DEFAULT_CAFE
 
 
 def resolve_board(rt: Runtime, m: Manuscript, spec: TaskSpec, cafe: str) -> str:
-    """원고 → 명령 → 제휴 카페 지정 게시판 → 기본 게시판."""
-    if m.board:
-        return m.board
+    """명령 게시판 → (명령 카페가 없을 때만) 원고 게시판 → 제휴 지정 게시판 → 기본."""
     if spec.board:
         return spec.board
+    if m.board and not spec.cafe:
+        return m.board
     entry = find_affiliate(cafe, rt.cafes_cfg)
     if entry and entry.get("board"):
         return str(entry["board"])

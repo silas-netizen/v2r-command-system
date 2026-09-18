@@ -101,6 +101,17 @@ def match_name(query: str, candidates: Iterable[Any], key: Callable[[Any], str])
                 + ", ".join(key(m) for m in kmatches)
             )
 
+    # 줄임말 허용: 정규화한 질의가 후보 이름에 포함되고 그 후보가 1건이면 채택 (예: 태극 → 태극마케팅센터)
+    if target:
+        pmatches = [item for item, name in zip(items, names) if target in normalize_name(name)]
+        if len(pmatches) == 1:
+            return pmatches[0]
+        if len(pmatches) > 1:
+            raise CatalogError(
+                f"'{query}'와(과) 부분 일치하는 항목이 여러 개입니다: "
+                + ", ".join(key(m) for m in pmatches)
+            )
+
     raise CatalogError(
         f"'{query}'와(과) 일치하는 항목이 없습니다. 후보: " + ", ".join(names)
     )
