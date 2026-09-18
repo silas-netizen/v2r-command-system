@@ -143,3 +143,72 @@ def test_local_files(tmp_path):
     csv_path = tmp_path / "a.csv"
     csv_path.write_text("제목,본문\n가,나\n", encoding="utf-8-sig")
     assert load_csv_rows(csv_path) == [{"제목": "가", "본문": "나"}]
+
+
+# --------------------------------------------------------------------
+# gviz 머리글 추측 끄기 (팥순이 `게시글 쓰기 원본` 탭 사고)
+# --------------------------------------------------------------------
+def test_gviz_url_탭이름과_headers():
+    url = gviz_csv_url("SID", sheet="게시글 쓰기 원본", headers=0)
+    assert "gid=" not in url
+    assert "headers=0" in url
+    assert "%EA%B2%8C%EC%8B%9C%EA%B8%80" in url  # 탭 이름이 URL 인코딩된다
+
+
+def test_load_source_는_sheet와_headers를_넘긴다(monkeypatch):
+    seen: dict = {}
+
+    def fake_get(url, **kw):
+        seen["url"] = url
+        return httpx.Response(200, text="A,B\n1,2\n", request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(sheets.httpx, "get", fake_get)
+    load_source({"name": "t", "spreadsheet_id": "SID", "sheet": "탭", "headers": 0})
+    assert "headers=0" in seen["url"] and "gid=" not in seen["url"]
+
+
+def test_중복_머리글도_열_자리를_지킨다(monkeypatch):
+    # 빈 머리글이 두 번 나와도 뒤엣것이 앞엣것을 덮지 않아야 한다
+    text = "키워드,본문,,\n가,나,다,라\n"
+
+    def fake_get(url, **kw):
+        return httpx.Response(200, text=text, request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(sheets.httpx, "get", fake_get)
+    rows = fetch_csv("https://example.test/csv")
+    assert len(rows[0]) == 4
+    assert list(rows[0].values()) == ["가", "나", "다", "라"]
+
+
+def test_머리글_없는_제휴시트도_A_J를_자리로_읽는다():
+    # 첫 줄이 머리글이 아니라 데이터인 시트 (gviz가 머리글로 먹어 버린 모양)
+    rows = [
+        {
+            "첫키워드": "둘째키워드",
+            "본문 하나": "본문 둘",
+            "씨씨앙": "씨씨앙",
+            "acct1": "acct2",
+            "후기형": "질문형",
+            "": "",
+            "_6": "",
+            "실명": "실명",
+            "Y": "Y",
+            "자유수다방": "자유수다방",
+        }
+    ]
+    assert sheets.header_row_is_data(rows) is True
+    out = parse_affiliate_rows(rows, source="제휴시트")
+    assert [m.keyword for m in out] == ["첫키워드", "둘째키워드"]
+    assert [m.manuscript_type for m in out] == ["후기형", "질문형"]
+    assert [m.source_row for m in out] == [1, 2]
+
+
+def test_머리글이_있으면_그대로_2행부터():
+    rows = [
+        {"키워드": "가", "본문": "본문", "카페명": "씨씨앙", "작성계정": "a",
+         "원고유형": "후기형", "완료 링크": "", "말머리": "", "계정유형": "실명",
+         "이미지 없음": "Y", "게시판명": "자유수다방"},
+    ]
+    assert sheets.header_row_is_data(rows) is False
+    out = parse_affiliate_rows(rows)
+    assert [m.source_row for m in out] == [2]

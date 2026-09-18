@@ -50,6 +50,20 @@ def is_review_type(manuscript_type: str) -> bool:
     return any(t.startswith(k) for k in REVIEW_TYPES)
 
 
+def manuscript_type_matches(wanted: str, value: str) -> bool:
+    """원고유형 필터. 질문형/후기형 두 갈래로만 본다(빈 필터는 전부 통과).
+
+    시트 E열 표기가 `후기`/`후기형`처럼 흔들려도 같은 갈래로 묶인다.
+    """
+    want = re.sub(r"\s+", "", str(wanted or ""))
+    if not want:
+        return True
+    got = re.sub(r"\s+", "", str(value or ""))
+    if not got:
+        return False  # 원고유형이 비어 있으면 어느 갈래로도 단정하지 않는다
+    return is_review_type(want) == is_review_type(got)
+
+
 def assign_comment_accounts(
     tree: list[dict],
     comment_pool: list[str],

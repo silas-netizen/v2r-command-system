@@ -257,3 +257,24 @@ def test_spec_roundtrip_and_validation():
         TaskSpec(task="status", count=-1)
     with pytest.raises(ValueError):
         TaskSpec(task="status", interval_min=20, interval_max=5)
+
+
+def test_원고유형_슬롯():
+    spec = parse_korean_command("팥순이 후기형 브랜드 글 1개 씨씨앙 카페에 올려줘", now=NOW)
+    assert spec.task == "publish_brand"
+    assert spec.brand == "팥순이"
+    assert spec.cafe == "씨씨앙"
+    assert spec.count == 1
+    assert spec.manuscript_type == "후기형"
+
+    spec = parse_korean_command("질문형 브랜드 글 2개 올려줘", now=NOW)
+    assert spec.manuscript_type == "질문형"
+
+    spec = parse_korean_command("브랜드 글 2개 올려줘", now=NOW)
+    assert spec.manuscript_type == ""
+
+
+def test_원고유형_슬롯은_발행계열에서만():
+    spec = parse_korean_command("후기형 사진 3장 생성해줘", now=NOW)
+    assert spec.task == "generate_photos"
+    assert spec.manuscript_type == ""

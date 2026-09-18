@@ -236,13 +236,14 @@ AFFILIATE_HEADERS = (
 def header_row_is_data(rows: list[dict]) -> bool:
     """첫 줄이 머리글이 아니라 **데이터**인가 (머리글 없는 시트).
 
-    머리글 별칭이 하나도 안 보이면 데이터로 본다. 이때 그 줄을 되살려야 A~J를
-    자리로 읽는 파서가 한 행도 잃지 않는다.
+    머리글 별칭(또는 열 문자 `A`~`J`)이 하나도 안 보이면 데이터로 본다. 이때 그
+    줄을 되살려야 A~J를 자리로 읽는 파서가 한 행도 잃지 않는다.
     """
     if not rows:
         return False
     keys = {_norm_key(k) for k in rows[0].keys()}
-    return not any(_norm_key(h) in keys for h in AFFILIATE_HEADERS)
+    known = tuple(AFFILIATE_HEADERS) + tuple("ABCDEFGHIJ")
+    return not any(_norm_key(h) in keys for h in known)
 
 
 def _restore_header_row(rows: list[dict]) -> tuple[list[dict], int]:

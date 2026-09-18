@@ -130,13 +130,29 @@ def open_gpt(headless: bool = False, profile_dir: str | Path | None = None):
     path.mkdir(parents=True, exist_ok=True)
 
     playwright = sync_playwright().start()
-    context = playwright.chromium.launch_persistent_context(
-        str(path),
-        headless=headless,
-        viewport={"width": 1440, "height": 950},
-        accept_downloads=True,
-        args=["--disable-blink-features=AutomationControlled"],
-    )
+    # PC에 설치된 실제 브라우저(크롬 → 엣지)를 우선 사용한다. Playwright 내장 크로미움은
+    # 설치 상태에 따라 "Executable doesn't exist"로 실패한 전력이 있어 마지막 수단으로만 쓴다.
+    last_exc: Exception | None = None
+    context = None
+    for channel in ("chrome", "msedge", None):
+        try:
+            kwargs = dict(
+                headless=headless,
+                viewport={"width": 1440, "height": 950},
+                accept_downloads=True,
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+            if channel:
+                kwargs["channel"] = channel
+            context = playwright.chromium.launch_persistent_context(str(path), **kwargs)
+            log.info("브라우저 실행: %s", channel or "bundled-chromium")
+            break
+        except Exception as exc:  # pragma: no cover - 환경 의존
+            last_exc = exc
+            log.warning("브라우저 실행 실패(%s): %s", channel or "bundled", str(exc).splitlines()[0][:160])
+    if context is None:
+        playwright.stop()
+        raise RuntimeError(f"브라우저를 열 수 없습니다: {last_exc}")
     page = context.pages[0] if context.pages else context.new_page()
     try:
         page.goto(GPT_URL, wait_until="domcontentloaded", timeout=60000)

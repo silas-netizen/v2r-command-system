@@ -77,6 +77,8 @@ RE_INTERVAL_FIXED = re.compile(r"(\d+)\s*분\s*간격")
 RE_BOARD = re.compile(r"게시판\s*(\S+)")
 RE_SOURCE = re.compile(r"시트\s*(\S+)")
 RE_BRAND_SLOT = re.compile(r"브랜드\s+(\S+)")
+#: 원고유형 슬롯 (시트 E열). 발행 계열 명령에서만 읽는다.
+RE_MANUSCRIPT_TYPE = re.compile(r"(질문형|후기형)")
 RE_KEYWORD_SLOT = re.compile(r"키워드\s+(\S+)")
 RE_ACCOUNTS = re.compile(
     r"아이디\s+([A-Za-z0-9_,\s]+?)(?=\s*(?:로|으로|써|사용|$))"
@@ -290,6 +292,12 @@ def parse_korean_command(text: str, now: datetime | None = None) -> TaskSpec | N
         m = RE_KEYWORD_SLOT.search(raw)
         if m:
             spec["keyword"] = _strip_particle(m.group(1))
+
+    # 원고유형 (발행 계열에서만. `후기형 브랜드 글 …` → E열이 후기형인 행만 고른다)
+    if task in PUBLISH_TASKS:
+        m = RE_MANUSCRIPT_TYPE.search(raw)
+        if m:
+            spec["manuscript_type"] = m.group(1)
 
     # 게시판 / 시트
     m = RE_BOARD.search(raw)

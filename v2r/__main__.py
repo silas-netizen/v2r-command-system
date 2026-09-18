@@ -33,7 +33,17 @@ def _print_result(out: dict | None) -> None:
                 f" {item.get('cafe', '')} {item.get('board', '')} /"
                 f" {item.get('scheduled_at', '')} → {item.get('status', '')}"
                 + (f" {item.get('url')}" if item.get("url") else "")
+                + (f" [{item['manuscript_type']}]" if item.get("manuscript_type") else "")
             )
+            for role in item.get("comment_roles") or []:
+                mark = " (작성자)" if role.get("is_author") else ""
+                reply = role.get("reply_member") or "-"
+                print(
+                    f"      {role['label']:<10} {role['account']}{mark}"
+                    f"  ← reply_member {reply}"
+                )
+            if item.get("comment_note"):
+                print(f"      ! {item['comment_note']}")
         for line in result.get("failures") or []:
             print(f"  ! {line}")
         for skip in result.get("skipped") or []:

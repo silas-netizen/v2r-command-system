@@ -118,6 +118,10 @@ def brand_sheet_entries(rt: Runtime, brand: str = "") -> list[dict]:
                 "brand": str(name),
                 "spreadsheet_id": str(cfg.get("spreadsheet_id")),
                 "gid": cfg.get("gid", 0),
+                "sheet": str(cfg.get("sheet") or ""),
+                # 브랜드 시트는 전부 문자열 열이라 gviz의 머리글 추측이 통째로
+                # 어긋난다 (sheets.gviz_csv_url 주석) → 항상 머리글 1줄로 못박는다.
+                "headers": cfg.get("headers", 0),
             }
         )
     return out
@@ -314,6 +318,10 @@ def prepare_manuscripts(
 ) -> list[Manuscript]:
     """발행할 원고를 고른다. 이미 발행됐거나 중복인 행은 건너뛴다."""
     skipped = skipped if skipped is not None else []
+    if spec.cafe and is_excluded_cafe(rt, spec.cafe):
+        entry = find_cafe_entry(spec.cafe, rt.cafes_cfg) or {}
+        label = str(entry.get("name") or spec.cafe)
+        raise PublishError(f"발행 제외 카페입니다: {label} (합류 지시 전까지 제외)")
     picked: list[Manuscript] = []
     # 명령이 카페를 지정하면 그 카페 원고를 먼저 쓴다(게시판이 카페와 맞아야 하므로).
     # 한 건도 없으면 other의 원고로 되돌아간다.
@@ -369,6 +377,22 @@ def prepare_manuscripts(
                             name, m.source_row, m.content_hash, "skipped", stage=verdict
                         )
                     skipped.append({"source": name, "row": m.source_row, "reason": reason})
+                    continue
+                if not comment_mod.manuscript_type_matches(
+                    spec.manuscript_type, m.manuscript_type
+                ):
+                    skipped.append(
+                        {
+                            "source": name,
+                            "row": m.source_row,
+                            "reason": f"원고유형 불일치({m.manuscript_type or '없음'})",
+                        }
+                    )
+                    continue
+                if is_excluded_cafe(rt, m.cafe):
+                    skipped.append(
+                        {"source": name, "row": m.source_row, "reason": "발행 제외 카페"}
+                    )
                     continue
                 if want_cafe and not cafe_matches(want_cafe, m.cafe):
                     other.append(m)
@@ -467,6 +491,34 @@ def cafe_matches(query: str, name: str) -> bool:
     if kq and kq == kn:
         return True
     return q in n or n in q
+
+
+def is_excluded_cafe(rt: Runtime, name: str) -> bool:
+    """`cafes.yaml`에서 `excluded: true`로 표시한 카페인가.
+
+    사용자 지시로 발행에서 빼 둔 카페다(합류 지시 전까지). 이름 비교는
+    `cafe_matches`와 같은 규칙(별칭·줄임말 허용)을 쓴다.
+    """
+    if not name:
+        return False
+    for entry in cafe_entries(rt.cafes_cfg):
+        if not entry.get("excluded"):
+            continue
+        names = [str(entry.get("name") or "")] + [
+            str(a) for a in (entry.get("aliases") or [])
+        ]
+        if any(cafe_matches(name, n) for n in names if n):
+            return True
+    return False
+
+
+def excluded_cafe_names(rt: Runtime) -> list[str]:
+    """발행 제외 카페 이름 목록."""
+    return [
+        str(e.get("name") or "")
+        for e in cafe_entries(rt.cafes_cfg)
+        if e.get("excluded") and e.get("name")
+    ]
 
 
 def cafe_entries(cafes_cfg: dict) -> list[dict]:
@@ -860,6 +912,49 @@ def build_comments(rt: Runtime, slot: Slot, root_start: datetime, cafe_id: Any) 
     return comment_mod.to_api_payload(items, members)
 
 
+def mask_login(login: str) -> str:
+    """계정을 앞 3글자만 남긴다 (기록·출력용)."""
+    text = str(login or "")
+    return (text[:3] + "…") if len(text) > 3 else text
+
+
+def comment_role_rows(rt: Runtime, slot: Slot) -> list[dict]:
+    """모의 실행용 댓글 역할 표: 라벨 → 작성 계정(가림) / reply_member(가림).
+
+    실제 계정은 발행할 때 다시 뽑으므로 여기 값은 **역할 확인용 예시**다.
+    보는 곳은 역할이다: 후기형이면 대대댓글2가 여분 계정, 대대대댓글2가 작성자다.
+    """
+    tree = _comment_tree(slot.manuscript)
+    if not tree:
+        return []
+    pool = comment_pool(rt, slot.workflow)
+    if not pool:
+        return []
+    items = comment_mod.assign_comment_accounts(
+        tree,
+        pool,
+        slot.account,
+        manuscript_type=getattr(slot.manuscript, "manuscript_type", ""),
+    )
+    by_label = {it["label"]: it for it in items}
+    rows: list[dict] = []
+    for it in items:
+        parent = by_label.get(it.get("parent") or "")
+        reply_member = (
+            parent.get("account", "") if parent and int(it.get("depth", 0)) >= 2 else ""
+        )
+        account = str(it.get("account", ""))
+        rows.append(
+            {
+                "label": it["label"],
+                "account": mask_login(account),
+                "reply_member": mask_login(reply_member),
+                "is_author": account.casefold() == str(slot.account).casefold(),
+            }
+        )
+    return rows
+
+
 def _daily_pool(rt: Runtime) -> list[Manuscript]:
     """일상 글 풀: 인박스 각색 xlsx(먼저) + 생성한 짧은 일상 글 풀.
 
@@ -1054,6 +1149,12 @@ def run_slot(
         "images": [str(p) for p in slot.images],
     }
     if spec.dry_run:
+        planned["manuscript_type"] = m.manuscript_type
+        try:
+            planned["comment_roles"] = comment_role_rows(rt, slot)
+        except Exception as exc:  # 역할 표는 참고용이라 모의 실행을 막지 않는다
+            planned["comment_roles"] = []
+            planned["comment_note"] = f"댓글 역할 표를 만들지 못했습니다: {exc}"
         return {**planned, "status": "planned", "dry_run": True}
 
     key = (m.source, m.source_row, m.content_hash)

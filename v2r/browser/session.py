@@ -45,12 +45,21 @@ def open_site(headless: bool = False, profile_dir: str | Path | None = None):
     path.mkdir(parents=True, exist_ok=True)
 
     playwright = sync_playwright().start()
-    context = playwright.chromium.launch_persistent_context(
-        str(path),
-        headless=headless,
-        viewport={"width": 1440, "height": 950},
-        accept_downloads=True,
-    )
+    # 설치된 실제 브라우저(크롬 → 엣지) 우선, 내장 크로미움은 마지막 수단
+    context = None
+    last_exc: Exception | None = None
+    for channel in ("chrome", "msedge", None):
+        try:
+            kwargs = dict(headless=headless, viewport={"width": 1440, "height": 950}, accept_downloads=True)
+            if channel:
+                kwargs["channel"] = channel
+            context = playwright.chromium.launch_persistent_context(str(path), **kwargs)
+            break
+        except Exception as exc:  # pragma: no cover - 환경 의존
+            last_exc = exc
+    if context is None:
+        playwright.stop()
+        raise RuntimeError(f"브라우저를 열 수 없습니다: {last_exc}")
     page = context.pages[0] if context.pages else context.new_page()
     return playwright, context, page
 

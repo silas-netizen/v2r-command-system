@@ -62,6 +62,8 @@ class TaskSpec(BaseModel):
     cafe: str = ""
     board: str = ""
     brand: str = ""
+    #: 원고유형 필터(시트 E열). `질문형` / `후기형` / 빈 값(전부)
+    manuscript_type: str = ""
     keyword: str = ""
     source: str = ""
     dry_run: bool = True

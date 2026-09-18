@@ -954,10 +954,10 @@ def test_명령_게시판이_있으면_그대로_쓴다(tmp_path):
 
 def test_명령_카페의_원고를_먼저_고른다(tmp_path, monkeypatch):
     rt = make_runtime(tmp_path)
-    spec = make_spec(cafe="웨딩 노트", board="", manuscripts=[], count=1)
+    spec = make_spec(cafe="송도포털", board="", manuscripts=[], count=1)
     items = [
         _m(title="다른 카페", body="b1", cafe="고요한 아침", board="반말일기", source="s", source_row=1),
-        _m(title="맞는 카페", body="b2", cafe="웨딩 노트", board="토크 수다", source="s", source_row=2),
+        _m(title="맞는 카페", body="b2", cafe="송도포털", board="친해지는 수다", source="s", source_row=2),
     ]
     monkeypatch.setattr(publish_mod, "select_source_entries", lambda r, s: [{"name": "s"}])
     monkeypatch.setattr(publish_mod, "load_manuscripts", lambda r, e, prefer_cache=False: items)
@@ -968,7 +968,7 @@ def test_명령_카페의_원고를_먼저_고른다(tmp_path, monkeypatch):
 
 def test_맞는_카페_원고가_없으면_아무_원고나_쓴다(tmp_path, monkeypatch):
     rt = make_runtime(tmp_path)
-    spec = make_spec(cafe="웨딩 노트", board="", manuscripts=[], count=1)
+    spec = make_spec(cafe="송도포털", board="", manuscripts=[], count=1)
     items = [_m(title="다른 카페", body="b1", cafe="고요한 아침", source="s", source_row=1)]
     monkeypatch.setattr(publish_mod, "select_source_entries", lambda r, s: [{"name": "s"}])
     monkeypatch.setattr(publish_mod, "load_manuscripts", lambda r, e, prefer_cache=False: items)
@@ -1063,4 +1063,107 @@ def test_모의실행은_카탈로그_없이_계정을_보류한다(tmp_path, mo
     spec = make_spec(cafe="소나무", board="자유게시판", manuscripts=[])
     slots = publish_mod.plan(rt, spec, [_m(source="s", source_row=1, images_enabled=False)])
     assert [s.account for s in slots] == [publish_mod.DEFERRED_ACCOUNT]
+    rt.close()
+
+
+# --------------------------------------------------------------------
+# 원고유형 필터 · 발행 제외 카페
+# --------------------------------------------------------------------
+def _fake_source(monkeypatch, items):
+    """시트 한 건을 대역으로 끼운다."""
+    monkeypatch.setattr(
+        publish_mod, "select_source_entries", lambda rt, spec: [{"name": "제휴시트"}]
+    )
+    monkeypatch.setattr(
+        publish_mod, "load_manuscripts", lambda rt, entry, prefer_cache=False: list(items)
+    )
+
+
+def _mrow(row, mtype, cafe="씨씨앙"):
+    from v2r.content.manuscript import Manuscript
+
+    return Manuscript(
+        title=f"제목{row}",
+        body=f"본문{row}",
+        cafe=cafe,
+        source="제휴시트",
+        source_row=row,
+        content_hash=f"h{row}",
+        manuscript_type=mtype,
+        images_enabled=False,
+    )
+
+
+def test_원고유형_필터가_후기형만_고른다(tmp_path, monkeypatch):
+    rt = make_runtime(tmp_path)
+    _fake_source(monkeypatch, [_mrow(2, "질문형"), _mrow(3, "후기형"), _mrow(4, "")])
+    spec = TaskSpec(
+        task="publish_brand", cafe="씨씨앙", manuscript_type="후기형", manuscripts=[]
+    )
+    skipped: list[dict] = []
+    picked = publish_mod.prepare_manuscripts(rt, spec, skipped)
+    assert [m.source_row for m in picked] == [3]
+    reasons = {s["row"]: s["reason"] for s in skipped}
+    assert "원고유형 불일치" in reasons[2] and "원고유형 불일치" in reasons[4]
+    rt.close()
+
+
+def test_원고유형_필터가_없으면_전부(tmp_path, monkeypatch):
+    rt = make_runtime(tmp_path)
+    _fake_source(monkeypatch, [_mrow(2, "질문형"), _mrow(3, "후기형")])
+    spec = TaskSpec(task="publish_brand", cafe="씨씨앙", manuscripts=[])
+    assert len(publish_mod.prepare_manuscripts(rt, spec, [])) == 2
+    rt.close()
+
+
+def test_발행제외_카페를_지정하면_에러(tmp_path):
+    rt = make_runtime(tmp_path)
+    assert publish_mod.is_excluded_cafe(rt, "웨딩 노트") is True
+    assert publish_mod.is_excluded_cafe(rt, "헬씨 트리") is True
+    assert publish_mod.is_excluded_cafe(rt, "씨씨앙") is False
+    spec = TaskSpec(task="publish_daily", cafe="웨딩 노트", manuscripts=[])
+    with pytest.raises(publish_mod.PublishError) as exc:
+        publish_mod.prepare_manuscripts(rt, spec, [])
+    assert "발행 제외 카페입니다" in str(exc.value)
+    assert "웨딩 노트" in str(exc.value)
+    rt.close()
+
+
+def test_발행제외_카페_원고는_건너뛴다(tmp_path, monkeypatch):
+    rt = make_runtime(tmp_path)
+    _fake_source(
+        monkeypatch,
+        [_mrow(2, "질문형", cafe="웨딩 노트"), _mrow(3, "질문형", cafe="고요한 아침")],
+    )
+    spec = TaskSpec(task="publish_batch", manuscripts=[])
+    skipped: list[dict] = []
+    picked = publish_mod.prepare_manuscripts(rt, spec, skipped)
+    assert [m.source_row for m in picked] == [3]
+    assert skipped == [{"source": "제휴시트", "row": 2, "reason": "발행 제외 카페"}]
+    rt.close()
+
+
+def test_모의실행에_댓글_역할표가_붙는다(tmp_path, monkeypatch):
+    from v2r.content.manuscript import CommentNode
+
+    rt = make_runtime(tmp_path)
+    labels = [n["label"] for n in publish_mod.comment_mod.DEFAULT_TREE]
+    m = _mrow(2, "후기형")
+    m.account = "author1"
+    m.comments = [CommentNode(label=lb, text=lb) for lb in labels]
+    spec = TaskSpec(
+        task="publish_brand", cafe="씨씨앙", board="자유수다방", manuscripts=[]
+    )
+    slot = publish_mod.plan(rt, spec, [m])[0]
+    out = publish_mod.run_slot(rt, spec, slot)
+    rows = {r["label"]: r for r in out["comment_roles"]}
+    assert len(rows) == 12
+    assert out["manuscript_type"] == "후기형"
+    # 후기형: 대대댓글2 = 여분 계정(reply_member=작성자), 대대대댓글2 = 작성자
+    assert rows["대대댓글2"]["is_author"] is False
+    assert rows["대대댓글2"]["reply_member"] == publish_mod.mask_login("author1")
+    assert rows["대대대댓글2"]["is_author"] is True
+    assert rows["대대대댓글2"]["reply_member"] == rows["대대댓글2"]["account"]
+    # 계정은 앞 3글자만 남는다
+    assert rows["대댓글1"]["account"] == "aut…"
     rt.close()

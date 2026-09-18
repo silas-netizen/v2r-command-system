@@ -157,3 +157,14 @@ def test_member_key_없으면_에러():
     items = schedule(tree, ROOT)
     with pytest.raises(CommentError):
         to_api_payload(items, {})  # member_key 미상 → 전송 금지
+
+
+def test_manuscript_type_matches():
+    from v2r.content.comments import manuscript_type_matches as match
+
+    assert match("", "질문형") and match("", "후기형") and match("", "")
+    assert match("후기형", "후기형") and match("후기형", "후기")
+    assert match("질문형", "질문형")
+    assert not match("후기형", "질문형")
+    assert not match("질문형", "후기형")
+    assert not match("후기형", "")  # 원고유형이 비면 어느 갈래로도 안 본다
