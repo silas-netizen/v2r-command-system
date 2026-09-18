@@ -52,7 +52,7 @@ brands:
     known_folders: [키워드]
     image_count: 1
     comment_type: manuscript
-    sheets: []                 # TODO: 브랜드 시트 ID 미확인
+    sheets: [1QYhQFnZznQ-NjIjwiIlmJcf6zkQlb6t3TBK-W6OwJm0]   # 원고 시트 (config/sources.yaml brand_sheets)
 
   코숨핏:
     folder: 코숨핏
@@ -80,7 +80,7 @@ brands:
       - 입호흡, 비강호흡
     image_count: 1
     comment_type: manuscript
-    sheets: []                 # TODO
+    sheets: [1Ey_laLK5-yJx2malh8s0vbmECpVW7CZQklCGKT3x0ek]   # 원고 시트 (config/sources.yaml brand_sheets)
 
   뉴더미스:
     folder: 뉴더미스
@@ -93,7 +93,7 @@ brands:
     known_folders: [키워드, 두드러기, 병원, 먹는 약, 좌욕사진, 연고사진]
     image_count: 1
     comment_type: manuscript
-    sheets: []                 # TODO
+    sheets: [1mgqghfeNrSZ1bTSrfTYWojtPGMc0u-K4VXEikxrHLOw]   # 원고 시트 (config/sources.yaml brand_sheets)
 
   장으뜸:
     folder: 장으뜸
@@ -105,7 +105,7 @@ brands:
     known_folders: [키워드]
     image_count: 1
     comment_type: manuscript
-    sheets: []                 # TODO
+    sheets: [1J8Nq-UQxLzrt3fOqIkZ2HRskZJTFQlOjmFjIh3wlzBs]   # 원고 시트 (config/sources.yaml brand_sheets)
 
   팥순이:
     folder: 팥순이
@@ -122,7 +122,7 @@ brands:
     known_folders: [키워드, BA]
     image_count: 1
     comment_type: manuscript
-    sheets: []                 # TODO
+    sheets: [1OwR_LSjO1ofOojldtSIqoxv0gieNSMx_t35_5G1VTCc]   # 원고 시트 (config/sources.yaml brand_sheets)
 
 # 브랜드 폴더가 아닌 인박스 폴더 (사진 수집에서 건너뛴다)
 ignored_inbox_folders:

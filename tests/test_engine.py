@@ -216,11 +216,41 @@ def test_이미지가_있으면_브라우저_없이는_실패(tmp_path, monkeypa
     rt.close()
 
 
-def test_사진이_부족하면_발행_전에_에러(tmp_path):
+def test_사진이_없으면_발행_전에_사진필요_오류(tmp_path):
+    """결정 1(2026-09-19): 원본이 하나도 없으면 NoPhotoError(텔레그램 알림용)."""
+    from v2r.warehouse.store import NoPhotoError
+
     rt = make_runtime(tmp_path)
     spec = make_spec(dry_run=False, brand="우아덤")
     spec.manuscripts[0]["images_enabled"] = True
     spec.manuscripts[0]["body"] = "첫 줄\n{이미지1}\n둘째 줄"
+    with pytest.raises(NoPhotoError) as exc:
+        publish_mod.plan(rt, spec, publish_mod.prepare_manuscripts(rt, spec))
+    assert "사진이 필요합니다" in str(exc.value)
+    assert "우아덤" in str(exc.value)
+    rt.close()
+
+
+def test_사진이_부족하면_발행_전에_에러(tmp_path):
+    """원본은 있지만 미사용 세탁본이 없으면 PublishError."""
+    from PIL import Image
+
+    rt = make_runtime(tmp_path)
+    spec = make_spec(dry_run=False, brand="우아덤")
+    spec.manuscripts[0]["images_enabled"] = True
+    spec.manuscripts[0]["body"] = "첫 줄\n{이미지1}\n둘째 줄"
+    wh = rt.warehouse
+    wh.ensure_dirs()
+    folder = wh.keyword_folder("우아덤", "이미지1")
+    folder.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (20, 20), (3, 4, 5)).save(folder / "a.jpg")
+    original = next(folder.iterdir())
+    sha = wh.sha256(original)
+    variant = wh.washed_folder(sha)
+    variant.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (20, 20), (6, 7, 8)).save(variant / "0.jpg")
+    publish_mod.record_variant_use(rt, sha, variant / "0.jpg", "SRC-USED")
+
     with pytest.raises(publish_mod.PublishError) as exc:
         publish_mod.plan(rt, spec, publish_mod.prepare_manuscripts(rt, spec))
     assert "사진이 부족합니다" in str(exc.value)

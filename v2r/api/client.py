@@ -9,7 +9,7 @@ from typing import Any, Iterator
 
 import httpx
 
-from .auth import AuthSession, api_base
+from .auth import BROWSER_HEADERS, AuthSession, api_base
 from .errors import V2RApiError, classify
 
 RATE_INTERVAL = 0.25
@@ -83,7 +83,7 @@ class V2RClient:
         self._client = client or httpx.Client(
             base_url=self.base_url,
             timeout=60.0,
-            headers={"Accept": "application/json"},
+            headers=dict(BROWSER_HEADERS),
         )
 
     # ---- 컨텍스트 ----

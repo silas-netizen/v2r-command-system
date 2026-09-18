@@ -91,6 +91,7 @@ events(id, job_id, level, message, created_at)   -- 보고·감사 로그
 | `reconcile` | `(끊긴\|미완료).*(이어\|재개\|점검)` | 끊긴 작업 이어가 |
 | `sync_all_sources` | `전체\s*(원본\|시트).*(동기화\|갱신)` | |
 | `sync_sources` | `(원본\|시트).*(동기화\|갱신)` | |
+| `generate_daily` | `일상\s*글.*(생성\|만들어)` | 일상 글 30개 만들어줘 |
 | `collect_daily` | `일상\s*글.*(수집\|가져와)` | |
 | `collect_photos` | `사진.*(수집\|가져와)` | |
 | `wash_photos` | `사진.*(세탁\|변형)\s*(\d+)?` | 사진 세탁 30장 |
@@ -120,7 +121,9 @@ events(id, job_id, level, message, created_at)   -- 보고·감사 로그
 - **카페**: 씨씨앙/양평맘/쌍둥이맘 모여라는 제휴. 제휴 수정글 지연 4h/20h/22h. 테스트 카페 글은 즉시 발행.
 - **시간**: `Asia/Seoul`. 시간창 안에서 첫 글 +5~15분, 카페별 체인으로 이전 예약 +5~15분(또는 명령의 고정 간격). 창 밖이면 다음 날 창 시작.
 - **댓글**: 루트 5 + 대댓글 5 + 대대댓글 + 대대대댓글 = 12. 오프셋 5~9/15~19/26/36분. 같은 계정 같은 분 충돌 시 12개 일괄 이동. 일상 글 댓글 생성 Haiku, 홍보 글 Sonnet.
-- **이미지**: 창고의 세탁본 중 미사용 변형 선택 → 사용 기록. 세탁은 `DateTime*`, `Make/Model`, 렌즈·노출 필드만 랜덤. 원본은 보존.
+- **이미지**(결정 1, 2026-09-19 / `config/brands.yaml`): 사진은 **`originals/<브랜드>/<키워드 또는 토큰>` 폴더에서만** 고른다. 본문 `{토큰}` 1개 = 사진 1장. 토큰 → 폴더는 `token_folder_name()` (팥순이·장으뜸·뉴더미스의 `{키워드}`/`{A열 키워드}` → `키워드`, 팥순이 `{B/A}` → `BA`, 그 외 토큰 그대로). 팥순이 `키워드` 폴더만 **파일명 매칭**, 나머지는 무작위. 폴더가 비었으면 `ensure_keyword_pool()`이 **브랜드 폴더 루트와 인박스(`inbox/image[/image]/<브랜드>`) 원본을 복사해 채우고** 세탁본을 만든다. 브랜드 폴더 바로 아래 사진은 직접 쓰지 않는다. 원본이 하나도 없으면 `NoPhotoError`("사진이 필요합니다 …") → 채널(텔레그램) 알림. 세탁은 `DateTime*`, `Make/Model`, 렌즈·노출 필드만 랜덤. 원본은 보존.
+- **일상 글 풀**(결정 2·3): `publish_daily`와 제휴 일상 글은 `warehouse/inbox/sheets/*각색*.xlsx`(kind `xlsx_daily`, A~F열, 등록시간·상태가 찬 행은 제외)를 **먼저** 쓰고, 이어서 `warehouse/manuscripts/daily_pool.jsonl`(kind `daily_pool`, `generate_daily`가 만든 제목 1줄·본문 1줄 짧은 글)을 쓴다. 둘 다 사진 없음. `content_hash`로 중복 제거, 한 실행 안 재사용 금지, 사용분은 `publications`에 기록.
+- **브랜드 원고 시트**: `config/sources.yaml: brand_sheets`(브랜드 → spreadsheet_id, A~J 배치 → `parse_affiliate_rows`). `publish_brand`는 `spec.brand`가 있으면 그 시트만, 없으면 전부. 완료 링크가 `http`로 시작하는 행은 건너뛴다.
 - **완료 판단**: POST 응답 `source_id` + GET `article` 재조회 일치 + (즉시 발행이면 `history.status ∈ {DONE,SUCCESS}`) 일 때만 `done`. 그 외 `uncertain`.
 
 ## 7. 모델 사용 정책 (`v2r/llm/router.py`)
@@ -129,7 +132,7 @@ events(id, job_id, level, message, created_at)   -- 보고·감사 로그
 | 모호 명령 해석 | `claude-haiku-4-5` |
 | 일상 글 댓글 | `claude-haiku-4-5` |
 | 홍보 글 댓글 | `claude-sonnet-5` |
-| 일상 글 수집·각색 | `claude-sonnet-5` |
+| 일상 글 수집·각색, 짧은 일상 글 생성(`DAILY_SHORT_SYSTEM`, 20건씩 배치) | `claude-sonnet-5` |
 호출 전 항상 "규칙으로 해결 가능한가" 검사. 키 없으면 해당 기능만 비활성, 나머지는 동작.
 
 ## 8. 구현 순서 (병렬 가능 묶음)

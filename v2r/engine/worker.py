@@ -155,8 +155,19 @@ def handle_text(rt: Runtime, text: str, *, via_channel: bool = False) -> dict:
 # --------------------------------------------------------------------
 def _sync_entries(rt: Runtime, spec: TaskSpec, all_kinds: bool) -> dict:
     entries = [e for e in (rt.sources_cfg.get("sources") or []) if isinstance(e, dict)]
+    # 브랜드 원고 시트 + 인박스 각색 xlsx도 함께 동기화한다
+    names = {publish_mod._norm(e.get("name", "")) for e in entries}
+    for extra in publish_mod.brand_sheet_entries(rt) + publish_mod.discovered_xlsx_entries(rt):
+        if publish_mod._norm(extra.get("name", "")) not in names:
+            names.add(publish_mod._norm(extra.get("name", "")))
+            entries.append(extra)
     if not all_kinds:
-        entries = [e for e in entries if (e.get("kind") or "sheet") == "sheet"]
+        entries = [
+            e
+            for e in entries
+            if (e.get("kind") or "sheet")
+            in ("sheet", "brand", publish_mod.XLSX_DAILY_KIND, "daily_pool")
+        ]
     if spec.source:
         entries = [
             e
@@ -214,13 +225,59 @@ def _collect_daily(rt: Runtime, spec: TaskSpec) -> dict:
 
 
 def _collect_photos(rt: Runtime, spec: TaskSpec) -> dict:
-    from v2r.warehouse.photo_collector import collect_from_folder
+    from v2r.warehouse.photo_collector import collect_from_folder, import_inbox
 
     inbox = rt.settings.warehouse_dir / "inbox"
+    if not spec.brand and not spec.source:
+        # 브랜드 지정이 없으면 인박스 전체를 브랜드 폴더 규칙대로 가져온다
+        stats = import_inbox(rt.warehouse)
+        return {"ok": not stats["errors"], "inbox": str(inbox), **stats}
     brand = spec.brand or "공용"
     folder = spec.source or "기본"
     stats = collect_from_folder(inbox, brand, folder, rt.warehouse)
     return {"ok": not stats["errors"], "inbox": str(inbox), **stats}
+
+
+def _generate_daily(rt: Runtime, spec: TaskSpec) -> dict:
+    """짧은 일상 글을 만들어 창고 풀에 쌓는다 (결정 2)."""
+    from v2r.warehouse import daily_generator
+
+    if rt.llm is None:
+        return {"ok": False, "error": "ANTHROPIC_API_KEY가 없어 일상 글을 생성할 수 없습니다"}
+    count = spec.count or daily_generator.BATCH_SIZE
+    cafes = [spec.cafe] if spec.cafe else _daily_target_cafes(rt)
+    per_cafe = max(1, -(-count // max(len(cafes), 1)))  # 올림 나눗셈
+    try:
+        items = daily_generator.generate_daily_pool(
+            rt.llm, cafes, per_cafe, rt.warehouse.guides_dir
+        )
+    except Exception as exc:
+        return {"ok": False, "error": f"일상 글 생성 실패: {exc}"}
+    items = items[:count] if count else items
+    added = daily_generator.save_pool(rt.settings.warehouse_dir, items)
+    total = len(daily_generator.load_pool(rt.settings.warehouse_dir))
+    return {
+        "ok": bool(items),
+        "generated": len(items),
+        "added": added,
+        "pool_total": total,
+        "cafes": cafes,
+        "pool_file": str(daily_generator.pool_path(rt.settings.warehouse_dir)),
+        "samples": [
+            {"title": m.title, "body": m.body, "cafe": m.cafe} for m in items[:5]
+        ],
+    }
+
+
+def _daily_target_cafes(rt: Runtime) -> list[str]:
+    """일상 글을 쓸 카페 목록 (제휴 + 자사, 테스트 카페 제외)."""
+    out: list[str] = []
+    for group in ("affiliate", "self_owned"):
+        for entry in rt.cafes_cfg.get(group) or []:
+            name = str((entry or {}).get("name") or "").strip()
+            if name and name not in out:
+                out.append(name)
+    return out or ["고요한 아침"]
 
 
 def _wash_photos(rt: Runtime, spec: TaskSpec) -> dict:
@@ -313,7 +370,22 @@ def _run_publish(
             "message": "발행할 원고가 없습니다",
         }
 
-    slots = publish_mod.plan(rt, spec, manuscripts)
+    from v2r.warehouse.store import NoPhotoError
+
+    try:
+        slots = publish_mod.plan(rt, spec, manuscripts)
+    except NoPhotoError as exc:
+        # 사진 원본이 아예 없다 → 텔레그램 등 채널로 바로 알린다 (결정 1)
+        rt.events.log(job_id, "error", str(exc))
+        notify_all(rt.channels, str(exc))
+        return {
+            "ok": False,
+            "slots": 0,
+            "skipped": skipped,
+            "failures": [str(exc)],
+            "dry_run": spec.dry_run,
+            "message": str(exc),
+        }
     need_browser = (not spec.dry_run) and any(s.images for s in slots)
     results: list[dict] = []
     failures: list[str] = []
@@ -433,6 +505,8 @@ def dispatch(rt: Runtime, job: Any, owner: str | None = None) -> dict:
     if task == "sync_all_sources":
         out = _sync_entries(rt, spec, all_kinds=True)
         return {"ok": not out.get("errors"), **out}
+    if task == "generate_daily":
+        return _generate_daily(rt, spec)
     if task == "collect_daily":
         return _collect_daily(rt, spec)
     if task == "collect_photos":

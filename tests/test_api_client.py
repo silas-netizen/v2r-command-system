@@ -10,7 +10,7 @@ import pytest
 from v2r.api import client as client_mod
 from v2r.api.auth import AuthSession, DeviceProfile
 from v2r.api.client import V2RClient, clear_cache, field, walk_dicts
-from v2r.api.errors import V2RApiError
+from v2r.api.errors import V2RApiError, classify, parse_error_body
 
 BASE = "https://api-test.example"
 
@@ -190,3 +190,55 @@ def test_non_get_adds_signal_headers(httpx_mock, api) -> None:
     req = httpx_mock.get_requests()[-1]
     assert req.headers["X-Device-Id"] == api.auth.device.device_id
     assert req.headers["X-Browser-Signal-Status"] == "ok"
+
+
+# --- FastAPI `{"detail": ...}` 오류 본문 (live-catalog.md §0) ---
+
+
+def test_parse_error_body_reads_fastapi_detail() -> None:
+    code, reason, extra = parse_error_body('{"detail": "bot user-agent blocked"}')
+    assert code is None
+    assert reason == "bot user-agent blocked"
+    assert extra is None
+
+
+def test_parse_error_body_promotes_token_from_detail() -> None:
+    code, reason, _ = parse_error_body('{"detail": "TOKEN_ERROR: expired"}')
+    assert code == "TOKEN_ERROR"
+    assert reason == "TOKEN_ERROR: expired"
+    code, _, _ = parse_error_body('{"detail": "naver NOT_LOGIN"}')
+    assert code == "NOT_LOGIN"
+
+
+def test_parse_error_body_detail_object() -> None:
+    body = '{"detail": {"code": 27000, "reason": "restricted", "extra": {"a": 1}}}'
+    code, reason, extra = parse_error_body(body)
+    assert code == "27000"
+    assert reason == "restricted"
+    assert extra == {"a": 1}
+
+
+def test_classify_still_works_with_detail_bodies() -> None:
+    err = V2RApiError.from_response(
+        httpx.Response(403, json={"detail": "TOKEN_ERROR"}, request=httpx.Request("GET", "http://x"))
+    )
+    assert err.kind == "token_expired"
+    err = V2RApiError.from_response(
+        httpx.Response(400, json={"detail": "NOT_LOGIN"}, request=httpx.Request("GET", "http://x"))
+    )
+    assert classify(err) == "not_login"
+    err = V2RApiError.from_response(
+        httpx.Response(400, json={"detail": "code 27000"}, request=httpx.Request("GET", "http://x"))
+    )
+    assert classify(err) == "account_restricted"
+    err = V2RApiError.from_response(
+        httpx.Response(403, json={"detail": "bot user-agent blocked"}, request=httpx.Request("GET", "http://x"))
+    )
+    assert err.kind == "other" and err.reason == "bot user-agent blocked"
+
+
+def test_error_block_form_unchanged() -> None:
+    code, reason, extra = parse_error_body(
+        '{"error": {"code": 401, "reason": "UNAUTHORIZED", "extra": {"login_id": "a"}}}'
+    )
+    assert (code, reason, extra) == ("401", "UNAUTHORIZED", {"login_id": "a"})

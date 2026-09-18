@@ -68,11 +68,17 @@ def _norm(name: str) -> str:
     return re.sub(r"\s+", "", name or "").casefold()
 
 
-def xlsx_dir(rt: Runtime) -> Path:
-    """각색 xlsx를 찾는 폴더 (`sources.yaml: local_xlsx_dir`)."""
-    from v2r.sources.local_files import DEFAULT_XLSX_DIR
+#: 로컬 각색 xlsx(자사 카페 일상 글) 원본 종류
+XLSX_DAILY_KIND = "xlsx_daily"
+#: 일상 글 풀로 쓰는 원본 종류 (xlsx 행을 먼저 쓴다)
+DAILY_KINDS = (XLSX_DAILY_KIND, "daily_pool")
 
-    raw = str(rt.sources_cfg.get("local_xlsx_dir") or DEFAULT_XLSX_DIR)
+
+def xlsx_dir(rt: Runtime) -> Path | None:
+    """각색 xlsx를 찾는 폴더. `sources.yaml: local_xlsx_dir`가 없으면 None."""
+    raw = str(rt.sources_cfg.get("local_xlsx_dir") or "").strip()
+    if not raw:
+        return None
     path = Path(raw)
     return path if path.is_absolute() else rt.settings.repo_root / path
 
@@ -81,22 +87,50 @@ def discovered_xlsx_entries(rt: Runtime) -> list[dict]:
     """`local_xlsx_dir`의 `*각색*.xlsx` 원본 항목 목록 (결정 3·7)."""
     from v2r.sources.local_files import discover_xlsx
 
+    base = xlsx_dir(rt)
+    if base is None:
+        return []
     try:
-        return discover_xlsx(xlsx_dir(rt))
+        return discover_xlsx(base)
     except Exception:
         return []
 
 
+def brand_sheet_entries(rt: Runtime, brand: str = "") -> list[dict]:
+    """`sources.yaml: brand_sheets`의 브랜드 원고 시트 목록 (A~J 제휴 배치).
+
+    항목 이름은 브랜드명 그대로다 (`pick_images`가 `m.source`로 브랜드를 찾는다).
+    """
+    out: list[dict] = []
+    for name, cfg in (rt.sources_cfg.get("brand_sheets") or {}).items():
+        if not isinstance(cfg, dict) or not cfg.get("spreadsheet_id"):
+            continue
+        if brand and _norm(brand) != _norm(name):
+            continue
+        out.append(
+            {
+                "name": str(name),
+                "kind": "brand",
+                "brand": str(name),
+                "spreadsheet_id": str(cfg.get("spreadsheet_id")),
+                "gid": cfg.get("gid", 0),
+            }
+        )
+    return out
+
+
 def _sheet_entries(rt: Runtime) -> list[dict]:
-    """원고 원본 목록: sources.yaml의 시트/일상풀/xlsx + 폴더에서 찾은 xlsx."""
+    """원고 원본 목록: sources.yaml의 시트/브랜드시트/일상풀/xlsx + 폴더에서 찾은 xlsx."""
     entries = [
         e
         for e in (rt.sources_cfg.get("sources") or [])
-        if isinstance(e, dict) and (e.get("kind") or "sheet") in ("sheet", "xlsx", "daily_pool")
+        if isinstance(e, dict)
+        and (e.get("kind") or "sheet") in ("sheet", "brand", XLSX_DAILY_KIND, "daily_pool")
     ]
     names = {_norm(e.get("name", "")) for e in entries}
-    for entry in discovered_xlsx_entries(rt):
+    for entry in brand_sheet_entries(rt) + discovered_xlsx_entries(rt):
         if _norm(entry.get("name", "")) not in names:
+            names.add(_norm(entry.get("name", "")))
             entries.append(entry)
     return entries
 
@@ -122,29 +156,33 @@ def select_source_entries(rt: Runtime, spec: TaskSpec) -> list[dict]:
 
     entries = _sheet_entries(rt)
     if spec.task == "publish_daily":
-        from v2r.sources.daily_pool import pool_entry
-
-        pool = pool_entry(rt.sources_cfg)
-        if pool is not None and load_manuscripts(rt, pool, prefer_cache=True):
-            return [pool]
+        # 일상 글 원본: 인박스 각색 xlsx(먼저) + 생성한 짧은 일상 글 풀
+        daily = [e for e in entries if (e.get("kind") or "sheet") in DAILY_KINDS]
+        daily.sort(key=lambda e: 0 if (e.get("kind") or "") == XLSX_DAILY_KIND else 1)
+        if daily:
+            return daily
         for wanted in ("일상글목록", DAILY_POOL_SOURCE):
             entry = _entry_by_name(rt, wanted)
             if entry is not None:
                 return [entry]
         return entries[:1]
     if spec.task == "publish_brand":
+        # 브랜드 시트가 있으면 그것만 쓴다 (spec.brand가 있으면 그 브랜드만)
+        brand_entries = brand_sheet_entries(rt, spec.brand)
+        if brand_entries:
+            return brand_entries
         picked = [
             e
             for e in entries
             if _norm(e.get("name", "")) != _norm(DAILY_POOL_SOURCE)
-            and (e.get("kind") or "sheet") != "daily_pool"
+            and (e.get("kind") or "sheet") not in DAILY_KINDS
             and ("각색" in (e.get("name") or "") or "제휴" in (e.get("name") or ""))
         ]
         return picked or [
             e
             for e in entries
             if _norm(e.get("name", "")) != _norm(DAILY_POOL_SOURCE)
-            and (e.get("kind") or "sheet") != "daily_pool"
+            and (e.get("kind") or "sheet") not in DAILY_KINDS
         ]
     if spec.task == "publish_info":
         entry = _entry_by_name(rt, "정보성")
@@ -190,14 +228,21 @@ def load_manuscripts(rt: Runtime, entry: dict, prefer_cache: bool = False) -> li
         from v2r.sources.daily_pool import load_pool
 
         return load_pool(rt.settings.warehouse_dir)
-    if kind == "xlsx":
+    if kind == XLSX_DAILY_KIND:
         from v2r.sources.local_files import parse_xlsx_entry
 
-        return parse_xlsx_entry(entry, rt.cafes_cfg)
+        cache: dict = rt.scratch.setdefault("xlsx_cache", {})
+        path = str(entry.get("path") or "")
+        if path not in cache:
+            cache[path] = parse_xlsx_entry(entry, rt.cafes_cfg)
+        return list(cache[path])
     cache_get, cache_put = _cache_hooks(rt)
     rows = sheets.load_source(
         entry, cache_get=cache_get, cache_put=cache_put, prefer_cache=prefer_cache
     )
+    if kind == "brand":
+        # 브랜드 시트는 A~J 제휴 배치 고정. 완료 링크가 있는 행은 파서가 건너뛴다.
+        return sheets.parse_affiliate_rows(rows, source=name)
     return _parse_rows(rows, name, rt.cafes_cfg)
 
 
@@ -208,7 +253,7 @@ def refresh_source(rt: Runtime, entry: dict) -> int:
         from v2r.sources.daily_pool import load_pool
 
         return len(load_pool(rt.settings.warehouse_dir))
-    if kind == "xlsx":
+    if kind == XLSX_DAILY_KIND:
         from v2r.sources.local_files import load_xlsx_rows
 
         rows = load_xlsx_rows(entry.get("path") or "")
@@ -611,17 +656,28 @@ def build_comments(rt: Runtime, slot: Slot, root_start: datetime, cafe_id: Any) 
 
 
 def _daily_pool(rt: Runtime) -> list[Manuscript]:
-    """제휴 일상 글 풀. 창고의 `daily_pool`을 먼저 보고, 없으면 랜덤일상 시트."""
+    """일상 글 풀: 인박스 각색 xlsx(먼저) + 생성한 짧은 일상 글 풀.
+
+    둘 다 비었으면 랜덤일상 시트로 되돌아간다. content_hash로 중복을 없앤다.
+    """
     pool = rt.scratch.get("daily_pool")
     if pool is None:
-        from v2r.sources.daily_pool import load_pool, pool_entry
-
+        entries = [
+            e for e in _sheet_entries(rt) if (e.get("kind") or "sheet") in DAILY_KINDS
+        ]
+        entries.sort(key=lambda e: 0 if (e.get("kind") or "") == XLSX_DAILY_KIND else 1)
         pool = []
-        if pool_entry(rt.sources_cfg) is not None:
+        seen: set[str] = set()
+        for entry in entries:
             try:
-                pool = load_pool(rt.settings.warehouse_dir)
+                items = load_manuscripts(rt, entry)
             except Exception:
-                pool = []
+                continue
+            for m in items:
+                if m.content_hash and m.content_hash in seen:
+                    continue
+                seen.add(m.content_hash)
+                pool.append(m)
         if not pool:
             entry = _entry_by_name(rt, DAILY_POOL_SOURCE)
             pool = load_manuscripts(rt, entry) if entry else []
@@ -632,11 +688,11 @@ def _daily_pool(rt: Runtime) -> list[Manuscript]:
 def _take_daily(rt: Runtime) -> Manuscript:
     """실행 중 겹치지 않게 일상 글 1건을 뽑는다(같은 실행 안 중복 금지)."""
     pool = _daily_pool(rt)
-    used: set[int] = rt.scratch.setdefault("daily_used", set())
+    used: set = rt.scratch.setdefault("daily_used", set())
     left = [
         m
         for m in pool
-        if m.source_row not in used
+        if (m.source, m.source_row) not in used
         and not rt.publications.exists(m.source, m.source_row, m.content_hash)
     ]
     if not left:
@@ -645,7 +701,7 @@ def _take_daily(rt: Runtime) -> Manuscript:
             " ('일상 글 30개 만들어줘'로 풀을 채우거나 랜덤일상 시트를 확인하세요)"
         )
     picked = random.choice(left)
-    used.add(picked.source_row)
+    used.add((picked.source, picked.source_row))
     return picked
 
 

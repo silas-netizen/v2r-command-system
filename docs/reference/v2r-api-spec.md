@@ -6,6 +6,27 @@
 - 베이스: `https://api-v2r.daboja.im`
 - 사이트: `https://v2r.daboja.im` (목록 `/nc/board?view=list`, 에디터 `/nc/seone`, 글 상세 `/nc/articleDetail/{source_id}`)
 
+## 0. 실측 정정 (2026-09-19)
+
+아래 문서 본문은 옛 코드 분석 기준이다. 라이브(`https://api-v2r.daboja.im`)를 읽기 전용으로
+호출해 확인한 정정 사항은 다음과 같다. 상세 근거는 `docs/reference/live-catalog.md`.
+
+1. **봇 User-Agent 차단** — 기본 httpx UA로는 로그인부터 403 `{"detail":"bot user-agent blocked"}`.
+   브라우저 UA(+`Origin`/`Referer`)가 필수다. → `v2r/api/auth.py`의 `BROWSER_HEADERS`.
+2. **`/auths/challenge`는 GET** — POST는 405 `Allow: GET`. (프로토콜 문서 §3의 POST는 오기)
+3. **`GET /naver_cafe_articles/board_histories`는 404 (경로 없음)** — 대체로
+   `GET /naver_cafe_articles/article/written_articles?cafe_id&naver_login_id&page`를 쓴다.
+   응답 `{"articles":[…], "total_count":int}`, 행에 `v2r_source_id`가 있어 source_id 확보 가능.
+   단 **계정 단위 조회**라 카페 전체 이력을 한 번에 얻을 수 없다.
+   `POST /naver_cafe_articles/board_histories/search`는 존재하지만 본문 스키마 미확인(기본 비활성).
+4. **래핑 키 이름** — 카페 단건은 `naver_join_cafe`(단수, 계정이 중첩), 게시판 목록은
+   `cafe_menus`이며 **행 키가 전부 camelCase**(`cafeId/menuId/menuName/writable`),
+   말머리는 `cafe_heads`.
+5. **말머리 미사용** — 실측한 카페의 대상 게시판은 모두 `useHead:false`라 말머리 0건이다.
+   말머리 행 키(`head_id`/`head_name`)는 아직 실물 샘플로 확인되지 않았다.
+6. 오류 본문은 `error{code,reason,extra}`와 FastAPI `{"detail":"…"}`가 혼재한다
+   (`parse_error_body`가 둘 다 처리).
+
 ## 1. 엔드포인트 목록
 
 공통 헤더: `Authorization: <브라우저에서 캡처한 토큰 문자열>`, `Content-Type: application/json`. 쿠키 미사용. GET은 쿼리스트링, POST/PUT은 JSON 바디.

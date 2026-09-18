@@ -23,6 +23,22 @@ LOGIN_PATH = "/auths/login"
 CHALLENGE_PATH = "/auths/challenge"
 LOGOUT_PATH = "/auths/logout"
 
+#: 서버가 비-브라우저 User-Agent를 403 `{"detail":"bot user-agent blocked"}`로
+#: 차단한다(2026-09-19 라이브 확인). 화면 코드와 같은 UA/Origin을 보낸다.
+BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+SITE_ORIGIN = "https://v2r.daboja.im"
+
+#: 모든 요청에 붙는 브라우저 위장 기본 헤더.
+BROWSER_HEADERS = {
+    "Accept": "application/json",
+    "User-Agent": BROWSER_USER_AGENT,
+    "Origin": SITE_ORIGIN,
+    "Referer": f"{SITE_ORIGIN}/",
+}
+
 FINGERPRINT_KEYS = (
     "canvas_hash",
     "color_depth",
@@ -164,6 +180,7 @@ class DeviceProfile:
             "X-Device-Id": self.device_id,
             "X-Browser-Signal": fingerprint_json(self.fingerprint),
             "X-Browser-Signal-Status": "ok",
+            "User-Agent": BROWSER_USER_AGENT,
         }
 
 
@@ -316,7 +333,8 @@ class AuthSession:
             raise err
 
         # 챌린지 필요 → PoW 후 재시도
-        ch_res = client.post(CHALLENGE_PATH, headers=self.device.signal_headers())
+        # 챌린지는 GET 전용(POST는 405 Method Not Allowed, 2026-09-19 라이브 확인)
+        ch_res = client.get(CHALLENGE_PATH, headers=self.device.signal_headers())
         if ch_res.status_code >= 400:
             raise V2RApiError.from_response(ch_res, "챌린지 발급 실패")
         challenge = _extract_challenge(ch_res.json())

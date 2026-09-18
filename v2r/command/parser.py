@@ -286,6 +286,7 @@ TASK_LABELS: dict[str, str] = {
     "reconcile": "끊긴 작업 이어가기",
     "sync_all_sources": "전체 원본 동기화",
     "sync_sources": "원본 동기화",
+    "generate_daily": "일상 글 생성",
     "collect_daily": "일상 글 수집",
     "collect_photos": "사진 수집",
     "wash_photos": "사진 세탁",

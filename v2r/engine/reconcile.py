@@ -117,7 +117,12 @@ def _created_at_ok(row: dict, floor) -> bool:
 
 def _find_child(rt: Runtime, cafe_id: Any, parent_id: str, pub: dict) -> dict | None:
     """제휴 수정글(부모=일상 글)을 이력에서 찾는다. 후보가 여럿이면 None."""
-    rows = api_articles.board_histories(rt.client, cafe_id, days_ago=HISTORY_DAYS)
+    rows = api_articles.board_histories(
+        rt.client,
+        cafe_id,
+        days_ago=HISTORY_DAYS,
+        login_id=pub.get("account") or None,
+    )
     floor = _created_floor(pub)
     matches = [
         row
@@ -212,7 +217,13 @@ def reconcile(rt: Runtime) -> dict:
             continue
 
         try:
-            rows = api_articles.board_histories(rt.client, cafe_id, days_ago=HISTORY_DAYS)
+            # board_histories GET 경로는 라이브에 없다 → 계정 기준 폴백이 필요하다
+            rows = api_articles.board_histories(
+                rt.client,
+                cafe_id,
+                days_ago=HISTORY_DAYS,
+                login_id=pub.get("account") or None,
+            )
         except V2RApiError as exc:
             result["errors"].append(f"{label}: {exc}")
             result["unresolved"].append(label)

@@ -37,6 +37,7 @@ def test_legacy_example_sentence():
         ("끊긴 작업 이어가", "reconcile"),
         ("전체 원본 지금 동기화", "sync_all_sources"),
         ("시트 갱신해줘", "sync_sources"),
+        ("일상 글 30개 만들어줘", "generate_daily"),
         ("일상 글 수집해줘", "collect_daily"),
         ("사진 가져와", "collect_photos"),
         ("사진 세탁 30장", "wash_photos"),
@@ -60,7 +61,7 @@ def test_each_task_pattern(text, task):
 
 
 def test_all_tasks_covered_by_tests():
-    assert len(ALLOWED_TASKS) == 16
+    assert len(ALLOWED_TASKS) == 17
 
 
 def test_wash_photos_count():

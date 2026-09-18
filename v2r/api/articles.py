@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 from zoneinfo import ZoneInfo
 
 import httpx
 
 from .client import V2RClient, field, walk_dicts
 from .errors import V2RApiError
+
+log = logging.getLogger(__name__)
 
 SITE_BASE = "https://v2r.daboja.im"
 
@@ -29,6 +32,14 @@ PATH_CREATE = "/naver_cafe_articles/naver_cafe_article_source"
 PATH_ARTICLE = "/naver_cafe_articles/article"
 PATH_DELETE = "/naver_cafe_articles/article/delete"
 PATH_HISTORIES = "/naver_cafe_articles/board_histories"
+#: 라이브 서버에 `board_histories` GET 경로가 없어(404) 쓰는 대체 조회 경로.
+#: 계정 단위로만 조회된다 (`live-catalog.md` §2 참고).
+PATH_WRITTEN = "/naver_cafe_articles/article/written_articles"
+#: 존재는 확인됐으나 요청 본문 스키마 미확인. 기본적으로 사용하지 않는다.
+PATH_HISTORIES_SEARCH = "/naver_cafe_articles/board_histories/search"
+
+#: `POST /board_histories/search` 사용 여부. 본문 스키마를 라이브에서 확인하기 전까지 끈다.
+ENABLE_HISTORIES_SEARCH = False
 
 DEFAULT_WRITE_OPTIONS: dict[str, Any] = {
     "enableComment": True,
@@ -179,10 +190,127 @@ def _parse_dt(value: Any) -> datetime | None:
     return dt
 
 
-def board_histories(
-    client: V2RClient, cafe_id: Any, days_ago: int = 30, max_pages: int = 5
+#: `written_articles` 행에서 정규화 결과로 옮겨가는 키(나머지는 `raw`에 남긴다)
+_WRITTEN_MAPPED_KEYS = {
+    "v2r_source_id",
+    "subject",
+    "writedt",
+    "parent_source_id",
+    "v2r_parent_source_id",
+}
+
+#: 네이버 원본 날짜 형식 (`"Sep 15, 2026 12:31:23 PM"`)
+NAVER_DT_FORMAT = "%b %d, %Y %I:%M:%S %p"
+
+
+def _parse_any_dt(value: Any) -> datetime | None:
+    """ISO 또는 네이버 원본 형식(`Sep 15, 2026 12:31:23 PM`) → aware datetime.
+
+    타임존이 없는 값은 프로젝트 기준대로 **KST**로 간주한다.
+    """
+    dt = _parse_dt(value)
+    if dt is not None:
+        return dt
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        naive = datetime.strptime(value.strip(), NAVER_DT_FORMAT)
+    except ValueError:
+        return None
+    return naive.replace(tzinfo=KST)
+
+
+def _normalize_written_row(row: dict, cafe_id: Any, login_id: Any) -> dict:
+    """`written_articles` 행 → `board_histories` 행과 같은 dict 모양.
+
+    행에는 작성 계정 필드가 없다(네이버 원본 필드 + `v2r_source_id`뿐). 조회를
+    계정 단위로 하므로 호출 시의 `login_id`를 그대로 채운다.
+    """
+    written = _parse_any_dt(row.get("writedt"))
+    written_iso = to_iso_z(written) if written else None
+    parent = field(row, "v2r_parent_source_id", "parent_source_id")
+    source_id = field(row, "v2r_source_id", "source_id")
+    return {
+        "source_id": str(source_id) if source_id else None,
+        "naver_account_login_id": login_id,
+        "naver_login_id": login_id,
+        "title": row.get("subject"),
+        "parent_source_id": str(parent) if parent else None,
+        # 이미 게시된 글만 돌아오므로 완료로 본다(엔드포인트에 상태 필드 없음).
+        "status": "DONE",
+        "created_at": written_iso,
+        "written_at": written_iso,
+        "cafe_id": field(row, "clubid", "cafe_id", default=cafe_id),
+        "article_id": field(row, "articleid", "article_id"),
+        "menu_id": field(row, "menuid", "menu_id"),
+        "raw": {k: v for k, v in row.items() if k not in _WRITTEN_MAPPED_KEYS},
+    }
+
+
+def written_articles(
+    client: V2RClient,
+    cafe_id: Any,
+    login_id: Any,
+    pages: int = 3,
 ) -> list[dict]:
-    """등록 이력 목록. 404는 빈 목록으로 취급한다."""
+    """계정이 해당 카페에 쓴 글 목록(`board_histories` 대체, 읽기 전용).
+
+    `GET /naver_cafe_articles/article/written_articles?cafe_id&naver_login_id&page`
+    → `{"articles": [...], "total_count": int}`. 행은 네이버 원본 필드에
+    `v2r_source_id`가 붙은 형태라 `board_histories` 행 모양으로 정규화해서 돌려준다.
+    """
+    rows: list[dict] = []
+    seen: set[str] = set()
+    for page in range(1, max(1, int(pages)) + 1):
+        try:
+            payload = client.get(
+                PATH_WRITTEN,
+                params={
+                    "cafe_id": cafe_id,
+                    "naver_login_id": login_id,
+                    "page": page,
+                },
+            )
+        except V2RApiError as exc:
+            if exc.status == 404:
+                log.warning("written_articles 404 (cafe_id=%s, page=%s)", cafe_id, page)
+                break
+            raise
+        items = payload.get("articles") if isinstance(payload, dict) else None
+        if not isinstance(items, list):
+            items = [d for d in walk_dicts(payload) if "v2r_source_id" in d]
+        if not items:
+            break
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            norm = _normalize_written_row(item, cafe_id, login_id)
+            key = norm["source_id"] or f"{norm['article_id']}"
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(norm)
+        total = payload.get("total_count") if isinstance(payload, dict) else None
+        if isinstance(total, int) and len(rows) >= total:
+            break
+    return rows
+
+
+def board_histories(
+    client: V2RClient,
+    cafe_id: Any,
+    days_ago: int = 30,
+    max_pages: int = 5,
+    login_id: Any = None,
+    login_ids: Sequence[Any] | None = None,
+) -> list[dict]:
+    """등록 이력 목록.
+
+    라이브 서버에는 `GET /naver_cafe_articles/board_histories`가 없다(항상 404).
+    옛 경로를 **한 번만** 시도하고, 404면 `written_articles`로 폴백한다. 폴백은
+    계정 단위 조회라 `login_id`(또는 `login_ids`)가 필요하며, 아무것도 없으면
+    경고만 남기고 빈 목록을 돌려준다.
+    """
     rows: list[dict] = []
     next_token: Any = None
     for _ in range(max_pages):
@@ -197,7 +325,9 @@ def board_histories(
             payload = client.get(PATH_HISTORIES, params=params)
         except V2RApiError as exc:
             if exc.status == 404:
-                break
+                if rows:
+                    break
+                return _histories_fallback(client, cafe_id, login_id, login_ids)
             raise
         page = payload.get("histories") if isinstance(payload, dict) else None
         if not isinstance(page, list):
@@ -211,6 +341,55 @@ def board_histories(
         if not next_token:
             break
     return rows
+
+
+def _histories_fallback(
+    client: V2RClient,
+    cafe_id: Any,
+    login_id: Any,
+    login_ids: Sequence[Any] | None,
+) -> list[dict]:
+    """`board_histories` 404 폴백: 계정별 `written_articles`를 모아 돌려준다."""
+    accounts: list[Any] = []
+    if login_id:
+        accounts.append(login_id)
+    for acc in login_ids or []:
+        if acc and acc not in accounts:
+            accounts.append(acc)
+    if not accounts:
+        log.warning(
+            "board_histories 경로 없음(404)이고 조회할 계정도 없어 빈 목록을 돌려준다 "
+            "(cafe_id=%s). login_id/login_ids를 넘겨야 폴백이 동작한다.",
+            cafe_id,
+        )
+        return []
+    rows: list[dict] = []
+    for acc in accounts:
+        rows.extend(written_articles(client, cafe_id, acc))
+    return rows
+
+
+def search_board_histories(
+    client: V2RClient, cafe_id: Any, body: dict | None = None
+) -> list[dict]:
+    """`POST /naver_cafe_articles/board_histories/search` 헬퍼 (기본 비활성).
+
+    라이브에 경로는 존재하지만(GET 시 405) **요청 본문 스키마가 미확인**이라
+    `ENABLE_HISTORIES_SEARCH`가 참일 때만 실제로 호출한다.
+
+    TODO: 라이브에서 본문 모양(필드명/필수값/페이지네이션 키)을 확인한 뒤
+    기본 경로로 승격할지 결정한다. 확인 전에는 쓰기 작업 경로에서 쓰지 않는다.
+    """
+    if not ENABLE_HISTORIES_SEARCH:
+        log.debug("search_board_histories 비활성 (ENABLE_HISTORIES_SEARCH=False)")
+        return []
+    payload = client.post(
+        PATH_HISTORIES_SEARCH, json={"cafe_id": cafe_id, **(body or {})}
+    )
+    page = payload.get("histories") if isinstance(payload, dict) else None
+    if not isinstance(page, list):
+        page = [d for d in walk_dicts(payload) if "source_id" in d and "title" in d]
+    return [d for d in page if isinstance(d, dict)]
 
 
 def find_recent_source(
@@ -229,10 +408,17 @@ def find_recent_source(
     - `created_at`이 없거나 파싱되지 않는 행은 채택하지 않는다.
     - `since`가 주어지면 그보다 이전에 만들어진 행은 제외한다.
     - 조건을 만족하는 행이 2건 이상이면 불확실하므로 `None`을 돌려준다.
+
+    조회는 계정 단위 `written_articles`를 **먼저** 쓴다(옛 `board_histories` GET은
+    라이브에 없다). 그 경로가 비면 `board_histories`(폴백 포함)로 한 번 더 본다.
     """
     for i in range(attempts):
         try:
-            rows = board_histories(client, cafe_id, days_ago=1, max_pages=1)
+            rows = written_articles(client, cafe_id, login_id, pages=1)
+            if not rows:
+                rows = board_histories(
+                    client, cafe_id, days_ago=1, max_pages=1, login_id=login_id
+                )
         except V2RApiError as exc:
             if exc.status == 404:
                 rows = []
@@ -247,7 +433,9 @@ def find_recent_source(
                 continue
             if (row.get("parent_source_id") or None) != (parent_source_id or None):
                 continue
-            created = _parse_dt(field(row, "created_at", "createdAt"))
+            created = _parse_any_dt(
+                field(row, "created_at", "createdAt", "written_at", "writedt")
+            )
             if created is None:
                 continue  # 시각을 모르면 "방금 만든 글"이라고 볼 수 없다
             if since is not None and created < since:
@@ -463,6 +651,10 @@ def verify_article(
 __all__ = [
     "AMBIGUOUS_KINDS",
     "DEFAULT_WRITE_OPTIONS",
+    "ENABLE_HISTORIES_SEARCH",
+    "PATH_WRITTEN",
+    "search_board_histories",
+    "written_articles",
     "KST",
     "PendingError",
     "article_url",

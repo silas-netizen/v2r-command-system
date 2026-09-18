@@ -38,6 +38,29 @@ def api(tmp_path):
     c.close()
 
 
+def _written_url(cafe_id, login_id, page: int = 1) -> httpx.URL:
+    return httpx.URL(
+        f"{BASE}{articles.PATH_WRITTEN}",
+        params={"cafe_id": cafe_id, "naver_login_id": login_id, "page": page},
+    )
+
+
+def _histories_url(cafe_id, days_ago: int) -> httpx.URL:
+    return httpx.URL(
+        f"{BASE}{articles.PATH_HISTORIES}",
+        params={"cafe_id": cafe_id, "days_ago": days_ago, "include_reserve": "true"},
+    )
+
+
+def _mock_written_empty(httpx_mock, cafe_id, login_id) -> None:
+    """`written_articles` 1페이지를 빈 응답으로 세워 둔다(옛 경로 폴백 테스트용)."""
+    httpx_mock.add_response(
+        url=_written_url(cafe_id, login_id),
+        json={"articles": [], "total_count": 0},
+        is_reusable=True,
+    )
+
+
 CAFE = Cafe(cafe_id=25016228, name="테스트카페")
 MENU = Menu(menu_id=328, name="자유 수다방")
 HEAD = Head(head_id=7, name="잡담")
@@ -93,11 +116,9 @@ def test_create_article_returns_source_id(httpx_mock, api) -> None:
 
 def test_find_recent_source_tolerates_404(httpx_mock, api, monkeypatch) -> None:
     monkeypatch.setattr(articles.time, "sleep", lambda s: None)
+    _mock_written_empty(httpx_mock, 1, "acc1")
     httpx_mock.add_response(
-        url=httpx.URL(
-            f"{BASE}{articles.PATH_HISTORIES}",
-            params={"cafe_id": 1, "days_ago": 1, "include_reserve": "true"},
-        ),
+        url=_histories_url(1, 1),
         status_code=404,
         json={},
         is_reusable=True,
@@ -109,11 +130,9 @@ def test_find_recent_source_tolerates_404(httpx_mock, api, monkeypatch) -> None:
 
 def test_find_recent_source_matches_row(httpx_mock, api, monkeypatch) -> None:
     monkeypatch.setattr(articles.time, "sleep", lambda s: None)
+    _mock_written_empty(httpx_mock, 1, "acc1")
     httpx_mock.add_response(
-        url=httpx.URL(
-            f"{BASE}{articles.PATH_HISTORIES}",
-            params={"cafe_id": 1, "days_ago": 1, "include_reserve": "true"},
-        ),
+        url=_histories_url(1, 1),
         json={
             "histories": [
                 {
@@ -132,15 +151,100 @@ def test_find_recent_source_matches_row(httpx_mock, api, monkeypatch) -> None:
 
 
 def test_board_histories_404_returns_empty(httpx_mock, api) -> None:
+    """계정을 안 넘기면 폴백할 수 없어 빈 목록."""
     httpx_mock.add_response(
-        url=httpx.URL(
-            f"{BASE}{articles.PATH_HISTORIES}",
-            params={"cafe_id": 5, "days_ago": 30, "include_reserve": "true"},
-        ),
+        url=_histories_url(5, 30),
         status_code=404,
         json={},
     )
     assert articles.board_histories(api, 5) == []
+
+
+WRITTEN_ROW = {
+    "clubid": 31670254,
+    "articleid": 1257,
+    "menuid": 1,
+    "subject": "제목",
+    "writernickname": "닉",
+    "writedt": "Sep 15, 2026 12:31:23 PM",
+    "readcount": 3,
+    "v2r_source_id": "01M2HHWSF8QSF322WR8TCCNZXS",
+}
+
+
+def test_written_articles_normalizes_rows(httpx_mock, api) -> None:
+    httpx_mock.add_response(
+        url=_written_url(31670254, "azqpale"),
+        json={"articles": [dict(WRITTEN_ROW)], "total_count": 1},
+    )
+    rows = articles.written_articles(api, 31670254, "azqpale", pages=2)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["source_id"] == "01M2HHWSF8QSF322WR8TCCNZXS"
+    assert row["naver_account_login_id"] == "azqpale"
+    assert row["title"] == "제목"
+    assert row["parent_source_id"] is None
+    assert row["status"] == "DONE"
+    # KST 12:31 → UTC 03:31
+    assert row["created_at"] == "2026-09-15T03:31:23Z"
+    assert row["written_at"] == row["created_at"]
+    assert row["raw"]["readcount"] == 3
+    assert "v2r_source_id" not in row["raw"]
+
+
+def test_board_histories_falls_back_to_written_articles(httpx_mock, api) -> None:
+    httpx_mock.add_response(url=_histories_url(31670254, 30), status_code=404, json={})
+    httpx_mock.add_response(
+        url=_written_url(31670254, "azqpale"),
+        json={"articles": [dict(WRITTEN_ROW)], "total_count": 1},
+    )
+    rows = articles.board_histories(api, 31670254, login_id="azqpale")
+    assert [r["source_id"] for r in rows] == ["01M2HHWSF8QSF322WR8TCCNZXS"]
+
+
+def test_board_histories_fallback_iterates_login_ids(httpx_mock, api) -> None:
+    httpx_mock.add_response(url=_histories_url(31670254, 30), status_code=404, json={})
+    for acc in ("a1", "a2"):
+        httpx_mock.add_response(
+            url=_written_url(31670254, acc),
+            json={
+                "articles": [dict(WRITTEN_ROW, v2r_source_id=f"SRC-{acc}")],
+                "total_count": 1,
+            },
+        )
+    rows = articles.board_histories(api, 31670254, login_ids=["a1", "a2"])
+    assert sorted(r["source_id"] for r in rows) == ["SRC-a1", "SRC-a2"]
+
+
+def test_find_recent_source_uses_written_articles(httpx_mock, api, monkeypatch) -> None:
+    monkeypatch.setattr(articles.time, "sleep", lambda s: None)
+    created = datetime.now(timezone.utc).astimezone(articles.KST)
+    row = dict(
+        WRITTEN_ROW,
+        writedt=created.strftime("%b %d, %Y %I:%M:%S %p"),
+        v2r_source_id="SRC-W",
+    )
+    httpx_mock.add_response(
+        url=_written_url(31670254, "azqpale"),
+        json={"articles": [row], "total_count": 1},
+        is_reusable=True,
+    )
+    got = articles.find_recent_source(
+        api,
+        31670254,
+        "azqpale",
+        "제목",
+        None,
+        since=datetime.now(timezone.utc) - timedelta(minutes=5),
+        attempts=1,
+    )
+    assert got == "SRC-W"
+
+
+def test_search_board_histories_disabled_by_default(httpx_mock, api) -> None:
+    assert articles.ENABLE_HISTORIES_SEARCH is False
+    assert articles.search_board_histories(api, 1, {"q": 1}) == []
+    assert httpx_mock.get_requests() == []
 
 
 def _detail(body: str, **over) -> dict:
@@ -251,6 +355,7 @@ def test_create_article_does_not_repost_on_5xx(httpx_mock, api, monkeypatch) -> 
     httpx_mock.add_response(
         url=f"{BASE}{articles.PATH_CREATE}", status_code=503, json={}, is_reusable=True
     )
+    _mock_written_empty(httpx_mock, 25016228, "acc1")
     created = (
         datetime.now(timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
     )
@@ -293,11 +398,9 @@ def test_create_article_raises_ambiguous_when_no_history(
     httpx_mock.add_response(
         url=f"{BASE}{articles.PATH_CREATE}", status_code=502, json={}
     )
+    _mock_written_empty(httpx_mock, 25016228, "acc1")
     httpx_mock.add_response(
-        url=httpx.URL(
-            f"{BASE}{articles.PATH_HISTORIES}",
-            params={"cafe_id": 25016228, "days_ago": 1, "include_reserve": "true"},
-        ),
+        url=_histories_url(25016228, 1),
         json={"histories": []},
         is_reusable=True,
     )
@@ -313,11 +416,9 @@ def test_find_recent_source_rejects_unparsable_created_at(
     httpx_mock, api, monkeypatch
 ) -> None:
     monkeypatch.setattr(articles.time, "sleep", lambda s: None)
+    _mock_written_empty(httpx_mock, 1, "acc1")
     httpx_mock.add_response(
-        url=httpx.URL(
-            f"{BASE}{articles.PATH_HISTORIES}",
-            params={"cafe_id": 1, "days_ago": 1, "include_reserve": "true"},
-        ),
+        url=_histories_url(1, 1),
         json={
             "histories": [
                 {
@@ -346,11 +447,9 @@ def test_find_recent_source_ambiguous_on_multiple_matches(
         "status": "RESERVED",
         "created_at": "2026-09-19T00:00:00Z",
     }
+    _mock_written_empty(httpx_mock, 1, "acc1")
     httpx_mock.add_response(
-        url=httpx.URL(
-            f"{BASE}{articles.PATH_HISTORIES}",
-            params={"cafe_id": 1, "days_ago": 1, "include_reserve": "true"},
-        ),
+        url=_histories_url(1, 1),
         json={"histories": [{**row, "source_id": "A"}, {**row, "source_id": "B"}]},
         is_reusable=True,
     )

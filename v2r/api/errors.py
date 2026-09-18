@@ -61,8 +61,54 @@ def _response_text(response: Any) -> str:
         return ""
 
 
+#: FastAPI `{"detail": "..."}` 본문에서 코드로 승격하는 토큰들.
+#: (실측: `detail` 형태 응답에는 `code`/`reason` 블록이 아예 없다 — live-catalog.md §0)
+DETAIL_CODE_TOKENS = (
+    "TOKEN_ERROR",
+    "NOT_LOGIN",
+    "NOT_FOUND_MODEL",
+    "DELETED_NAVER_CAFE_ARTICLE_SOURCE",
+    "UNAUTHORIZED",
+    "FORBIDDEN",
+)
+
+
+def _from_detail(data: dict) -> tuple[str | None, str | None, dict | None] | None:
+    """FastAPI 기본 오류 본문(`{"detail": ...}`)을 (code, reason, extra)로."""
+    if "detail" not in data:
+        return None
+    detail = data.get("detail")
+    if isinstance(detail, dict):
+        code = detail.get("code")
+        reason = detail.get("reason") or detail.get("message") or detail.get("detail")
+        extra = detail.get("extra")
+        text = " ".join(str(x) for x in (code, reason) if x)
+    elif isinstance(detail, list):
+        # 검증 오류 배열 — 통째로 문자열화해 reason에 담는다
+        code, extra = None, None
+        reason = text = json.dumps(detail, ensure_ascii=False)
+    else:
+        code, extra = None, None
+        reason = text = str(detail or "")
+    if code is None:
+        upper = text.upper()
+        code = next((t for t in DETAIL_CODE_TOKENS if t in upper), None)
+    if code is not None and not isinstance(code, str):
+        code = str(code)
+    if reason is not None and not isinstance(reason, str):
+        reason = str(reason)
+    if not isinstance(extra, dict):
+        extra = None
+    return code, (reason or None), extra
+
+
 def parse_error_body(body: str) -> tuple[str | None, str | None, dict | None]:
-    """본문 JSON의 `error` 블록을 (code, reason, extra)로 파싱."""
+    """본문 JSON의 `error` 블록을 (code, reason, extra)로 파싱.
+
+    `error` 블록이 없는 FastAPI 기본 형태(`{"detail": "..."}`)도 처리해
+    `reason`을 채우고, 본문에 `TOKEN_ERROR`/`NOT_LOGIN` 같은 토큰이 있으면
+    `code`로 끌어올린다(그래야 `classify()`가 계속 동작한다).
+    """
     if not body:
         return None, None, None
     try:
@@ -73,6 +119,9 @@ def parse_error_body(body: str) -> tuple[str | None, str | None, dict | None]:
         return None, None, None
     error = data.get("error")
     if not isinstance(error, dict):
+        parsed = _from_detail(data)
+        if parsed is not None:
+            return parsed
         # 최상위에 code/reason만 있는 형태도 허용
         error = data
     code = error.get("code")
