@@ -26,14 +26,27 @@ def create_message(
     system: str,
     user: str,
     max_tokens: int = 1200,
+    usage_out: dict | None = None,
 ) -> str:
-    """messages.create 한 번 호출하고 본문 텍스트만 돌려준다."""
+    """messages.create 한 번 호출하고 본문 텍스트만 돌려준다.
+
+    `usage_out`을 주면 입력/출력 토큰 수를 그 dict에 더한다(비용 집계용).
+    """
     response = client.messages.create(
         model=model,
         max_tokens=max_tokens,
         system=system,
         messages=[{"role": "user", "content": user}],
     )
+    if usage_out is not None:
+        usage = getattr(response, "usage", None)
+        usage_out["input_tokens"] = usage_out.get("input_tokens", 0) + int(
+            getattr(usage, "input_tokens", 0) or 0
+        )
+        usage_out["output_tokens"] = usage_out.get("output_tokens", 0) + int(
+            getattr(usage, "output_tokens", 0) or 0
+        )
+        usage_out["calls"] = usage_out.get("calls", 0) + 1
     if getattr(response, "stop_reason", None) == "refusal":
         raise LLMDisabled("모델이 요청을 거절했습니다")
     parts: list[str] = []

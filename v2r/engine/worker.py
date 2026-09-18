@@ -263,6 +263,8 @@ def _generate_daily(rt: Runtime, spec: TaskSpec) -> dict:
         "pool_total": total,
         "cafes": cafes,
         "pool_file": str(daily_generator.pool_path(rt.settings.warehouse_dir)),
+        "model": rt.llm.model_for("daily_adapt") if hasattr(rt.llm, "model_for") else "",
+        "tokens": dict(getattr(rt.llm, "usage", {}) or {}),
         "samples": [
             {"title": m.title, "body": m.body, "cafe": m.cafe} for m in items[:5]
         ],

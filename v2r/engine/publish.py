@@ -217,6 +217,25 @@ def _parse_rows(rows: list[dict], name: str, cafes_cfg: dict) -> list[Manuscript
     return sheets.parse_daily_rows(rows, source=name)
 
 
+def _expand_article(m: Manuscript) -> Manuscript:
+    """B열 본문이 `제목 :` / `본문 :` / `댓글N :` 블록이면 펼쳐 넣는다.
+
+    브랜드 시트는 A열 키워드를 제목으로 쓰지만 실제 제목·댓글은 B열 안에 있다.
+    """
+    if "제목" not in (m.body or ""):
+        return m
+    from v2r.content.manuscript import content_hash, parse_article
+
+    parsed = parse_article(m.body)
+    if not parsed.title and not parsed.comments:
+        return m
+    m.title = parsed.title or m.title
+    m.body = parsed.body or m.body
+    m.comments = parsed.comments
+    m.content_hash = content_hash(m.title, m.body)
+    return m
+
+
 def load_manuscripts(rt: Runtime, entry: dict, prefer_cache: bool = False) -> list[Manuscript]:
     """원본 1건을 원고 목록으로. `prefer_cache`면 네트워크를 쓰지 않는다.
 
@@ -242,7 +261,8 @@ def load_manuscripts(rt: Runtime, entry: dict, prefer_cache: bool = False) -> li
     )
     if kind == "brand":
         # 브랜드 시트는 A~J 제휴 배치 고정. 완료 링크가 있는 행은 파서가 건너뛴다.
-        return sheets.parse_affiliate_rows(rows, source=name)
+        items = sheets.parse_affiliate_rows(rows, source=name)
+        return [_expand_article(m) for m in items]
     return _parse_rows(rows, name, rt.cafes_cfg)
 
 

@@ -68,6 +68,8 @@ class LLMRouter:
         self.api_key = (api_key or "").strip()
         self._client = client
         self.enabled = bool(self._client) or bool(self.api_key)
+        #: 이 라우터로 쓴 토큰 누계 (비용 보고용)
+        self.usage: dict[str, int] = {}
 
     @classmethod
     def from_settings(cls, settings: Any | None = None) -> "LLMRouter":
@@ -94,7 +96,9 @@ class LLMRouter:
         client = self._ensure_client()
         model = self.model_for(purpose)
         log.debug("LLM 호출 용도=%s 모델=%s", purpose, model)
-        return create_message(client, model, system, user, max_tokens=max_tokens)
+        return create_message(
+            client, model, system, user, max_tokens=max_tokens, usage_out=self.usage
+        )
 
     def complete_json(
         self, purpose: str, system: str, user: str, max_tokens: int = 1200

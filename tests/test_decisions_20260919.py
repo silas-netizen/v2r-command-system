@@ -242,3 +242,21 @@ def test_xlsx_카페별_배치는_발행된_행을_건너뛴다(tmp_path: Path):
 def test_sniff_layout():
     assert local_files.sniff_layout(FULL_HEADER) == "full"
     assert local_files.sniff_layout(CAFE_HEADER) == "cafe"
+
+
+# --------------------------------------------------------------------
+# 브랜드 원고 시트
+# --------------------------------------------------------------------
+def test_브랜드시트_본문블록을_제목_댓글로_펼친다():
+    from v2r.content.manuscript import Manuscript
+    from v2r.engine.publish import _expand_article
+
+    raw = (
+        "제목 :\n키워드 질문 제목\n\n본문 :\n첫 줄\n\n{키워드}\n\n"
+        "댓글1 : 첫 댓글\n대댓글1 : 답글\n"
+    )
+    m = Manuscript(title="키워드", body=raw, keyword="키워드")
+    out = _expand_article(m)
+    assert out.title == "키워드 질문 제목"
+    assert "{키워드}" in out.body and "댓글1" not in out.body
+    assert [c.label for c in out.comments] == ["댓글1", "대댓글1"]
