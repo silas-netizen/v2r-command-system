@@ -1,0 +1,52 @@
+# 카페 카탈로그 — legacy-business-logic.md §4 기준. V2R은 가상 테스트 사이트.
+default_board: 자유게시판
+
+affiliate:
+  - name: 씨씨앙
+    cafe_id: 25016228
+    board: 자유수다방(구)
+    menu_id: 2458
+    revision_delay_hours: 4
+    revision_board_alt:
+      name: 자유수다방
+      menu_id: 328
+    aliases: [씨씨앙, ccang, 씨씨앙카페]
+  - name: 양평맘
+    cafe_id: 22788814
+    board: 이모저모 이야기
+    menu_id: 14
+    revision_delay_hours: 20
+    aliases: [양평맘, 양평맘카페]
+  - name: 쌍둥이맘 모여라
+    cafe_id: 10174516
+    board: 가족업체 자유게시판
+    menu_id: 664
+    revision_delay_hours: 22
+    aliases: [쌍둥이맘, 쌍둥이맘모여라, 쌍둥이맘 모여라]
+
+self_owned:
+  - name: 쌍둥이맘 모여라
+    cafe_id: 10174516
+  - name: 고요한 아침
+    cafe_id: 14567700
+  - name: 글로시 마이
+    cafe_id: 15175096
+  - name: 웨딩 노트
+    cafe_id: 15441090
+  - name: 송도포털
+    cafe_id: 16149995
+  - name: 헬씨 트리
+    cafe_id: 23708088
+  - name: 러브 인썸
+    cafe_id: 26616683
+  - name: 마이 웨딩 드림
+    cafe_id: 26680163
+
+test:
+  태극: 31670254
+  소나무: 31670256
+
+# 댓글 전용 계정(본문 작성에 쓰지 않는다)
+comment_accounts:
+  affiliate: [quilliant, hunnede, prtchht, chocobbn, chenallo, colpith]
+  self_owned: [repalbass, jeehashed, maritane, skabakc, uatrayb, rowpalse]

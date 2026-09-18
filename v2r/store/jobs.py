@@ -1,0 +1,160 @@
+"""작업 큐 저장소."""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+from datetime import datetime, timedelta
+
+from v2r.command.spec import TaskSpec
+from v2r.store.db import KST, now_iso
+
+OPEN_STATUSES = ("queued", "running")
+STATUSES = ("queued", "running", "done", "failed", "uncertain", "cancelled")
+
+
+def _parse(ts: str | None) -> datetime | None:
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(ts)
+    except ValueError:
+        return None
+
+
+class JobStore:
+    """jobs + executor_lease 조작."""
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self.conn = conn
+
+    def enqueue(self, spec: TaskSpec, idem_key: str) -> int:
+        """작업 등록. 같은 키가 있으면 기존 id 반환."""
+        row = self.conn.execute(
+            "SELECT id FROM jobs WHERE idem_key = ?", (idem_key,)
+        ).fetchone()
+        if row:
+            return int(row["id"])
+        ts = now_iso()
+        cur = self.conn.execute(
+            "INSERT INTO jobs (idem_key, task, spec_json, status, created_at, updated_at)"
+            " VALUES (?, ?, ?, 'queued', ?, ?)",
+            (idem_key, spec.task, spec.to_json(), ts, ts),
+        )
+        return int(cur.lastrowid)
+
+    # --- 리스 ---
+    def _take_lease(self, owner: str, lease_seconds: int) -> bool:
+        """비었거나 만료됐거나 내 것이면 리스 획득."""
+        now = datetime.now(KST)
+        row = self.conn.execute(
+            "SELECT owner, until FROM executor_lease WHERE id = 1"
+        ).fetchone()
+        if row is not None:
+            until = _parse(row["until"])
+            if row["owner"] and row["owner"] != owner and until and until > now:
+                return False
+        until_iso = (now + timedelta(seconds=lease_seconds)).isoformat(timespec="seconds")
+        ts = now_iso()
+        self.conn.execute(
+            "INSERT INTO executor_lease (id, owner, until, created_at, updated_at)"
+            " VALUES (1, ?, ?, ?, ?)"
+            " ON CONFLICT(id) DO UPDATE SET owner = excluded.owner,"
+            " until = excluded.until, updated_at = excluded.updated_at",
+            (owner, until_iso, ts, ts),
+        )
+        return True
+
+    def _release_lease(self, owner: str) -> None:
+        self.conn.execute(
+            "UPDATE executor_lease SET owner = NULL, until = NULL, updated_at = ?"
+            " WHERE id = 1 AND (owner = ? OR owner IS NULL)",
+            (now_iso(), owner),
+        )
+
+    def acquire(self, owner: str, lease_seconds: int = 900) -> sqlite3.Row | None:
+        """리스를 잡고 가장 오래된 queued 1건을 running으로."""
+        if not self._take_lease(owner, lease_seconds):
+            return None
+        row = self.conn.execute(
+            "SELECT * FROM jobs WHERE status = 'queued' ORDER BY id LIMIT 1"
+        ).fetchone()
+        if row is None:
+            self._release_lease(owner)
+            return None
+        until = (datetime.now(KST) + timedelta(seconds=lease_seconds)).isoformat(
+            timespec="seconds"
+        )
+        self.conn.execute(
+            "UPDATE jobs SET status = 'running', lease_owner = ?, lease_until = ?,"
+            " updated_at = ? WHERE id = ?",
+            (owner, until, now_iso(), row["id"]),
+        )
+        return self.conn.execute(
+            "SELECT * FROM jobs WHERE id = ?", (row["id"],)
+        ).fetchone()
+
+    def heartbeat(self, job_id: int, owner: str, lease_seconds: int = 900) -> bool:
+        """리스 연장."""
+        until = (datetime.now(KST) + timedelta(seconds=lease_seconds)).isoformat(
+            timespec="seconds"
+        )
+        ts = now_iso()
+        cur = self.conn.execute(
+            "UPDATE jobs SET lease_until = ?, updated_at = ?"
+            " WHERE id = ? AND lease_owner = ?",
+            (until, ts, job_id, owner),
+        )
+        self.conn.execute(
+            "UPDATE executor_lease SET until = ?, updated_at = ? WHERE id = 1 AND owner = ?",
+            (until, ts, owner),
+        )
+        return cur.rowcount > 0
+
+    def finish(
+        self,
+        job_id: int,
+        status: str,
+        result: dict | None = None,
+        error: str | None = None,
+    ) -> None:
+        """작업 종료 처리 + 리스 해제."""
+        if status not in STATUSES:
+            raise ValueError(f"알 수 없는 상태: {status}")
+        row = self.get(job_id)
+        owner = (row or {}).get("lease_owner")
+        self.conn.execute(
+            "UPDATE jobs SET status = ?, result_json = ?, error = ?, lease_owner = NULL,"
+            " lease_until = NULL, updated_at = ? WHERE id = ?",
+            (
+                status,
+                json.dumps(result, ensure_ascii=False) if result is not None else None,
+                error,
+                now_iso(),
+                job_id,
+            ),
+        )
+        if owner:
+            self._release_lease(str(owner))
+
+    def cancel_open(self, owner: str) -> int:
+        """대기·실행 중 작업 전부 취소."""
+        cur = self.conn.execute(
+            "UPDATE jobs SET status = 'cancelled', lease_owner = NULL, lease_until = NULL,"
+            " updated_at = ? WHERE status IN ('queued', 'running')",
+            (now_iso(),),
+        )
+        self._release_lease(owner)
+        return cur.rowcount
+
+    def get(self, job_id: int) -> dict | None:
+        """작업 1건."""
+        row = self.conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        return dict(row) if row else None
+
+    def recent(self, limit: int = 10) -> list[dict]:
+        """최근 작업 목록."""
+        rows = self.conn.execute(
+            "SELECT * FROM jobs ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [dict(r) for r in rows]

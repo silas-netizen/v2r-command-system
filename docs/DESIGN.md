@@ -126,8 +126,8 @@ events(id, job_id, level, message, created_at)   -- 보고·감사 로그
 ## 7. 모델 사용 정책 (`v2r/llm/router.py`)
 | 용도 | 모델 ID |
 |---|---|
-| 모호 명령 해석 | `claude-haiku-4-5-20251001` |
-| 일상 글 댓글 | `claude-haiku-4-5-20251001` |
+| 모호 명령 해석 | `claude-haiku-4-5` |
+| 일상 글 댓글 | `claude-haiku-4-5` |
 | 홍보 글 댓글 | `claude-sonnet-5` |
 | 일상 글 수집·각색 | `claude-sonnet-5` |
 호출 전 항상 "규칙으로 해결 가능한가" 검사. 키 없으면 해당 기능만 비활성, 나머지는 동작.

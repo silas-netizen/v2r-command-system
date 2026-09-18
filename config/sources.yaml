@@ -1,0 +1,33 @@
+# 원본 시트 목록 — legacy-business-logic.md §3 기준.
+sources:
+  - name: 일상글목록
+    kind: sheet
+    spreadsheet_id: 1vSON0Rej9anDQXcAOXyBrCr50B4MMqZ79FahF4cDPJw
+    gid: 2015103906
+  - name: 랜덤일상
+    kind: sheet
+    spreadsheet_id: 1vSON0Rej9anDQXcAOXyBrCr50B4MMqZ79FahF4cDPJw
+    gid: 1842684291
+  - name: 계정시트
+    kind: accounts
+    spreadsheet_id: 1UgcAvHFCpC5N9joC9T5WCATK834F3XAtRrepFv6XbEs
+    gid: 218285244
+  - name: 각색 전체
+    kind: sheet
+    spreadsheet_id: 1WlNgw9Jzr7dWYAabqVB3yn220--uucVb
+    gid: 21220889
+  - name: 기존일상시트
+    kind: sheet
+    spreadsheet_id: 14N_Mjji4mWqi9ib_4T_AGI1ruYdHOeKT
+    gid: 755409539
+  - name: 정보성 글
+    kind: sheet
+    spreadsheet_id: 1vSON0Rej9anDQXcAOXyBrCr50B4MMqZ79FahF4cDPJw
+    gid: 1193993260
+
+# 동기화 금지 문서 (요청 시 SourceError)
+excluded_document_ids:
+  - 1DLQgLWBo1c4CDkgvH4fjkuDrRM1C03XT
+
+# 브랜드별 참고 시트. 형식: <브랜드명>: {spreadsheet_id: …, gid: …}
+brand_sheets: {}
