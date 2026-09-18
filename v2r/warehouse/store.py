@@ -13,10 +13,116 @@ import hashlib
 import re
 import shutil
 from pathlib import Path
+from typing import Any
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
 
 _SAFE_RE = re.compile(r"[^0-9A-Za-z가-힣._\- ]+")
+
+#: 키워드 공용 폴더 이름 (`{키워드}` 토큰이 가리키는 폴더)
+KEYWORD_FOLDER = "키워드"
+
+
+class NoPhotoError(RuntimeError):
+    """키워드 폴더를 채울 원본 사진이 하나도 없다(텔레그램 알림 대상)."""
+
+
+def _squash(text: str) -> str:
+    """공백 제거 + casefold (레거시 `images.py` 비교 규칙)."""
+    return re.sub(r"\s+", "", str(text or "")).casefold()
+
+
+def load_brands_config() -> dict:
+    """`config/brands.yaml`을 읽는다. 없으면 빈 dict."""
+    try:
+        from v2r.config import load_yaml
+
+        return load_yaml("brands") or {}
+    except Exception:
+        return {}
+
+
+def brand_entry(brand: str, cfg: dict | None = None) -> dict:
+    """브랜드 설정 1건. 별칭(`aliases`)으로도 찾는다."""
+    cfg = cfg if cfg is not None else load_brands_config()
+    brands = cfg.get("brands") or {}
+    key = _squash(brand)
+    for name, entry in brands.items():
+        if not isinstance(entry, dict):
+            continue
+        if _squash(name) == key:
+            return entry
+        if any(_squash(a) == key for a in (entry.get("aliases") or [])):
+            return entry
+    return {}
+
+
+def brand_folder_name(brand: str, cfg: dict | None = None) -> str:
+    """브랜드 → 창고/인박스 폴더 이름 (별칭을 정식 폴더명으로 바꾼다)."""
+    entry = brand_entry(brand, cfg)
+    return str(entry.get("folder") or entry.get("drive_folder") or brand or "")
+
+
+def token_folder_name(
+    brand: str, token: str, keyword: str = "", cfg: dict | None = None
+) -> str:
+    """플레이스홀더 토큰 → 브랜드 하위 폴더 이름.
+
+    - `{키워드}` 또는 A열 키워드와 같은 문자열 → 브랜드에 `keyword` 규칙이 있으면 `키워드`
+    - 브랜드별 별칭(팥순이 `B/A` → `BA`) → 지정 폴더
+    - 그 외 → 토큰 문자열 그대로
+    """
+    cfg = cfg if cfg is not None else load_brands_config()
+    entry = brand_entry(brand, cfg)
+    rules = entry.get("placeholder_rules") or {}
+    token = str(token or "").strip()
+
+    aliases = rules.get("aliases") or {}
+    for alias, rule in aliases.items():
+        if _squash(alias) == _squash(token) and isinstance(rule, dict):
+            return str(rule.get("folder") or token)
+
+    is_keyword = _squash(token) == _squash(KEYWORD_FOLDER) or (
+        bool(keyword) and _squash(token) == _squash(keyword)
+    )
+    keyword_rule = rules.get("keyword")
+    if is_keyword and isinstance(keyword_rule, dict):
+        return str(keyword_rule.get("folder") or KEYWORD_FOLDER)
+    if _squash(token) == _squash(KEYWORD_FOLDER):
+        return KEYWORD_FOLDER
+    return token or KEYWORD_FOLDER
+
+
+def token_select_mode(
+    brand: str, token: str, keyword: str = "", cfg: dict | None = None
+) -> str:
+    """토큰의 사진 선택 방식: `random` 또는 `filename_match`."""
+    cfg = cfg if cfg is not None else load_brands_config()
+    entry = brand_entry(brand, cfg)
+    rules = entry.get("placeholder_rules") or {}
+    folder = token_folder_name(brand, token, keyword, cfg)
+    keyword_rule = rules.get("keyword")
+    if isinstance(keyword_rule, dict) and _squash(keyword_rule.get("folder") or "") == _squash(folder):
+        return str(keyword_rule.get("select") or "random")
+    for alias, rule in (rules.get("aliases") or {}).items():
+        del alias
+        if isinstance(rule, dict) and _squash(rule.get("folder") or "") == _squash(folder):
+            return str(rule.get("select") or "random")
+    default = rules.get("default") or {}
+    return str(default.get("select") or "random")
+
+
+def inbox_brand_dirs(root: str | Path, brand_folder: str) -> list[Path]:
+    """`inbox/image/**/<브랜드>` 후보 폴더 목록 (`image/image` 이중 경로 포함)."""
+    base = Path(root) / "inbox"
+    if not base.exists():
+        return []
+    key = _squash(brand_folder)
+    out: list[Path] = []
+    for path in base.rglob("*"):
+        if path.is_dir() and _squash(path.name) == key:
+            out.append(path)
+    return sorted(out)
 
 
 def sha256(path: str | Path) -> str:
@@ -88,6 +194,121 @@ class Warehouse:
     def washed_folder(self, sha: str) -> Path:
         """원본 해시별 세탁본 폴더."""
         return self.washed_dir / sha
+
+    def brand_root(self, brand: str, cfg: dict | None = None) -> Path:
+        """`originals/<브랜드>` 경로 (별칭은 정식 폴더명으로)."""
+        return self.originals_dir / safe_name(brand_folder_name(brand, cfg) or brand)
+
+    def keyword_folder(
+        self, brand: str, keyword: str, *, cfg: dict | None = None, token: str = ""
+    ) -> Path:
+        """`originals/<브랜드>/키워드`(또는 토큰 폴더) 경로.
+
+        `token`을 주면 그 토큰의 폴더 규칙을 따른다. 안 주면 `keyword`를 토큰으로 본다.
+        """
+        cfg = cfg if cfg is not None else load_brands_config()
+        folder = token_folder_name(brand, token or keyword, keyword, cfg)
+        return self.brand_root(brand, cfg) / safe_name(folder)
+
+    def root_originals(self, brand: str, cfg: dict | None = None) -> list[Path]:
+        """브랜드 폴더 **바로 아래** 원본 목록 (키워드 폴더를 채울 후보)."""
+        base = self.brand_root(brand, cfg)
+        if not base.is_dir():
+            return []
+        return sorted(
+            p
+            for p in base.iterdir()
+            if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES
+        )
+
+    def seed_candidates(self, brand: str, cfg: dict | None = None) -> list[Path]:
+        """키워드 폴더 씨앗이 될 원본 후보: 창고 브랜드 루트 + 인박스 브랜드 폴더."""
+        cfg = cfg if cfg is not None else load_brands_config()
+        out: list[Path] = list(self.root_originals(brand, cfg))
+        folder = brand_folder_name(brand, cfg) or brand
+        for directory in inbox_brand_dirs(self.root, folder):
+            out.extend(
+                sorted(
+                    p
+                    for p in directory.iterdir()
+                    if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES
+                )
+            )
+        return out
+
+    def ensure_keyword_pool(
+        self,
+        brand: str,
+        keyword: str,
+        min_variants: int = 1,
+        washer: Any = None,
+        *,
+        token: str = "",
+        cfg: dict | None = None,
+    ) -> list[Path]:
+        """키워드(토큰) 폴더에 원본과 세탁본을 확보한다. 원본 목록을 돌려준다.
+
+        1. 폴더에 원본이 하나도 없으면 브랜드 루트/인박스 원본을 복사해 채운다.
+        2. 세탁본이 `min_variants`개에 못 미치면 `photo_washer.make_variants`로 만든다.
+        3. 쓸 원본이 하나도 없으면 `NoPhotoError`(한국어 메시지, 브랜드·키워드 명시).
+        """
+        cfg = cfg if cfg is not None else load_brands_config()
+        label = token or keyword or KEYWORD_FOLDER
+        folder = self.keyword_folder(brand, keyword, cfg=cfg, token=token)
+        folder_name = folder.name
+        originals = [
+            p
+            for p in (sorted(folder.iterdir()) if folder.is_dir() else [])
+            if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES
+        ]
+
+        if not originals:
+            seeds = self.seed_candidates(brand, cfg)
+            if not seeds:
+                raise NoPhotoError(
+                    f"사진이 필요합니다: 브랜드 {brand}의 '{label}' 폴더"
+                    f"({folder_name})에 쓸 원본이 하나도 없습니다."
+                    " 창고 브랜드 폴더나 인박스에 사진을 넣어 주세요."
+                )
+            for seed in seeds:
+                try:
+                    self.add_original(seed, brand_folder_name(brand, cfg) or brand, folder_name)
+                except Exception:
+                    continue
+            originals = [
+                p
+                for p in (sorted(folder.iterdir()) if folder.is_dir() else [])
+                if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES
+            ]
+
+        if not originals:
+            raise NoPhotoError(
+                f"사진이 필요합니다: 브랜드 {brand}의 '{label}' 폴더"
+                f"({folder_name})를 채우지 못했습니다."
+            )
+
+        if min_variants > 0:
+            if washer is None:
+                from v2r.warehouse import photo_washer
+
+                washer = photo_washer.make_variants
+            made = sum(len(self.washed_variants(sha256(p))) for p in originals)
+            for original in originals:
+                if made >= min_variants:
+                    break
+                sha = sha256(original)
+                need = min_variants - made
+                try:
+                    washer(original, need, self.washed_folder(sha))
+                except Exception:
+                    continue
+                made = sum(len(self.washed_variants(sha256(p))) for p in originals)
+            if made <= 0:
+                raise NoPhotoError(
+                    f"사진이 필요합니다: 브랜드 {brand}의 '{label}' 폴더"
+                    f"({folder_name}) 세탁본을 만들지 못했습니다."
+                )
+        return originals
 
     # --- 원본 ---------------------------------------------------------
     def add_original(self, path: str | Path, brand: str, folder: str) -> Path:

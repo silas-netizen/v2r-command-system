@@ -1,0 +1,171 @@
+# 브랜드별 사진/원고 규칙 — docs/reference/brand-cafe-rules.md §5 기준 (2026-09-19)
+# 브랜드명은 시트 제목 마지막 괄호 안 문자열과 정확히 일치해야 한다.
+#
+# 결정 1(2026-09-19): 사진은 `브랜드/키워드`(또는 `브랜드/<토큰>`) 폴더에서만 고른다.
+# 브랜드 폴더 바로 아래 사진은 직접 쓰지 않고, 키워드 폴더를 채우는 원본 후보로만 쓴다.
+
+version: 1
+
+defaults:
+  # 사진 원본
+  drive_root_id: 13ouLpDi-mSJctFuw3iKCg-z4FZLPjKiK
+  # 인박스 실제 경로는 `image` 폴더가 한 겹 더 있다 (§4)
+  local_image_root: warehouse/inbox/image/image
+  # 창고 원본 배치: warehouse/images/originals/<brand_folder>/<폴더>/<파일>
+  warehouse_image_root: warehouse/images/originals
+  image_source: local          # drive | local
+  # 플레이스홀더 해석
+  placeholder_pattern: '\{([^{}\r\n]+)\}'
+  placeholder_rules:
+    default:
+      folder: '{token}'        # 토큰 문자열을 그대로 하위 폴더명으로
+      select: random           # random | filename_match
+  image_count: 1               # 플레이스홀더 1개당 사진 1장
+  image_count_mode: by_placeholder  # 본문의 {...} 개수만큼
+  min_variants: 1              # 키워드 폴더에 최소로 확보할 세탁본 수
+  image_disabled_column: 이미지 없음   # 값이 y면 사진 0장
+  strip_placeholders: true
+  fail_if_placeholder_unresolved: true  # 사진 없는 글은 등록하지 않는다
+  body_autoformat: false       # 브랜드 시트는 원문 그대로
+  comment_type: manuscript     # 원고 내 댓글 계층 사용, V2R AI 댓글 미사용
+  use_comment_ai: false
+  tag_rule: keyword_no_space   # 태그 = 공백 제거한 A열 키워드, 1개
+  sheet_columns:               # A~J 고정
+    A: 키워드
+    B: 본문
+    C: 카페명
+    D: 작성계정
+    E: 원고유형
+    F: 완료 링크
+    G: 말머리
+    H: 계정유형
+    I: 이미지 없음
+    J: 게시판명
+
+brands:
+  우아덤:
+    folder: 우아덤             # 창고/인박스 폴더명
+    drive_folder: 우아덤
+    aliases: []
+    placeholder_rules:
+      default: {folder: '{token}', select: random}
+    known_folders: [키워드]
+    image_count: 1
+    comment_type: manuscript
+    sheets: []                 # TODO: 브랜드 시트 ID 미확인
+
+  코숨핏:
+    folder: 코숨핏
+    drive_folder: 코숨핏
+    aliases: []
+    placeholder_rules:
+      default: {folder: '{token}', select: random}
+    known_folders:
+      - 키워드                 # 주의: 인박스에서 비어 있음 → 브랜드 루트 원본으로 채운다
+      - 기도근육운동_기사&자료
+      - 기도좁아짐_기사&자료
+      - 기도좁아짐_이미지
+      - 수면무호흡_위험성_기사&자료
+      - 수면점수
+      - 코골이_개선이유_기사&자료
+      - 코골이밴드 사진
+      - 비염_개선이유_기사&자료
+      - 비염 괴로움_이미지
+      - 대체제_기사&자료
+      - 대체제_이미지
+      - 스무숨_착용사진
+      - 운동 안 하는 이유
+      - 점진적 저항 운동 (송아지)
+      - 프레임 분리 요소_이미지
+      - 입호흡, 비강호흡
+    image_count: 1
+    comment_type: manuscript
+    sheets: []                 # TODO
+
+  뉴더미스:
+    folder: 뉴더미스
+    drive_folder: 뉴더미스
+    # 같은 브랜드의 다른 표기. 지침(SUMMARY §8)에서는 `자연방패 항문세정제`로 부른다.
+    aliases: [자연방패, 자연방패 항문세정제]
+    placeholder_rules:
+      keyword: {folder: 키워드, select: random}   # {키워드} 또는 {A열 키워드}
+      default: {folder: '{token}', select: random}
+    known_folders: [키워드, 두드러기, 병원, 먹는 약, 좌욕사진, 연고사진]
+    image_count: 1
+    comment_type: manuscript
+    sheets: []                 # TODO
+
+  장으뜸:
+    folder: 장으뜸
+    drive_folder: 장으뜸
+    aliases: [장으뜸 장어즙]
+    placeholder_rules:
+      keyword: {folder: 키워드, select: random}
+      default: {folder: '{token}', select: random}
+    known_folders: [키워드]
+    image_count: 1
+    comment_type: manuscript
+    sheets: []                 # TODO
+
+  팥순이:
+    folder: 팥순이
+    drive_folder: 팥순이
+    aliases: [팥순추출물, 팥순ㅇㅣ]
+    placeholder_rules:
+      keyword:                 # {키워드} 또는 {A열 키워드와 같은 문자열}
+        folder: 키워드
+        select: filename_match # 파일 stem 공백제거·casefold == 키워드 공백제거·casefold
+        retry_direct_search: true
+      aliases:
+        'B/A': {folder: BA, select: random}
+      default: {folder: '{token}', select: random}
+    known_folders: [키워드, BA]
+    image_count: 1
+    comment_type: manuscript
+    sheets: []                 # TODO
+
+# 브랜드 폴더가 아닌 인박스 폴더 (사진 수집에서 건너뛴다)
+ignored_inbox_folders:
+  - photowasher2.1
+  - 기관총_선택이미지
+
+# 원고유형별 댓글 구조 (브랜드 무관)
+comment_profiles:
+  질문형:
+    required_labels: [댓글1, 대댓글1, 댓글2, 대댓글2, 대대댓글2, 대대대댓글2,
+                      댓글3, 대댓글3, 댓글4, 대댓글4, 댓글5, 대댓글5]
+    special_label: 대대대댓글2
+    대대댓글2_writer: comment_account_2
+    대대대댓글2_writer: comment_account_6
+  후기형:
+    required_labels: [댓글1, 대댓글1, 댓글2, 대댓글2, 대대댓글2, 대대대댓글2,
+                      댓글3, 대댓글3, 댓글4, 대댓글4, 댓글5, 대댓글5]
+    special_label: 대대댓글2
+    대대댓글2_writer: comment_account_6
+    대대대댓글2_writer: author      # 본문 작성계정
+  common:
+    replies_writer: author          # 대댓글1/3/4/5는 항상 본문 작성계정
+    offsets_minutes:
+      댓글1: 5
+      댓글2: 6
+      댓글3: 7
+      댓글4: 8
+      댓글5: 9
+      대댓글1: 15
+      대댓글2: 16
+      대댓글3: 17
+      대댓글4: 18
+      대댓글5: 19
+      대대댓글2: 26
+      대대대댓글2: 36
+    shift_whole_bundle_on_conflict: true
+    max_shift_minutes: 1440
+    total_comments: 12            # 루트 5 + 대댓 7
+
+# 사진 없는 글 유형
+no_image_sources:
+  - daily_excel        # Excel 일상 글
+  - daily_random       # 랜덤일상 시트 일상 글
+  - daily_pool         # 새로 생성한 짧은 일상 글 풀 (결정 2)
+  - account_test       # 한 줄 노출 테스트
+  - informational      # 정보성 키워드 시트 (댓글도 없음)

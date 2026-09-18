@@ -14,6 +14,7 @@ TASK_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("reconcile", re.compile(r"(끊긴|미완료).*(이어|재개|점검)")),
     ("sync_all_sources", re.compile(r"전체\s*(원본|시트).*(동기화|갱신)")),
     ("sync_sources", re.compile(r"(원본|시트).*(동기화|갱신)")),
+    ("generate_daily", re.compile(r"일상\s*글.*(생성|만들어)")),
     ("collect_daily", re.compile(r"일상\s*글.*(수집|가져와)")),
     ("collect_photos", re.compile(r"사진.*(수집|가져와)")),
     ("wash_photos", re.compile(r"사진.*(세탁|변형)\s*(\d+)?")),
@@ -208,7 +209,7 @@ def parse_korean_command(text: str, now: datetime | None = None) -> TaskSpec | N
     m = RE_COUNT.search(raw)
     if m:
         spec["count"] = int(m.group(1))
-    elif task in PUBLISH_TASKS | {"collect_daily", "collect_photos"}:
+    elif task in PUBLISH_TASKS | {"generate_daily", "collect_daily", "collect_photos"}:
         # `글` 없이 `N개`만 있어도 개수로 인정. 단 계정 수 표현은 먼저 제거한다.
         m = RE_ANY_COUNT.search(RE_ACCOUNT_COUNT.sub(" ", raw))
         if m:

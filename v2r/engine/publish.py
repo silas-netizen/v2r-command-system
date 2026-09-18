@@ -68,13 +68,37 @@ def _norm(name: str) -> str:
     return re.sub(r"\s+", "", name or "").casefold()
 
 
+def xlsx_dir(rt: Runtime) -> Path:
+    """각색 xlsx를 찾는 폴더 (`sources.yaml: local_xlsx_dir`)."""
+    from v2r.sources.local_files import DEFAULT_XLSX_DIR
+
+    raw = str(rt.sources_cfg.get("local_xlsx_dir") or DEFAULT_XLSX_DIR)
+    path = Path(raw)
+    return path if path.is_absolute() else rt.settings.repo_root / path
+
+
+def discovered_xlsx_entries(rt: Runtime) -> list[dict]:
+    """`local_xlsx_dir`의 `*각색*.xlsx` 원본 항목 목록 (결정 3·7)."""
+    from v2r.sources.local_files import discover_xlsx
+
+    try:
+        return discover_xlsx(xlsx_dir(rt))
+    except Exception:
+        return []
+
+
 def _sheet_entries(rt: Runtime) -> list[dict]:
-    """sources.yaml의 원고 시트 목록."""
-    return [
+    """원고 원본 목록: sources.yaml의 시트/일상풀/xlsx + 폴더에서 찾은 xlsx."""
+    entries = [
         e
         for e in (rt.sources_cfg.get("sources") or [])
-        if isinstance(e, dict) and (e.get("kind") or "sheet") == "sheet"
+        if isinstance(e, dict) and (e.get("kind") or "sheet") in ("sheet", "xlsx", "daily_pool")
     ]
+    names = {_norm(e.get("name", "")) for e in entries}
+    for entry in discovered_xlsx_entries(rt):
+        if _norm(entry.get("name", "")) not in names:
+            entries.append(entry)
+    return entries
 
 
 def _entry_by_name(rt: Runtime, name: str) -> dict | None:
@@ -98,6 +122,11 @@ def select_source_entries(rt: Runtime, spec: TaskSpec) -> list[dict]:
 
     entries = _sheet_entries(rt)
     if spec.task == "publish_daily":
+        from v2r.sources.daily_pool import pool_entry
+
+        pool = pool_entry(rt.sources_cfg)
+        if pool is not None and load_manuscripts(rt, pool, prefer_cache=True):
+            return [pool]
         for wanted in ("일상글목록", DAILY_POOL_SOURCE):
             entry = _entry_by_name(rt, wanted)
             if entry is not None:
@@ -108,15 +137,22 @@ def select_source_entries(rt: Runtime, spec: TaskSpec) -> list[dict]:
             e
             for e in entries
             if _norm(e.get("name", "")) != _norm(DAILY_POOL_SOURCE)
+            and (e.get("kind") or "sheet") != "daily_pool"
             and ("각색" in (e.get("name") or "") or "제휴" in (e.get("name") or ""))
         ]
-        return picked or [e for e in entries if _norm(e.get("name", "")) != _norm(DAILY_POOL_SOURCE)]
+        return picked or [
+            e
+            for e in entries
+            if _norm(e.get("name", "")) != _norm(DAILY_POOL_SOURCE)
+            and (e.get("kind") or "sheet") != "daily_pool"
+        ]
     if spec.task == "publish_info":
         entry = _entry_by_name(rt, "정보성")
         if entry is None:
             raise PublishError("정보성 글 시트가 sources.yaml에 없습니다")
         return [entry]
-    return entries  # publish_batch
+    # publish_batch — 일상 글 풀은 제휴 일상 글 전용이라 일괄 발행에서 제외한다
+    return [e for e in entries if (e.get("kind") or "sheet") != "daily_pool"]
 
 
 def _cache_hooks(rt: Runtime):
@@ -144,8 +180,20 @@ def _parse_rows(rows: list[dict], name: str, cafes_cfg: dict) -> list[Manuscript
 
 
 def load_manuscripts(rt: Runtime, entry: dict, prefer_cache: bool = False) -> list[Manuscript]:
-    """시트 1건을 원고 목록으로. `prefer_cache`면 네트워크를 쓰지 않는다."""
+    """원본 1건을 원고 목록으로. `prefer_cache`면 네트워크를 쓰지 않는다.
+
+    `kind`: `sheet`(구글 시트) / `xlsx`(로컬 각색 엑셀) / `daily_pool`(창고 일상 글 풀).
+    """
     name = str(entry.get("name") or "")
+    kind = entry.get("kind") or "sheet"
+    if kind == "daily_pool":
+        from v2r.sources.daily_pool import load_pool
+
+        return load_pool(rt.settings.warehouse_dir)
+    if kind == "xlsx":
+        from v2r.sources.local_files import parse_xlsx_entry
+
+        return parse_xlsx_entry(entry, rt.cafes_cfg)
     cache_get, cache_put = _cache_hooks(rt)
     rows = sheets.load_source(
         entry, cache_get=cache_get, cache_put=cache_put, prefer_cache=prefer_cache
@@ -154,7 +202,18 @@ def load_manuscripts(rt: Runtime, entry: dict, prefer_cache: bool = False) -> li
 
 
 def refresh_source(rt: Runtime, entry: dict) -> int:
-    """시트 1건을 새로 읽어 캐시에 저장. 행 수 반환."""
+    """원본 1건을 새로 읽어 캐시에 저장. 행 수 반환."""
+    kind = entry.get("kind") or "sheet"
+    if kind == "daily_pool":
+        from v2r.sources.daily_pool import load_pool
+
+        return len(load_pool(rt.settings.warehouse_dir))
+    if kind == "xlsx":
+        from v2r.sources.local_files import load_xlsx_rows
+
+        rows = load_xlsx_rows(entry.get("path") or "")
+        _cache_hooks(rt)[1](str(entry.get("name") or ""), rows)
+        return len(rows)
     cache_get, cache_put = _cache_hooks(rt)
     rows = sheets.load_source(entry, cache_get=cache_get, cache_put=cache_put)
     return len(rows)
@@ -340,32 +399,73 @@ def record_variant_use(rt: Runtime, sha: str, variant: Path, source_id: str) -> 
     )
 
 
+def placeholder_tokens(body: str) -> list[str]:
+    """본문의 `{...}` 토큰 목록(등장 순서, 중괄호 제외)."""
+    return [
+        raw[1:-1].strip()
+        for raw in seone.PLACEHOLDER.findall((body or "").replace("\r\n", "\n"))
+    ]
+
+
+def _match_by_filename(originals: list[Path], keyword: str) -> list[Path]:
+    """파일 stem(공백제거·casefold)이 키워드와 같은 원본만 (팥순이 규칙)."""
+    key = re.sub(r"\s+", "", keyword or "").casefold()
+    if not key:
+        return []
+    return [p for p in originals if re.sub(r"\s+", "", p.stem).casefold() == key]
+
+
 def pick_images(rt: Runtime, m: Manuscript, spec: TaskSpec, need: int) -> list[Path]:
-    """창고에서 미사용 세탁본을 need장 고른다. 모자라면 PublishError."""
+    """플레이스홀더 토큰별로 키워드/토큰 폴더에서 미사용 세탁본을 고른다.
+
+    결정 1(2026-09-19): 브랜드 폴더 바로 아래 사진은 직접 쓰지 않는다.
+    폴더가 비어 있으면 `ensure_keyword_pool`이 브랜드 루트/인박스 원본으로 채운다.
+    원본이 하나도 없으면 `NoPhotoError`가 그대로 올라간다(텔레그램 알림용).
+    """
     if need <= 0:
         return []
+    from v2r.warehouse import store as wh_store
+
     brand = spec.brand or m.source or ""
+    if not brand:
+        raise PublishError("사진을 고를 브랜드를 알 수 없습니다")
     wh = rt.warehouse
-    originals = wh.list_originals(brand) if brand else wh.list_originals()
-    if not originals:
-        raise PublishError(f"사진이 부족합니다 (브랜드 {brand or '전체'} 원본 없음)")
+    cfg = wh_store.load_brands_config()
+    tokens = placeholder_tokens(m.body)[:need]
     used = used_variants(rt)
     out: list[Path] = []
-    for original in originals:
-        if len(out) >= need:
-            break
-        sha = wh.sha256(original)
-        while len(out) < need:
+
+    for token in tokens:
+        originals = wh.ensure_keyword_pool(
+            brand, m.keyword or token, min_variants=1, token=token, cfg=cfg
+        )
+        if wh_store.token_select_mode(brand, token, m.keyword, cfg) == "filename_match":
+            matched = _match_by_filename(originals, m.keyword or token)
+            originals = matched or originals
+        picked: Path | None = None
+        for original in originals:
+            sha = wh.sha256(original)
+            if not wh.washed_variants(sha):
+                wh.ensure_keyword_pool(
+                    brand, m.keyword or token, min_variants=1, token=token, cfg=cfg
+                )
             variant = wh.pick_variant(sha, used)
             if variant is None:
-                break
+                continue
             used.add(str(variant))
             rt.scratch.setdefault("variant_sha", {})[str(variant)] = sha
-            out.append(variant)
+            picked = variant
+            break
+        if picked is None:
+            folder = wh.keyword_folder(brand, m.keyword or token, cfg=cfg, token=token)
+            raise PublishError(
+                f"사진이 부족합니다 (브랜드 {brand} '{token}' 폴더 {folder.name}의"
+                " 미사용 세탁본 없음)"
+            )
+        out.append(picked)
+
     if len(out) < need:
-        raise PublishError(
-            f"사진이 부족합니다 (필요 {need}장, 사용 가능 {len(out)}장)"
-        )
+        raise PublishError(f"사진이 부족합니다 (필요 {need}장, 사용 가능 {len(out)}장)")
     return out
 
 
@@ -511,22 +611,39 @@ def build_comments(rt: Runtime, slot: Slot, root_start: datetime, cafe_id: Any) 
 
 
 def _daily_pool(rt: Runtime) -> list[Manuscript]:
-    """제휴 일상 글 풀(랜덤일상)."""
+    """제휴 일상 글 풀. 창고의 `daily_pool`을 먼저 보고, 없으면 랜덤일상 시트."""
     pool = rt.scratch.get("daily_pool")
     if pool is None:
-        entry = _entry_by_name(rt, DAILY_POOL_SOURCE)
-        pool = load_manuscripts(rt, entry) if entry else []
+        from v2r.sources.daily_pool import load_pool, pool_entry
+
+        pool = []
+        if pool_entry(rt.sources_cfg) is not None:
+            try:
+                pool = load_pool(rt.settings.warehouse_dir)
+            except Exception:
+                pool = []
+        if not pool:
+            entry = _entry_by_name(rt, DAILY_POOL_SOURCE)
+            pool = load_manuscripts(rt, entry) if entry else []
         rt.scratch["daily_pool"] = pool
     return pool
 
 
 def _take_daily(rt: Runtime) -> Manuscript:
-    """실행 중 겹치지 않게 일상 글 1건을 뽑는다."""
+    """실행 중 겹치지 않게 일상 글 1건을 뽑는다(같은 실행 안 중복 금지)."""
     pool = _daily_pool(rt)
     used: set[int] = rt.scratch.setdefault("daily_used", set())
-    left = [m for m in pool if m.source_row not in used]
+    left = [
+        m
+        for m in pool
+        if m.source_row not in used
+        and not rt.publications.exists(m.source, m.source_row, m.content_hash)
+    ]
     if not left:
-        raise PublishError("제휴 일상 글 원고가 부족합니다 (랜덤일상 시트 확인)")
+        raise PublishError(
+            "제휴 일상 글 원고가 부족합니다"
+            " ('일상 글 30개 만들어줘'로 풀을 채우거나 랜덤일상 시트를 확인하세요)"
+        )
     picked = random.choice(left)
     used.add(picked.source_row)
     return picked
@@ -691,6 +808,16 @@ def run_slot(
             )
             del daily_pending  # 일상 글 확정 보류는 수정글 등록을 막지 않는다
             rt.publications.mark(*key, "uncertain", "daily_done", source_id=daily_id)
+            if daily.source and daily.content_hash:
+                # 일상 글 자체도 사용 기록을 남겨 다음 실행에서 다시 뽑히지 않게 한다
+                rt.publications.mark(
+                    daily.source,
+                    daily.source_row,
+                    daily.content_hash,
+                    "done",
+                    "daily_used",
+                    source_id=daily_id,
+                )
             _beat()
 
             rev_at = slot.revision_at or (root_start + timedelta(hours=4))

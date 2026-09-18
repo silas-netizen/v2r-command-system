@@ -24,6 +24,13 @@ sources:
     kind: sheet
     spreadsheet_id: 1vSON0Rej9anDQXcAOXyBrCr50B4MMqZ79FahF4cDPJw
     gid: 1193993260
+  # 결정 2: 새로 생성한 짧은 일상 글 풀 (제목 1줄 + 본문 1줄, 사진 없음)
+  - name: 일상글풀
+    kind: daily_pool
+    path: manuscripts/daily_pool.jsonl
+
+# 결정 3·7: `각색_…xlsx` = 브랜드 원고 엑셀. 이 폴더에 두면 자동 등록된다.
+local_xlsx_dir: warehouse/inbox/sheets
 
 # 동기화 금지 문서 (요청 시 SourceError)
 excluded_document_ids:
