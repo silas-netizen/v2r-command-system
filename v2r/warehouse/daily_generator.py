@@ -16,8 +16,10 @@ from typing import Any
 
 from v2r.content.manuscript import Manuscript, content_hash
 
-#: 풀 파일 이름
+#: 풀 파일 이름 (자사 카페 일상 글 — 모델 API로 생성)
 POOL_FILENAME = "daily_pool.jsonl"
+#: 제휴 카페 일상 글 풀 (ChatGPT 웹 세션으로 생성, API 토큰 0)
+AFFILIATE_POOL_FILENAME = "affiliate_daily_pool.jsonl"
 #: 모델 호출 1회당 생성 건수
 BATCH_SIZE = 20
 #: 길이 상한 (지침 §4 "일상 글 20~30자 또는 20~40자")
@@ -29,9 +31,14 @@ _BANNED_PUNCT = re.compile(r"[,.]|…")
 _WS = re.compile(r"\s+")
 
 
-def pool_path(warehouse_dir: str | Path) -> Path:
+def pool_path(warehouse_dir: str | Path, filename: str = POOL_FILENAME) -> Path:
     """풀 파일 경로."""
-    return Path(warehouse_dir) / "manuscripts" / POOL_FILENAME
+    return Path(warehouse_dir) / "manuscripts" / filename
+
+
+def affiliate_pool_path(warehouse_dir: str | Path) -> Path:
+    """제휴 카페 일상 글 풀 경로."""
+    return pool_path(warehouse_dir, AFFILIATE_POOL_FILENAME)
 
 
 def clean_line(text: str) -> str:
@@ -159,13 +166,172 @@ def generate_daily_pool(
 
 
 # --------------------------------------------------------------------
+# 제휴 카페 일상 글 — ChatGPT 웹 세션 생성 (API 토큰 0)
+# --------------------------------------------------------------------
+#: 제휴 일상 글 1회 요청당 건수 (웹 채팅은 응답이 길면 잘리므로 작게)
+AFFILIATE_BATCH_SIZE = 10
+
+#: 제휴 일상 글 작성 규칙 (지침 `제휴 게시판(소재 포함) 일상 글 작성.md` 요약)
+AFFILIATE_RULES = (
+    "너는 맘카페 회원이야. 카페에 올릴 짧은 일상 글을 쓴다.\n"
+    "규칙:\n"
+    "1. 제목 1줄, 본문 1줄. 딱 2줄이다.\n"
+    f"2. 제목은 {TITLE_MAX}자 이내, 본문은 {BODY_MAX}자 이내.\n"
+    "3. 쉼표(,) 마침표(.) 말줄임표(…)를 절대 쓰지 마라.\n"
+    "4. ㅋㅋ ㅠㅠ 같은 한글 이모티콘은 써도 된다. 이모지(그림문자)는 금지.\n"
+    "5. 브랜드명 제품명 광고 느낌 금지. 그냥 회원이 수다 떠는 말투.\n"
+    "6. 나열식 정리식 말고 상황 중심으로 툭 던지듯이.\n"
+    "7. 페르소나와 소재는 매번 다르게. 같은 패턴 반복 금지.\n"
+    "출력 형식은 정확히 아래를 반복한다 (번호 없이):\n"
+    "제목: ...\n본문: ...\n"
+)
+
+_TITLE_LINE = re.compile(r"^\s*제목\s*[:：]\s*(.+)$")
+_BODY_LINE = re.compile(r"^\s*본문\s*[:：]\s*(.+)$")
+
+
+def build_affiliate_prompt(cafe: str, count: int, avoid: list[str] | None = None) -> str:
+    """제휴 일상 글 요청 프롬프트."""
+    target = (cafe or "").strip() or "맘카페"
+    parts = [
+        AFFILIATE_RULES,
+        f"카페 이름: {target}\n이 카페 회원이 쓸 법한 짧은 일상 글 {count}개를 만들어 줘.",
+    ]
+    if avoid:
+        sample = "\n".join(f"- {t}" for t in list(avoid)[-30:])
+        parts.append(f"아래 제목은 이미 썼다 겹치지 않게 해 줘\n{sample}")
+    return "\n\n".join(parts)
+
+
+def parse_affiliate_reply(text: str) -> list[tuple[str, str]]:
+    """`제목: / 본문:` 형식 응답 → 규칙을 지킨 (제목, 본문) 목록."""
+    out: list[tuple[str, str]] = []
+    pending: str | None = None
+    for raw in str(text or "").splitlines():
+        m = _TITLE_LINE.match(raw)
+        if m:
+            pending = clean_line(m.group(1))
+            continue
+        m = _BODY_LINE.match(raw)
+        if m and pending is not None:
+            body = clean_line(m.group(1))
+            if is_valid(pending, body):
+                out.append((pending, body))
+            pending = None
+    return out
+
+
+def generate_affiliate_pool_via_gpt(
+    cafes: list[str],
+    per_cafe: int,
+    page: Any = None,
+    warehouse_dir: str | Path | None = None,
+    *,
+    ask_fn: Any = None,
+    max_calls: int = 10,
+    headless: bool = False,
+) -> dict:
+    """제휴 카페 일상 글을 **ChatGPT 웹 세션**으로 만들어 풀 파일에 쌓는다.
+
+    `page`를 주면 그 페이지를 쓰고, 없으면 직접 브라우저를 열고 로그인을 기다린다.
+    `ask_fn(page, prompt)`를 주면 그것으로 물어본다(테스트용 대역).
+    반환: `{ok, added, generated, cafes, pool, errors, login_pending?}`
+    """
+    from v2r.warehouse.store import Warehouse
+
+    root = Path(warehouse_dir) if warehouse_dir is not None else Warehouse().root
+    targets = [str(c).strip() for c in (cafes or []) if str(c).strip()]
+    per_cafe = max(int(per_cafe or 0), 0)
+
+    result: dict[str, Any] = {
+        "ok": False,
+        "added": 0,
+        "generated": 0,
+        "cafes": targets,
+        "pool": str(affiliate_pool_path(root)),
+        "errors": [],
+    }
+    if not targets or per_cafe <= 0:
+        result["ok"] = True
+        result["message"] = "생성할 카페나 건수가 없습니다."
+        return result
+
+    owned = None  # 우리가 연 브라우저면 닫는다
+    if ask_fn is None:
+        from v2r.warehouse import gpt_chat
+        from v2r.warehouse.gpt_images import _close, open_gpt, wait_for_login
+
+        ask_fn = gpt_chat.ask
+        if page is None:
+            owned = open_gpt(headless=headless)
+            page = owned[2]
+            if not wait_for_login(page):
+                _close(*owned)
+                result["login_pending"] = True
+                result["message"] = "로그인 대기 — 내일 재시도"
+                return result
+
+    made: list[Manuscript] = []
+    seen: set[str] = {m.content_hash for m in load_pool(root, AFFILIATE_POOL_FILENAME)}
+    try:
+        for cafe in targets:
+            remaining = per_cafe
+            titles: list[str] = []
+            calls = 0
+            while remaining > 0 and calls < max_calls:
+                calls += 1
+                want = min(AFFILIATE_BATCH_SIZE, remaining)
+                prompt = build_affiliate_prompt(cafe, want, titles)
+                try:
+                    reply = ask_fn(page, prompt)
+                except Exception as exc:
+                    result["errors"].append(f"{cafe}: {exc}")
+                    break
+                items = parse_affiliate_reply(reply)
+                if not items:
+                    result["errors"].append(f"{cafe}: 규칙에 맞는 글을 받지 못했습니다")
+                    break
+                for title, body in items:
+                    if remaining <= 0:
+                        break
+                    digest = content_hash(title, body)
+                    if digest in seen:
+                        continue
+                    seen.add(digest)
+                    titles.append(title)
+                    made.append(
+                        Manuscript(
+                            title=title,
+                            body=body,
+                            cafe=cafe,
+                            source="affiliate_daily_pool",
+                            source_row=len(made) + 1,
+                            images_enabled=False,
+                            content_hash=digest,
+                        )
+                    )
+                    remaining -= 1
+    finally:
+        if owned is not None:
+            from v2r.warehouse.gpt_images import _close
+
+            _close(*owned)
+
+    result["generated"] = len(made)
+    result["added"] = save_pool(root, made, AFFILIATE_POOL_FILENAME)
+    result["ok"] = result["added"] > 0 or not result["errors"]
+    return result
+
+
+# --------------------------------------------------------------------
 # 풀 파일 입출력
 # --------------------------------------------------------------------
-def load_pool(warehouse_dir: str | Path) -> list[Manuscript]:
+def load_pool(warehouse_dir: str | Path, filename: str = POOL_FILENAME) -> list[Manuscript]:
     """풀 파일을 읽어 원고 목록으로. 깨진 줄은 건너뛴다."""
-    path = pool_path(warehouse_dir)
+    path = pool_path(warehouse_dir, filename)
     if not path.exists():
         return []
+    source_name = "affiliate_daily_pool" if filename == AFFILIATE_POOL_FILENAME else "daily_pool"
     out: list[Manuscript] = []
     for index, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
         line = line.strip()
@@ -177,7 +343,7 @@ def load_pool(warehouse_dir: str | Path) -> list[Manuscript]:
             continue
         if not isinstance(data, dict):
             continue
-        data.setdefault("source", "daily_pool")
+        data.setdefault("source", source_name)
         data.setdefault("source_row", index)
         data["images_enabled"] = False
         if not data.get("content_hash"):
@@ -191,11 +357,14 @@ def load_pool(warehouse_dir: str | Path) -> list[Manuscript]:
     return out
 
 
-def save_pool(warehouse_dir: str | Path, items: list[Manuscript]) -> int:
+def save_pool(
+    warehouse_dir: str | Path, items: list[Manuscript], filename: str = POOL_FILENAME
+) -> int:
     """풀 파일에 덧붙인다. 이미 있는 content_hash는 건너뛴다. 추가 건수 반환."""
-    path = pool_path(warehouse_dir)
+    path = pool_path(warehouse_dir, filename)
     path.parent.mkdir(parents=True, exist_ok=True)
-    existing = {m.content_hash for m in load_pool(warehouse_dir)}
+    existing = {m.content_hash for m in load_pool(warehouse_dir, filename)}
+    source_name = "affiliate_daily_pool" if filename == AFFILIATE_POOL_FILENAME else "daily_pool"
     added = 0
     with path.open("a", encoding="utf-8") as fp:
         for m in items or []:
@@ -210,7 +379,7 @@ def save_pool(warehouse_dir: str | Path, items: list[Manuscript]) -> int:
                         "body": m.body,
                         "cafe": m.cafe,
                         "board": m.board,
-                        "source": "daily_pool",
+                        "source": source_name,
                         "images_enabled": False,
                         "content_hash": digest,
                     },
@@ -223,12 +392,19 @@ def save_pool(warehouse_dir: str | Path, items: list[Manuscript]) -> int:
 
 
 __all__ = [
+    "AFFILIATE_BATCH_SIZE",
+    "AFFILIATE_POOL_FILENAME",
+    "AFFILIATE_RULES",
     "BATCH_SIZE",
     "BODY_MAX",
     "POOL_FILENAME",
     "TITLE_MAX",
+    "affiliate_pool_path",
+    "build_affiliate_prompt",
     "clean_line",
+    "generate_affiliate_pool_via_gpt",
     "generate_daily_pool",
+    "parse_affiliate_reply",
     "is_valid",
     "load_pool",
     "pool_path",

@@ -14,6 +14,8 @@ TASK_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("reconcile", re.compile(r"(끊긴|미완료).*(이어|재개|점검)")),
     ("sync_all_sources", re.compile(r"전체\s*(원본|시트).*(동기화|갱신)")),
     ("sync_sources", re.compile(r"(원본|시트).*(동기화|갱신)")),
+    # 제휴 카페 일상 글은 ChatGPT 웹 세션으로 만든다 (자사 xlsx 일상 글과 별개)
+    ("generate_affiliate_daily", re.compile(r"제휴.*일상\s*글.*(생성|만들어)")),
     ("generate_daily", re.compile(r"일상\s*글.*(생성|만들어)")),
     ("collect_daily", re.compile(r"일상\s*글.*(수집|가져와)")),
     ("collect_new_photos", re.compile(r"새\s*(사진|이미지)\s*(수거|회수|가져오기|가져와)")),
@@ -235,6 +237,7 @@ def parse_korean_command(text: str, now: datetime | None = None) -> TaskSpec | N
     if m:
         spec["count"] = int(m.group(1))
     elif task in PUBLISH_TASKS | {
+        "generate_affiliate_daily",
         "generate_daily",
         "collect_daily",
         "collect_photos",
@@ -338,6 +341,7 @@ TASK_LABELS: dict[str, str] = {
     "reconcile": "끊긴 작업 이어가기",
     "sync_all_sources": "전체 원본 동기화",
     "sync_sources": "원본 동기화",
+    "generate_affiliate_daily": "제휴 일상 글 생성(GPT)",
     "generate_daily": "일상 글 생성",
     "collect_daily": "일상 글 수집",
     "collect_photos": "사진 수집",

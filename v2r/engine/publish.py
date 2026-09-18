@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import random
 import re
 from dataclasses import dataclass, field
@@ -21,6 +22,8 @@ from v2r.content.manuscript import Manuscript
 from v2r.engine.context import Runtime
 from v2r.engine.scheduler import KST, plan_slots, revision_at
 from v2r.sources import sheets
+
+log = logging.getLogger(__name__)
 
 DAILY_POOL_SOURCE = "랜덤일상"
 DEFAULT_CAFE = "고요한 아침"
@@ -956,29 +959,28 @@ def comment_role_rows(rt: Runtime, slot: Slot) -> list[dict]:
 
 
 def _daily_pool(rt: Runtime) -> list[Manuscript]:
-    """일상 글 풀: 인박스 각색 xlsx(먼저) + 생성한 짧은 일상 글 풀.
+    """제휴 카페 일상 글 풀 — **`affiliate_daily_pool.jsonl`만** 읽는다.
 
-    둘 다 비었으면 랜덤일상 시트로 되돌아간다. content_hash로 중복을 없앤다.
+    제휴 카페 일상 글은 자사 카페 xlsx 일상 글과 완전히 별개다(사용자 결정).
+    ChatGPT 웹 세션으로 만든 `affiliate_daily_pool.jsonl`이 유일한 정규 출처다.
+    풀이 비었을 때만 옛 `랜덤일상` 시트로 되돌아가고, 그때 경고를 남긴다.
     """
     pool = rt.scratch.get("daily_pool")
     if pool is None:
-        entries = [
-            e for e in _sheet_entries(rt) if (e.get("kind") or "sheet") in DAILY_KINDS
-        ]
-        entries.sort(key=lambda e: 0 if (e.get("kind") or "") == XLSX_DAILY_KIND else 1)
-        pool = []
-        seen: set[str] = set()
-        for entry in entries:
-            try:
-                items = load_manuscripts(rt, entry)
-            except Exception:
-                continue
-            for m in items:
-                if m.content_hash and m.content_hash in seen:
-                    continue
-                seen.add(m.content_hash)
-                pool.append(m)
+        from v2r.warehouse.daily_generator import AFFILIATE_POOL_FILENAME, load_pool
+
+        try:
+            pool = load_pool(rt.warehouse.root, AFFILIATE_POOL_FILENAME)
+        except Exception as exc:
+            log.warning("제휴 일상 글 풀 읽기 실패: %s", exc)
+            pool = []
         if not pool:
+            log.warning(
+                "제휴 일상 글 풀(%s)이 비어 있어 옛 %s 시트로 되돌아갑니다."
+                " ('제휴 일상 글 만들어줘'로 풀을 채우세요)",
+                AFFILIATE_POOL_FILENAME,
+                DAILY_POOL_SOURCE,
+            )
             entry = _entry_by_name(rt, DAILY_POOL_SOURCE)
             pool = load_manuscripts(rt, entry) if entry else []
         rt.scratch["daily_pool"] = pool

@@ -112,13 +112,87 @@ def test_login_prompt_text():
 
 
 def test_wait_for_login_gives_up_quietly(monkeypatch):
-    monkeypatch.setattr(gpt_images, "composer", lambda page, timeout_ms=0: None)
+    monkeypatch.setattr(gpt_images, "is_logged_in", lambda page, timeout_ms=0: False)
     assert gpt_images.wait_for_login(object(), timeout=1, poll=0.1) is False
 
 
-def test_wait_for_login_true_when_composer_present(monkeypatch):
-    monkeypatch.setattr(gpt_images, "composer", lambda page, timeout_ms=0: "loc")
+def test_wait_for_login_true_when_account_present(monkeypatch):
+    monkeypatch.setattr(gpt_images, "is_logged_in", lambda page, timeout_ms=0: True)
     assert gpt_images.wait_for_login(object(), timeout=1, poll=0.1) is True
+
+
+# --- 로그인 판정 (로그아웃 방문자도 입력창을 본다) --------------------------
+class _FakePage:
+    """`is_logged_in` 판정용 가짜 페이지."""
+
+    def __init__(self, url="https://chatgpt.com/", visible=()):
+        self.url = url
+        self._visible = set(visible)
+
+    def locator(self, selector):
+        page = self
+
+        class _Loc:
+            @property
+            def first(self):
+                return self
+
+            def is_visible(self, timeout=0):
+                return selector in page._visible
+
+        return _Loc()
+
+
+def test_logged_out_visitor_with_composer_is_not_logged_in():
+    """회귀: 입력창만 보고 '로그인 완료'로 오인하던 버그."""
+    page = _FakePage(visible={"#prompt-textarea"})
+    assert gpt_images.is_logged_in(page) is False
+
+
+def test_login_button_visible_means_logged_out():
+    page = _FakePage(visible={"#prompt-textarea", "button:has-text('로그인')",
+                              "[data-testid='profile-button']"})
+    assert gpt_images.is_logged_in(page) is False
+
+
+def test_auth_url_means_logged_out():
+    page = _FakePage(url="https://auth.openai.com/auth/login",
+                     visible={"[data-testid='profile-button']"})
+    assert gpt_images.is_logged_in(page) is False
+
+
+@pytest.mark.parametrize(
+    "sel",
+    [
+        "[data-testid='profile-button']",
+        "button[aria-label*='profile' i]",
+        "img[alt*='User' i]",
+    ],
+)
+def test_account_element_means_logged_in(sel):
+    page = _FakePage(visible={"#prompt-textarea", sel})
+    assert gpt_images.is_logged_in(page) is True
+
+
+def test_no_account_element_means_logged_out():
+    assert gpt_images.is_logged_in(_FakePage()) is False
+
+
+def test_waiting_notice_printed_every_30s(monkeypatch, capsys):
+    """로그인 전에는 30초마다 안내를 찍는다."""
+    monkeypatch.setattr(gpt_images, "is_logged_in", lambda page, timeout_ms=0: False)
+    clock = {"t": 0.0}
+    monkeypatch.setattr(gpt_images.time, "monotonic", lambda: clock["t"])
+
+    def _sleep(sec):
+        clock["t"] += 31  # 한 번 잘 때마다 30초 경계를 넘긴다
+
+    monkeypatch.setattr(gpt_images.time, "sleep", _sleep)
+
+    assert gpt_images.wait_for_login(object(), timeout=90, poll=1) is False
+    out = capsys.readouterr().out
+    assert gpt_images.LOGIN_PROMPT in out
+    assert out.count(gpt_images.WAITING_NOTICE) >= 2
 
 
 def test_generate_batch_stops_on_login_pending(monkeypatch, tmp_path: Path):

@@ -155,6 +155,10 @@ idx cid    parent login start  reply_member  라벨
 맞췄다. 새 source_id와 수리 전/후 표는 `docs/reports/comment-repair-2026-09-19.md`.
 복구기는 `v2r/engine/repair.py::repair_revision_comments`(작업 `repair_comments`).
 
+**후기형 실발행 검증(2026-09-19).** 씨씨앙에 팥순이 후기형 1건을 실제로 올려
+§2-2 규칙이 라이브에서 그대로 나오는 것을 확인했다(대대댓글2 = 여분 계정 rm=작성자,
+대대대댓글2 = 작성자 rm=여분 계정). 기록은 `docs/reports/review-type-publish-2026-09-19.md`.
+
 → 수정: `v2r/content/comments.py::assign_comment_accounts`가 `manuscript_type`을
 받아 질문형/후기형별로 대대댓글2·대대대댓글2 계정을 배정하고, 여분 댓글풀 계정을
 한 개 남겨둔다. 순서는 `DEFAULT_TREE`를 읽는 순서로 고정한다.

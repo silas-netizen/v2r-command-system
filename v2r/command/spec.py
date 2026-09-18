@@ -18,6 +18,7 @@ ALLOWED_TASKS: frozenset[str] = frozenset(
         "reconcile",
         "sync_all_sources",
         "sync_sources",
+        "generate_affiliate_daily",
         "generate_daily",
         "collect_daily",
         "collect_photos",

@@ -35,6 +35,8 @@ log = logging.getLogger(__name__)
 
 #: 사용자에게 보여 줄 로그인 안내 문구 (요구사항 고정 문구)
 LOGIN_PROMPT = "브라우저 창에서 ChatGPT에 직접 로그인해 주세요"
+#: 대기 중 30초마다 찍는 안내
+WAITING_NOTICE = "아직 로그인 전입니다. 창에서 로그인해 주세요"
 #: ChatGPT 웹앱 주소
 GPT_URL = "https://chatgpt.com"
 #: 로그인 대기 기본 한도(초)
@@ -77,8 +79,30 @@ DOWNLOAD_SELECTORS: tuple[str, ...] = (
     "button[aria-label*='다운로드']",
     "a[download]",
 )
-#: 로그인 완료 판정에 쓰는 셀렉터 (입력창이 보이면 로그인된 것)
-LOGIN_DONE_SELECTORS = COMPOSER_SELECTORS
+#: 로그인 계정이 있을 때만 나타나는 것들 (아바타/프로필/사이드바 계정 영역).
+#: **입력창은 판정에 쓰지 않는다** — 로그아웃 방문자에게도 입력창이 보이기 때문.
+ACCOUNT_SELECTORS: tuple[str, ...] = (
+    "[data-testid='profile-button']",
+    "button[aria-label*='profile' i]",
+    "button[aria-label*='계정']",
+    "img[alt*='User' i]",
+    "[data-testid='accounts-profile-button']",
+    "nav [data-testid='account-menu']",
+    "button[data-testid='workspace-switcher']",
+)
+#: 로그아웃 상태에서만 보이는 버튼들 (하나라도 보이면 로그인 안 된 것)
+LOGGED_OUT_SELECTORS: tuple[str, ...] = (
+    "[data-testid='login-button']",
+    "[data-testid='signup-button']",
+    "button:has-text('Log in')",
+    "button:has-text('로그인')",
+    "button:has-text('Sign up')",
+    "button:has-text('회원가입')",
+    "a:has-text('Log in')",
+    "a:has-text('로그인')",
+)
+#: 로그인 페이지로 튕겼는지 판단할 URL 조각
+AUTH_URL_MARKERS: tuple[str, ...] = ("/auth/login", "/auth/signup", "auth0.openai.com")
 
 #: 사용 한도 안내 문구 (영/한 혼용)
 LIMIT_PATTERNS: tuple[re.Pattern[str], ...] = (
@@ -173,23 +197,66 @@ def composer(page, timeout_ms: int = 3000):
     return None
 
 
+def _any_visible(page, selectors, timeout_ms: int) -> bool:
+    """후보 셀렉터 중 화면에 보이는 게 하나라도 있으면 True."""
+    for sel in selectors:
+        try:
+            if page.locator(sel).first.is_visible(timeout=timeout_ms):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def is_logged_in(page, timeout_ms: int = 2500) -> bool:
+    """정말 로그인된 상태인지 판정한다.
+
+    **입력창(composer)만으로는 판정하지 않는다.** chatgpt.com은 로그아웃 방문자에게도
+    입력창을 보여 주기 때문에 예전 판정은 항상 "로그인 완료"로 오인했다.
+
+    세 조건을 모두 만족해야 로그인으로 본다.
+    (a) `로그인`/`Log in`/`회원가입`/`Sign up` 버튼이 **안 보이고**
+    (b) 계정 메뉴/아바타 요소가 **있고**
+    (c) URL이 `/auth/login` 같은 인증 페이지가 **아니다**
+    """
+    # (c) URL
+    try:
+        url = (page.url or "").lower()
+    except Exception:
+        return False
+    if any(marker in url for marker in AUTH_URL_MARKERS):
+        return False
+
+    # (a) 로그아웃 버튼이 보이면 즉시 탈락
+    if _any_visible(page, LOGGED_OUT_SELECTORS, timeout_ms=1200):
+        return False
+
+    # (b) 계정 요소가 있어야 한다
+    return _any_visible(page, ACCOUNT_SELECTORS, timeout_ms=timeout_ms)
+
+
 def wait_for_login(page, timeout: int = LOGIN_TIMEOUT, poll: float = 3.0) -> bool:
-    """입력창이 보일 때까지(= 로그인 완료) 기다린다.
+    """**정말** 로그인될 때까지 기다린다 (`is_logged_in` 기준).
 
     한도 안에 로그인하지 않으면 `False`를 돌려준다(예외를 던지지 않는다).
     호출자는 "로그인 대기 — 내일 재시도"처럼 조용히 물러나면 된다.
+    30초마다 아직 로그인 전이라는 안내를 한 줄 찍는다.
     """
-    if composer(page, timeout_ms=4000) is not None:
+    if is_logged_in(page):
         return True
 
     print(LOGIN_PROMPT, flush=True)
     log.info(LOGIN_PROMPT)
     deadline = time.monotonic() + max(int(timeout), 0)
+    next_notice = time.monotonic() + 30
     while time.monotonic() < deadline:
         time.sleep(poll)
-        if composer(page, timeout_ms=1500) is not None:
+        if is_logged_in(page):
             print("ChatGPT 로그인 확인됨.", flush=True)
             return True
+        if time.monotonic() >= next_notice:
+            print(WAITING_NOTICE, flush=True)
+            next_notice = time.monotonic() + 30
     return False
 
 
@@ -267,13 +334,13 @@ def check_gpt_session(profile_dir: str | Path | None = None, timeout_ms: int = 1
             title = page.title() or ""
         except Exception:
             pass
-        if composer(page, timeout_ms=timeout_ms) is not None:
-            out.update(logged_in=True, method="headless", note="입력창 확인됨")
+        if is_logged_in(page, timeout_ms=timeout_ms):
+            out.update(logged_in=True, method="headless", note="계정 메뉴 확인됨")
             return out
         if "just a moment" in title.lower() or "__cf_chl" in (page.url or ""):
             out["note"] = "헤드리스가 Cloudflare 챌린지에 막힘 → 쿠키 만료로 판정"
         else:
-            out["note"] = "헤드리스에서 입력창을 찾지 못함 → 쿠키 만료로 판정"
+            out["note"] = "헤드리스에서 계정 메뉴를 찾지 못함 → 쿠키 만료로 판정"
     except Exception as exc:
         out["note"] = f"헤드리스 확인 실패({exc.__class__.__name__}) → 쿠키 만료로 판정"
     finally:
@@ -640,6 +707,8 @@ def _login_cli() -> int:
     print(f"ChatGPT 로그인 창을 엽니다. 프로필: {default_profile_dir()}")
     playwright, context, page = open_gpt(headless=False)
     try:
+        # 창은 **진짜 로그인이 확인될 때까지** 닫지 않는다 (최대 15분).
+        # 예전에는 로그아웃 상태에서도 보이는 입력창을 보고 곧바로 닫아 버렸다.
         if wait_for_login(page, timeout=LOGIN_TIMEOUT):
             print("로그인 완료. 이제 창을 닫아도 됩니다 (세션이 프로필에 저장됩니다).")
             return 0
@@ -666,8 +735,13 @@ __all__ = [
     "IMAGE_SELECTORS",
     "LOGIN_PROMPT",
     "TARGET_LONG_SIDE",
+    "ACCOUNT_SELECTORS",
+    "AUTH_URL_MARKERS",
+    "LOGGED_OUT_SELECTORS",
     "RELOGIN_NOTICE",
+    "WAITING_NOTICE",
     "GptImageError",
+    "is_logged_in",
     "GptLimitError",
     "add_noise",
     "check_gpt_session",
