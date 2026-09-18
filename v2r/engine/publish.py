@@ -946,6 +946,9 @@ def _create_and_verify(
     반환: `(source_id, pending_reason)`. `pending_reason`이 있으면 글은 서버에 있고
     등록 확정만 못 본 상태(실패 아님).
     """
+    if not components:
+        # 사진 없이 발행하는 원고(이미지 없음=Y 등): {…} 자리표시를 제거하고 문단 간격만 남긴다
+        body = seone.PLACEHOLDER.sub("", body)
     content = seone.content_json(body, components)
     destination = api_articles.build_destination(
         cafe, menu, head, login_id, start_at, target_view_count, parent_id
