@@ -188,6 +188,12 @@ def parse_affiliate_rows(rows: list[dict], source: str = "") -> list[Manuscript]
         if not keyword and not body:
             continue
 
+        # 태그 규칙: 태그는 키워드 1개(공백 제거)뿐이다. A열이 비면 G열을 키워드로 본다.
+        # 실제 브랜드 시트는 말머리를 안 쓰는 카페에서도 G열에 키워드를 적어 둔다
+        # (예: `단호박 샐러드` → 태그 `단호박샐러드`) → 이때 G열은 말머리가 아니다.
+        if not keyword and head:
+            keyword, head = head, ""
+
         out.append(
             Manuscript(
                 title=keyword,

@@ -843,7 +843,12 @@ def build_comments(rt: Runtime, slot: Slot, root_start: datetime, cafe_id: Any) 
     pool = comment_pool(rt, slot.workflow)
     if not pool:
         return []
-    items = comment_mod.assign_comment_accounts(tree, pool, slot.account)
+    items = comment_mod.assign_comment_accounts(
+        tree,
+        pool,
+        slot.account,
+        manuscript_type=getattr(slot.manuscript, "manuscript_type", ""),
+    )
     items = comment_mod.schedule(items, root_start)
     items = comment_mod.resolve_conflicts(items)
     members: dict[str, dict] = {}
@@ -923,6 +928,34 @@ def _attach_images(rt: Runtime, slot: Slot, browser_page: Any) -> list[dict]:
     )
 
 
+def _keyword_tags(m: Manuscript) -> list[str]:
+    """제휴·브랜드 글의 태그: 키워드 1개(공백 제거)뿐이다 (legacy 태그 규칙).
+
+    키워드는 A열 `키워드` → 비면 G열 `말머리`(브랜드 시트가 키워드를 여기 적는다)
+    순으로 시트 파서가 채운다. 둘 다 없으면 태그 없이 발행한다(경고만).
+    """
+    from v2r.content.manuscript import tags_from_keyword
+
+    return list(m.tags or []) or tags_from_keyword(m.keyword)
+
+
+def _strip_placeholders(body: str, components: list[dict]) -> str:
+    """사진 없이 발행하는 원고(이미지 없음=Y 등)는 `{…}` 자리표시를 지운다."""
+    if not components:
+        return seone.PLACEHOLDER.sub("", body)
+    return body
+
+
+def _prepare_content(body: str, components: list[dict]) -> tuple[str, str]:
+    """'이미지 없음' 규칙을 적용한 본문과 SE-ONE content_json.
+
+    사진 수와 자리표시 수가 안 맞으면 여기서 `ValueError`가 난다 → V2R에 글을
+    만들기 전에 미리 돌려 보면(사전 점검) 되감기 없이 실패할 수 있다.
+    """
+    body = _strip_placeholders(body, components)
+    return body, seone.content_json(body, components)
+
+
 def _create_and_verify(
     rt: Runtime,
     *,
@@ -930,6 +963,7 @@ def _create_and_verify(
     tags: list[str],
     body: str,
     components: list[dict],
+    content: str | None = None,
     cafe: Any,
     menu: Any,
     head: Any,
@@ -946,10 +980,11 @@ def _create_and_verify(
     반환: `(source_id, pending_reason)`. `pending_reason`이 있으면 글은 서버에 있고
     등록 확정만 못 본 상태(실패 아님).
     """
-    if not components:
-        # 사진 없이 발행하는 원고(이미지 없음=Y 등): {…} 자리표시를 제거하고 문단 간격만 남긴다
-        body = seone.PLACEHOLDER.sub("", body)
-    content = seone.content_json(body, components)
+    # 사전 점검에서 이미 만들어 둔 content가 있으면 그대로 쓴다(두 번 만들지 않는다)
+    if content is None:
+        body, content = _prepare_content(body, components)
+    else:
+        body = _strip_placeholders(body, components)
     destination = api_articles.build_destination(
         cafe, menu, head, login_id, start_at, target_view_count, parent_id
     )
@@ -976,6 +1011,8 @@ def _create_and_verify(
         start_at=start_at,
         # 페이로드는 답글이 루트에 중첩된다 → 전체 노드 수로 비교한다
         comments_count=api_articles.count_comment_nodes(comments or []),
+        # 개수뿐 아니라 읽는 순서까지 본다 (docs/reference/live-comment-order.md §1)
+        expected_comment_sequence=comment_mod.payload_sequence(comments or []),
     )
     if problems:
         raise PublishError("등록 검증 실패: " + "; ".join(problems))
@@ -1026,6 +1063,10 @@ def run_slot(
     # False면 create_article 이전 단계에서 끊긴 것이므로 재시도 가능한 failed로 내린다.
     target_created = False
     pending: str | None = None
+    # 제휴 체인에서 방금 만든 일상 글. 수정글 등록 전에 끊기면 이 글을 지운다(되감기).
+    daily_source_id: str | None = None
+    rolled_back_daily: str | None = None
+    daily_used_key: tuple | None = None  # 일상 글 원고의 사용 기록 키(되감기 때 되돌린다)
 
     def _beat() -> None:
         if heartbeat is not None:
@@ -1042,12 +1083,44 @@ def run_slot(
 
         return hook
 
+    def _rollback_daily() -> str | None:
+        """수정글이 안 만들어졌는데 일상 글만 남았다 → 그 일상 글을 지운다(최선 노력).
+
+        모호한 오류(ambiguous/network)에서는 부르지 않는다: 글이 생겼는지 알 수 없어
+        reconcile이 처리해야 한다.
+        """
+        nonlocal rolled_back_daily
+        if target_created or not daily_source_id or rolled_back_daily:
+            return rolled_back_daily
+        try:
+            api_articles.delete_article(rt.client, daily_source_id)
+        except Exception as exc:  # 되감기 실패는 실패 처리를 막지 않는다
+            rt.events.log(
+                job_id, "warn", f"일상 글 되감기 실패: rolled_back_daily={daily_source_id} ({exc})"
+            )
+        else:
+            rt.events.log(job_id, "warn", f"일상 글 되감기: rolled_back_daily={daily_source_id}")
+        rolled_back_daily = daily_source_id
+        # 되감은 일상 글은 다시 뽑을 수 있게 사용 기록도 지운다
+        if daily_used_key is not None:
+            try:
+                rt.publications.mark(*daily_used_key, "failed", "일상 글 되감기")
+            except Exception:
+                pass
+        return rolled_back_daily
+
+    def _rollback_note() -> str:
+        """되감기를 했으면 결과/이벤트에 남길 꼬리표."""
+        return f" (rolled_back_daily={rolled_back_daily})" if rolled_back_daily else ""
+
     def _mark_precreate_failed(reason: str) -> None:
         """본 글 등록 전에 끊긴 실패 → 재시도할 수 있게 failed로 남긴다."""
         if target_created:
             return  # 글은 이미 서버에 있다 → 미확정 유지
         text = " ".join(str(reason).split())
-        rt.publications.mark(*key, "failed", f"등록 전 실패: {text}"[:200])
+        rolled = _rollback_daily()
+        label = "등록 전 실패(일상 글 되감기)" if rolled else "등록 전 실패"
+        rt.publications.mark(*key, "failed", f"{label}: {text}"[:200])
 
     try:
         cafe, menu, head = rt.catalog.resolve(slot.cafe, slot.board, slot.account)
@@ -1055,6 +1128,18 @@ def run_slot(
 
         if slot.workflow == "affiliate":
             daily = _take_daily(rt)
+            # --- 사전 점검: V2R에 글을 만들기 전에 수정글 재료를 모두 준비한다 ---
+            # (사진 수 vs 자리표시, content_json, 댓글 payload) 여기서 터지면 되감기가 필요 없다.
+            rev_at = slot.revision_at or (root_start + timedelta(hours=4))
+            rev_tags = _keyword_tags(m)
+            if not rev_tags:
+                # 키워드가 A열·G열 둘 다 비었다 → 태그 없이 발행하고 경고만 남긴다
+                planned["tag_note"] = "태그 없음"
+                rt.events.log(
+                    job_id, "warn", f"키워드가 없어 태그 없이 발행합니다 (행 {m.source_row})"
+                )
+            rev_body, rev_content = _prepare_content(m.body, components)
+            payload = build_comments(rt, slot, rev_at, getattr(cafe, "cafe_id", None))
             rt.publications.mark(
                 *key,
                 "uncertain",
@@ -1079,29 +1164,28 @@ def run_slot(
                 on_created=_on_created("daily_created", target=False),
             )
             del daily_pending  # 일상 글 확정 보류는 수정글 등록을 막지 않는다
+            daily_source_id = daily_id
             rt.publications.mark(*key, "uncertain", "daily_done", source_id=daily_id)
             if daily.source and daily.content_hash:
                 # 일상 글 자체도 사용 기록을 남겨 다음 실행에서 다시 뽑히지 않게 한다
+                daily_used_key = (daily.source, daily.source_row, daily.content_hash)
                 rt.publications.mark(
-                    daily.source,
-                    daily.source_row,
-                    daily.content_hash,
+                    *daily_used_key,
                     "done",
                     "daily_used",
                     source_id=daily_id,
                 )
             _beat()
 
-            rev_at = slot.revision_at or (root_start + timedelta(hours=4))
-            payload = build_comments(rt, slot, rev_at, getattr(cafe, "cafe_id", None))
             # source_id는 부모(일상 글)로 남겨둔다 → reconcile이 자식(수정글)을 찾는다 (C-1)
             rt.publications.mark(*key, "uncertain", "revision_submitting", source_id=daily_id)
             source_id, pending = _create_and_verify(
                 rt,
                 title=m.title,
-                tags=m.tags,
-                body=m.body,
+                tags=rev_tags,
+                body=rev_body,
                 components=components,
+                content=rev_content,
                 cafe=cafe,
                 menu=menu,
                 head=head,
@@ -1152,16 +1236,19 @@ def run_slot(
             rt.account_state.restrict(slot.account, until, RESTRICT_CODE, "계정 제한(27000)")
             rt.events.log(job_id, "warn", f"계정 제한: {slot.account}")
             raise RetryWithOtherAccount(f"계정 제한: {slot.account}") from exc
-        rt.events.log(job_id, "error", f"발행 실패({kind}): {m.title}")
-        raise PublishError(f"발행 실패({kind}): {exc}") from exc
+        rt.events.log(job_id, "error", f"발행 실패({kind}): {m.title}{_rollback_note()}")
+        raise PublishError(f"발행 실패({kind}): {exc}{_rollback_note()}") from exc
     except PublishError as exc:
         # 등록 검증 실패처럼 create 이후에 난 것은 미확정 유지, 그 전이면 failed
         _mark_precreate_failed(str(exc))
+        if rolled_back_daily:
+            rt.events.log(job_id, "error", f"발행 실패: {m.title}{_rollback_note()}")
+            raise PublishError(f"{exc}{_rollback_note()}") from exc
         raise
     except Exception as exc:  # 그 외(NoPhotoError, seone ValueError 등)는 그대로 실패로
         _mark_precreate_failed(str(exc))
-        rt.events.log(job_id, "error", f"발행 실패: {m.title}: {exc}")
-        raise PublishError(f"발행 실패: {exc}") from exc
+        rt.events.log(job_id, "error", f"발행 실패: {m.title}: {exc}{_rollback_note()}")
+        raise PublishError(f"발행 실패: {exc}{_rollback_note()}") from exc
 
     url = api_articles.article_url(source_id)
     if pending:

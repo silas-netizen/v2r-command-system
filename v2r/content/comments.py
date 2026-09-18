@@ -3,23 +3,28 @@
 from __future__ import annotations
 
 import random
+import re
 from datetime import datetime, timedelta
 
-#: 12노드 기본 트리 (label, depth, parent, role)
-DEFAULT_TREE: list[dict] = (
-    [
-        {"label": f"댓글{i}", "depth": 0, "parent": None, "role": "comment"}
-        for i in range(1, 6)
+def _thread(i: int) -> list[dict]:
+    """댓글i 스레드를 읽는 순서대로."""
+    nodes = [
+        {"label": f"댓글{i}", "depth": 0, "parent": None, "role": "comment"},
+        {"label": f"대댓글{i}", "depth": 1, "parent": f"댓글{i}", "role": "reply"},
     ]
-    + [
-        {"label": f"대댓글{i}", "depth": 1, "parent": f"댓글{i}", "role": "reply"}
-        for i in range(1, 6)
-    ]
-    + [
-        {"label": "대대댓글2", "depth": 2, "parent": "대댓글2", "role": "reply2"},
-        {"label": "대대대댓글2", "depth": 3, "parent": "대대댓글2", "role": "reply3"},
-    ]
-)
+    if i == 2:
+        nodes += [
+            {"label": "대대댓글2", "depth": 2, "parent": "대댓글2", "role": "reply2"},
+            {"label": "대대대댓글2", "depth": 3, "parent": "대대댓글2", "role": "reply3"},
+        ]
+    return nodes
+
+
+#: 12노드 기본 트리 (label, depth, parent, role).
+#: 순서는 **라이브에서 읽히는 순서**와 같다(docs/reference/live-comment-order.md §1):
+#: 댓글1, 대댓글1, 댓글2, 대댓글2, 대대댓글2, 대대대댓글2, 댓글3, 대댓글3, …
+#: 시간순이 아니다 — 댓글2 스레드가 댓글3(+1분)보다 앞에 온다.
+DEFAULT_TREE: list[dict] = [n for i in range(1, 6) for n in _thread(i)]
 
 #: 라벨별 고정 오프셋(분)
 OFFSETS_MIN: dict[str, int] = {
@@ -31,9 +36,18 @@ OFFSETS_MIN: dict[str, int] = {
 
 MAX_SHIFT_MIN = 24 * 60
 
+#: 작성자가 이미 써본 사람으로 등장하는 원고유형
+REVIEW_TYPES = ("후기형", "후기", "review")
+
 
 class CommentError(RuntimeError):
     """댓글 구성 실패."""
+
+
+def is_review_type(manuscript_type: str) -> bool:
+    """원고유형이 후기형인가(그 외는 질문형으로 본다)."""
+    t = re.sub(r"\s+", "", str(manuscript_type or ""))
+    return any(t.startswith(k) for k in REVIEW_TYPES)
 
 
 def assign_comment_accounts(
@@ -41,8 +55,16 @@ def assign_comment_accounts(
     comment_pool: list[str],
     author: str,
     rng: random.Random | None = None,
+    manuscript_type: str = "",
 ) -> list[dict]:
-    """루트 댓글은 댓글 전용 계정 무작위(작성자 제외), 답글은 본문 작성계정."""
+    """노드별 작성 계정 배정. 기준: docs/reference/live-comment-order.md §2.
+
+    - 댓글1~5(루트): 서로 다른 댓글 전용 계정(작성자 제외)
+    - 대댓글1~5: 본문 작성계정(작성자)
+    - 대대댓글2 / 대대대댓글2: 원고유형에 따라 갈린다
+      - 질문형: 대대댓글2 = **댓글2를 쓴 계정**, 대대대댓글2 = 루트에 안 쓰인 여분 계정
+      - 후기형: 대대댓글2 = 여분 계정, 대대대댓글2 = **작성자**
+    """
     rng = rng or random.Random()
     pool = [p for p in (comment_pool or []) if p.casefold() != (author or "").casefold()]
     if not pool:
@@ -54,10 +76,32 @@ def assign_comment_accounts(
     ]
     root_accounts = {n["label"]: a for n, a in zip(roots, picks)}
 
+    used = {a.casefold() for a in root_accounts.values()}
+    spares = [p for p in pool if p.casefold() not in used]
+    if spares:
+        spare = rng.choice(spares)
+    else:
+        # 풀이 루트 수와 같으면 댓글2 계정만 피해서 재사용한다
+        others = [a for lbl, a in root_accounts.items() if lbl != "댓글2"]
+        spare = rng.choice(others) if others else pool[0]
+
+    review = is_review_type(manuscript_type)
+    root2 = root_accounts.get("댓글2", spare)
+    special = {
+        "대대댓글2": spare if review else root2,
+        "대대대댓글2": author if review else spare,
+    }
+
     out: list[dict] = []
     for node in tree:
         item = dict(node)
-        item["account"] = root_accounts[node["label"]] if node["depth"] == 0 else author
+        label = node["label"]
+        if node["depth"] == 0:
+            item["account"] = root_accounts[label]
+        elif label in special:
+            item["account"] = special[label]
+        else:
+            item["account"] = author
         out.append(item)
     return out
 
@@ -193,3 +237,19 @@ def to_api_payload(items: list[dict], members: dict[str, dict]) -> list[dict]:
         )
 
     return result
+
+
+def flatten_payload(payload: list[dict]) -> list[dict]:
+    """중첩 페이로드를 서버가 돌려주는 평탄 순서(= 읽는 순서)로 편다."""
+    out: list[dict] = []
+    for node in payload or []:
+        if not isinstance(node, dict):
+            continue
+        out.append(node)
+        out.extend(flatten_payload(node.get("comments") or []))
+    return out
+
+
+def payload_sequence(payload: list[dict], width: int = 12) -> list[str]:
+    """등록 검증용 기대 순서(각 댓글 본문 앞부분)."""
+    return [str(n.get("contents") or "")[:width] for n in flatten_payload(payload)]

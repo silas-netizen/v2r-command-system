@@ -17,10 +17,13 @@ TASK_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("generate_daily", re.compile(r"일상\s*글.*(생성|만들어)")),
     ("collect_daily", re.compile(r"일상\s*글.*(수집|가져와)")),
     ("collect_new_photos", re.compile(r"새\s*(사진|이미지)\s*(수거|회수|가져오기|가져와)")),
+    # GPT 웹앱으로 직접 생성 (요청서 발송인 `request_photos`보다 앞선다)
+    ("generate_photos", re.compile(r"(사진|이미지).*(생성|만들어)")),
     ("request_photos", re.compile(r"(사진|이미지).*(요청|필요)")),
     ("collect_photos", re.compile(r"사진.*(수집|가져와)")),
     ("wash_photos", re.compile(r"사진.*(세탁|변형)\s*(\d+)?")),
     ("learn_guides", re.compile(r"(메이크|make|지침).*(학습|읽어|가져와)", re.I)),
+    ("cleanup_orphans", re.compile(r"(고아|찌꺼기).*(정리|삭제)")),
     ("open_login", re.compile(r"로그인\s*(창|세션|준비)")),
     ("stop", re.compile(r"(중지|멈춰|중단|취소)")),
     # `진행`은 "진행 상황/중/률"처럼 명사형일 때만 상태 조회로 본다(발행 문장 가로채기 방지)
@@ -112,7 +115,13 @@ _PRIORITY_TASKS = PUBLISH_TASKS | {"catalog"}
 _HIJACKABLE = {"stop", "status"}
 #: `브랜드 X` / `키워드 Y` 슬롯을 읽는 작업 (사진 계열)
 _PHOTO_SLOT_TASKS = frozenset(
-    {"request_photos", "collect_new_photos", "collect_photos", "wash_photos"}
+    {
+        "request_photos",
+        "generate_photos",
+        "collect_new_photos",
+        "collect_photos",
+        "wash_photos",
+    }
 )
 #: 시트/게시판 같은 슬롯 추출을 하지 않는 작업
 _NO_SLOT_TASKS = frozenset(
@@ -124,6 +133,7 @@ _NO_SLOT_TASKS = frozenset(
         "reconcile",
         "inspect_failures",
         "catalog",
+        "cleanup_orphans",
     }
 )
 
@@ -217,9 +227,19 @@ def parse_korean_command(text: str, now: datetime | None = None) -> TaskSpec | N
     m = RE_COUNT.search(raw)
     if m:
         spec["count"] = int(m.group(1))
-    elif task in PUBLISH_TASKS | {"generate_daily", "collect_daily", "collect_photos"}:
+    elif task in PUBLISH_TASKS | {
+        "generate_daily",
+        "collect_daily",
+        "collect_photos",
+        "generate_photos",
+    }:
         # `글` 없이 `N개`만 있어도 개수로 인정. 단 계정 수 표현은 먼저 제거한다.
         m = RE_ANY_COUNT.search(RE_ACCOUNT_COUNT.sub(" ", raw))
+        if m:
+            spec["count"] = int(m.group(1))
+    if task == "generate_photos" and not spec.get("count"):
+        # `사진 3장 생성`처럼 `장` 단위로 세는 표현도 받는다
+        m = RE_SHEETS.search(raw)
         if m:
             spec["count"] = int(m.group(1))
     if task == "wash_photos":
@@ -309,9 +329,11 @@ TASK_LABELS: dict[str, str] = {
     "collect_daily": "일상 글 수집",
     "collect_photos": "사진 수집",
     "collect_new_photos": "새 사진 수거",
+    "generate_photos": "사진 생성(GPT)",
     "request_photos": "사진 요청",
     "wash_photos": "사진 세탁",
     "learn_guides": "지침 학습",
+    "cleanup_orphans": "고아 글 정리",
     "open_login": "로그인 창 열기",
     "stop": "작업 중지",
     "status": "상태 조회",

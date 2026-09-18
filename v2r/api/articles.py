@@ -587,6 +587,24 @@ def count_comment_nodes(nodes: Any) -> int:
     return total
 
 
+def flatten_comment_nodes(nodes: Any) -> list[dict]:
+    """댓글 목록을 읽는 순서(부모 → 그 답글들)의 평탄 목록으로 편다.
+
+    라이브 GET 응답은 이미 평탄하고, 등록 요청 페이로드는 ``comments``에 중첩돼
+    있다. 두 모양 모두 같은 순서를 돌려준다.
+    """
+    out: list[dict] = []
+    if not isinstance(nodes, list):
+        return out
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        out.append(node)
+        for key in COMMENT_CHILD_KEYS:
+            out.extend(flatten_comment_nodes(node.get(key)))
+    return out
+
+
 def _count_images(components: Iterable[dict]) -> int:
     """유효한 이미지 컴포넌트 개수."""
     count = 0
@@ -617,10 +635,14 @@ def verify_article(
     image_count: int,
     start_at: datetime | None,
     comments_count: int,
+    expected_comment_sequence: list[str] | None = None,
 ) -> list[str]:
     """등록 후 GET 결과 검증. 불일치 항목 목록을 반환(빈 목록 = 정상).
 
     `comments_count`는 **답글까지 포함한 전체 댓글 수**다(`count_comment_nodes`).
+    `expected_comment_sequence`를 주면 응답 댓글 배열의 **순서**까지 본다. 값은
+    각 댓글 본문의 앞부분(접두사) 목록이고, 응답 순서대로 `startswith`로 맞춘다
+    (docs/reference/live-comment-order.md §1).
     """
     problems: list[str] = []
     source = detail.get("naver_cafe_article_source")
@@ -668,9 +690,26 @@ def verify_article(
             problems.append(f"예약시각 불일치: {got_start} != {expected_start}")
 
     # 응답은 평탄, 요청은 중첩이므로 양쪽 모두 "전체 노드 수"로 맞춰 비교한다
-    n_comments = count_comment_nodes(detail.get("naver_cafe_article_source_comments"))
+    got_comments = detail.get("naver_cafe_article_source_comments")
+    n_comments = count_comment_nodes(got_comments)
     if n_comments != int(comments_count):
         problems.append(f"댓글 개수 불일치: {n_comments} != {comments_count}")
+
+    if expected_comment_sequence:
+        expected = list(expected_comment_sequence)
+        got_seq = [
+            str(field(n, "contents", "content", default="") or "")
+            for n in flatten_comment_nodes(got_comments)
+        ]
+        if len(got_seq) != len(expected):
+            problems.append(f"댓글 순서 길이 불일치: {len(got_seq)} != {len(expected)}")
+        else:
+            for i, (got, want) in enumerate(zip(got_seq, expected)):
+                if not got.startswith(want):
+                    problems.append(
+                        f"댓글 순서 불일치 #{i}: {got[:20]!r} != {want!r}"
+                    )
+                    break
 
     return problems
 
@@ -691,6 +730,7 @@ __all__ = [
     "create_article",
     "delete_article",
     "find_recent_source",
+    "flatten_comment_nodes",
     "get_article",
     "to_iso_z",
     "verify_article",

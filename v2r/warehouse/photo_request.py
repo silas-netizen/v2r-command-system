@@ -55,6 +55,23 @@ STYLE_RULES = (
     "사람 얼굴이 크게 나오지 않게, 4:3 또는 3:4 비율, 고해상도"
 )
 
+#: "AI 느낌" 제거용 추가 지시. GPT 이미지 생성은 기본값이 너무 매끈해서
+#: 이 블록을 반드시 함께 붙인다 (규칙: 생성 이미지는 전부 세탁 전 단계에서
+#: 이미 '진짜 폰 사진'처럼 보여야 한다).
+ANTI_AI_RULES = (
+    "아주 중요 — AI로 만든 티가 절대 나면 안 된다. "
+    "평범한 사람이 스마트폰으로 아무 생각 없이 찍은 스냅샷처럼 보여야 한다. "
+    "자연광(창문·형광등 섞임) 그대로, 화이트밸런스가 살짝 어긋나도 좋다. "
+    "가벼운 손떨림에 의한 미세한 모션 블러와 센서 노이즈(그레인)가 있어야 한다. "
+    "생활감 있는 잡동사니(행주, 컵, 부스러기, 전선, 구겨진 천)가 화면 가장자리에 조금 걸치게. "
+    "중앙 정렬·완벽한 대칭 금지, 피사체를 일부러 살짝 치우친 구도로. "
+    "지평선이나 테이블 선이 1~2도 기울어져도 좋다. "
+    "글자·문구·로고·라벨·워터마크·서명 넣지 말 것. "
+    "3D 렌더·CG·일러스트·과한 보케·유리알 같은 반짝임·HDR 과보정·매끈한 플라스틱 질감 금지. "
+    "인위적인 스튜디오 조명, 완벽한 그림자, 잡티 없는 표면 금지. "
+    "색은 채도를 낮춰 약간 밋밋하게, 어두운 부분은 살짝 뭉개지게."
+)
+
 
 def _read_guides(guides_dir: str | Path, brand: str, limit: int = 200) -> str:
     """지침 폴더에서 브랜드 관련 텍스트를 짧게 모은다."""
@@ -118,7 +135,8 @@ def build_gpt_prompts(
         out.append(
             f"[{i + 1}/{count}] {context}.\n"
             f"'{subject}' 주제에 어울리는 사진을 만들어 줘. 장면: {scene}.\n"
-            f"스타일: {STYLE_RULES}."
+            f"스타일: {STYLE_RULES}.\n"
+            f"{ANTI_AI_RULES}"
         )
     return out
 
@@ -269,8 +287,10 @@ def _archive(path: Path, source_root: Path, done_dir: Path) -> None:
 
 
 __all__ = [
+    "ANTI_AI_RULES",
     "DEFAULT_PROMPT_COUNT",
     "NEW_INBOX",
+    "STYLE_RULES",
     "brand_context",
     "build_gpt_prompts",
     "collect_new",

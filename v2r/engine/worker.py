@@ -390,6 +390,28 @@ def _request_photos(rt: Runtime, spec: TaskSpec) -> dict:
     return request_photos(rt, brand, getattr(spec, "keyword", "") or spec.source or "")
 
 
+def _generate_photos(rt: Runtime, spec: TaskSpec) -> dict:
+    """ChatGPT 웹앱(구독)으로 사진을 직접 만들고 적재 + 세탁까지 한다."""
+    from v2r.warehouse.gpt_images import generate_batch
+
+    brand = spec.brand or ""
+    if not brand:
+        return {"ok": False, "error": "사진을 만들 브랜드를 알 수 없습니다 (`브랜드 X`를 넣어 주세요)"}
+    keyword = getattr(spec, "keyword", "") or spec.source or ""
+    count = spec.count or 1
+    out = generate_batch(brand, keyword, count, warehouse=rt.warehouse)
+    if out.get("login_pending"):
+        notify_all(rt.channels, f"ChatGPT {out['message']}")
+    elif out.get("limited"):
+        notify_all(rt.channels, f"ChatGPT 이미지 사용 한도: {out.get('wait_text', '')}")
+    elif out.get("generated"):
+        notify_all(
+            rt.channels,
+            f"GPT 사진 {out['generated']}장 생성 (브랜드 {out['brand']} / {out['keyword']})",
+        )
+    return out
+
+
 #: `NoPhotoError` 메시지에서 브랜드·폴더를 뽑는다 (`store.ensure_keyword_pool` 문구)
 _NO_PHOTO_RE = re.compile(r"브랜드\s+(\S+?)의\s+'([^']*)'\s*폴더")
 
@@ -639,10 +661,16 @@ def dispatch(rt: Runtime, job: Any, owner: str | None = None) -> dict:
         return _collect_photos(rt, spec)
     if task == "collect_new_photos":
         return _collect_new_photos(rt, spec)
+    if task == "generate_photos":
+        return _generate_photos(rt, spec)
     if task == "request_photos":
         return _request_photos(rt, spec)
     if task == "wash_photos":
         return _wash_photos(rt, spec)
+    if task == "cleanup_orphans":
+        from v2r.engine.cleanup import cleanup_orphans
+
+        return cleanup_orphans(rt, spec)
     if task == "learn_guides":
         from v2r.knowledge.make_import import learn_make_guides
 
@@ -726,44 +754,113 @@ def drain(rt: Runtime, owner: str | None = None, limit: int = 100) -> list[dict]
     return done
 
 
-def serve(rt: Runtime, poll_seconds: int = 5) -> None:  # pragma: no cover - 장시간 루프
-    """채널을 폴링하며 명령을 받아 실행한다."""
-    owner = default_owner()
-    print(f"serve 시작: 채널 {len(rt.channels)}개, {poll_seconds}초 간격")
-    while True:
-        for channel in rt.channels:
+def _reply(channel: Any, chat_id: str, text: str) -> None:
+    """명령을 보낸 그 대화방에만 답한다. 실패해도 루프를 세우지 않는다."""
+    try:
+        from v2r.channels import sanitize
+
+        channel.send(chat_id, sanitize(text))
+    except Exception as exc:  # pragma: no cover - 알림 실패는 삼킨다
+        log.warning("답장 실패(%s): %s", getattr(channel, "name", "?"), exc)
+
+
+def serve_poll(rt: Runtime, owner: str | None = None) -> dict:
+    """serve 루프 1회분: 채널 수신 → 접수 → 큐 실행 → 보낸 방에 답장.
+
+    루프를 절대 죽이지 않기 위해 채널별·명령별로 예외를 가둔다.
+    """
+    owner = owner or default_owner()
+    #: job_id → (채널, 보낸 방) — 결과를 브로드캐스트만 하지 않고 그 방에도 답한다
+    origins: dict[int, tuple[Any, str]] = {}
+    received = 0
+
+    for channel in rt.channels:
+        try:
+            incoming = channel.poll()
+        except Exception as exc:
+            log.warning("채널 %s 수신 실패: %s", getattr(channel, "name", "?"), exc)
+            continue
+        # 중지 명령은 언제나 먼저 처리한다 (M-9)
+        incoming = sorted(
+            incoming,
+            key=lambda c: 0 if "중지" in (getattr(c, "text", "") or "") else 1,
+        )
+        for cmd in incoming:
+            received += 1
             try:
-                incoming = channel.poll()
-            except Exception as exc:
-                log.warning("채널 %s 수신 실패: %s", getattr(channel, "name", "?"), exc)
-                continue
-            # 중지 명령은 언제나 먼저 처리한다 (M-9)
-            incoming = sorted(
-                incoming,
-                key=lambda c: 0 if "중지" in (getattr(c, "text", "") or "") else 1,
-            )
-            for cmd in incoming:
                 out = handle_text(rt, cmd.text, via_channel=True)
-                if out.get("stopped"):
-                    try:
-                        channel.send(cmd.chat_id, out.get("message") or "중지했습니다")
-                    except Exception:
-                        pass
-                    continue
-                if not out.get("ok"):
-                    try:
-                        channel.send(cmd.chat_id, "명령을 해석하지 못했습니다")
-                    except Exception:
-                        pass
-                    continue
-                try:
-                    channel.send(
-                        cmd.chat_id,
-                        format_report(out["job_id"], "running", out["description"]),
-                    )
-                except Exception:
-                    pass
-        drain(rt, owner)
+            except Exception as exc:
+                log.exception("명령 처리 실패: %s", exc)
+                _reply(channel, cmd.chat_id, f"명령 처리 중 오류가 났습니다: {exc}")
+                continue
+            if out.get("stopped"):
+                _reply(channel, cmd.chat_id, out.get("message") or "중지했습니다")
+                continue
+            if not out.get("ok"):
+                _reply(channel, cmd.chat_id, out.get("error") or "명령을 해석하지 못했습니다")
+                continue
+            # 중지 뒤에 들어온 새 명령은 중지 상태를 푼다(그래야 큐가 다시 돈다)
+            clear_stop(rt)
+            job_id = out.get("job_id")
+            if job_id is not None:
+                origins[int(job_id)] = (channel, cmd.chat_id)
+            _reply(channel, cmd.chat_id, format_report(job_id, "running", out["description"]))
+
+    # 죽은 실행기가 남긴 작업 정리 (M-5). run_once 안에서도 하지만
+    # 큐가 비어 있는 동안에도 주기적으로 돌아야 한다.
+    try:
+        reaped = rt.jobs.reap_stale_running()
+        if reaped:
+            log.warning("리스가 끊긴 작업 %d건을 불확실로 정리했습니다", reaped)
+    except Exception as exc:
+        log.warning("고아 작업 정리 실패: %s", exc)
+        reaped = 0
+
+    if stop_requested(rt):
+        # 중지 플래그가 살아 있으면 새 작업을 꺼내지 않는다. 새 명령이 오면 풀린다.
+        return {"received": received, "reaped": reaped, "done": [], "stopped": True}
+
+    try:
+        outs = drain(rt, owner)
+    except Exception as exc:
+        log.exception("큐 실행 실패: %s", exc)
+        return {"received": received, "reaped": reaped, "done": [], "error": str(exc)}
+
+    for out in outs:
+        origin = origins.get(int(out.get("job_id") or 0))
+        if origin is None:
+            continue  # 이 방이 시킨 작업이 아니다 (결과는 notify_all이 이미 보냈다)
+        channel, chat_id = origin
+        result = out.get("result") or {}
+        text = format_report(
+            out.get("job_id"), out.get("status", ""), out.get("description", ""),
+            error=out.get("error"),
+        )
+        extra = result.get("report") or result.get("message") or ""
+        _reply(channel, chat_id, f"{text}\n{extra}".strip())
+
+    return {"received": received, "reaped": reaped, "done": outs, "stopped": False}
+
+
+#: serve 시작할 때 보내는 안내 문구
+SERVE_HELLO = "실행기 시작됨. '상태' 라고 보내보세요"
+
+
+def serve(rt: Runtime, poll_seconds: int = 5, announce: bool = True) -> None:  # pragma: no cover - 장시간 루프
+    """채널을 폴링하며 명령을 받아 실행한다. 어떤 예외로도 멈추지 않는다."""
+    owner = default_owner()
+    print(f"serve 시작: 채널 {len(rt.channels)}개, {poll_seconds}초 간격", flush=True)
+    log.info("serve 시작: 채널 %d개", len(rt.channels))
+    if announce:
+        notify_all(rt.channels, SERVE_HELLO)
+    while True:
+        try:
+            serve_poll(rt, owner)
+        except KeyboardInterrupt:
+            print("serve 중지", flush=True)
+            return
+        except Exception as exc:
+            log.exception("serve 폴링 실패(계속 진행): %s", exc)
         time.sleep(poll_seconds)
 
 

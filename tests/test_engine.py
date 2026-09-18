@@ -250,6 +250,9 @@ def test_제휴_수정글_등록_전_실패도_failed(tmp_path, monkeypatch):
     slot = _one_slot(rt, spec)
     slot.workflow = "affiliate"
 
+    slot.manuscript.keyword = "테스트 키워드"
+    slot.manuscript.tags = ["테스트키워드"]
+
     daily = Manuscript(
         source="랜덤일상",
         source_row=9,
@@ -268,7 +271,7 @@ def test_제휴_수정글_등록_전_실패도_failed(tmp_path, monkeypatch):
 
     def content_json(body, components):
         calls["n"] += 1
-        if calls["n"] >= 2:  # 수정글 차례 → create 전에 터진다
+        if calls["n"] >= 2:  # 일상 글 차례 → create 전에 터진다
             raise ValueError("사진 수가 부족합니다: 자리 1, 사진 0")
         return real_content_json(body, components)
 
@@ -283,6 +286,214 @@ def test_제휴_수정글_등록_전_실패도_failed(tmp_path, monkeypatch):
     assert row["status"] == "failed"
     assert "사진 수가 부족합니다" in row["stage"]
     rt.close()
+
+
+# --------------------------------------------------------------------
+# 제휴 체인 되감기 (일상 글 → 수정글)
+# --------------------------------------------------------------------
+def _affiliate_slot(rt, spec, monkeypatch):
+    """제휴 슬롯 1건 + 일상 글 대역. (슬롯, 일상원고)를 돌려준다."""
+    from v2r.content.manuscript import Manuscript
+
+    slot = _one_slot(rt, spec)
+    slot.workflow = "affiliate"
+    slot.manuscript.keyword = "단호박 샐러드"
+    slot.manuscript.tags = ["단호박샐러드"]
+    daily = Manuscript(
+        source="랜덤일상",
+        source_row=9,
+        title="일상 제목",
+        body="일상 본문",
+        content_hash="dailyhash",
+    )
+    monkeypatch.setattr(publish_mod, "_take_daily", lambda rt_: daily)
+    monkeypatch.setattr(publish_mod, "build_comments", lambda *a, **k: [])
+    return slot, daily
+
+
+def test_사전점검_실패면_V2R에_아무_글도_안_만든다(tmp_path, monkeypatch):
+    """수정글 재료 점검은 일상 글 등록 전에 끝난다 → create 호출이 0건이어야 한다."""
+    rt = make_runtime(tmp_path)
+    spec = make_spec(dry_run=False, count=1)
+    slot, _daily = _affiliate_slot(rt, spec, monkeypatch)
+
+    monkeypatch.setattr(
+        publish_mod.api_articles, "create_article", lambda c, **k: pytest.fail("호출 금지")
+    )
+    monkeypatch.setattr(
+        publish_mod.api_articles, "delete_article", lambda c, sid: pytest.fail("삭제 금지")
+    )
+
+    def boom(body, components):
+        raise ValueError("사진 수가 부족합니다: 자리 1, 사진 0")
+
+    monkeypatch.setattr(publish_mod.seone, "content_json", boom)
+
+    with pytest.raises(publish_mod.PublishError):
+        publish_mod.run_slot(rt, spec, slot)
+
+    row = rt.conn.execute(
+        "SELECT status, stage FROM publications WHERE source_key = '테스트시트'"
+    ).fetchone()
+    assert row["status"] == "failed"
+    assert "되감기" not in row["stage"]
+    rt.close()
+
+
+def test_일상글_등록_뒤_실패하면_일상글을_지운다(tmp_path, monkeypatch):
+    rt = make_runtime(tmp_path)
+    spec = make_spec(dry_run=False, count=1)
+    slot, _daily = _affiliate_slot(rt, spec, monkeypatch)
+    deleted: list[str] = []
+
+    created = {"n": 0}
+
+    def fake_create(client, **kwargs):
+        created["n"] += 1
+        if created["n"] >= 2:  # 수정글 등록에서 거절 (모호하지 않은 오류)
+            raise V2RApiError("등급 부족", status=400, code="27005")
+        return "DAILY-1"
+
+    monkeypatch.setattr(publish_mod.api_articles, "create_article", fake_create)
+    monkeypatch.setattr(publish_mod.api_articles, "get_article", lambda c, sid: {})
+    monkeypatch.setattr(publish_mod.api_articles, "verify_article", lambda detail, **k: [])
+    monkeypatch.setattr(publish_mod.api_articles, "wait_written", lambda *a, **k: {})
+    monkeypatch.setattr(
+        publish_mod.api_articles, "delete_article", lambda c, sid: deleted.append(sid) or {}
+    )
+    monkeypatch.setattr(publish_mod, "classify", lambda exc: "grade")
+
+    with pytest.raises(publish_mod.PublishError) as exc:
+        publish_mod.run_slot(rt, spec, slot)
+
+    assert deleted == ["DAILY-1"]
+    assert "rolled_back_daily=DAILY-1" in str(exc.value)
+    row = rt.conn.execute(
+        "SELECT status, stage FROM publications WHERE source_key = '테스트시트'"
+    ).fetchone()
+    assert row["status"] == "failed"
+    assert "되감기" in row["stage"]
+    assert rt.publications.list_uncertain() == []
+    rt.close()
+
+
+def test_수정글_오류가_모호하면_되감지_않고_uncertain(tmp_path, monkeypatch):
+    rt = make_runtime(tmp_path)
+    spec = make_spec(dry_run=False, count=1)
+    slot, _daily = _affiliate_slot(rt, spec, monkeypatch)
+
+    created = {"n": 0}
+
+    def fake_create(client, **kwargs):
+        created["n"] += 1
+        if created["n"] >= 2:
+            raise V2RApiError("서버 오류", status=502)
+        return "DAILY-1"
+
+    monkeypatch.setattr(publish_mod.api_articles, "create_article", fake_create)
+    monkeypatch.setattr(publish_mod.api_articles, "get_article", lambda c, sid: {})
+    monkeypatch.setattr(publish_mod.api_articles, "verify_article", lambda detail, **k: [])
+    monkeypatch.setattr(publish_mod.api_articles, "wait_written", lambda *a, **k: {})
+    monkeypatch.setattr(
+        publish_mod.api_articles, "delete_article", lambda c, sid: pytest.fail("삭제 금지")
+    )
+    monkeypatch.setattr(publish_mod, "classify", lambda exc: "ambiguous")
+
+    with pytest.raises(publish_mod.PublishError):
+        publish_mod.run_slot(rt, spec, slot)
+
+    left = rt.publications.list_uncertain()
+    assert [r["source_key"] for r in left] == ["테스트시트"]
+    assert left[0]["source_id"] == "DAILY-1"
+    rt.close()
+
+
+# --------------------------------------------------------------------
+# 태그(키워드) 규칙
+# --------------------------------------------------------------------
+def test_제휴행_A열이_비면_G열을_키워드로_쓰고_태그는_공백없이(tmp_path):
+    rows = [
+        {
+            "키워드": "",
+            "본문": "본문 내용",
+            "카페명": "고요한 아침",
+            "작성계정": "user0",
+            "말머리": "단호박 샐러드",
+        }
+    ]
+    items = sheets.parse_affiliate_rows(rows, source="브랜드시트")
+    assert len(items) == 1
+    m = items[0]
+    assert m.keyword == "단호박 샐러드"
+    assert m.tags == ["단호박샐러드"]
+    assert m.head == ""  # 말머리를 안 쓰는 카페 → G열은 키워드일 뿐이다
+
+
+def test_키워드가_없으면_태그없이_발행한다(tmp_path, monkeypatch):
+    rt = make_runtime(tmp_path)
+    spec = make_spec(dry_run=False, count=1)
+    slot, _daily = _affiliate_slot(rt, spec, monkeypatch)
+    slot.manuscript.keyword = ""
+    slot.manuscript.tags = []
+    seen: list[list[str]] = []
+
+    def fake_create(client, **kwargs):
+        seen.append(list(kwargs.get("tags") or []))
+        return f"SRC-{len(seen)}"
+
+    monkeypatch.setattr(publish_mod.api_articles, "create_article", fake_create)
+    monkeypatch.setattr(publish_mod.api_articles, "get_article", lambda c, sid: {})
+    monkeypatch.setattr(publish_mod.api_articles, "verify_article", lambda detail, **k: [])
+    monkeypatch.setattr(publish_mod.api_articles, "wait_written", lambda *a, **k: {})
+
+    out = publish_mod.run_slot(rt, spec, slot)
+
+    assert out["status"] == "done"
+    assert out["tag_note"] == "태그 없음"
+    assert seen[-1] == []  # 수정글도 태그 없이 등록된다
+    rt.close()
+
+
+def test_키워드가_있으면_태그_한개로_등록한다(tmp_path, monkeypatch):
+    rt = make_runtime(tmp_path)
+    spec = make_spec(dry_run=False, count=1)
+    slot, _daily = _affiliate_slot(rt, spec, monkeypatch)
+    slot.manuscript.tags = []  # 키워드만 있어도 태그를 만든다
+    seen: list[list[str]] = []
+
+    def fake_create(client, **kwargs):
+        seen.append(list(kwargs.get("tags") or []))
+        return f"SRC-{len(seen)}"
+
+    monkeypatch.setattr(publish_mod.api_articles, "create_article", fake_create)
+    monkeypatch.setattr(publish_mod.api_articles, "get_article", lambda c, sid: {})
+    monkeypatch.setattr(publish_mod.api_articles, "verify_article", lambda detail, **k: [])
+    monkeypatch.setattr(publish_mod.api_articles, "wait_written", lambda *a, **k: {})
+
+    out = publish_mod.run_slot(rt, spec, slot)
+
+    assert out["status"] == "done"
+    assert "tag_note" not in out
+    assert seen[-1] == ["단호박샐러드"]
+    rt.close()
+
+
+def test_태그가_다르면_등록검증_실패(tmp_path, monkeypatch):
+    """verify_article은 tag_list를 비교한다 → 태그 불일치는 실패여야 한다."""
+    from v2r.api import articles as api_articles
+
+    problems = api_articles.verify_article(
+        {"title": "제목", "tag_list": ["다른태그"]},
+        title="제목",
+        tags=["단호박샐러드"],
+        menu_id=None,
+        head_id=None,
+        body_lines=[],
+        image_count=0,
+        start_at=None,
+        comments_count=0,
+    )
+    assert any("태그" in p for p in problems)
 
 
 def test_사진이_없으면_발행_전에_사진필요_오류(tmp_path):

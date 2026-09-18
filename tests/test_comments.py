@@ -26,7 +26,11 @@ def test_기본트리_12노드():
     depths = [n["depth"] for n in DEFAULT_TREE]
     assert depths.count(0) == 5 and depths.count(1) == 5
     assert depths.count(2) == 1 and depths.count(3) == 1
-    assert [n["label"] for n in DEFAULT_TREE][-2:] == ["대대댓글2", "대대대댓글2"]
+    # 순서는 읽는 순서 (docs/reference/live-comment-order.md §1)
+    assert [n["label"] for n in DEFAULT_TREE] == [
+        "댓글1", "대댓글1", "댓글2", "대댓글2", "대대댓글2", "대대대댓글2",
+        "댓글3", "대댓글3", "댓글4", "대댓글4", "댓글5", "대댓글5",
+    ]
     by_label = {n["label"]: n for n in DEFAULT_TREE}
     assert by_label["대댓글3"]["parent"] == "댓글3"
     assert by_label["대대댓글2"]["parent"] == "대댓글2"
@@ -39,13 +43,14 @@ def test_오프셋_표():
     assert OFFSETS_MIN["대대댓글2"] == 26 and OFFSETS_MIN["대대대댓글2"] == 36
 
 
-def test_계정배정_작성자제외_답글은_작성자():
+def test_계정배정_작성자제외_대댓글은_작성자():
     tree = assign_comment_accounts(DEFAULT_TREE, POOL + ["author"], "author",
                                    random.Random(5))
     roots = [n for n in tree if n["depth"] == 0]
     assert all(n["account"] != "author" for n in roots)
     assert len({n["account"] for n in roots}) == 5  # 중복 없이
-    assert all(n["account"] == "author" for n in tree if n["depth"] > 0)
+    # 대댓글1~5만 작성자. 대대/대대대댓글2는 원고유형에 따라 다르다(test_comment_order.py)
+    assert all(n["account"] == "author" for n in tree if n["depth"] == 1)
 
 
 def test_계정배정_풀없으면_에러():
@@ -103,7 +108,11 @@ def test_api_payload_중첩구조():
     for n in tree:
         n["text"] = n["label"] + " 내용"
     items = schedule(tree, ROOT)
-    members = {"author": {"member_key": "MK", "nick": "닉네임"}}
+    # 대대/대대대댓글2는 댓글 계정도 답글 대상이 된다 → 풀 전체의 member_key가 필요
+    members = {
+        a: {"member_key": "MK" if a == "author" else f"MK-{a}", "nick": "닉네임"}
+        for a in POOL + ["author"]
+    }
     payload = to_api_payload(items, members)
 
     assert len(payload) == 5  # 루트 5개
@@ -123,7 +132,8 @@ def test_root_start_at는_루트댓글_시각이고_루트는_None():
     for n in tree:
         n["text"] = n["label"]
     items = schedule(tree, ROOT)
-    payload = to_api_payload(items, {"author": {"member_key": "MK", "nick": "닉"}})
+    members = {a: {"member_key": f"MK-{a}", "nick": "닉"} for a in POOL + ["author"]}
+    payload = to_api_payload(items, members)
     for root in payload:
         assert root["root_start_at"] is None  # 답글일 때만 값을 갖는다
         for child in root["comments"]:

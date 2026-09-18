@@ -88,6 +88,10 @@ CAMERA_PRESETS: list[CameraPreset] = [
 
 _SERIAL_CHARS = "0123456789ABCDEFGHJKLMNPQRSTUVWXYZ"
 
+#: 세탁본(발행에 붙는 사진)의 최대 가로 폭(px).
+#: 이보다 넓으면 비율을 지켜 줄인다. **절대 확대하지 않는다.**
+MAX_VARIANT_WIDTH = 400
+
 #: 픽셀까지 손볼지의 기본값. 배포 환경에서 이 값만 바꾸면 전체 동작이 바뀐다.
 #: True  = 가장자리 1px crop + 품질 92~96 재인코딩 (크기 1px 감소, 세대 손실)
 #: False = EXIF 메타만 교체 (handoff §10 "변경 대상은 촬영 날짜, 카메라 정보")

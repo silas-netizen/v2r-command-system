@@ -1,0 +1,563 @@
+{
+ "note": "마스킹한 라이브 참고 트리. 자세한 설명은 docs/reference/live-comment-order.md",
+ "reading_order": [
+  "댓글1",
+  "대댓글1",
+  "댓글2",
+  "대댓글2",
+  "대대댓글2",
+  "대대대댓글2",
+  "댓글3",
+  "대댓글3",
+  "댓글4",
+  "대댓글4",
+  "댓글5",
+  "대댓글5"
+ ],
+ "articles": [
+  {
+   "cafe": "씨씨앙",
+   "manuscript_type": "질문형",
+   "source_id": "01M1BEGF16TNH2PXF0KVSXGW7F",
+   "author": "oll",
+   "revision_start_at": "13:48",
+   "root_accounts": [
+    "col",
+    "hun",
+    "prt",
+    "qui",
+    "che"
+   ],
+   "nodes": [
+    {
+     "label": "댓글1",
+     "depth": 0,
+     "api_parent": null,
+     "role": "root_pool",
+     "account": "col",
+     "reply_member": null,
+     "reply_member_role": null,
+     "start_at": "13:53"
+    },
+    {
+     "label": "대댓글1",
+     "depth": 1,
+     "api_parent": "댓글1",
+     "role": "author",
+     "account": "oll",
+     "reply_member": null,
+     "reply_member_role": null,
+     "start_at": "14:03"
+    },
+    {
+     "label": "댓글2",
+     "depth": 0,
+     "api_parent": null,
+     "role": "root_pool",
+     "account": "hun",
+     "reply_member": null,
+     "reply_member_role": null,
+     "start_at": "13:54"
+    },
+    {
+     "label": "대댓글2",
+     "depth": 1,
+     "api_parent": "댓글2",
+     "role": "author",
+     "account": "oll",
+     "reply_member": null,
+     "reply_member_role": null,
+     "start_at": "14:04"
+    },
+    {
+     "label": "대대댓글2",
+     "depth": 2,
+     "api_parent": "댓글2",
+     "role": "root2_pool",
+     "account": "hun",
+     "reply_member": "oll",
+     "reply_member_role": "author",
+     "start_at": "14:14"
+    },
+    {
+     "label": "대대대댓글2",
+     "depth": 3,
+     "api_parent": "댓글2",
+     "role": "spare_pool",
+     "account": "cho",
+     "reply_member": "hun",
+     "reply_member_role": "root2_pool",
+     "start_at": "14:24"
+    },
+    {
+     "label": "댓글3",
+     "depth": 0,
+     "api_parent": null,
+     "role": "root_pool",
+     "account": "prt",
+     "reply_member": null,
+     "reply_member_role": null,
+     "start_at": "13:55"
+    },
+    {
+     "label": "대댓글3",
+     "depth": 1,
+     "api_parent": "댓글3",
+     "role": "author",
+     "account": "oll",
+     "reply_member": null,
+     "reply_member_role": null,
+     "start_at": "14:05"
+    },
+    {
+     "label": "댓글4",
+     "depth": 0,
+     "api_parent": null,
+     "role": "root_pool",
+     "account": "qui",
+     "reply_member": null,
+     "reply_member_role": null,
+     "start_at": "13:56"
+    },
+    {
+     "label": "대댓글4",
+     "depth": 1,
+     "api_parent": "댓글4",
+     "role": "author",
+     "account": "oll",
+     "reply_member": null,
+     "reply_member_role": null,
+     "start_at": "14:06"
+    },
+    {
+     "label": "댓글5",
+     "depth": 0,
+     "api_parent": null,
+     "role": "root_pool",
+     "account": "che",
+     "reply_member": null,
+     "reply_member_role": null,
+     "start_at": "13:57"
+    },
+    {
+     "label": "대댓글5",
+     "depth": 1,
+     "api_parent": "댓글5",
+     "role": "author",
+     "account": "oll",
+     "reply_member": null,
+     "reply_member_role": null,
+     "start_at": "14:07"
+    }
+   ]
+  },
+  {
+   "cafe": "씨씨앙",
+   "manuscript_type": "후기형",
+   "source_id": "01M1XBAH9R4BAY58ZQ0AVRZWGA",
+   "author": "lgh",
+   "revision_start_at": "13:59",
+   "root_accounts": [
+    "col",
+    "prt",
+    "qui",
+    "hun",
+    "che"
+   ],
+   "nodes": [
+    {
+     "label": "댓글1",
+     "depth": 0,
+     "api_parent": null,
+     "role": "root_pool",
+     "account": "col",
+     "reply_member": null,
+     "reply_member_role": null,
+     "start_at": "14:04"
+    },
+    {
+     "label": "대댓글1",
+     "depth": 1,
+     "api_parent": "댓글1",
+     "role": "author",
+     "account": "lgh",
+     "reply_member": null,
+     "reply_member_role": null,
+     "start_at": "14:14"
+    },
+    {
+     "label": "댓글2",
+     "depth": 0,
+     "api_parent": null,
+     "role": "root_pool",
+     "account": "prt",
+     "reply_member": null,
+     "reply_member_role": null,
+     "start_at": "14:05"
+    },
+    {
+     "label": "대댓글2",
+     "depth": 1,
+     "api_parent": "댓글2",
+     "role": "author",
+     "account": "lgh",
+     "reply_member": null,
+     "reply_member_role": null,
+     "start_at": "14:15"
+    },
+    {
+     "label": "대대댓글2",
+     "depth": 2,
+     "api_parent": "댓글2",
+     "role": "spare_pool",
+     "account": "cho",
+     "reply_member": "lgh",
+     "reply_member_role": "author",
+     "start_at": "14:25"
+    },
+    {
+     "label": "대대대댓글2",
+     "depth": 3,
+     "api_parent": "댓글2",
+     "role": "author",
+     "account": "lgh",
+     "reply_member": "cho",
+     "reply_member_role": "spare_pool",
+     "start_at": "14:35"
+    },
+    {
+     "label": "댓글3",
+     "depth": 0,
+     "api_parent": null,
+     "role": "root_pool",
+     "account": "qui",
+     "reply_member": null,
+     "reply_member_role": null,
+     "start_at": "14:06"
+    },
+    {
+     "label": "대댓글3",
+     "depth": 1,
+     "api_parent": "댓글3",
+     "role": "author",
+     "account": "lgh",
+     "reply_member": null,
+     "reply_member_role": null,
+     "start_at": "14:16"
+    },
+    {
+     "label": "댓글4",
+     "depth": 0,
+     "api_parent": null,
+     "role": "root_pool",
+     "account": "hun",
+     "reply_member": null,
+     "reply_member_role": null,
+     "start_at": "14:07"
+    },
+    {
+     "label": "대댓글4",
+     "depth": 1,
+     "api_parent": "댓글4",
+     "role": "author",
+     "account": "lgh",
+     "reply_member": null,
+     "reply_member_role": null,
+     "start_at": "14:17"
+    },
+    {
+     "label": "댓글5",
+     "depth": 0,
+     "api_parent": null,
+     "role": "root_pool",
+     "account": "che",
+     "reply_member": null,
+     "reply_member_role": null,
+     "start_at": "14:08"
+    },
+    {
+     "label": "대댓글5",
+     "depth": 1,
+     "api_parent": "댓글5",
+     "role": "author",
+     "account": "lgh",
+     "reply_member": null,
+     "reply_member_role": null,
+     "start_at": "14:18"
+    }
+   ]
+  },
+  {
+   "cafe": "양평맘",
+   "manuscript_type": "질문형",
+   "source_id": "01M1GPJ3W7A6KS6T387YGS3RJ9",
+   "author": "tab",
+   "revision_start_at": "06:54",
+   "root_accounts": [
+    "che",
+    "col",
+    "prt",
+    "hun",
+    "cho"
+   ],
+   "nodes": [
+    {
+     "label": "댓글1",
+     "depth": 0,
+     "api_parent": null,
+     "role": "root_pool",
+     "account": "che",
+     "reply_member": null,
+     "reply_member_role": null,
+     "start_at": "06:59"
+    },
+    {
+     "label": "대댓글1",
+     "depth": 1,
+     "api_parent": "댓글1",
+     "role": "author",
+     "account": "tab",
+     "reply_member": null,
+     "reply_member_role": null,
+     "start_at": "07:09"
+    },
+    {
+     "label": "댓글2",
+     "depth": 0,
+     "api_parent": null,
+     "role": "root_pool",
+     "account": "col",
+     "reply_member": null,
+     "reply_member_role": null,
+     "start_at": "07:00"
+    },
+    {
+     "label": "대댓글2",
+     "depth": 1,
+     "api_parent": "댓글2",
+     "role": "author",
+     "account": "tab",
+     "reply_member": null,
+     "reply_member_role": null,
+     "start_at": "07:10"
+    },
+    {
+     "label": "대대댓글2",
+     "depth": 2,
+     "api_parent": "댓글2",
+     "role": "root2_pool",
+     "account": "col",
+     "reply_member": "tab",
+     "reply_member_role": "author",
+     "start_at": "07:20"
+    },
+    {
+     "label": "대대대댓글2",
+     "depth": 3,
+     "api_parent": "댓글2",
+     "role": "spare_pool",
+     "account": "qui",
+     "reply_member": "col",
+     "reply_member_role": "root2_pool",
+     "start_at": "07:30"
+    },
+    {
+     "label": "댓글3",
+     "depth": 0,
+     "api_parent": null,
+     "role": "root_pool",
+     "account": "prt",
+     "reply_member": null,
+     "reply_member_role": null,
+     "start_at": "07:01"
+    },
+    {
+     "label": "대댓글3",
+     "depth": 1,
+     "api_parent": "댓글3",
+     "role": "author",
+     "account": "tab",
+     "reply_member": null,
+     "reply_member_role": null,
+     "start_at": "07:11"
+    },
+    {
+     "label": "댓글4",
+     "depth": 0,
+     "api_parent": null,
+     "role": "root_pool",
+     "account": "hun",
+     "reply_member": null,
+     "reply_member_role": null,
+     "start_at": "07:02"
+    },
+    {
+     "label": "대댓글4",
+     "depth": 1,
+     "api_parent": "댓글4",
+     "role": "author",
+     "account": "tab",
+     "reply_member": null,
+     "reply_member_role": null,
+     "start_at": "07:12"
+    },
+    {
+     "label": "댓글5",
+     "depth": 0,
+     "api_parent": null,
+     "role": "root_pool",
+     "account": "cho",
+     "reply_member": null,
+     "reply_member_role": null,
+     "start_at": "07:03"
+    },
+    {
+     "label": "대댓글5",
+     "depth": 1,
+     "api_parent": "댓글5",
+     "role": "author",
+     "account": "tab",
+     "reply_member": null,
+     "reply_member_role": null,
+     "start_at": "07:13"
+    }
+   ]
+  },
+  {
+   "cafe": "쌍둥이맘",
+   "manuscript_type": "질문형",
+   "source_id": "01M2MQT74GE0ZR0H9KXVV7QWPF",
+   "author": "wal",
+   "revision_start_at": "07:30",
+   "root_accounts": [
+    "che",
+    "hun",
+    "cho",
+    "qui",
+    "prt"
+   ],
+   "nodes": [
+    {
+     "label": "댓글1",
+     "depth": 0,
+     "api_parent": null,
+     "role": "root_pool",
+     "account": "che",
+     "reply_member": null,
+     "reply_member_role": null,
+     "start_at": "07:35"
+    },
+    {
+     "label": "대댓글1",
+     "depth": 1,
+     "api_parent": "댓글1",
+     "role": "author",
+     "account": "wal",
+     "reply_member": null,
+     "reply_member_role": null,
+     "start_at": "07:45"
+    },
+    {
+     "label": "댓글2",
+     "depth": 0,
+     "api_parent": null,
+     "role": "root_pool",
+     "account": "hun",
+     "reply_member": null,
+     "reply_member_role": null,
+     "start_at": "07:36"
+    },
+    {
+     "label": "대댓글2",
+     "depth": 1,
+     "api_parent": "댓글2",
+     "role": "author",
+     "account": "wal",
+     "reply_member": null,
+     "reply_member_role": null,
+     "start_at": "07:46"
+    },
+    {
+     "label": "대대댓글2",
+     "depth": 2,
+     "api_parent": "댓글2",
+     "role": "root2_pool",
+     "account": "hun",
+     "reply_member": "wal",
+     "reply_member_role": "author",
+     "start_at": "07:56"
+    },
+    {
+     "label": "대대대댓글2",
+     "depth": 3,
+     "api_parent": "댓글2",
+     "role": "spare_pool",
+     "account": "col",
+     "reply_member": "hun",
+     "reply_member_role": "root2_pool",
+     "start_at": "08:06"
+    },
+    {
+     "label": "댓글3",
+     "depth": 0,
+     "api_parent": null,
+     "role": "root_pool",
+     "account": "cho",
+     "reply_member": null,
+     "reply_member_role": null,
+     "start_at": "07:37"
+    },
+    {
+     "label": "대댓글3",
+     "depth": 1,
+     "api_parent": "댓글3",
+     "role": "author",
+     "account": "wal",
+     "reply_member": null,
+     "reply_member_role": null,
+     "start_at": "07:47"
+    },
+    {
+     "label": "댓글4",
+     "depth": 0,
+     "api_parent": null,
+     "role": "root_pool",
+     "account": "qui",
+     "reply_member": null,
+     "reply_member_role": null,
+     "start_at": "07:38"
+    },
+    {
+     "label": "대댓글4",
+     "depth": 1,
+     "api_parent": "댓글4",
+     "role": "author",
+     "account": "wal",
+     "reply_member": null,
+     "reply_member_role": null,
+     "start_at": "07:48"
+    },
+    {
+     "label": "댓글5",
+     "depth": 0,
+     "api_parent": null,
+     "role": "root_pool",
+     "account": "prt",
+     "reply_member": null,
+     "reply_member_role": null,
+     "start_at": "07:39"
+    },
+    {
+     "label": "대댓글5",
+     "depth": 1,
+     "api_parent": "댓글5",
+     "role": "author",
+     "account": "wal",
+     "reply_member": null,
+     "reply_member_role": null,
+     "start_at": "07:49"
+    }
+   ]
+  }
+ ]
+}
