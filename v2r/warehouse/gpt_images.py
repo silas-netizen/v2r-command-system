@@ -177,6 +177,104 @@ def wait_for_login(page, timeout: int = LOGIN_TIMEOUT, poll: float = 3.0) -> boo
     return False
 
 
+# --- 세션 점검 ------------------------------------------------------------
+#: 로그인 풀렸을 때 보낼 안내 (요구사항 고정 문구)
+RELOGIN_NOTICE = (
+    "ChatGPT 로그인이 풀렸습니다. PC에서 scripts\\gpt-login.cmd 를 실행해 "
+    "다시 로그인해 주세요"
+)
+
+
+def _cookie_expiry(profile_dir: Path) -> float | None:
+    """프로필 쿠키 DB에서 chatgpt.com 쿠키의 가장 늦은 만료 시각(epoch 초).
+
+    **쿠키 값은 절대 읽지 않는다.** 만료 시각(메타)만 본다.
+    """
+    db = profile_dir / "Default" / "Network" / "Cookies"
+    if not db.is_file():
+        db = profile_dir / "Network" / "Cookies"
+    if not db.is_file():
+        return None
+
+    import shutil as _shutil
+    import sqlite3
+    import tempfile
+
+    # 브라우저가 잠가 둘 수 있으므로 복사본을 읽는다
+    tmp = Path(tempfile.gettempdir()) / f"v2r-cookies-{int(time.time())}.db"
+    try:
+        _shutil.copy2(db, tmp)
+        con = sqlite3.connect(str(tmp))
+        try:
+            row = con.execute(
+                "SELECT MAX(expires_utc) FROM cookies WHERE host_key LIKE ?",
+                ("%chatgpt.com",),
+            ).fetchone()
+        finally:
+            con.close()
+    except Exception as exc:
+        log.info("쿠키 만료 확인 실패: %s", exc)
+        return None
+    finally:
+        tmp.unlink(missing_ok=True)
+
+    if not row or not row[0]:
+        return None
+    # 크롬은 1601-01-01 기준 마이크로초로 저장한다
+    return int(row[0]) / 1_000_000 - 11_644_473_600
+
+
+def check_gpt_session(profile_dir: str | Path | None = None, timeout_ms: int = 12000) -> dict:
+    """로그인 상태를 **비밀번호 입력 없이** 확인한다.
+
+    1차: 헤드리스로 프로필을 열어 입력창이 보이는지 본다.
+    Cloudflare 챌린지 등으로 판정이 안 되면 2차로 프로필 쿠키의 **만료 시각만**
+    읽어 추정한다 (쿠키 값은 읽지도, 찍지도 않는다).
+    """
+    path = Path(profile_dir) if profile_dir is not None else default_profile_dir()
+    out: dict[str, Any] = {
+        "ok": True,
+        "logged_in": False,
+        "method": "",
+        "profile": str(path),
+        "note": "",
+    }
+    if not path.is_dir():
+        out["note"] = "프로필 폴더가 없습니다 (아직 한 번도 로그인하지 않음)."
+        return out
+
+    playwright = context = page = None
+    try:
+        playwright, context, page = open_gpt(headless=True, profile_dir=path)
+        title = ""
+        try:
+            title = page.title() or ""
+        except Exception:
+            pass
+        if composer(page, timeout_ms=timeout_ms) is not None:
+            out.update(logged_in=True, method="headless", note="입력창 확인됨")
+            return out
+        if "just a moment" in title.lower() or "__cf_chl" in (page.url or ""):
+            out["note"] = "헤드리스가 Cloudflare 챌린지에 막힘 → 쿠키 만료로 판정"
+        else:
+            out["note"] = "헤드리스에서 입력창을 찾지 못함 → 쿠키 만료로 판정"
+    except Exception as exc:
+        out["note"] = f"헤드리스 확인 실패({exc.__class__.__name__}) → 쿠키 만료로 판정"
+    finally:
+        _close(playwright, context, page)
+
+    expiry = _cookie_expiry(path)
+    out["method"] = "cookie-expiry"
+    if expiry is None:
+        out["note"] += " / chatgpt.com 쿠키 없음"
+        return out
+    remain = expiry - time.time()
+    out["expires_in_days"] = round(remain / 86400, 1)
+    out["logged_in"] = remain > 0
+    out["note"] += f" / 쿠키 만료까지 {out['expires_in_days']}일"
+    return out
+
+
 # --- 이미지 생성 ----------------------------------------------------------
 def _submit(page, prompt: str) -> None:
     """입력창에 프롬프트를 넣고 보낸다."""
@@ -521,6 +619,30 @@ def _close(playwright=None, context=None, page=None) -> None:
         pass
 
 
+def _login_cli() -> int:
+    """`python -m v2r.warehouse.gpt_images --login` — 창을 띄우고 로그인을 기다린다."""
+    print(f"ChatGPT 로그인 창을 엽니다. 프로필: {default_profile_dir()}")
+    playwright, context, page = open_gpt(headless=False)
+    try:
+        if wait_for_login(page, timeout=LOGIN_TIMEOUT):
+            print("로그인 완료. 이제 창을 닫아도 됩니다 (세션이 프로필에 저장됩니다).")
+            return 0
+        print("로그인 대기 시간이 끝났습니다. 다시 실행해 주세요.")
+        return 1
+    finally:
+        _close(playwright, context, page)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI 진입점. `--login`은 로그인 창, `--check`는 세션 점검."""
+    args = list(argv if argv is not None else __import__("sys").argv[1:])
+    if "--check" in args:
+        out = check_gpt_session()
+        print(f"로그인 상태: {'OK' if out['logged_in'] else '풀림'} ({out['method']}) {out['note']}")
+        return 0 if out["logged_in"] else 1
+    return _login_cli()
+
+
 __all__ = [
     "COMPOSER_SELECTORS",
     "DOWNLOAD_SELECTORS",
@@ -528,10 +650,13 @@ __all__ = [
     "IMAGE_SELECTORS",
     "LOGIN_PROMPT",
     "TARGET_LONG_SIDE",
+    "RELOGIN_NOTICE",
     "GptImageError",
     "GptLimitError",
     "add_noise",
+    "check_gpt_session",
     "composer",
+    "main",
     "default_profile_dir",
     "generate_batch",
     "generate_image",
@@ -539,3 +664,7 @@ __all__ = [
     "postprocess",
     "wait_for_login",
 ]
+
+
+if __name__ == "__main__":  # pragma: no cover - CLI
+    raise SystemExit(main())

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import random
+import time
 from pathlib import Path
 
 import pytest
@@ -218,6 +219,98 @@ def test_request_photos_still_wins_for_request_wording():
 def test_daily_generation_not_hijacked():
     spec = parse_korean_command("일상 글 3개 생성해줘")
     assert spec is not None and spec.task == "generate_daily"
+
+
+# --- 세션 점검 / 킵얼라이브 ------------------------------------------------
+def test_check_gpt_session_without_profile(tmp_path: Path):
+    out = gpt_images.check_gpt_session(tmp_path / "없는프로필")
+    assert out["logged_in"] is False
+    assert "프로필 폴더가 없습니다" in out["note"]
+
+
+def test_check_gpt_session_falls_back_to_cookie_expiry(monkeypatch, tmp_path: Path):
+    """헤드리스가 막히면 쿠키 만료 시각만 보고 판정한다 (쿠키 값은 안 읽는다)."""
+    profile = tmp_path / "prof"
+    profile.mkdir()
+
+    def _boom(**kwargs):
+        raise RuntimeError("Cloudflare")
+
+    monkeypatch.setattr(gpt_images, "open_gpt", _boom)
+    monkeypatch.setattr(gpt_images, "_cookie_expiry", lambda p: time.time() + 86400 * 10)
+
+    out = gpt_images.check_gpt_session(profile)
+    assert out["logged_in"] is True
+    assert out["method"] == "cookie-expiry"
+    assert out["expires_in_days"] == 10.0
+
+
+def test_check_gpt_session_expired_cookie(monkeypatch, tmp_path: Path):
+    profile = tmp_path / "prof"
+    profile.mkdir()
+    monkeypatch.setattr(gpt_images, "open_gpt", lambda **k: (_ for _ in ()).throw(RuntimeError()))
+    monkeypatch.setattr(gpt_images, "_cookie_expiry", lambda p: time.time() - 60)
+
+    out = gpt_images.check_gpt_session(profile)
+    assert out["logged_in"] is False
+
+
+def test_relogin_notice_text():
+    assert gpt_images.RELOGIN_NOTICE == (
+        "ChatGPT 로그인이 풀렸습니다. PC에서 scripts\\gpt-login.cmd 를 실행해 "
+        "다시 로그인해 주세요"
+    )
+
+
+def test_login_script_exists():
+    script = Path(__file__).resolve().parent.parent / "scripts" / "gpt-login.cmd"
+    assert script.is_file()
+    text = script.read_text(encoding="utf-8")
+    assert "--login" in text and "gpt_images" in text
+
+
+@pytest.mark.parametrize(
+    "text", ["gpt 세션 점검", "지피티 세션 유지", "GPT 로그인 점검해줘", "지피티 유지해줘"]
+)
+def test_gpt_keepalive_patterns(text):
+    spec = parse_korean_command(text)
+    assert spec is not None and spec.task == "gpt_keepalive", text
+
+
+def test_gpt_keepalive_notifies_when_logged_out(monkeypatch):
+    from v2r.engine import worker
+
+    sent: list[str] = []
+    monkeypatch.setattr(
+        "v2r.warehouse.gpt_images.check_gpt_session",
+        lambda **k: {"ok": True, "logged_in": False, "method": "cookie-expiry", "note": ""},
+    )
+    monkeypatch.setattr(worker, "notify_all", lambda ch, text: sent.append(text) or 1)
+
+    class _RT:
+        channels = []
+
+    out = worker._gpt_keepalive(_RT(), None)
+    assert out["notified"] is True
+    assert sent == [gpt_images.RELOGIN_NOTICE]
+
+
+def test_gpt_keepalive_quiet_when_logged_in(monkeypatch):
+    from v2r.engine import worker
+
+    sent: list[str] = []
+    monkeypatch.setattr(
+        "v2r.warehouse.gpt_images.check_gpt_session",
+        lambda **k: {"ok": True, "logged_in": True, "method": "headless", "note": ""},
+    )
+    monkeypatch.setattr(worker, "notify_all", lambda ch, text: sent.append(text) or 1)
+
+    class _RT:
+        channels = []
+
+    out = worker._gpt_keepalive(_RT(), None)
+    assert "notified" not in out
+    assert sent == []
 
 
 def test_describe_mentions_gpt():

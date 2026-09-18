@@ -41,6 +41,7 @@ def test_legacy_example_sentence():
         ("일상 글 수집해줘", "collect_daily"),
         ("사진 가져와", "collect_photos"),
         ("새 사진 수거", "collect_new_photos"),
+        ("gpt 세션 점검", "gpt_keepalive"),
         ("브랜드 우아덤 키워드 단호박 사진 2개 생성", "generate_photos"),
         ("브랜드 팥순이 키워드 단호박 사진 요청", "request_photos"),
         ("사진 세탁 30장", "wash_photos"),
@@ -66,7 +67,7 @@ def test_each_task_pattern(text, task):
 
 
 def test_all_tasks_covered_by_tests():
-    assert len(ALLOWED_TASKS) == 21
+    assert len(ALLOWED_TASKS) == 22
 
 
 def test_wash_photos_count():

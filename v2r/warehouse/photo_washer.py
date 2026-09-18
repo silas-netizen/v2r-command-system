@@ -235,6 +235,57 @@ def prepare_jpeg(src: str | Path, dest: str | Path | None = None) -> Path:
     return out
 
 
+def shrink_to_width(img: Image.Image, max_width: int = MAX_VARIANT_WIDTH) -> Image.Image:
+    """가로가 `max_width`를 넘으면 비율을 지켜 줄인다. 작으면 **그대로** 둔다.
+
+    확대는 하지 않는다 (작은 원본을 늘리면 화질이 티 나게 뭉개진다).
+    """
+    width, height = img.size
+    if max_width <= 0 or width <= max_width:
+        return img
+    new_height = max(int(round(height * (max_width / float(width)))), 1)
+    return img.resize((max_width, new_height), Image.LANCZOS)
+
+
+def shrink_file_to_width(path: str | Path, max_width: int = MAX_VARIANT_WIDTH) -> bool:
+    """이미 저장된 JPEG을 자리에서 줄인다. 줄였으면 True.
+
+    EXIF는 보존한다 (세탁으로 심어 둔 카메라 메타가 날아가면 안 된다).
+    """
+    path = Path(path)
+    with Image.open(path) as opened:
+        if opened.size[0] <= max_width:
+            return False
+        exif_bytes = opened.info.get("exif")
+        resized = shrink_to_width(opened.convert("RGB"), max_width)
+    resized.save(path, format="JPEG", quality=95, subsampling=0)
+    resized.close()
+    if exif_bytes:
+        try:
+            piexif.insert(exif_bytes, str(path))
+        except Exception:  # pragma: no cover - 손상된 EXIF
+            pass
+    return True
+
+
+def resize_all_variants(washed_dir: str | Path, max_width: int = MAX_VARIANT_WIDTH) -> dict:
+    """`images/washed/` 아래 모든 세탁본을 폭 `max_width` 이하로 맞춘다 (자리 수정)."""
+    base = Path(washed_dir)
+    stats = {"scanned": 0, "resized": 0, "skipped": 0, "errors": []}
+    if not base.is_dir():
+        return stats
+    for path in sorted(base.rglob("*.jpg")):
+        stats["scanned"] += 1
+        try:
+            if shrink_file_to_width(path, max_width):
+                stats["resized"] += 1
+            else:
+                stats["skipped"] += 1
+        except Exception as exc:
+            stats["errors"].append(f"{path.name}: {exc}")
+    return stats
+
+
 def _flatten_on_white(img: Image.Image) -> Image.Image:
     """알파 채널을 흰 배경에 합성해 RGB 이미지를 만든다."""
     if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
@@ -282,6 +333,8 @@ def wash(
                 "bottom": (0, 0, width, height - 1),
             }[edge]
             image = image.crop(box)
+        # 세탁본은 언제나 폭 400px 이하 (비율 유지, 확대 없음)
+        image = shrink_to_width(image, MAX_VARIANT_WIDTH)
         quality = rng.randint(92, 96) if tweak_pixels else 95
         buffer = io.BytesIO()
         image.save(buffer, format="JPEG", quality=quality, subsampling=0)
@@ -366,6 +419,10 @@ def make_variants(
 __all__ = [
     "CAMERA_PRESETS",
     "DEFAULT_TWEAK_PIXELS",
+    "MAX_VARIANT_WIDTH",
+    "resize_all_variants",
+    "shrink_file_to_width",
+    "shrink_to_width",
     "CameraPreset",
     "WashError",
     "load_exif",

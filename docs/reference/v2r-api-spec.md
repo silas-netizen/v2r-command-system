@@ -197,3 +197,47 @@ GET /naver_cafes/heads?cafe_id=…&naver_login_id=…&menu_id=…  → 말머리
 1. 로그인 API (토큰 발급) 엔드포인트
 2. 이미지 업로드 엔드포인트
 → 브라우저 CDP 캡처 도구로 1회 탐색해 확정하는 작업을 첫 스프린트에 넣는다.
+
+## 9. 댓글 취소·추가 실측 (프런트 번들 2026-09-19)
+
+공개 프런트 번들 `https://v2r.daboja.im/assets/index-BTDlw7VX.js`를 내려받아
+`naverCafeArticle` 스토어의 정적 메서드를 그대로 뽑았다(`JM = /naver_cafe_articles`).
+**경로는 실측이고, 요청 바디 모양은 미확인**이다(바디는 지연 로드되는 화면 청크에
+들어 있고 번들 안에서는 `e`로 그대로 전달만 한다).
+
+| 화면 메서드 | HTTP | 경로 |
+|---|---|---|
+| `getArticleDetail` | GET | `/naver_cafe_articles/article` |
+| `getArticleDetailComments` | GET | `/naver_cafe_articles/comments` (params: `cafe_id, article_id, naver_login_id, page`, v2는 `order_by, cafe_url` 추가) |
+| `addArticle` / `addSeoneArticle` | POST | `/naver_cafe_articles/naver_cafe_article_source` |
+| `updateArticle` / `updateSeoneArticle` | **PUT** | `/naver_cafe_articles/article` |
+| `deleteArticle` | POST | `/naver_cafe_articles/article/delete` |
+| `syncArticle` | POST | `/naver_cafe_articles/article/sync` |
+| `syncComments` | POST | `/naver_cafe_articles/comments/sync` |
+| `createInstantComment` | POST | `/naver_cafe_articles/comment` |
+| `updateInstantComment` | PUT | `/naver_cafe_articles/comment` |
+| `createInstantReplyComment` | POST | `/naver_cafe_articles/comment/reply` |
+| `deleteInstantComment` | POST | `/naver_cafe_articles/comment/delete` |
+| `deleteStaffArticleDetailComment` | POST | `/naver_cafe_articles/staff_board/comment/delete` |
+| `createCommentByAi` | POST | `/naver_cafe_articles/comments/by_ai` |
+| `recoverArticle` | POST | `/naver_cafe_articles/article/recover` |
+| `deleteNaverWrittenArticle` | POST | `/naver_cafe_articles/article/delete_in_direct` |
+
+읽어낸 것:
+
+- **댓글 단위 엔드포인트는 존재한다.** 다만 `Instant*` 계열은 이름·파라미터
+  (`article_id`, `cafe_id`, `naver_login_id`)로 보아 **이미 네이버에 올라간 글의
+  실시간 댓글**을 다루는 쪽이다. 우리가 고쳐야 하는 건 아직 `RESERVED` 상태인
+  **source 댓글**이라 같은 경로인지 확인되지 않았다.
+- **예약 상태 글·댓글의 수정 경로는 `PUT /naver_cafe_articles/article`** 로 보인다
+  (등록 화면의 "수정"이 이 메서드를 쓴다). 등록(POST)과 같은 바디에
+  `source_id`를 얹는 형태일 가능성이 높으나 **미검증**이다.
+- 번들의 오류 문구로 미루어 서버는 예약 댓글 취소를 인지한다:
+  `"원본 댓글이 삭제되어 댓글 등록에 실패했습니다"`(cancelCommentReserve),
+  `"원글이 삭제되어 댓글/답글 발행이 취소되었습니다"`(notFountArticle)
+  → **원글을 지우면 딸린 예약 댓글도 함께 취소**된다.
+- `POST /naver_cafe_articles/article/recover`(복구)가 있어 삭제가 완전 파괴는
+  아닐 수 있으나, 이 역시 바디 미확인.
+
+→ 결론: 예약 댓글만 골라 취소/추가하는 경로는 **확정하지 못했다**. 실제 수리는
+바디 모양을 한 번 캡처(브라우저 CDP)해 확정한 뒤에 하는 것이 안전하다.

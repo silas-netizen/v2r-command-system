@@ -23,6 +23,7 @@ ALLOWED_TASKS: frozenset[str] = frozenset(
         "collect_photos",
         "collect_new_photos",
         "generate_photos",
+        "gpt_keepalive",
         "request_photos",
         "wash_photos",
         "learn_guides",

@@ -9,6 +9,7 @@ import piexif
 import pytest
 from PIL import Image
 
+from v2r.warehouse import photo_washer
 from v2r.warehouse.photo_washer import (
     CAMERA_PRESETS,
     WashError,
@@ -177,3 +178,98 @@ def test_wash_png_source(tmp_path: Path):
 def test_wash_missing_file_raises(tmp_path: Path):
     with pytest.raises((FileNotFoundError, WashError, OSError)):
         wash(tmp_path / "nope.jpg", tmp_path / "x.jpg", random.Random(0))
+
+
+# --- 폭 400px 규칙 --------------------------------------------------------
+def test_wash_output_is_at_most_400_wide(tmp_path: Path):
+    """세탁본은 언제나 폭 400px 이하 (비율 유지)."""
+    src = _make_jpeg(tmp_path / "big.jpg", size=(1600, 1200))
+    out = photo_washer.wash(src, tmp_path / "out.jpg")
+    with Image.open(out) as img:
+        assert img.size[0] <= photo_washer.MAX_VARIANT_WIDTH
+        # 비율 유지 (4:3 → 400x300 근처)
+        assert abs(img.size[0] / img.size[1] - 1600 / 1200) < 0.02
+
+
+def test_wash_does_not_upscale_small_images(tmp_path: Path):
+    src = _make_jpeg(tmp_path / "small.jpg", size=(160, 120))
+    out = photo_washer.wash(src, tmp_path / "out.jpg")
+    with Image.open(out) as img:
+        assert img.size[0] <= 160
+
+
+def test_all_variants_are_at_most_400_wide(tmp_path: Path):
+    src = _make_jpeg(tmp_path / "big.jpg", size=(2000, 1500))
+    made = photo_washer.make_variants(src, 3, tmp_path / "washed")
+    assert len(made) == 3
+    for path in made:
+        with Image.open(path) as img:
+            assert img.size[0] <= photo_washer.MAX_VARIANT_WIDTH, path
+
+
+def test_shrink_to_width_keeps_aspect_and_never_upscales():
+    big = Image.new("RGB", (1000, 500))
+    assert photo_washer.shrink_to_width(big, 400).size == (400, 200)
+    small = Image.new("RGB", (200, 100))
+    assert photo_washer.shrink_to_width(small, 400).size == (200, 100)
+
+
+def test_shrink_file_keeps_exif(tmp_path: Path):
+    src = _make_jpeg(tmp_path / "big.jpg", size=(1200, 900))
+    washed = photo_washer.wash(src, tmp_path / "w.jpg")
+    # 일부러 다시 키운 옛 세탁본을 흉내낸다
+    with Image.open(washed) as img:
+        exif = img.info.get("exif")
+        img.resize((1200, 900)).save(washed, format="JPEG", quality=95, exif=exif or b"")
+    before = photo_washer.read_camera_meta(washed)
+
+    assert photo_washer.shrink_file_to_width(washed) is True
+    with Image.open(washed) as img:
+        assert img.size[0] == 400
+    after = photo_washer.read_camera_meta(washed)
+    assert after["Make"] == before["Make"] and after["Model"] == before["Model"]
+    # 이미 작으면 다시 줄이지 않는다
+    assert photo_washer.shrink_file_to_width(washed) is False
+
+
+def test_resize_all_variants_walks_tree(tmp_path: Path):
+    washed_dir = tmp_path / "washed"
+    src = _make_jpeg(tmp_path / "s.jpg", size=(800, 600))
+    for sha in ("aa", "bb"):
+        folder = washed_dir / sha
+        folder.mkdir(parents=True)
+        for i in range(2):
+            with Image.open(src) as img:
+                img.save(folder / f"{i}.jpg", format="JPEG", quality=95)
+
+    stats = photo_washer.resize_all_variants(washed_dir)
+    assert stats["scanned"] == 4
+    assert stats["resized"] == 4
+    assert not stats["errors"]
+    for path in washed_dir.rglob("*.jpg"):
+        with Image.open(path) as img:
+            assert img.size[0] == 400
+    # 두 번째 실행은 손댈 게 없다
+    assert photo_washer.resize_all_variants(washed_dir)["resized"] == 0
+
+
+def test_pick_variant_shrinks_legacy_wide_variant(tmp_path: Path):
+    from v2r.warehouse.store import Warehouse, sha256
+
+    wh = Warehouse(tmp_path / "wh")
+    wh.ensure_dirs()
+    (wh.originals_dir / "브랜드" / "키워드").mkdir(parents=True, exist_ok=True)
+    original = _make_jpeg(wh.originals_dir / "브랜드" / "키워드" / "a.jpg", size=(900, 600))
+    sha = sha256(original)
+    folder = wh.washed_folder(sha)
+    folder.mkdir(parents=True, exist_ok=True)
+    photo_washer.wash(original, folder / "0.jpg")
+    # 옛 규칙으로 저장된 넓은 세탁본을 흉내낸다
+    with Image.open(folder / "0.jpg") as img:
+        exif = img.info.get("exif")
+        img.resize((900, 600)).save(folder / "0.jpg", format="JPEG", quality=95, exif=exif or b"")
+
+    picked = wh.pick_variant(sha, set())
+    assert picked is not None
+    with Image.open(picked) as img:
+        assert img.size[0] <= photo_washer.MAX_VARIANT_WIDTH

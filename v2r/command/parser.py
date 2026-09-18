@@ -17,6 +17,7 @@ TASK_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("generate_daily", re.compile(r"일상\s*글.*(생성|만들어)")),
     ("collect_daily", re.compile(r"일상\s*글.*(수집|가져와)")),
     ("collect_new_photos", re.compile(r"새\s*(사진|이미지)\s*(수거|회수|가져오기|가져와)")),
+    ("gpt_keepalive", re.compile(r"(gpt|지피티).*(유지|점검)", re.I)),
     # GPT 웹앱으로 직접 생성 (요청서 발송인 `request_photos`보다 앞선다)
     ("generate_photos", re.compile(r"(사진|이미지).*(생성|만들어)")),
     ("request_photos", re.compile(r"(사진|이미지).*(요청|필요)")),
@@ -134,6 +135,7 @@ _NO_SLOT_TASKS = frozenset(
         "inspect_failures",
         "catalog",
         "cleanup_orphans",
+        "gpt_keepalive",
     }
 )
 
@@ -330,6 +332,7 @@ TASK_LABELS: dict[str, str] = {
     "collect_photos": "사진 수집",
     "collect_new_photos": "새 사진 수거",
     "generate_photos": "사진 생성(GPT)",
+    "gpt_keepalive": "GPT 세션 점검",
     "request_photos": "사진 요청",
     "wash_photos": "사진 세탁",
     "learn_guides": "지침 학습",

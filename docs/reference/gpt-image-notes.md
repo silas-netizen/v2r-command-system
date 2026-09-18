@@ -75,7 +75,41 @@ generate_batch(브랜드, 키워드, n)   # 프롬프트 n개 → inbox/new/<브
    JPEG 품질 86~93 재압축(약한 세대 손실).
 3. **세탁** — 이어지는 `photo_washer.wash`가 랜덤 EXIF(카메라/렌즈/촬영일시/시리얼)를 심는다.
 
+## 4-1. 폭 400px 규칙 (발행에 붙는 사진)
+
+생성물은 긴 변 1024px로 만들지만, **세탁본(= 실제로 글에 붙는 파일)은 폭 400px
+이하**다. 비율은 유지하고 **작은 건 절대 늘리지 않는다**.
+
+- `photo_washer.MAX_VARIANT_WIDTH = 400`
+- `wash()` — 크롭 직후 `shrink_to_width()`를 거쳐 저장한다 → `make_variants()`도 자동 적용
+- `Warehouse.pick_variant()` — 옛 세탁본이 더 넓으면 돌려주기 전에 자리에서 줄인다(방어선)
+- `resize_all_variants(washed_dir)` — 기존 세탁본 일괄 정리(자리 수정, EXIF 보존)
+
+일괄 정리 실측(2026-09-19): 세탁본 3,240장 중 **336장이 400px 초과 → 전부 축소**,
+2,904장은 이미 규격(건드리지 않음), 오류 0건. 정리 후 최대 폭 400px.
+표본 400장 EXIF 재확인 결과 카메라 메타 유실 0건.
+
+```powershell
+.\.venv\Scripts\python.exe -c "from v2r.warehouse.photo_washer import resize_all_variants; print(resize_all_variants('warehouse/images/washed'))"
+```
+
+## 4-2. 세션 점검 / 킵얼라이브
+
+- `check_gpt_session()` — 비밀번호 없이 로그인 상태만 본다.
+  1차 헤드리스로 입력창 확인 → Cloudflare 등으로 막히면 2차로 프로필 쿠키의
+  **만료 시각만** 읽어 판정한다. **쿠키 값은 읽지도 찍지도 않는다.**
+  반환: `logged_in`, `method`(`headless`/`cookie-expiry`), `expires_in_days`, `note`.
+- 명령 `gpt 세션 점검` / `지피티 세션 유지` → 작업 `gpt_keepalive`
+  (파서 `(gpt|지피티).*(유지|점검)`). 로그인이 풀려 있으면 텔레그램으로
+  `ChatGPT 로그인이 풀렸습니다. PC에서 scripts\gpt-login.cmd 를 실행해 다시 로그인해 주세요` 발송.
+
 ## 5. 다시 로그인하는 법
+
+가장 쉬운 방법: 바탕화면에서 **`scripts\gpt-login.cmd` 를 더블클릭**한다.
+(.venv 활성화 → `python -m v2r.warehouse.gpt_images --login` → 창이 뜨면 직접 로그인,
+최대 15분 대기. 반드시 본인이 로그인한 윈도우 세션에서 실행할 것.)
+
+수동 절차:
 
 1. 세션이 풀리면 `generate_photos` 실행 시 창이 열리고 콘솔에
    `브라우저 창에서 ChatGPT에 직접 로그인해 주세요` 가 뜬다.
@@ -85,11 +119,32 @@ generate_batch(브랜드, 키워드, n)   # 프롬프트 n개 → inbox/new/<브
 4. 프로필이 깨졌다 싶으면 `data/browser-profile-gpt/` 폴더를 통째로 지우고
    1번부터 다시 한다. (지우면 로그인도 같이 날아간다)
 
-수동으로 로그인만 해 두려면:
+세션이 살아 있는지만 보려면 (창 안 뜸):
 
 ```powershell
-.\.venv\Scripts\python.exe -c "from v2r.warehouse.gpt_images import open_gpt, wait_for_login; p,c,pg=open_gpt(); print(wait_for_login(pg, 900))"
+.\.venv\Scripts\python.exe -m v2r.warehouse.gpt_images --check
 ```
+
+## 5-1. 매일 09:00 세션 점검 (작업 스케줄러)
+
+등록 명령 — **사용자가 직접 한 번 실행**한다 (관리자 권한 명령 프롬프트):
+
+```cmd
+schtasks /Create /TN "V2R-GptKeepalive" /SC DAILY /ST 09:00 ^
+  /TR "\"D:\v2r 자동화\v2r-command-system\.venv\Scripts\python.exe\" -m v2r \"gpt 세션 점검\"" ^
+  /RL LIMITED /F
+```
+
+확인 / 수동 실행 / 삭제:
+
+```cmd
+schtasks /Query  /TN "V2R-GptKeepalive" /V /FO LIST
+schtasks /Run    /TN "V2R-GptKeepalive"
+schtasks /Delete /TN "V2R-GptKeepalive" /F
+```
+
+로그인이 풀려 있으면 텔레그램으로 안내가 오고, `scripts\gpt-login.cmd`를
+실행해 다시 로그인하면 된다.
 
 ## 6. 결과 파일
 

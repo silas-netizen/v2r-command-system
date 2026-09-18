@@ -644,6 +644,11 @@ def test_모든_허용작업에_처리기가_있다(tmp_path, monkeypatch):
     monkeypatch.setattr("v2r.browser.session.open_site", lambda **k: (None, None, object()))
     monkeypatch.setattr("v2r.browser.session.ensure_logged_in", lambda page, site=None, **k: True)
     monkeypatch.setattr("v2r.browser.session.close", lambda *a, **k: None)
+    # GPT 세션 점검이 진짜 브라우저를 띄우지 않게 막는다
+    monkeypatch.setattr(
+        "v2r.warehouse.gpt_images.check_gpt_session",
+        lambda **k: {"ok": True, "logged_in": True, "method": "test", "note": ""},
+    )
 
     for index, task in enumerate(sorted(ALLOWED_TASKS)):
         spec = TaskSpec(

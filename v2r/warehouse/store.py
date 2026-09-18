@@ -383,12 +383,21 @@ class Warehouse:
 
         **규칙 0**: 여기서 나오는 경로는 반드시 `images/washed/` 아래다.
         세탁 안 된 원본은 어떤 경우에도 돌려주지 않는다.
+
+        **폭 400px 규칙**: 옛 세탁본이 더 넓으면 돌려주기 전에 자리에서 줄인다
+        (비율 유지, 확대 없음). 붙는 사진은 언제나 400px 이하다.
         """
         for variant in self.washed_variants(sha):
             if variant.stem in used or str(variant) in used:
                 continue
             if not self.is_washed(variant):  # pragma: no cover - 방어적 검사
                 continue
+            try:
+                from v2r.warehouse.photo_washer import shrink_file_to_width
+
+                shrink_file_to_width(variant)
+            except Exception:  # pragma: no cover - 축소 실패해도 발행은 막지 않는다
+                pass
             return variant
         return None
 
