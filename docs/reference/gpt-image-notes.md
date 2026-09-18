@@ -30,12 +30,32 @@ generate_batch(브랜드, 키워드, n)   # 프롬프트 n개 → inbox/new/<브
 
 | 용도 | 상수 | 후보 |
 | --- | --- | --- |
+| 계정 메뉴/아바타 (**로그인 판정**) | `ACCOUNT_SELECTORS` | `[data-testid='profile-button']`, `button[aria-label*='profile' i]`, `button[aria-label*='계정']`, `img[alt*='User' i]`, `[data-testid='accounts-profile-button']` |
+| 로그아웃 표시 | `LOGGED_OUT_SELECTORS` | `[data-testid='login-button']`, `button:has-text('Log in')`, `button:has-text('로그인')`, `button:has-text('회원가입')` … |
+| 어시스턴트 응답 (`gpt_chat`) | `ASSISTANT_SELECTORS` | `[data-message-author-role='assistant']`, `div[data-testid^='conversation-turn'] .markdown`, `main .agent-turn` |
+| 생성 중 표시 (`gpt_chat`) | `STREAMING_SELECTORS` | `button[data-testid='stop-button']`, `button[aria-label*='Stop' i]`, `button[aria-label*='중지']` |
 | 프롬프트 입력창 | `COMPOSER_SELECTORS` | `#prompt-textarea`, `div[contenteditable='true']#prompt-textarea`, `textarea[data-id='root']`, `form div[contenteditable='true']`, `main textarea` |
 | 전송 | `SEND_SELECTORS` | `button[data-testid='send-button']`, `button[aria-label='Send prompt']`, `button[aria-label='프롬프트 보내기']`, `form button[type='submit']` → 전부 실패하면 `Enter` 키 |
 | 결과 이미지 | `IMAGE_SELECTORS` | `img[alt*='Generated' i]`, `div[data-testid^='conversation-turn'] img[src^='http']`, `main img[src*='oaiusercontent']`, `main img[src^='blob:']` |
 | 원본 내려받기 | `DOWNLOAD_SELECTORS` | `[data-testid='image-gen-download-button']`, `button[aria-label*='Download' i]`, `button[aria-label*='다운로드']`, `a[download]` |
 
-로그인 완료 판정은 "입력창이 보이는가" 하나로 한다(`LOGIN_DONE_SELECTORS`).
+### 로그인 판정 (`is_logged_in`) — 중요
+
+**입력창으로 판정하면 안 된다.** chatgpt.com은 **로그아웃 방문자에게도 입력창을
+보여 준다.** 예전 판정이 이것만 봐서 로그인 전에도 "로그인 완료"로 오인했고,
+`--login` 창이 뜨자마자 닫혀 버렸다(2026-09-19 실사용 증상).
+
+지금은 세 조건을 **모두** 만족해야 로그인으로 본다.
+
+1. `로그인`/`Log in`/`회원가입`/`Sign up` 버튼이 **안 보인다** (`LOGGED_OUT_SELECTORS`)
+2. 계정 메뉴/아바타가 **있다** (`ACCOUNT_SELECTORS`)
+3. URL이 `/auth/login`·`/auth/signup`·`auth0.openai.com`이 **아니다** (`AUTH_URL_MARKERS`)
+
+`wait_for_login`과 `check_gpt_session` 둘 다 이 함수를 쓴다. 대기 중에는 30초마다
+`아직 로그인 전입니다. 창에서 로그인해 주세요`를 찍고, `--login` 창은 **진짜
+로그인이 확인될 때까지(최대 15분) 닫지 않는다.**
+
+브라우저는 설치된 크롬 → 엣지 → 내장 크로미움 순으로 시도한다(`open_gpt`).
 
 이미지 획득 순서: ① 내려받기 버튼(원본 화질) → 실패하면 ② `img.currentSrc`를
 `page.request.get()` 또는 `blob:`/`data:`면 페이지 안 `fetch`로 직접 읽는다.
@@ -102,6 +122,26 @@ generate_batch(브랜드, 키워드, n)   # 프롬프트 n개 → inbox/new/<브
 - 명령 `gpt 세션 점검` / `지피티 세션 유지` → 작업 `gpt_keepalive`
   (파서 `(gpt|지피티).*(유지|점검)`). 로그인이 풀려 있으면 텔레그램으로
   `ChatGPT 로그인이 풀렸습니다. PC에서 scripts\gpt-login.cmd 를 실행해 다시 로그인해 주세요` 발송.
+
+## 4-3. 제휴 카페 일상 글 생성 (`gpt_chat`)
+
+제휴 카페(씨씨앙·양평맘·쌍둥이맘) 일상 글은 **자사 카페 xlsx 일상 글과 완전히
+별개**이고, ChatGPT 웹 세션으로만 만든다(**API 토큰 0**).
+
+- `gpt_chat.ask(page, prompt, timeout=120)` — 프롬프트를 보내고 스트리밍이 끝날
+  때까지 기다렸다가 마지막 어시스턴트 메시지를 돌려준다. 종료 판정은
+  "중지 버튼이 사라졌고 + 텍스트가 2회 연속 동일". 한도 문구면 `GptLimitError`.
+- `daily_generator.generate_affiliate_pool_via_gpt(cafes, per_cafe)` →
+  `warehouse/manuscripts/affiliate_daily_pool.jsonl` (append, `content_hash` 중복 제거)
+- 규칙: 제목 1줄 ≤20자 + 본문 1줄 ≤40자, 쉼표·마침표·말줄임표 금지,
+  `ㅋㅋ`/`ㅠㅠ` 허용(이모지 금지), 브랜드명 금지, 상황 중심 반말 수다체.
+  (`AFFILIATE_RULES`, 지침 `제휴 게시판(소재 포함) 일상 글 작성.md` 요약)
+- 응답은 `제목: …` / `본문: …` 형식으로 받아 `parse_affiliate_reply`가
+  길이·문장부호를 검증하고 **통과한 것만** 담는다.
+- 명령: `제휴 일상 글 20개 만들어줘` → 작업 `generate_affiliate_daily`
+  (파서 `제휴.*일상\s*글.*(생성|만들어)`, 기존 `generate_daily`보다 앞).
+- 발행 쪽 `publish._daily_pool`은 이제 **이 풀만** 읽는다. 풀이 비었을 때만
+  옛 `랜덤일상` 시트로 되돌아가며 그때 경고 로그를 남긴다.
 
 ## 5. 다시 로그인하는 법
 

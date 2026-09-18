@@ -242,6 +242,41 @@ def _collect_photos(rt: Runtime, spec: TaskSpec) -> dict:
     return {"ok": not stats["errors"], "inbox": str(inbox), **stats}
 
 
+def _affiliate_cafes(rt: Runtime) -> list[str]:
+    """설정의 제휴 카페 이름 목록 (씨씨앙·양평맘·쌍둥이맘)."""
+    out: list[str] = []
+    for entry in (rt.cafes_cfg or {}).get("affiliate") or []:
+        name = (entry or {}).get("name") if isinstance(entry, dict) else None
+        if name:
+            out.append(str(name))
+    return out
+
+
+def _generate_affiliate_daily(rt: Runtime, spec: TaskSpec) -> dict:
+    """제휴 카페 일상 글을 ChatGPT 웹 세션으로 만든다 (API 토큰 0)."""
+    from v2r.warehouse import daily_generator
+
+    cafes = [spec.cafe] if spec.cafe else _affiliate_cafes(rt)
+    if not cafes:
+        return {"ok": False, "error": "제휴 카페를 찾을 수 없습니다 (cafes 설정을 확인하세요)"}
+    count = spec.count or daily_generator.AFFILIATE_BATCH_SIZE
+    per_cafe = max(1, -(-count // max(len(cafes), 1)))  # 올림 나눗셈
+    out = daily_generator.generate_affiliate_pool_via_gpt(
+        cafes, per_cafe, warehouse_dir=rt.warehouse.root
+    )
+    if out.get("login_pending"):
+        notify_all(rt.channels, f"ChatGPT {out['message']}")
+    elif out.get("added"):
+        notify_all(
+            rt.channels,
+            f"제휴 일상 글 {out['added']}건 생성 (카페 {', '.join(out['cafes'])})",
+        )
+    out["pool_total"] = len(
+        daily_generator.load_pool(rt.warehouse.root, daily_generator.AFFILIATE_POOL_FILENAME)
+    )
+    return out
+
+
 def _generate_daily(rt: Runtime, spec: TaskSpec) -> dict:
     """짧은 일상 글을 만들어 창고 풀에 쌓는다 (결정 2)."""
     from v2r.warehouse import daily_generator
@@ -665,6 +700,8 @@ def dispatch(rt: Runtime, job: Any, owner: str | None = None) -> dict:
     if task == "sync_all_sources":
         out = _sync_entries(rt, spec, all_kinds=True)
         return {"ok": not out.get("errors"), **out}
+    if task == "generate_affiliate_daily":
+        return _generate_affiliate_daily(rt, spec)
     if task == "generate_daily":
         return _generate_daily(rt, spec)
     if task == "collect_daily":

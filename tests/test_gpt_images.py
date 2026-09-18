@@ -395,3 +395,94 @@ def test_describe_mentions_gpt():
     text = describe_spec(spec)
     assert "사진 생성(GPT)" in text
     assert "브랜드 우아덤" in text and "키워드 단호박" in text
+
+
+# --- gpt_chat.ask (스트리밍 종료 판정) --------------------------------------
+class _ChatPage:
+    """텍스트가 점점 늘다가 멈추는 가짜 응답 페이지."""
+
+    def __init__(self, frames, streaming_until=1):
+        self.url = "https://chatgpt.com/"
+        self._frames = list(frames)
+        self._i = -1
+        self._streaming_until = streaming_until
+        self.submitted = []
+        self.keyboard = self
+        self.wait_for_timeout = lambda ms: None
+
+    # gpt_images._submit 이 쓰는 최소 API
+    def locator(self, selector):
+        page = self
+
+        class _Loc:
+            @property
+            def first(self):
+                return self
+
+            @property
+            def last(self):
+                return self
+
+            def is_visible(self, timeout=0):
+                if "stop" in selector.lower() or "중지" in selector:
+                    return page._i < page._streaming_until
+                return selector == "#prompt-textarea"
+
+            def is_enabled(self, timeout=0):
+                return True
+
+            def click(self):
+                pass
+
+            def fill(self, text):
+                pass
+
+            def count(self):
+                return 1 if selector == "[data-message-author-role='assistant']" else 0
+
+            def nth(self, i):
+                return self
+
+            def inner_text(self, timeout=0):
+                if selector == "main":
+                    return "정상 응답"
+                page._i = min(page._i + 1, len(page._frames) - 1)
+                return page._frames[page._i]
+
+        return _Loc()
+
+    def insert_text(self, text):
+        self.submitted.append(text)
+
+    def press(self, key):
+        pass
+
+
+def test_ask_returns_finished_reply(monkeypatch):
+    from v2r.warehouse import gpt_chat
+
+    monkeypatch.setattr(gpt_chat.time, "sleep", lambda s: None)
+    page = _ChatPage(["제목: 하", "제목: 하나\n본문: 글", "제목: 하나\n본문: 글이다",
+                      "제목: 하나\n본문: 글이다", "제목: 하나\n본문: 글이다"],
+                     streaming_until=2)
+    out = gpt_chat.ask(page, "테스트 프롬프트", timeout=30, poll=0)
+    assert out == "제목: 하나\n본문: 글이다"
+    assert page.submitted and "테스트 프롬프트" in page.submitted[0]
+
+
+def test_ask_raises_on_limit(monkeypatch):
+    from v2r.warehouse import gpt_chat
+
+    monkeypatch.setattr(gpt_chat.time, "sleep", lambda s: None)
+    monkeypatch.setattr(gpt_chat, "_page_text", lambda page: "You've hit the usage limit")
+    page = _ChatPage(["아무거나"])
+    with pytest.raises(gpt_images.GptLimitError):
+        gpt_chat.ask(page, "프롬프트", timeout=10, poll=0)
+
+
+def test_ask_needs_composer(monkeypatch):
+    from v2r.warehouse import gpt_chat
+
+    monkeypatch.setattr(gpt_chat, "composer", lambda page, timeout_ms=0: None)
+    with pytest.raises(gpt_chat.GptChatError):
+        gpt_chat.ask(object(), "프롬프트", timeout=5)
