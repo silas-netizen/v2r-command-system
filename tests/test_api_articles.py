@@ -262,6 +262,73 @@ def _detail(body: str, **over) -> dict:
     return base
 
 
+def _flat_live_comments() -> list[dict]:
+    """라이브 응답 모양: 루트 5 + 답글 7 = 12개가 한 배열에 평탄하게 담긴다."""
+    out: list[dict] = []
+    for r in range(5):
+        root_id = f"ROOT-{r}"
+        out.append({"comment_id": root_id, "parent_comment_id": None, "comments": []})
+        for k in range(2 if r < 2 else 1):
+            out.append(
+                {
+                    "comment_id": f"REPLY-{r}-{k}",
+                    "parent_comment_id": root_id,
+                    "comments": [],
+                }
+            )
+    return out
+
+
+def _nested_payload_comments() -> list[dict]:
+    """등록 요청 모양: 답글이 루트의 `comments`에 중첩된 5개 루트."""
+    return [
+        {
+            "contents": f"root{r}",
+            "comments": [{"contents": f"reply{r}-{k}"} for k in range(2 if r < 2 else 1)],
+        }
+        for r in range(5)
+    ]
+
+
+def test_count_comment_nodes_flat_and_nested_agree() -> None:
+    assert len(_flat_live_comments()) == 12
+    assert len(_nested_payload_comments()) == 5
+    assert articles.count_comment_nodes(_flat_live_comments()) == 12
+    assert articles.count_comment_nodes(_nested_payload_comments()) == 12
+    assert articles.count_comment_nodes([]) == 0
+    assert articles.count_comment_nodes(None) == 0
+
+
+def _verify_comments(detail_comments: list[dict], expected: int) -> list[str]:
+    body = seone.content_json("첫 줄", [])
+    detail = _detail(body, naver_cafe_article_source_comments=detail_comments)
+    return articles.verify_article(
+        detail,
+        title="제목",
+        tags=["a", "b"],
+        menu_id=328,
+        head_id=None,
+        body_lines=["첫 줄"],
+        image_count=0,
+        start_at=datetime(2026, 8, 31, 1, 30, tzinfo=timezone.utc),
+        comments_count=expected,
+    )
+
+
+def test_verify_article_counts_replies_in_flat_live_shape() -> None:
+    # 실제 라이브(잡 41)에서 났던 "12 != 5" 회귀: 기대값도 전체 노드 수여야 한다
+    assert _verify_comments(_flat_live_comments(), 12) == []
+
+
+def test_verify_article_counts_replies_in_nested_shape() -> None:
+    assert _verify_comments(_nested_payload_comments(), 12) == []
+
+
+def test_verify_article_still_strict_on_comment_total() -> None:
+    problems = _verify_comments(_flat_live_comments()[:-1], 12)
+    assert any("댓글 개수 불일치: 11 != 12" in p for p in problems)
+
+
 def test_verify_article_ok() -> None:
     img = {"@ctype": "image", "id": "SE-1", "src": "http://x/a.jpg", "fileSize": 100}
     body = seone.content_json("첫 줄\n{사진}\n끝", [img])

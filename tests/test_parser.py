@@ -40,6 +40,8 @@ def test_legacy_example_sentence():
         ("일상 글 30개 만들어줘", "generate_daily"),
         ("일상 글 수집해줘", "collect_daily"),
         ("사진 가져와", "collect_photos"),
+        ("새 사진 수거", "collect_new_photos"),
+        ("브랜드 팥순이 키워드 단호박 사진 요청", "request_photos"),
         ("사진 세탁 30장", "wash_photos"),
         ("메이크 지침 학습해줘", "learn_guides"),
         ("로그인 창 열어줘", "open_login"),
@@ -61,12 +63,54 @@ def test_each_task_pattern(text, task):
 
 
 def test_all_tasks_covered_by_tests():
-    assert len(ALLOWED_TASKS) == 17
+    assert len(ALLOWED_TASKS) == 19
 
 
 def test_wash_photos_count():
     spec = parse_korean_command("사진 세탁 30장", now=NOW)
     assert spec.count == 30
+
+
+def test_wash_photos_per_original_and_brand():
+    spec = parse_korean_command("사진 세탁 3장씩", now=NOW)
+    assert spec.task == "wash_photos"
+    assert spec.count == 3
+    assert spec.brand == ""
+
+    brandy = parse_korean_command("팥순이 사진 세탁", now=NOW)
+    assert brandy.task == "wash_photos"
+    assert brandy.brand == "팥순이"
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["사진 요청", "이미지 필요해", "브랜드 코숨핏 사진이 필요합니다", "이미지 요청해줘"],
+)
+def test_request_photos_patterns(text):
+    spec = parse_korean_command(text, now=NOW)
+    assert spec is not None, text
+    assert spec.task == "request_photos"
+
+
+def test_request_photos_slots():
+    spec = parse_korean_command("브랜드 팥순이 키워드 단호박샐러드 사진 요청", now=NOW)
+    assert spec.task == "request_photos"
+    assert spec.brand == "팥순이"
+    assert spec.keyword == "단호박샐러드"
+    assert "키워드 단호박샐러드" in describe_spec(spec)
+
+
+def test_collect_new_photos_pattern():
+    for text in ("새 사진 수거", "새 이미지 수거해줘", "새사진 가져와"):
+        spec = parse_korean_command(text, now=NOW)
+        assert spec is not None, text
+        assert spec.task == "collect_new_photos", text
+
+
+def test_brand_slot_does_not_hijack_publish_brand():
+    spec = parse_korean_command("브랜드 글 올려줘", now=NOW)
+    assert spec.task == "publish_brand"
+    assert spec.brand == ""
 
 
 def test_real_publish_turns_off_dry_run():

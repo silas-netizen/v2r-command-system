@@ -23,6 +23,10 @@ log = logging.getLogger(__name__)
 
 PUBLISH_TASKS = {"publish_daily", "publish_brand", "publish_info", "publish_batch"}
 DEFAULT_WASH_COUNT = 10
+#: `사진 세탁`에서 원본 1장당 만들 세탁본 수 (계획 2026-09-19)
+DEFAULT_PER_ORIGINAL = 3
+#: 한 번의 세탁 작업에서 새로 만들 수 있는 변형 수 상한(안전장치)
+DEFAULT_MAX_NEW = 3000
 _URL_RE = re.compile(r"https?://\S+")
 _COUNTER = itertools.count(1)
 
@@ -283,29 +287,147 @@ def _daily_target_cafes(rt: Runtime) -> list[str]:
 
 
 def _wash_photos(rt: Runtime, spec: TaskSpec) -> dict:
-    from v2r.warehouse.photo_washer import make_variants
+    """`images/originals/<브랜드>/<폴더>`를 전부 돌며 원본당 세탁본 수를 맞춘다.
 
-    count = spec.count or DEFAULT_WASH_COUNT
+    - `사진 세탁 3장씩` → 원본 1장당 세탁본 3장 (`per_original`, 기본 3)
+    - `팥순이 사진 세탁` → 그 브랜드만
+    - 이미 충분한 원본은 건너뛴다(재실행 가능: 멈춘 지점부터 이어서 채운다)
+    - `max_new`장을 만들면 안전하게 멈춘다(기본 3000)
+    """
+    from v2r.warehouse import stock
+    from v2r.warehouse.photo_washer import make_variants
+    from v2r.warehouse.store import _squash
+
+    per_original = spec.count or DEFAULT_PER_ORIGINAL
+    max_new = int(rt.scratch.get("wash_max_new") or DEFAULT_MAX_NEW)
     wh = rt.warehouse
     wh.ensure_dirs()
-    originals = wh.list_originals(spec.brand) if spec.brand else wh.list_originals()
-    made, skipped, errors = 0, 0, []
-    for original in originals:
-        sha = wh.sha256(original)
-        if wh.washed_variants(sha):
-            skipped += 1
-            continue
-        try:
-            made += len(make_variants(original, count, wh.washed_folder(sha)))
-        except Exception as exc:
-            errors.append(f"{original.name}: {exc}")
-    return {
+
+    brand_key = _squash(spec.brand) if spec.brand else ""
+    folders = [
+        (brand, folder, files)
+        for brand, folder, files in stock.iter_folders(wh)
+        if not brand_key or _squash(brand) == brand_key
+    ]
+
+    started = time.monotonic()
+    made = seen = skipped = 0
+    errors: list[str] = []
+    report: list[dict] = []
+    stopped = False
+
+    for brand, folder, originals in folders:
+        created = total = 0
+        for original in originals:
+            seen += 1
+            if seen % 100 == 0:
+                log.info(
+                    "사진 세탁 진행: 원본 %d장 확인, 변형 %d장 생성 (%.0f초)",
+                    seen,
+                    made,
+                    time.monotonic() - started,
+                )
+            try:
+                sha = wh.sha256(original)
+            except OSError as exc:
+                errors.append(f"{brand}/{folder}/{original.name}: {exc}")
+                continue
+            have = len(wh.washed_variants(sha))
+            if have >= per_original:
+                skipped += 1
+                total += have
+                continue
+            if made >= max_new:
+                stopped = True
+                total += have
+                continue
+            need = min(per_original - have, max_new - made)
+            try:
+                new = make_variants(original, need, wh.washed_folder(sha))
+            except Exception as exc:
+                errors.append(f"{brand}/{folder}/{original.name}: {exc}")
+                total += have
+                continue
+            created += len(new)
+            made += len(new)
+            total += have + len(new)
+        report.append(
+            {
+                "brand": brand,
+                "folder": folder,
+                "originals": len(originals),
+                "created": created,
+                "variants": total,
+            }
+        )
+        if stopped:
+            break
+
+    out = {
         "ok": not errors,
-        "originals": len(originals),
+        "per_original": per_original,
+        "originals": seen,
         "variants": made,
         "skipped": skipped,
+        "folders": report,
+        "elapsed_sec": round(time.monotonic() - started, 1),
         "errors": errors,
     }
+    if stopped:
+        out["stopped"] = True
+        out["message"] = (
+            f"안전 한도 {max_new}장에 도달해 멈췄습니다. 같은 명령을 다시 실행하면 이어서 채웁니다."
+        )
+    return out
+
+
+def _request_photos(rt: Runtime, spec: TaskSpec) -> dict:
+    from v2r.warehouse.photo_request import request_photos
+
+    brand = spec.brand or ""
+    if not brand:
+        return {"ok": False, "error": "사진을 요청할 브랜드를 알 수 없습니다 (`브랜드 X`를 넣어 주세요)"}
+    return request_photos(rt, brand, getattr(spec, "keyword", "") or spec.source or "")
+
+
+#: `NoPhotoError` 메시지에서 브랜드·폴더를 뽑는다 (`store.ensure_keyword_pool` 문구)
+_NO_PHOTO_RE = re.compile(r"브랜드\s+(\S+?)의\s+'([^']*)'\s*폴더")
+
+
+def _request_missing_photos(
+    rt: Runtime, job_id: int | None, spec: TaskSpec, exc: Exception
+) -> None:
+    """사진이 없어 발행이 막혔을 때 새 사진 생성 요청서를 보낸다 (실패해도 삼킨다)."""
+    brand = spec.brand or ""
+    keyword = getattr(spec, "keyword", "") or ""
+    m = _NO_PHOTO_RE.search(str(exc))
+    if m:
+        brand = brand or m.group(1)
+        keyword = keyword or m.group(2)
+    if not brand:
+        return
+    try:
+        from v2r.warehouse.photo_request import request_photos
+
+        out = request_photos(rt, brand, keyword)
+        rt.events.log(
+            job_id, "info", f"사진 요청서 발송: 브랜드 {out['brand']} / {out['keyword']}"
+        )
+    except Exception as err:  # pragma: no cover - 알림 실패는 발행 결과를 바꾸지 않는다
+        log.warning("사진 요청서 발송 실패: %s", err)
+
+
+def _collect_new_photos(rt: Runtime, spec: TaskSpec) -> dict:
+    from v2r.warehouse.photo_request import collect_new
+
+    del spec
+    stats = collect_new(rt.warehouse)
+    if stats.get("added") or stats.get("variants"):
+        notify_all(
+            rt.channels,
+            f"새 사진 {stats['added']}장 확보, 세탁본 {stats['variants']}장 생성",
+        )
+    return stats
 
 
 def _catalog_report(rt: Runtime, spec: TaskSpec) -> dict:
@@ -380,6 +502,8 @@ def _run_publish(
         # 사진 원본이 아예 없다 → 텔레그램 등 채널로 바로 알린다 (결정 1)
         rt.events.log(job_id, "error", str(exc))
         notify_all(rt.channels, str(exc))
+        # 이어서 GPT 이미지 생성 프롬프트 묶음을 보내 새 사진을 요청한다 (계획 §확보 2단계)
+        _request_missing_photos(rt, job_id, spec, exc)
         return {
             "ok": False,
             "slots": 0,
@@ -513,6 +637,10 @@ def dispatch(rt: Runtime, job: Any, owner: str | None = None) -> dict:
         return _collect_daily(rt, spec)
     if task == "collect_photos":
         return _collect_photos(rt, spec)
+    if task == "collect_new_photos":
+        return _collect_new_photos(rt, spec)
+    if task == "request_photos":
+        return _request_photos(rt, spec)
     if task == "wash_photos":
         return _wash_photos(rt, spec)
     if task == "learn_guides":

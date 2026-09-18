@@ -974,7 +974,8 @@ def _create_and_verify(
         body_lines=seone.body_lines_for_verify(body),
         image_count=len(components),
         start_at=start_at,
-        comments_count=len(comments or []),
+        # 페이로드는 답글이 루트에 중첩된다 → 전체 노드 수로 비교한다
+        comments_count=api_articles.count_comment_nodes(comments or []),
     )
     if problems:
         raise PublishError("등록 검증 실패: " + "; ".join(problems))
@@ -1021,20 +1022,32 @@ def run_slot(
     key = (m.source, m.source_row, m.content_hash)
     root_start = slot.scheduled_at or datetime.now(KST)
     created_any = False  # 이번 슬롯에서 V2R에 글이 실제로 만들어졌는가
+    # 이 발행 행의 "본 글"(제휴면 수정글, 일반이면 그 글)이 실제로 등록됐는가.
+    # False면 create_article 이전 단계에서 끊긴 것이므로 재시도 가능한 failed로 내린다.
+    target_created = False
     pending: str | None = None
 
     def _beat() -> None:
         if heartbeat is not None:
             heartbeat()
 
-    def _on_created(stage: str):
+    def _on_created(stage: str, *, target: bool = True):
         def hook(source_id: str) -> None:
-            nonlocal created_any
+            nonlocal created_any, target_created
             created_any = True
+            if target:
+                target_created = True
             rt.publications.mark(*key, "uncertain", stage, source_id=source_id)
             _beat()
 
         return hook
+
+    def _mark_precreate_failed(reason: str) -> None:
+        """본 글 등록 전에 끊긴 실패 → 재시도할 수 있게 failed로 남긴다."""
+        if target_created:
+            return  # 글은 이미 서버에 있다 → 미확정 유지
+        text = " ".join(str(reason).split())
+        rt.publications.mark(*key, "failed", f"등록 전 실패: {text}"[:200])
 
     try:
         cafe, menu, head = rt.catalog.resolve(slot.cafe, slot.board, slot.account)
@@ -1063,7 +1076,7 @@ def run_slot(
                 login_id=slot.account,
                 start_at=slot.scheduled_at,
                 comments=[],
-                on_created=_on_created("daily_created"),
+                on_created=_on_created("daily_created", target=False),
             )
             del daily_pending  # 일상 글 확정 보류는 수정글 등록을 막지 않는다
             rt.publications.mark(*key, "uncertain", "daily_done", source_id=daily_id)
@@ -1131,6 +1144,9 @@ def run_slot(
         if kind in DEFINITIVE_REJECTIONS and not created_any:
             # 서버가 요청을 거부해 글이 생기지 않았다 → 다른 계정으로 재시도 가능하게 failed
             rt.publications.mark(*key, "failed", f"거부({kind})")
+        elif kind not in api_articles.AMBIGUOUS_KINDS:
+            # 본 글이 아직 안 만들어졌고 모호한 오류도 아니다 → failed
+            _mark_precreate_failed(f"{kind}: {exc}")
         if kind == "account_restricted":
             until = datetime.now(KST) + timedelta(days=RESTRICT_DAYS)
             rt.account_state.restrict(slot.account, until, RESTRICT_CODE, "계정 제한(27000)")
@@ -1138,9 +1154,12 @@ def run_slot(
             raise RetryWithOtherAccount(f"계정 제한: {slot.account}") from exc
         rt.events.log(job_id, "error", f"발행 실패({kind}): {m.title}")
         raise PublishError(f"발행 실패({kind}): {exc}") from exc
-    except PublishError:
+    except PublishError as exc:
+        # 등록 검증 실패처럼 create 이후에 난 것은 미확정 유지, 그 전이면 failed
+        _mark_precreate_failed(str(exc))
         raise
-    except Exception as exc:  # 그 외는 그대로 실패로
+    except Exception as exc:  # 그 외(NoPhotoError, seone ValueError 등)는 그대로 실패로
+        _mark_precreate_failed(str(exc))
         rt.events.log(job_id, "error", f"발행 실패: {m.title}: {exc}")
         raise PublishError(f"발행 실패: {exc}") from exc
 

@@ -16,6 +16,8 @@ TASK_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("sync_sources", re.compile(r"(원본|시트).*(동기화|갱신)")),
     ("generate_daily", re.compile(r"일상\s*글.*(생성|만들어)")),
     ("collect_daily", re.compile(r"일상\s*글.*(수집|가져와)")),
+    ("collect_new_photos", re.compile(r"새\s*(사진|이미지)\s*(수거|회수|가져오기|가져와)")),
+    ("request_photos", re.compile(r"(사진|이미지).*(요청|필요)")),
     ("collect_photos", re.compile(r"사진.*(수집|가져와)")),
     ("wash_photos", re.compile(r"사진.*(세탁|변형)\s*(\d+)?")),
     ("learn_guides", re.compile(r"(메이크|make|지침).*(학습|읽어|가져와)", re.I)),
@@ -68,6 +70,8 @@ RE_INTERVAL_RANGE = re.compile(r"(\d+)\s*~\s*(\d+)\s*분")
 RE_INTERVAL_FIXED = re.compile(r"(\d+)\s*분\s*간격")
 RE_BOARD = re.compile(r"게시판\s*(\S+)")
 RE_SOURCE = re.compile(r"시트\s*(\S+)")
+RE_BRAND_SLOT = re.compile(r"브랜드\s+(\S+)")
+RE_KEYWORD_SLOT = re.compile(r"키워드\s+(\S+)")
 RE_ACCOUNTS = re.compile(
     r"아이디\s+([A-Za-z0-9_,\s]+?)(?=\s*(?:로|으로|써|사용|$))"
 )
@@ -106,6 +110,10 @@ PUBLISH_TASKS = frozenset(
 #: 개수가 함께 나오면 `stop`/`status`보다 우선하는 작업
 _PRIORITY_TASKS = PUBLISH_TASKS | {"catalog"}
 _HIJACKABLE = {"stop", "status"}
+#: `브랜드 X` / `키워드 Y` 슬롯을 읽는 작업 (사진 계열)
+_PHOTO_SLOT_TASKS = frozenset(
+    {"request_photos", "collect_new_photos", "collect_photos", "wash_photos"}
+)
 #: 시트/게시판 같은 슬롯 추출을 하지 않는 작업
 _NO_SLOT_TASKS = frozenset(
     {
@@ -247,6 +255,17 @@ def parse_korean_command(text: str, now: datetime | None = None) -> TaskSpec | N
             spec["brand"] = name
             break
 
+    # `브랜드 X` / `키워드 Y` 슬롯 (사진 작업에서만. `브랜드 글`처럼 작업 이름이
+    # 뒤에 오는 발행 문장에서는 쓰지 않는다)
+    if task in _PHOTO_SLOT_TASKS:
+        if "brand" not in spec:
+            m = RE_BRAND_SLOT.search(raw)
+            if m:
+                spec["brand"] = _strip_particle(m.group(1))
+        m = RE_KEYWORD_SLOT.search(raw)
+        if m:
+            spec["keyword"] = _strip_particle(m.group(1))
+
     # 게시판 / 시트
     m = RE_BOARD.search(raw)
     if m:
@@ -289,6 +308,8 @@ TASK_LABELS: dict[str, str] = {
     "generate_daily": "일상 글 생성",
     "collect_daily": "일상 글 수집",
     "collect_photos": "사진 수집",
+    "collect_new_photos": "새 사진 수거",
+    "request_photos": "사진 요청",
     "wash_photos": "사진 세탁",
     "learn_guides": "지침 학습",
     "open_login": "로그인 창 열기",
@@ -311,6 +332,8 @@ def describe_spec(spec: TaskSpec) -> str:
         parts.append(f"카페 {spec.cafe}")
     if spec.brand:
         parts.append(f"브랜드 {spec.brand}")
+    if getattr(spec, "keyword", ""):
+        parts.append(f"키워드 {spec.keyword}")
     if spec.board:
         parts.append(f"게시판 {spec.board}")
     if spec.source:

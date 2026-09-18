@@ -216,6 +216,75 @@ def test_이미지가_있으면_브라우저_없이는_실패(tmp_path, monkeypa
     rt.close()
 
 
+def test_등록_전_실패는_uncertain이_아니라_failed(tmp_path, monkeypatch):
+    """잡 40 회귀: create_article 전에 끊긴 실패는 재시도할 수 있게 failed여야 한다."""
+    rt = make_runtime(tmp_path)
+    spec = make_spec(dry_run=False, count=1)
+
+    def boom(*a, **k):
+        raise ValueError("사진 수가 부족합니다: 자리 1, 사진 0")
+
+    monkeypatch.setattr(publish_mod.seone, "content_json", boom)
+    monkeypatch.setattr(
+        publish_mod.api_articles, "create_article", lambda c, **k: pytest.fail("호출 금지")
+    )
+
+    with pytest.raises(publish_mod.PublishError):
+        publish_mod.run_slot(rt, spec, _one_slot(rt, spec))
+
+    assert rt.publications.list_uncertain() == []
+    row = rt.conn.execute(
+        "SELECT status, stage FROM publications WHERE source_key = '테스트시트'"
+    ).fetchone()
+    assert row["status"] == "failed"
+    assert "사진 수가 부족합니다" in row["stage"]
+    rt.close()
+
+
+def test_제휴_수정글_등록_전_실패도_failed(tmp_path, monkeypatch):
+    """일상 글은 올라갔어도 본 글(수정글)이 안 만들어졌으면 failed로 내린다."""
+    from v2r.content.manuscript import Manuscript
+
+    rt = make_runtime(tmp_path)
+    spec = make_spec(dry_run=False, count=1)
+    slot = _one_slot(rt, spec)
+    slot.workflow = "affiliate"
+
+    daily = Manuscript(
+        source="랜덤일상",
+        source_row=9,
+        title="일상 제목",
+        body="일상 본문",
+        content_hash="dailyhash",
+    )
+    monkeypatch.setattr(publish_mod, "_take_daily", lambda rt_: daily)
+    monkeypatch.setattr(publish_mod, "build_comments", lambda *a, **k: [])
+    monkeypatch.setattr(publish_mod.api_articles, "create_article", lambda c, **k: "DAILY-1")
+    monkeypatch.setattr(publish_mod.api_articles, "get_article", lambda c, sid: {})
+    monkeypatch.setattr(publish_mod.api_articles, "verify_article", lambda detail, **k: [])
+
+    real_content_json = publish_mod.seone.content_json
+    calls = {"n": 0}
+
+    def content_json(body, components):
+        calls["n"] += 1
+        if calls["n"] >= 2:  # 수정글 차례 → create 전에 터진다
+            raise ValueError("사진 수가 부족합니다: 자리 1, 사진 0")
+        return real_content_json(body, components)
+
+    monkeypatch.setattr(publish_mod.seone, "content_json", content_json)
+
+    with pytest.raises(publish_mod.PublishError):
+        publish_mod.run_slot(rt, spec, slot)
+
+    row = rt.conn.execute(
+        "SELECT status, stage FROM publications WHERE source_key = '테스트시트'"
+    ).fetchone()
+    assert row["status"] == "failed"
+    assert "사진 수가 부족합니다" in row["stage"]
+    rt.close()
+
+
 def test_사진이_없으면_발행_전에_사진필요_오류(tmp_path):
     """결정 1(2026-09-19): 원본이 하나도 없으면 NoPhotoError(텔레그램 알림용)."""
     from v2r.warehouse.store import NoPhotoError

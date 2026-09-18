@@ -29,6 +29,28 @@ def _publication_counts(rt: Runtime) -> dict[str, int]:
     return {r["status"]: int(r["n"]) for r in rows}
 
 
+def photo_stock_lines(rt: Runtime, threshold: int = 30) -> list[str]:
+    """브랜드별 사진 재고 한 줄씩 (원본/세탁본/미사용). 실패하면 빈 목록."""
+    try:
+        from v2r.warehouse import stock
+
+        inv = stock.inventory(rt.warehouse, stock.used_variants(rt.conn))
+    except Exception:  # pragma: no cover - 창고가 없어도 상태 보고는 계속한다
+        return []
+    if not inv:
+        return ["사진 재고: 없음"]
+    low = {(r["brand"], r["folder"]) for r in stock.low_stock(inv, threshold)}
+    out = ["사진 재고:"]
+    for row in stock.brand_summary(inv):
+        short = sum(1 for key in low if key[0] == row["brand"])
+        mark = f" 부족 {short}폴더" if short else ""
+        out.append(
+            f"  {row['brand']} 원본 {row['originals']}장 / 세탁본 {row['variants']}장"
+            f" / 미사용 {row['unused']}장{mark}"
+        )
+    return out
+
+
 def status_report(rt: Runtime, exclude_job_id: int | None = None) -> str:
     """최근 작업·발행 현황·불확실 건·제한 계정 요약.
 
@@ -63,6 +85,8 @@ def status_report(rt: Runtime, exclude_job_id: int | None = None) -> str:
             )
     else:
         lines.append("불확실 건 없음")
+
+    lines.extend(photo_stock_lines(rt))
 
     restricted = [
         login
@@ -121,4 +145,4 @@ def inspect_failures(rt: Runtime, days: int = 7) -> str:
     return "\n".join(lines)
 
 
-__all__ = ["inspect_failures", "status_report"]
+__all__ = ["inspect_failures", "photo_stock_lines", "status_report"]

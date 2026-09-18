@@ -287,27 +287,31 @@ class Warehouse:
                 f"({folder_name})를 채우지 못했습니다."
             )
 
-        if min_variants > 0:
-            if washer is None:
-                from v2r.warehouse import photo_washer
+        # 규칙 0: 세탁본 없이는 절대 원본을 쓰지 않는다. 최소 1장은 즉석에서 세탁한다.
+        need_min = max(int(min_variants or 0), 1)
+        if washer is None:
+            from v2r.warehouse import photo_washer
 
-                washer = photo_washer.make_variants
+            washer = photo_washer.make_variants
+        made = sum(len(self.washed_variants(sha256(p))) for p in originals)
+        wash_errors: list[str] = []
+        for original in originals:
+            if made >= need_min:
+                break
+            sha = sha256(original)
+            need = need_min - made
+            try:
+                washer(original, need, self.washed_folder(sha))
+            except Exception as exc:
+                wash_errors.append(f"{original.name}: {exc}")
+                continue
             made = sum(len(self.washed_variants(sha256(p))) for p in originals)
-            for original in originals:
-                if made >= min_variants:
-                    break
-                sha = sha256(original)
-                need = min_variants - made
-                try:
-                    washer(original, need, self.washed_folder(sha))
-                except Exception:
-                    continue
-                made = sum(len(self.washed_variants(sha256(p))) for p in originals)
-            if made <= 0:
-                raise NoPhotoError(
-                    f"사진이 필요합니다: 브랜드 {brand}의 '{label}' 폴더"
-                    f"({folder_name}) 세탁본을 만들지 못했습니다."
-                )
+        if made <= 0:
+            detail = f" ({'; '.join(wash_errors[:3])})" if wash_errors else ""
+            raise NoPhotoError(
+                f"사진이 필요합니다: 브랜드 {brand}의 '{label}' 폴더"
+                f"({folder_name}) 세탁본을 만들지 못했습니다{detail}."
+            )
         return originals
 
     # --- 원본 ---------------------------------------------------------
@@ -366,11 +370,26 @@ class Warehouse:
                     continue
         return [p for _, p in sorted(items)]
 
+    def is_washed(self, path: str | Path) -> bool:
+        """규칙 0 검사: 경로가 `images/washed/` 아래인가."""
+        try:
+            Path(path).resolve().relative_to(self.washed_dir.resolve())
+        except (ValueError, OSError):
+            return False
+        return True
+
     def pick_variant(self, sha: str, used: set[str]) -> Path | None:
-        """`used`(변형 이름 집합)에 없는 첫 세탁본. 남은 게 없으면 None."""
+        """`used`(변형 이름 집합)에 없는 첫 세탁본. 남은 게 없으면 None.
+
+        **규칙 0**: 여기서 나오는 경로는 반드시 `images/washed/` 아래다.
+        세탁 안 된 원본은 어떤 경우에도 돌려주지 않는다.
+        """
         for variant in self.washed_variants(sha):
-            if variant.stem not in used and str(variant) not in used:
-                return variant
+            if variant.stem in used or str(variant) in used:
+                continue
+            if not self.is_washed(variant):  # pragma: no cover - 방어적 검사
+                continue
+            return variant
         return None
 
     # --- 텍스트 -------------------------------------------------------

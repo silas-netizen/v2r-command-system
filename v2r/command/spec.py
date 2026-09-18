@@ -21,6 +21,8 @@ ALLOWED_TASKS: frozenset[str] = frozenset(
         "generate_daily",
         "collect_daily",
         "collect_photos",
+        "collect_new_photos",
+        "request_photos",
         "wash_photos",
         "learn_guides",
         "open_login",
@@ -56,6 +58,7 @@ class TaskSpec(BaseModel):
     cafe: str = ""
     board: str = ""
     brand: str = ""
+    keyword: str = ""
     source: str = ""
     dry_run: bool = True
     immediate: bool = False

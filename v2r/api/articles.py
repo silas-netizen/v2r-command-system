@@ -563,6 +563,30 @@ def _paragraph_lines(components: Iterable[dict]) -> list[str]:
     return lines
 
 
+#: 답글이 중첩될 수 있는 키(요청 페이로드는 `comments` 아래에 답글을 넣는다)
+COMMENT_CHILD_KEYS = ("comments", "children", "replies")
+
+
+def count_comment_nodes(nodes: Any) -> int:
+    """댓글 목록의 전체 노드 수(루트 + 답글)를 센다.
+
+    등록 요청 페이로드는 답글을 루트의 ``comments``에 **중첩**해서 보내고,
+    라이브 GET 응답은 루트와 답글을 한 배열에 **평탄하게** 담아 돌려준다
+    (답글은 ``parent_comment_id``로 부모를 가리킨다). 두 모양 모두에서 같은
+    총계(예: 루트 5 + 답글 7 = 12)가 나오도록 재귀로 센다.
+    """
+    if not isinstance(nodes, list):
+        return 0
+    total = 0
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        total += 1
+        for key in COMMENT_CHILD_KEYS:
+            total += count_comment_nodes(node.get(key))
+    return total
+
+
 def _count_images(components: Iterable[dict]) -> int:
     """유효한 이미지 컴포넌트 개수."""
     count = 0
@@ -594,7 +618,10 @@ def verify_article(
     start_at: datetime | None,
     comments_count: int,
 ) -> list[str]:
-    """등록 후 GET 결과 검증. 불일치 항목 목록을 반환(빈 목록 = 정상)."""
+    """등록 후 GET 결과 검증. 불일치 항목 목록을 반환(빈 목록 = 정상).
+
+    `comments_count`는 **답글까지 포함한 전체 댓글 수**다(`count_comment_nodes`).
+    """
     problems: list[str] = []
     source = detail.get("naver_cafe_article_source")
     if not isinstance(source, dict):
@@ -640,8 +667,8 @@ def verify_article(
         ) != (expected_start or None):
             problems.append(f"예약시각 불일치: {got_start} != {expected_start}")
 
-    got_comments = detail.get("naver_cafe_article_source_comments")
-    n_comments = len(got_comments) if isinstance(got_comments, list) else 0
+    # 응답은 평탄, 요청은 중첩이므로 양쪽 모두 "전체 노드 수"로 맞춰 비교한다
+    n_comments = count_comment_nodes(detail.get("naver_cafe_article_source_comments"))
     if n_comments != int(comments_count):
         problems.append(f"댓글 개수 불일치: {n_comments} != {comments_count}")
 
@@ -660,6 +687,7 @@ __all__ = [
     "article_url",
     "board_histories",
     "build_destination",
+    "count_comment_nodes",
     "create_article",
     "delete_article",
     "find_recent_source",
