@@ -12,7 +12,9 @@ call ".venv\Scripts\activate.bat"
 echo.
 echo  브라우저 창이 열립니다. 창에서 직접 ChatGPT에 로그인해 주세요 (최대 15분 대기).
 echo.
-python -m v2r.warehouse.gpt_images --login
+if not exist logs mkdir logs
+python -m v2r.warehouse.gpt_images --login > logs\gpt-login.log 2>&1
+type logs\gpt-login.log
 set RC=%errorlevel%
 
 if "%RC%"=="0" (

@@ -6,6 +6,7 @@ import csv
 import io
 import re
 from typing import Any, Callable
+from urllib.parse import quote
 
 import httpx
 
@@ -16,7 +17,7 @@ from v2r.content.manuscript import (
     tags_from_keyword,
 )
 
-GVIZ = "https://docs.google.com/spreadsheets/d/{sid}/gviz/tq?tqx=out:csv&gid={gid}"
+GVIZ = "https://docs.google.com/spreadsheets/d/{sid}/gviz/tq?tqx=out:csv"
 
 #: 동기화 금지 문서
 EXCLUDED_DOCUMENT_IDS = {"1DLQgLWBo1c4CDkgvH4fjkuDrRM1C03XT"}
@@ -28,11 +29,31 @@ class SourceError(RuntimeError):
     """원본 적재 실패."""
 
 
-def gviz_csv_url(spreadsheet_id: str, gid: str | int) -> str:
-    """gviz CSV 내보내기 URL."""
+def gviz_csv_url(
+    spreadsheet_id: str,
+    gid: str | int = 0,
+    sheet: str = "",
+    headers: int | None = None,
+) -> str:
+    """gviz CSV 내보내기 URL.
+
+    - `sheet`(탭 이름)를 주면 `gid` 대신 탭 이름으로 지정한다.
+    - `headers`는 gviz에게 "머리글 행이 몇 줄인가"를 알려 준다. **생략하면 gviz가
+      스스로 추측하는데**, 모든 열이 문자열인 시트에서는 시트 전체를 머리글로 보고
+      각 열의 값을 공백으로 이어 붙인 한 줄만 돌려주는 사고가 난다
+      (팥순이 `게시글 쓰기 원본` 탭이 그랬다: 75행 → 31행, 후기형 행이 통째로 사라짐).
+      `headers=0`을 주면 추측을 끄고 첫 줄부터 그대로 돌려준다.
+    """
     if spreadsheet_id in EXCLUDED_DOCUMENT_IDS:
         raise SourceError(f"동기화 금지 문서입니다: {spreadsheet_id}")
-    return GVIZ.format(sid=spreadsheet_id, gid=gid)
+    url = GVIZ.format(sid=spreadsheet_id)
+    if sheet:
+        url += "&sheet=" + quote(str(sheet))
+    else:
+        url += f"&gid={gid}"
+    if headers is not None:
+        url += f"&headers={int(headers)}"
+    return url
 
 
 def fetch_csv(url: str, timeout: float = 5.0) -> list[dict]:
@@ -45,8 +66,39 @@ def fetch_csv(url: str, timeout: float = 5.0) -> list[dict]:
         resp.raise_for_status()
     except httpx.HTTPError as exc:  # 네트워크·상태 코드 모두
         raise SourceError(f"시트 가져오기 실패: {exc}") from exc
-    reader = csv.DictReader(io.StringIO(resp.text))
-    return [dict(r) for r in reader]
+    return rows_from_csv(resp.text)
+
+
+def _uniquify(names: list[str]) -> list[str]:
+    """중복·빈 머리글을 자리마다 다른 키로 만든다.
+
+    `csv.DictReader`는 같은 이름이 두 번 나오면 뒤엣것만 남겨 **열 자리가 밀린다**.
+    A~J를 자리로 읽는 제휴 시트에서는 그게 곧 오배정이라, 자리를 보존한다.
+    """
+    out: list[str] = []
+    taken: set[str] = set()
+    for i, raw in enumerate(names):
+        name = str(raw or "").strip() or f"_{i}"
+        candidate = name
+        n = 1
+        while candidate.casefold() in taken:
+            n += 1
+            candidate = f"{name}_{n}"
+        taken.add(candidate.casefold())
+        out.append(candidate)
+    return out
+
+
+def rows_from_csv(text: str) -> list[dict]:
+    """CSV 본문 → dict 행 목록. 첫 줄이 머리글, 열 자리는 보존한다."""
+    table = list(csv.reader(io.StringIO(text or "")))
+    if not table:
+        return []
+    width = max(len(r) for r in table)
+    header = _uniquify(list(table[0]) + [""] * (width - len(table[0])))
+    return [
+        dict(zip(header, list(row) + [""] * (width - len(row)))) for row in table[1:]
+    ]
 
 
 # ---------------------------------------------------------------- 값 꺼내기
@@ -166,10 +218,46 @@ def parse_adapted_rows(
     return out
 
 
+#: 제휴 시트 A~J 머리글 (하나라도 보이면 첫 줄이 머리글이다)
+AFFILIATE_HEADERS = (
+    "키워드",
+    "본문",
+    "카페명",
+    "작성계정",
+    "원고유형",
+    "완료 링크",
+    "말머리",
+    "계정유형",
+    "이미지 없음",
+    "게시판명",
+)
+
+
+def header_row_is_data(rows: list[dict]) -> bool:
+    """첫 줄이 머리글이 아니라 **데이터**인가 (머리글 없는 시트).
+
+    머리글 별칭이 하나도 안 보이면 데이터로 본다. 이때 그 줄을 되살려야 A~J를
+    자리로 읽는 파서가 한 행도 잃지 않는다.
+    """
+    if not rows:
+        return False
+    keys = {_norm_key(k) for k in rows[0].keys()}
+    return not any(_norm_key(h) in keys for h in AFFILIATE_HEADERS)
+
+
+def _restore_header_row(rows: list[dict]) -> tuple[list[dict], int]:
+    """머리글이 없으면 머리글 자리의 값을 첫 행으로 되살린다. (행 목록, 시작 행번호)"""
+    if not rows or not header_row_is_data(rows):
+        return list(rows or []), 2
+    first = {k: ("" if str(k).startswith("_") else k) for k in rows[0].keys()}
+    return [first, *rows], 1
+
+
 def parse_affiliate_rows(rows: list[dict], source: str = "") -> list[Manuscript]:
     """제휴/브랜드 시트 A~J 행 → 원고 목록. legacy §5-2 건너뛰기 규칙 적용."""
     out: list[Manuscript] = []
-    for i, row in enumerate(rows or [], start=2):
+    rows, start_row = _restore_header_row(rows)
+    for i, row in enumerate(rows or [], start=start_row):
         keyword = _by_letter(row, "A", ("키워드",))
         body = _by_letter(row, "B", ("본문",))
         cafe = _by_letter(row, "C", ("카페명",))
@@ -231,13 +319,16 @@ def load_source(
     """
     sid = str(cfg_entry.get("spreadsheet_id") or "")
     gid = cfg_entry.get("gid", 0)
-    key = cfg_entry.get("name") or f"{sid}:{gid}"
+    sheet = str(cfg_entry.get("sheet") or "")
+    headers = cfg_entry.get("headers")
+    key = cfg_entry.get("name") or f"{sid}:{sheet or gid}"
     if prefer_cache:
         cached = cache_get(key) if cache_get else None
         if cached is not None:
             return cached
         raise SourceError(NO_CACHE_MESSAGE)
-    url = gviz_csv_url(sid, gid)  # 금지 문서면 여기서 SourceError
+    # 금지 문서면 여기서 SourceError
+    url = gviz_csv_url(sid, gid, sheet=sheet, headers=headers)
     try:
         rows = fetch_csv(url)
     except SourceError:
