@@ -123,6 +123,8 @@ def classify(exc_or_response: Any) -> str:
         reason = reason or ""
 
     haystack = " ".join(str(x) for x in (code, reason, body) if x)
+    # 숫자 코드는 본문 전체에서 찾으면 조회수·ID 같은 숫자에 오탐한다 → code/reason만
+    code_field = " ".join(str(x) for x in (code, reason) if x)
 
     if status == 403 and "TOKEN_ERROR" in haystack:
         return "token_expired"
@@ -130,11 +132,11 @@ def classify(exc_or_response: Any) -> str:
         return "rate_limited"
     if status is not None and 500 <= int(status) < 600:
         return "server"
-    if "27000" in (code or "") or "27000" in haystack:
+    if "27000" in code_field:
         return "account_restricted"
-    if "20004" in (code or "") or "20004" in haystack or "연속으로 등록" in haystack:
+    if "20004" in code_field or "연속으로 등록" in haystack:
         return "consecutive_limit"
-    if "33007" in (code or "") or "33007" in haystack:
+    if "33007" in code_field:
         return "grade"
     if "NOT_FOUND_MODEL" in haystack and "NaverJoinCafeAccoun" in haystack:
         return "no_membership"

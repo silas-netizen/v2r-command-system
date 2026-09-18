@@ -119,12 +119,19 @@ class DeviceProfile:
             try:
                 raw = json.loads(target.read_text(encoding="utf-8"))
                 fp = raw.get("fingerprint") or {}
-                if isinstance(fp, dict) and all(k in fp for k in FINGERPRINT_KEYS):
-                    return cls(
+                if isinstance(fp, dict) and fp:
+                    # 키가 일부 빠졌어도 기기 일관성(auth-protocol §4)을 위해
+                    # device_id와 기존 값은 유지하고 빠진 키만 기본값으로 보충한다.
+                    defaults = _default_fingerprint()
+                    merged = {k: fp.get(k, defaults[k]) for k in FINGERPRINT_KEYS}
+                    profile = cls(
                         device_id=str(raw.get("device_id") or uuid.uuid4()),
-                        fingerprint={k: fp[k] for k in FINGERPRINT_KEYS},
+                        fingerprint=merged,
                         path=target,
                     )
+                    if merged != {k: fp.get(k) for k in FINGERPRINT_KEYS}:
+                        profile.save()
+                    return profile
             except (ValueError, OSError):
                 pass
         profile = cls(path=target)
@@ -160,20 +167,28 @@ class DeviceProfile:
         }
 
 
+MAX_POW_DIFFICULTY = 8
+MAX_POW_ATTEMPTS = 50_000_000
+
+
 def solve_pow(challenge: dict, path: str, fp_hash: str) -> int:
-    """`0`*difficulty로 시작하는 해시를 만드는 최소 proof_nonce를 찾는다."""
+    """`0`*difficulty로 시작하는 해시를 만드는 최소 proof_nonce를 찾는다.
+
+    난이도·시도 횟수에 상한을 둬 무한 루프를 막는다.
+    """
     version = challenge.get("version", "")
     nonce = challenge.get("nonce", "")
     timestamp = challenge.get("timestamp", "")
     difficulty = int(challenge.get("difficulty", 0) or 0)
+    if difficulty > MAX_POW_DIFFICULTY:
+        raise V2RApiError(f"PoW 난이도가 너무 높습니다: {difficulty}")
     prefix = "0" * difficulty
     head = f"{version}:{path}:{fp_hash}:{nonce}:{timestamp}:"
-    n = 0
-    while True:
+    for n in range(MAX_POW_ATTEMPTS):
         digest = hashlib.sha256(f"{head}{n}".encode("utf-8")).hexdigest()
         if digest.startswith(prefix):
             return n
-        n += 1
+    raise V2RApiError(f"PoW 해답을 찾지 못했습니다 (난이도 {difficulty})")
 
 
 def build_proof(challenge: dict, path: str, fp_hash: str, proof_nonce: int) -> str:
@@ -203,6 +218,25 @@ def _extract_challenge(payload: Any) -> dict | None:
         if "difficulty" in payload and "nonce" in payload:
             return payload
     return None
+
+
+#: 챌린지 요구로 해석하는 오류 코드/사유 토큰
+CHALLENGE_TOKENS = ("CHALLENGE", "POW", "PROOF")
+
+
+def _needs_challenge(err: V2RApiError, status: int) -> bool:
+    """PoW 챌린지를 풀고 재시도해야 하는 응답인지.
+
+    느슨하게 판정하면 비밀번호 오류에도 같은 비밀번호로 2회 로그인해
+    일일 로그인 한도를 두 배로 쓴다. 챌린지 신호가 분명할 때만 참.
+    """
+    if not 400 <= status < 500:
+        return False
+    text = f"{err.code or ''} {err.reason or ''}".upper()
+    if any(token in text for token in CHALLENGE_TOKENS):
+        return True
+    extra = err.extra if isinstance(err.extra, dict) else {}
+    return any(k in extra for k in ("challenge", "nonce", "difficulty", "signature"))
 
 
 class AuthSession:
@@ -278,7 +312,7 @@ class AuthSession:
         err = V2RApiError.from_response(response, "로그인 실패")
         if err.kind == "rate_limited":
             raise err
-        if not (400 <= response.status_code < 500 and isinstance(err.extra, dict)):
+        if not _needs_challenge(err, response.status_code):
             raise err
 
         # 챌린지 필요 → PoW 후 재시도

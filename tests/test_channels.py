@@ -82,6 +82,30 @@ def test_telegram_broadcast(tmp_path, httpx_mock):
     assert channel.broadcast("작업 1 진행: 발행 시작") == 2
 
 
+def test_telegram_error_log_hides_token(tmp_path, httpx_mock, caplog):
+    """오류 로그에 봇 토큰이 남으면 안 된다 (안전 불변식 2)."""
+    import logging
+
+    httpx_mock.add_response(url=UPDATES_URL, status_code=404, json={})
+    channel = TelegramChannel(TOKEN, {"1234"}, data_dir=tmp_path)
+    with caplog.at_level(logging.WARNING):
+        assert channel.poll() == []
+    text = " ".join(r.getMessage() for r in caplog.records)
+    assert TOKEN not in text
+    assert "404" in text
+
+
+def test_telegram_allowed_user_ids(tmp_path, httpx_mock):
+    httpx_mock.add_response(
+        url=UPDATES_URL,
+        json={"ok": True, "result": [_update(21, "1234", "상태 알려줘")]},
+    )
+    channel = TelegramChannel(
+        TOKEN, {"1234"}, data_dir=tmp_path, allowed_user_ids={"999"}
+    )
+    assert channel.poll() == []  # 발신자 777은 허용 목록 밖
+
+
 # --- 슬랙 ---------------------------------------------------------
 def test_slack_requires_allowed_channels(tmp_path):
     channel = SlackChannel("xoxb-abc", set(), data_dir=tmp_path)

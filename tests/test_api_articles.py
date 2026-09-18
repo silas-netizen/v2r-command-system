@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import httpx
 import pytest
@@ -12,6 +12,7 @@ from v2r.api import articles
 from v2r.api.auth import AuthSession, DeviceProfile
 from v2r.api.catalog import Cafe, Head, Menu
 from v2r.api.client import V2RClient, clear_cache
+from v2r.api.errors import V2RApiError
 from v2r.content import seone
 
 BASE = "https://api-test.example"
@@ -186,7 +187,7 @@ def test_verify_article_reports_mismatches() -> None:
         head_id=3,
         body_lines=["다른 줄"],
         image_count=1,
-        start_at=None,
+        start_at=datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc),
         comments_count=0,
     )
     joined = " ".join(problems)
@@ -216,6 +217,150 @@ def test_verify_article_detects_leftover_placeholder() -> None:
         comments_count=2,
     )
     assert any("플레이스홀더 잔존" in p for p in problems)
+
+
+def test_to_iso_z_treats_naive_as_kst() -> None:
+    # KST 10시 = UTC 01시
+    assert articles.to_iso_z(datetime(2026, 9, 19, 10, 0)) == "2026-09-19T01:00:00Z"
+    assert articles.to_iso_z(None) is None
+    aware = datetime(2026, 9, 19, 1, 0, tzinfo=timezone.utc)
+    assert articles.to_iso_z(aware) == "2026-09-19T01:00:00Z"
+
+
+def test_verify_article_skips_start_at_when_immediate() -> None:
+    body = seone.content_json("첫 줄", [])
+    detail = _detail(body)  # 서버가 실제 발행 시각을 채운 상태
+    problems = articles.verify_article(
+        detail,
+        title="제목",
+        tags=["a", "b"],
+        menu_id=328,
+        head_id=None,
+        body_lines=["첫 줄"],
+        image_count=0,
+        start_at=None,
+        comments_count=2,
+    )
+    assert problems == []
+
+
+def test_create_article_does_not_repost_on_5xx(httpx_mock, api, monkeypatch) -> None:
+    """5xx면 재POST 없이 이력 복구로 source_id를 찾는다 (중복 발행 방지)."""
+    monkeypatch.setattr(articles.time, "sleep", lambda s: None)
+    monkeypatch.setattr("v2r.api.client.time.sleep", lambda s: None)
+    httpx_mock.add_response(
+        url=f"{BASE}{articles.PATH_CREATE}", status_code=503, json={}, is_reusable=True
+    )
+    created = (
+        datetime.now(timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+    )
+    httpx_mock.add_response(
+        url=httpx.URL(
+            f"{BASE}{articles.PATH_HISTORIES}",
+            params={"cafe_id": 25016228, "days_ago": 1, "include_reserve": "true"},
+        ),
+        json={
+            "histories": [
+                {
+                    "source_id": "SRC-R",
+                    "naver_account_login_id": "acc1",
+                    "title": "제목",
+                    "parent_source_id": None,
+                    "status": "RESERVED",
+                    "created_at": created,
+                }
+            ]
+        },
+        is_reusable=True,
+    )
+    dest = articles.build_destination(CAFE, MENU, None, "acc1", None)
+    sid = articles.create_article(
+        api, title="제목", tags=[], content_json="{}", destination=dest
+    )
+    assert sid == "SRC-R"
+    posts = [
+        r
+        for r in httpx_mock.get_requests()
+        if r.url.path == articles.PATH_CREATE and r.method == "POST"
+    ]
+    assert len(posts) == 1  # 절대 재전송하지 않는다
+
+
+def test_create_article_raises_ambiguous_when_no_history(
+    httpx_mock, api, monkeypatch
+) -> None:
+    monkeypatch.setattr(articles.time, "sleep", lambda s: None)
+    httpx_mock.add_response(
+        url=f"{BASE}{articles.PATH_CREATE}", status_code=502, json={}
+    )
+    httpx_mock.add_response(
+        url=httpx.URL(
+            f"{BASE}{articles.PATH_HISTORIES}",
+            params={"cafe_id": 25016228, "days_ago": 1, "include_reserve": "true"},
+        ),
+        json={"histories": []},
+        is_reusable=True,
+    )
+    dest = articles.build_destination(CAFE, MENU, None, "acc1", None)
+    with pytest.raises(V2RApiError) as exc:
+        articles.create_article(
+            api, title="제목", tags=[], content_json="{}", destination=dest
+        )
+    assert exc.value.kind == "ambiguous"
+
+
+def test_find_recent_source_rejects_unparsable_created_at(
+    httpx_mock, api, monkeypatch
+) -> None:
+    monkeypatch.setattr(articles.time, "sleep", lambda s: None)
+    httpx_mock.add_response(
+        url=httpx.URL(
+            f"{BASE}{articles.PATH_HISTORIES}",
+            params={"cafe_id": 1, "days_ago": 1, "include_reserve": "true"},
+        ),
+        json={
+            "histories": [
+                {
+                    "source_id": "SRC-X",
+                    "naver_account_login_id": "acc1",
+                    "title": "제목",
+                    "parent_source_id": None,
+                    "status": "RESERVED",
+                    "created_at": "어제쯤",
+                }
+            ]
+        },
+        is_reusable=True,
+    )
+    assert articles.find_recent_source(api, 1, "acc1", "제목", None, attempts=1) is None
+
+
+def test_find_recent_source_ambiguous_on_multiple_matches(
+    httpx_mock, api, monkeypatch
+) -> None:
+    monkeypatch.setattr(articles.time, "sleep", lambda s: None)
+    row = {
+        "naver_account_login_id": "acc1",
+        "title": "제목",
+        "parent_source_id": None,
+        "status": "RESERVED",
+        "created_at": "2026-09-19T00:00:00Z",
+    }
+    httpx_mock.add_response(
+        url=httpx.URL(
+            f"{BASE}{articles.PATH_HISTORIES}",
+            params={"cafe_id": 1, "days_ago": 1, "include_reserve": "true"},
+        ),
+        json={"histories": [{**row, "source_id": "A"}, {**row, "source_id": "B"}]},
+        is_reusable=True,
+    )
+    assert articles.find_recent_source(api, 1, "acc1", "제목", None, attempts=1) is None
+
+
+def test_wait_written_defers_far_future_schedule(api) -> None:
+    far = datetime.now(timezone.utc) + timedelta(hours=3)
+    with pytest.raises(articles.PendingError):
+        articles.wait_written(api, "SRC-1", scheduled_at=far)
 
 
 def test_delete_and_get_article(httpx_mock, api) -> None:

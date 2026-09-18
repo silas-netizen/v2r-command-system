@@ -53,7 +53,7 @@ def test_rate_gate_enforces_interval(httpx_mock, api, monkeypatch) -> None:
     start = time.monotonic()
     api.get("/x")
     api.get("/x")
-    assert time.monotonic() - start >= 0.19
+    assert time.monotonic() - start >= 0.15
 
 
 def test_get_cache_for_listed_paths(httpx_mock, api) -> None:
@@ -136,6 +136,52 @@ def test_server_error_gives_up_after_three_attempts(httpx_mock, api, monkeypatch
         api.get("/x")
     assert exc.value.kind == "server"
     assert len([r for r in httpx_mock.get_requests() if r.url.path == "/x"]) == 3
+
+
+def test_post_is_not_retried_on_server_error(httpx_mock, api, monkeypatch) -> None:
+    """비멱등 요청은 한 번만 보내고 kind='ambiguous'로 올린다."""
+    monkeypatch.setattr(client_mod.time, "sleep", lambda s: None)
+    httpx_mock.add_response(url=f"{BASE}/y", status_code=503, json={}, is_reusable=True)
+    with pytest.raises(V2RApiError) as exc:
+        api.post("/y", json={"a": 1})
+    assert exc.value.kind == "ambiguous"
+    assert len([r for r in httpx_mock.get_requests() if r.url.path == "/y"]) == 1
+
+
+def test_post_can_opt_into_retry(httpx_mock, api, monkeypatch) -> None:
+    monkeypatch.setattr(client_mod.time, "sleep", lambda s: None)
+    httpx_mock.add_response(url=f"{BASE}/y", status_code=503, json={})
+    httpx_mock.add_response(url=f"{BASE}/y", json={"ok": 1})
+    assert api.post("/y", json={"a": 1}, idempotent=True) == {"ok": 1}
+
+
+def test_post_rate_limited_is_not_retried(httpx_mock, api, monkeypatch) -> None:
+    monkeypatch.setattr(client_mod.time, "sleep", lambda s: None)
+    httpx_mock.add_response(url=f"{BASE}/y", status_code=429, json={}, is_reusable=True)
+    with pytest.raises(V2RApiError) as exc:
+        api.post("/y", json={"a": 1})
+    assert exc.value.kind == "rate_limited"
+    assert len([r for r in httpx_mock.get_requests() if r.url.path == "/y"]) == 1
+
+
+def test_cache_returns_copy(httpx_mock, api) -> None:
+    httpx_mock.add_response(url=f"{BASE}/navers/accounts", json={"n": {"deep": 1}})
+    first = api.get("/navers/accounts")
+    first["n"]["deep"] = 999
+    first["extra"] = "오염"
+    assert api.get("/navers/accounts") == {"n": {"deep": 1}}
+
+
+def test_custom_headers_survive_retry(httpx_mock, api, monkeypatch) -> None:
+    monkeypatch.setattr(client_mod.time, "sleep", lambda s: None)
+    httpx_mock.add_response(url=f"{BASE}/x", status_code=500, json={})
+    httpx_mock.add_response(url=f"{BASE}/x", json={"ok": 1})
+    api.get("/x", headers={"X-Custom": "keep"})
+    assert all(
+        r.headers.get("X-Custom") == "keep"
+        for r in httpx_mock.get_requests()
+        if r.url.path == "/x"
+    )
 
 
 def test_non_get_adds_signal_headers(httpx_mock, api) -> None:

@@ -214,7 +214,8 @@ class Catalog:
                 name = field(d, "menuName", "menu_name")
                 if menu_id is None or not isinstance(name, str) or not name:
                     continue
-                if not _truthy(field(d, "writable", "isWritable")):
+                # 필드 자체가 없으면 쓰기 가능으로 본다. 명시적 False만 제외.
+                if not _truthy(field(d, "writable", "isWritable", default=True)):
                     continue
                 menu = merged.get(menu_id)
                 if menu is None:
@@ -248,23 +249,29 @@ class Catalog:
 
     # ---- 해석 ----
     def resolve(
-        self, cafe_name: str, board_name: str, login_id: str
+        self, cafe_name: str, board_name: str, login_id: str, head_name: str = ""
     ) -> tuple[Cafe, Menu, Head | None]:
-        """카페명·게시판명(+말머리 표기)을 실제 객체로 해석."""
+        """카페명·게시판명(+말머리명)을 실제 객체로 해석.
+
+        말머리는 `head_name`으로만 찾는다(게시판명으로 말머리를 찾는 건 무의미).
+        """
         cafe = match_name(cafe_name, self.cafes(), key=lambda c: c.name)
         menus = self.menus(cafe.cafe_id, [login_id])
         if not menus:
+            reason = self.unhealthy_accounts.get(login_id)
+            detail = f" (계정 상태: {reason})" if reason else ""
             raise CatalogError(
-                f"'{cafe.name}'에서 계정 {login_id}가 쓸 수 있는 게시판이 없습니다."
+                f"'{cafe.name}'에서 계정 {login_id}가 쓸 수 있는 게시판이 없습니다.{detail}"
             )
         menu = match_name(board_name, menus, key=lambda m: m.name)
         head: Head | None = None
-        heads = self.heads(cafe.cafe_id, login_id, menu.menu_id)
-        if heads:
-            try:
-                head = match_name(board_name, heads, key=lambda h: h.name)
-            except CatalogError:
-                head = None
+        if head_name:
+            heads = self.heads(cafe.cafe_id, login_id, menu.menu_id)
+            if heads:
+                try:
+                    head = match_name(head_name, heads, key=lambda h: h.name)
+                except CatalogError:
+                    head = None
         return cafe, menu, head
 
     def sync_account(self, cafe_id: int, login_id: str) -> dict:

@@ -44,22 +44,35 @@ def _text_component(lines: list[str]) -> dict:
     }
 
 
+def _normalize(body: str) -> str:
+    """줄바꿈 표기 통일(CRLF/CR → LF). `\\r`이 문단에 남지 않게 한다."""
+    return (body or "").replace("\r\n", "\n").replace("\r", "\n")
+
+
 def count_placeholders(body: str) -> int:
     """본문 안의 플레이스홀더 개수."""
-    return len(PLACEHOLDER.findall(body or ""))
+    return len(PLACEHOLDER.findall(_normalize(body)))
 
 
 def body_lines_for_verify(body: str) -> list[str]:
     """검증용 본문 줄 목록(플레이스홀더 제거 후)."""
-    lines: list[str] = []
-    for raw in (body or "").split("\n"):
-        lines.append(PLACEHOLDER.sub("", raw))
-    return lines
+    return [PLACEHOLDER.sub("", raw) for raw in _normalize(body).split("\n")]
 
 
 def build_document(body: str, image_components: list[dict]) -> dict:
-    """본문과 이미지 컴포넌트로 SE-ONE 문서 dict를 만든다."""
+    """본문과 이미지 컴포넌트로 SE-ONE 문서 dict를 만든다.
+
+    플레이스홀더 수와 이미지 컴포넌트 수가 다르면 `ValueError`를 던진다.
+    사진이 모자랄 때 조용히 건너뛰면 "사진 없는 글"이 등록되므로
+    (api-spec §4: 사진 실패 시 발행 중단) 반드시 실패시킨다.
+    """
+    body = _normalize(body)
     images = list(image_components or [])
+    slots = count_placeholders(body)
+    if len(images) != slots:
+        if len(images) < slots:
+            raise ValueError(f"사진 수가 부족합니다: 자리 {slots}, 사진 {len(images)}")
+        raise ValueError(f"사진 수가 많습니다: 자리 {slots}, 사진 {len(images)}")
     components: list[dict] = []
     pending: list[str] = []
     image_index = 0
@@ -69,7 +82,7 @@ def build_document(body: str, image_components: list[dict]) -> dict:
             components.append(_text_component(list(pending)))
             pending.clear()
 
-    for raw_line in (body or "").split("\n"):
+    for raw_line in body.split("\n"):
         matches = PLACEHOLDER.findall(raw_line)
         if not matches:
             pending.append(raw_line)

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from v2r.content import seone
 
 
@@ -61,9 +63,25 @@ def test_placeholder_with_text_on_same_line() -> None:
     assert _lines(comps[0]) == ["안녕"]
 
 
-def test_missing_image_component_is_skipped() -> None:
-    doc = seone.build_document("{사진}\n{사진}", [{"@ctype": "image"}])
-    assert [c["@ctype"] for c in _components(doc)] == ["text", "image", "text"]
+def test_missing_image_component_raises() -> None:
+    """사진이 모자라면 조용히 넘기지 않고 실패한다 (api-spec §4)."""
+    with pytest.raises(ValueError) as exc:
+        seone.build_document("{사진}\n{사진}", [{"@ctype": "image"}])
+    assert "사진 수가 부족합니다: 자리 2, 사진 1" in str(exc.value)
+
+
+def test_extra_image_component_raises() -> None:
+    with pytest.raises(ValueError):
+        seone.build_document("{사진}", [{"@ctype": "image"}, {"@ctype": "image"}])
+
+
+def test_crlf_body_has_no_carriage_return() -> None:
+    doc = seone.build_document("가\r\n{사진}\r\n나", [{"@ctype": "image"}])
+    comps = _components(doc)
+    assert [c["@ctype"] for c in comps] == ["text", "image", "text"]
+    assert _lines(comps[0]) == ["가", ""]
+    assert _lines(comps[2]) == ["나"]
+    assert seone.body_lines_for_verify("a\r\n{사진}\r\nb") == ["a", "", "b"]
 
 
 def test_count_and_body_lines_for_verify() -> None:

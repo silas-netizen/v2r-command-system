@@ -123,6 +123,26 @@ def test_make_variants_distinct_combos(tmp_path: Path):
     assert len(combos) == 6
 
 
+def test_make_variants_does_not_overwrite_existing(tmp_path: Path):
+    from v2r.warehouse.store import sha256
+
+    src = _make_jpeg(tmp_path / "src.jpg")
+    out_dir = tmp_path / "washed"
+    first = make_variants(src, 3, out_dir, seed=1)
+    digests = {p.name: sha256(p) for p in first}
+
+    more = make_variants(src, 2, out_dir, seed=2)
+    assert [p.name for p in more] == ["3.jpg", "4.jpg"]  # 번호를 이어서
+    for path in first:
+        assert sha256(path) == digests[path.name]  # 기존 파일 그대로
+
+    combos = set()
+    for path in sorted(out_dir.glob("*.jpg")):
+        meta = read_camera_meta(path)
+        combos.add((meta["Make"], meta["Model"], meta["DateTimeOriginal"]))
+    assert len(combos) == 5  # 기존 변형과도 조합이 겹치지 않는다
+
+
 def test_make_variants_zero(tmp_path: Path):
     src = _make_jpeg(tmp_path / "src.jpg")
     assert make_variants(src, 0, tmp_path / "w") == []

@@ -20,7 +20,8 @@ TASK_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("learn_guides", re.compile(r"(메이크|make|지침).*(학습|읽어|가져와)", re.I)),
     ("open_login", re.compile(r"로그인\s*(창|세션|준비)")),
     ("stop", re.compile(r"(중지|멈춰|중단|취소)")),
-    ("status", re.compile(r"(상태|현황|진행)")),
+    # `진행`은 "진행 상황/중/률"처럼 명사형일 때만 상태 조회로 본다(발행 문장 가로채기 방지)
+    ("status", re.compile(r"(상태|현황|진행\s*(?:상황|중|률))")),
     ("catalog", re.compile(r"(카페|게시판|계정)\s*(목록|카탈로그)")),
     ("publish_brand", re.compile(r"(브랜드|수정)\s*글")),
     ("publish_info", re.compile(r"정보성\s*글")),
@@ -56,8 +57,10 @@ def _loose(name: str) -> re.Pattern[str]:
 CAFE_PATTERNS = [(n, _loose(n)) for n in CAFE_NAMES]
 BRAND_PATTERNS = [(n, _loose(n)) for n in BRAND_NAMES]
 
-RE_CLOCK = re.compile(r"(오전|오후)?\s*(\d{1,2})\s*시(?:\s*(\d{1,2})\s*분)?")
+# `2시간`의 `2시`를 시각으로 오인하지 않도록 `간`을 부정 전방탐색으로 제외
+RE_CLOCK = re.compile(r"(오전|오후)?\s*(\d{1,2})\s*시(?!간)(?:\s*(\d{1,2})\s*분)?")
 RE_COUNT = re.compile(r"(?:일상\s*글|글)\s*(\d+)\s*개")
+RE_ANY_COUNT = re.compile(r"(\d+)\s*개")
 RE_SHEETS = re.compile(r"(\d+)\s*장")
 RE_ACCOUNT_COUNT = re.compile(r"(?:아이디|계정)\s*(\d+)\s*개")
 RE_INTERVAL_RANGE = re.compile(r"(\d+)\s*~\s*(\d+)\s*분")
@@ -95,9 +98,44 @@ def _to_hhmm(meridiem: str | None, hour: int, minute: int | None) -> str:
     return f"{h % 24:02d}:{(minute or 0) % 60:02d}"
 
 
+#: 발행 계열 작업 (개수 표현이 붙는 작업)
+PUBLISH_TASKS = frozenset(
+    {"publish_brand", "publish_info", "publish_batch", "publish_daily"}
+)
+#: 개수가 함께 나오면 `stop`/`status`보다 우선하는 작업
+_PRIORITY_TASKS = PUBLISH_TASKS | {"catalog"}
+_HIJACKABLE = {"stop", "status"}
+#: 시트/게시판 같은 슬롯 추출을 하지 않는 작업
+_NO_SLOT_TASKS = frozenset(
+    {
+        "sync_sources",
+        "sync_all_sources",
+        "status",
+        "stop",
+        "reconcile",
+        "inspect_failures",
+        "catalog",
+    }
+)
+
+
 def _match_task(text: str) -> str | None:
+    """표 순서대로 첫 매치. 단, 개수 표현이 있으면 발행/카탈로그를 우선한다.
+
+    `일상 글 5개 발행 진행해`처럼 발행 의도가 분명한 문장을
+    `status`/`stop` 패턴이 가로채지 않게 한다.
+    """
+    preferred: str | None = None
+    if RE_ANY_COUNT.search(text) or "목록" in text or "카탈로그" in text:
+        for task, pattern in TASK_PATTERNS:
+            if task in _PRIORITY_TASKS and pattern.search(text):
+                preferred = task
+                break
+
     for task, pattern in TASK_PATTERNS:
         if pattern.search(text):
+            if task in _HIJACKABLE and preferred:
+                return preferred
             return task
     return None
 
@@ -131,6 +169,12 @@ def parse_korean_command(text: str, now: datetime | None = None) -> TaskSpec | N
         except json.JSONDecodeError:
             data = None
         if isinstance(data, dict):
+            # 안전 불변식: 실제 발행은 `(실제|바로)(발행|등록)` 문구가 있을 때만.
+            # JSON의 `dry_run: false`는 `notes`에 그 문구가 있을 때만 존중한다.
+            notes = data.get("notes")
+            allowed = RE_REAL.search(notes) is not None if isinstance(notes, str) else False
+            if not allowed:
+                data = {**data, "dry_run": True}
             try:
                 return TaskSpec.from_json(data)
             except Exception:
@@ -145,12 +189,16 @@ def parse_korean_command(text: str, now: datetime | None = None) -> TaskSpec | N
     # 시간창: 시각 표기 2개 → 시작/종료
     clocks = RE_CLOCK.findall(raw)
     if len(clocks) >= 2:
-        spec["window_start"] = _to_hhmm(
-            clocks[0][0] or None, int(clocks[0][1]), int(clocks[0][2] or 0)
-        )
-        spec["window_end"] = _to_hhmm(
-            clocks[1][0] or None, int(clocks[1][1]), int(clocks[1][2] or 0)
-        )
+        start = _to_hhmm(clocks[0][0] or None, int(clocks[0][1]), int(clocks[0][2] or 0))
+        end_meridiem = clocks[1][0] or None
+        end_hour, end_min = int(clocks[1][1]), int(clocks[1][2] or 0)
+        end = _to_hhmm(end_meridiem, end_hour, end_min)
+        # 둘째 시각에 오전/오후가 없고 그대로 두면 종료 <= 시작이 되는 경우
+        # 첫 시각의 오전/오후를 상속한다. ("오후 2시부터 5시까지" → 14:00~17:00)
+        if end_meridiem is None and end <= start and end_hour < 12:
+            end = _to_hhmm("오후", end_hour, end_min)
+        spec["window_start"] = start
+        spec["window_end"] = end
     elif len(clocks) == 1:
         spec["window_start"] = _to_hhmm(
             clocks[0][0] or None, int(clocks[0][1]), int(clocks[0][2] or 0)
@@ -160,6 +208,11 @@ def parse_korean_command(text: str, now: datetime | None = None) -> TaskSpec | N
     m = RE_COUNT.search(raw)
     if m:
         spec["count"] = int(m.group(1))
+    elif task in PUBLISH_TASKS | {"collect_daily", "collect_photos"}:
+        # `글` 없이 `N개`만 있어도 개수로 인정. 단 계정 수 표현은 먼저 제거한다.
+        m = RE_ANY_COUNT.search(RE_ACCOUNT_COUNT.sub(" ", raw))
+        if m:
+            spec["count"] = int(m.group(1))
     if task == "wash_photos":
         m = RE_SHEETS.search(raw)
         if m:
@@ -197,9 +250,11 @@ def parse_korean_command(text: str, now: datetime | None = None) -> TaskSpec | N
     m = RE_BOARD.search(raw)
     if m:
         spec["board"] = _strip_particle(m.group(1))
-    m = RE_SOURCE.search(raw)
-    if m:
-        spec["source"] = _strip_particle(m.group(1))
+    # 동기화·상태류 문장에서는 `시트 갱신`의 "갱신"이 시트 이름으로 잡히므로 건너뛴다
+    if task not in _NO_SLOT_TASKS:
+        m = RE_SOURCE.search(raw)
+        if m:
+            spec["source"] = _strip_particle(m.group(1))
 
     # 지정 계정 (계정 수 표현이면 무시)
     if not m_acc_count:
@@ -244,7 +299,7 @@ TASK_LABELS: dict[str, str] = {
     "publish_daily": "일상 글 발행",
 }
 
-_PUBLISH_TASKS = {"publish_brand", "publish_info", "publish_batch", "publish_daily"}
+_PUBLISH_TASKS = PUBLISH_TASKS
 
 
 def describe_spec(spec: TaskSpec) -> str:

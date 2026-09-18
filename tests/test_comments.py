@@ -116,3 +116,34 @@ def test_api_payload_중첩구조():
     shallow = next(c for c in c2["comments"] if c["contents"].startswith("대댓글2 "))
     assert shallow["reply_member"] is None
     assert payload[0]["start_at"].endswith("Z")
+
+
+def test_root_start_at는_루트댓글_시각이고_루트는_None():
+    tree = assign_comment_accounts(DEFAULT_TREE, POOL, "author", random.Random(2))
+    for n in tree:
+        n["text"] = n["label"]
+    items = schedule(tree, ROOT)
+    payload = to_api_payload(items, {"author": {"member_key": "MK", "nick": "닉"}})
+    for root in payload:
+        assert root["root_start_at"] is None  # 답글일 때만 값을 갖는다
+        for child in root["comments"]:
+            assert child["root_start_at"] == root["start_at"]
+
+
+def test_iso_는_naive를_KST로_본다():
+    naive = datetime(2026, 9, 19, 10, 0)
+    items = schedule(
+        [{"label": "댓글1", "depth": 0, "parent": None, "role": "comment"}], naive
+    )
+    payload = to_api_payload([{**items[0], "account": "a", "text": "t"}], {})
+    # KST 10:05 = UTC 01:05
+    assert payload[0]["start_at"] == "2026-09-19T01:05:00Z"
+
+
+def test_member_key_없으면_에러():
+    tree = assign_comment_accounts(DEFAULT_TREE, POOL, "author", random.Random(2))
+    for n in tree:
+        n["text"] = n["label"]
+    items = schedule(tree, ROOT)
+    with pytest.raises(CommentError):
+        to_api_payload(items, {})  # member_key 미상 → 전송 금지

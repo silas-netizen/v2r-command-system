@@ -11,3 +11,6 @@ browser-profile/
 *.sqlite-wal
 *.sqlite-shm
 v2r_command_system.egg-info/
+!warehouse/
+warehouse/*
+!warehouse/guides/

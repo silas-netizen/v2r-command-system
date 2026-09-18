@@ -120,17 +120,19 @@ def resolve_conflicts(
     return out
 
 
-def _iso(dt: datetime) -> str:
-    """API용 UTC ISO 문자열."""
-    from datetime import timezone
+def _iso(dt: datetime | None) -> str | None:
+    """API용 UTC ISO 문자열. naive datetime은 KST로 간주한다."""
+    from v2r.api.articles import to_iso_z
 
-    if dt.tzinfo is None:
-        return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return to_iso_z(dt)
 
 
 def to_api_payload(items: list[dict], members: dict[str, dict]) -> list[dict]:
-    """api-spec §5 comments 배열(1단계 중첩, 깊은 계층은 reply_member)."""
+    """api-spec §5 comments 배열(1단계 중첩, 깊은 계층은 reply_member).
+
+    `root_start_at`은 답글일 때만 값을 갖고, 값은 **루트 댓글의 예약 시각**이다.
+    루트 댓글 자신은 `None`(기준이 곧 자기 자신)으로 둔다.
+    """
     by_label = {it["label"]: it for it in items}
 
     def root_of(item: dict) -> dict:
@@ -151,7 +153,7 @@ def to_api_payload(items: list[dict], members: dict[str, dict]) -> list[dict]:
             "start_at": _iso(it["start_at"]),
             "repeat_count": 0,
             "interval_seconds": 0,
-            "root_start_at": _iso(it.get("root_start_at") or it["start_at"]),
+            "root_start_at": None,  # 답글일 때만 값을 갖는다
             "reply_member": None,
             "comments": [],
         }
@@ -165,10 +167,16 @@ def to_api_payload(items: list[dict], members: dict[str, dict]) -> list[dict]:
         parent = by_label[it["parent"]]
         reply_member = None
         if it["depth"] >= 2:
-            info = members.get(parent.get("account", ""), {})
+            parent_account = parent.get("account", "")
+            info = members.get(parent_account, {})
+            member_key = info.get("member_key") or ""
+            if not member_key:
+                raise CommentError(
+                    f"답글 대상 계정의 member_key를 알 수 없습니다: {parent_account or '(미지정)'}"
+                )
             reply_member = {
-                "member_key": info.get("member_key", ""),
-                "naver_login_id": parent.get("account", ""),
+                "member_key": member_key,
+                "naver_login_id": parent_account,
                 "nick": info.get("nick", ""),
             }
         payload_by_root[root["label"]]["comments"].append(

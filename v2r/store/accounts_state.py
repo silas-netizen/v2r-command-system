@@ -5,11 +5,23 @@ from __future__ import annotations
 import sqlite3
 from datetime import datetime
 
-from v2r.store.db import now_iso
+from v2r.store.db import KST, now_iso
+
+
+def _aware(dt: datetime) -> datetime:
+    """naive datetime은 KST로 간주한다(프로젝트 전역 기준)."""
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=KST)
 
 
 def _iso(value: datetime | str) -> str:
-    return value.isoformat(timespec="seconds") if isinstance(value, datetime) else value
+    if isinstance(value, datetime):
+        return _aware(value).isoformat(timespec="seconds")
+    return value
+
+
+def _parse(value: str) -> datetime:
+    """저장된 ISO 문자열 → aware datetime (naive면 KST)."""
+    return _aware(datetime.fromisoformat(value))
 
 
 class AccountStateStore:
@@ -60,9 +72,10 @@ class AccountStateStore:
             return False
         ref = _iso(now) if now else now_iso()
         try:
-            return datetime.fromisoformat(row["restricted_until"]) > datetime.fromisoformat(ref)
-        except ValueError:
-            return False
+            return _parse(row["restricted_until"]) > _parse(ref)
+        except (ValueError, TypeError):
+            # 해석할 수 없으면 보수적으로 "제한 중"으로 본다
+            return True
 
     def last_used_map(self) -> dict[str, str | None]:
         """계정별 마지막 사용 시각."""

@@ -6,6 +6,7 @@ import json
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
+from zoneinfo import ZoneInfo
 
 import httpx
 
@@ -13,6 +14,16 @@ from .client import V2RClient, field, walk_dicts
 from .errors import V2RApiError
 
 SITE_BASE = "https://v2r.daboja.im"
+
+#: 프로젝트 전역 기준 시간대. naive datetime은 KST로 간주한다.
+KST = ZoneInfo("Asia/Seoul")
+
+#: POST 결과가 불확실해 이력 복구가 필요한 오류 종류
+AMBIGUOUS_KINDS = {"server", "ambiguous", "rate_limited"}
+
+
+class PendingError(RuntimeError):
+    """아직 확인할 수 없는 상태(예약 시각이 멀어 대기 불가). 호출자가 뒤로 미룬다."""
 
 PATH_CREATE = "/naver_cafe_articles/naver_cafe_article_source"
 PATH_ARTICLE = "/naver_cafe_articles/article"
@@ -36,11 +47,14 @@ IMAGE_CTYPES = {"image", "imageGroup", "imageStrip"}
 
 
 def to_iso_z(dt: datetime | None) -> str | None:
-    """UTC ISO(`YYYY-MM-DDTHH:MM:SSZ`). None이면 즉시 발행."""
+    """UTC ISO(`YYYY-MM-DDTHH:MM:SSZ`). None이면 즉시 발행.
+
+    naive datetime은 UTC가 아니라 **KST**로 간주한다(프로젝트 전역 기준).
+    """
     if dt is None:
         return None
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.replace(tzinfo=KST)
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
@@ -85,7 +99,12 @@ def create_article(
     parent_source_id: str | None = None,
     write_options: dict | None = None,
 ) -> str:
-    """글 등록 후 source_id 반환. 네트워크 실패 시 이력 조회로 복구 시도."""
+    """글 등록 후 source_id 반환.
+
+    POST는 비멱등이므로 클라이언트 층에서 재전송하지 않는다(`idempotent=False`).
+    네트워크 오류·5xx·429 등 결과가 불확실한 모든 실패에서는 재POST 대신
+    `board_histories` 이력 조회로 복구한다(api-spec §4, 중복 발행 방지).
+    """
     payload = {
         "tag_list": list(tags or []),
         "title": title,
@@ -97,10 +116,9 @@ def create_article(
         "parent_source_id": parent_source_id,
     }
     since = datetime.now(timezone.utc) - timedelta(seconds=15)
-    try:
-        response = client.post(PATH_CREATE, json=payload)
-    except (httpx.HTTPError, TimeoutError) as exc:
-        found = find_recent_source(
+
+    def recover() -> str | None:
+        return find_recent_source(
             client,
             cafe_id=destination.get("cafe_id"),
             login_id=destination.get("naver_login_id"),
@@ -108,22 +126,27 @@ def create_article(
             parent_source_id=parent_source_id,
             since=since,
         )
+
+    try:
+        response = client.post(PATH_CREATE, json=payload, idempotent=False)
+    except V2RApiError as exc:
+        if (exc.kind or "") not in AMBIGUOUS_KINDS:
+            raise
+        found = recover()
         if found:
             return found
-        raise V2RApiError(f"글 등록 실패(네트워크): {exc}") from exc
+        raise
+    except (httpx.HTTPError, TimeoutError) as exc:
+        found = recover()
+        if found:
+            return found
+        raise V2RApiError(f"글 등록 실패(네트워크): {exc}", kind="ambiguous") from exc
 
     source_id = _source_id_from(response)
     if source_id:
         return source_id
 
-    found = find_recent_source(
-        client,
-        cafe_id=destination.get("cafe_id"),
-        login_id=destination.get("naver_login_id"),
-        title=title,
-        parent_source_id=parent_source_id,
-        since=since,
-    )
+    found = recover()
     if found:
         return found
     raise V2RApiError("글 등록 응답에 source_id 없음")
@@ -200,7 +223,13 @@ def find_recent_source(
     attempts: int = 8,
     interval: float = 0.5,
 ) -> str | None:
-    """POST 실패/타임아웃 후 이력에서 방금 만들어진 글을 찾아낸다."""
+    """POST 실패/타임아웃 후 이력에서 방금 만들어진 글을 찾아낸다.
+
+    보수적으로 판정한다:
+    - `created_at`이 없거나 파싱되지 않는 행은 채택하지 않는다.
+    - `since`가 주어지면 그보다 이전에 만들어진 행은 제외한다.
+    - 조건을 만족하는 행이 2건 이상이면 불확실하므로 `None`을 돌려준다.
+    """
     for i in range(attempts):
         try:
             rows = board_histories(client, cafe_id, days_ago=1, max_pages=1)
@@ -209,6 +238,7 @@ def find_recent_source(
                 rows = []
             else:
                 raise
+        matches: list[str] = []
         for row in rows:
             if field(row, "title") != title:
                 continue
@@ -218,14 +248,20 @@ def find_recent_source(
             if (row.get("parent_source_id") or None) != (parent_source_id or None):
                 continue
             created = _parse_dt(field(row, "created_at", "createdAt"))
-            if since is not None and created is not None and created < since:
+            if created is None:
+                continue  # 시각을 모르면 "방금 만든 글"이라고 볼 수 없다
+            if since is not None and created < since:
                 continue
             status = str(field(row, "status", default="") or "").upper()
             if status and status not in DONE_STATUSES | {"RESERVED"}:
                 continue
             source_id = field(row, "source_id", "sourceId")
-            if source_id:
-                return str(source_id)
+            if source_id and str(source_id) not in matches:
+                matches.append(str(source_id))
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            return None  # 동일 조건 복수 건 → 불확실
         if i < attempts - 1:
             time.sleep(interval)
     return None
@@ -247,18 +283,26 @@ def wait_written(
     scheduled_at: datetime | None = None,
     poll: tuple[float, float] = (2.0, 5.0),
     timeout_after_sched: float = 1800.0,
+    max_wait_s: float = 120.0,
 ) -> dict:
-    """등록 완료까지 폴링. 예약 15초 전까지는 호출하지 않는다."""
+    """등록 완료까지 폴링. 예약 15초 전까지는 호출하지 않는다.
+
+    예약 시각이 `max_wait_s`(기본 120초)보다 멀면 스레드를 오래 붙잡지 않고
+    `PendingError`를 던진다. 호출자(reconcile)가 나중에 다시 확인해야 한다.
+    naive `scheduled_at`은 KST로 간주한다.
+    """
     if scheduled_at is not None:
         target = scheduled_at
         if target.tzinfo is None:
-            target = target.replace(tzinfo=timezone.utc)
+            target = target.replace(tzinfo=KST)
         wait = (target - datetime.now(timezone.utc)).total_seconds() - 15.0
+        if wait > max_wait_s:
+            raise PendingError(
+                f"예약 시각이 {wait:.0f}초 뒤라 대기하지 않습니다(상한 {max_wait_s:.0f}초): {source_id}"
+            )
         if wait > 0:
             time.sleep(wait)
-        deadline = time.monotonic() + timeout_after_sched
-    else:
-        deadline = time.monotonic() + timeout_after_sched
+    deadline = time.monotonic() + timeout_after_sched
 
     first, later = poll
     interval = first
@@ -399,12 +443,14 @@ def verify_article(
     if got_images != int(image_count):
         problems.append(f"이미지 개수 불일치: {got_images} != {image_count}")
 
-    expected_start = to_iso_z(start_at)
-    got_start = field(destination, "start_at", "startAt")
-    if _parse_dt(got_start) != _parse_dt(expected_start) and (
-        got_start or None
-    ) != (expected_start or None):
-        problems.append(f"예약시각 불일치: {got_start} != {expected_start}")
+    # 즉시 발행(start_at=None)은 서버가 실제 시각을 채우므로 예약시각 검사를 생략한다.
+    if start_at is not None:
+        expected_start = to_iso_z(start_at)
+        got_start = field(destination, "start_at", "startAt")
+        if _parse_dt(got_start) != _parse_dt(expected_start) and (
+            got_start or None
+        ) != (expected_start or None):
+            problems.append(f"예약시각 불일치: {got_start} != {expected_start}")
 
     got_comments = detail.get("naver_cafe_article_source_comments")
     n_comments = len(got_comments) if isinstance(got_comments, list) else 0
@@ -415,7 +461,10 @@ def verify_article(
 
 
 __all__ = [
+    "AMBIGUOUS_KINDS",
     "DEFAULT_WRITE_OPTIONS",
+    "KST",
+    "PendingError",
     "article_url",
     "board_histories",
     "build_destination",

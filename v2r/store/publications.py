@@ -43,7 +43,10 @@ class PublicationStore:
         stage: str | None = None,
         **fields: object,
     ) -> None:
-        """상태 upsert. 지정하지 않은 열은 유지."""
+        """상태 upsert. 지정하지 않은 열은 유지.
+
+        `done` → `uncertain` 역행은 막는다(확정된 성공을 미확정으로 되돌리지 않음).
+        """
         unknown = set(fields) - set(_FIELDS)
         if unknown:
             raise ValueError(f"알 수 없는 열: {sorted(unknown)}")
@@ -52,7 +55,8 @@ class PublicationStore:
             "INSERT INTO publications (source_key, row_number, content_hash, status, stage,"
             " created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
             " ON CONFLICT(source_key, row_number, content_hash) DO UPDATE SET"
-            " status = excluded.status,"
+            " status = CASE WHEN publications.status = 'done' AND excluded.status = 'uncertain'"
+            "   THEN publications.status ELSE excluded.status END,"
             " stage = COALESCE(excluded.stage, publications.stage),"
             " updated_at = excluded.updated_at",
             (source_key, row_number, content_hash, status, stage, ts, ts),

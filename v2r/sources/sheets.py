@@ -209,15 +209,28 @@ def parse_affiliate_rows(rows: list[dict], source: str = "") -> list[Manuscript]
     return out
 
 
+NO_CACHE_MESSAGE = "원본 캐시가 없습니다. '시트 동기화' 명령을 먼저 실행하세요"
+
+
 def load_source(
     cfg_entry: dict,
     cache_get: Callable[[str], list[dict] | None] | None = None,
     cache_put: Callable[[str, list[dict]], None] | None = None,
+    prefer_cache: bool = False,
 ) -> list[dict]:
-    """시트 한 건 적재. 실패하면 마지막 캐시로 대체."""
+    """시트 한 건 적재. 실패하면 마지막 캐시로 대체.
+
+    `prefer_cache=True`(모의 실행)면 네트워크를 전혀 쓰지 않는다.
+    캐시가 없으면 `SourceError`로 알린다.
+    """
     sid = str(cfg_entry.get("spreadsheet_id") or "")
     gid = cfg_entry.get("gid", 0)
     key = cfg_entry.get("name") or f"{sid}:{gid}"
+    if prefer_cache:
+        cached = cache_get(key) if cache_get else None
+        if cached is not None:
+            return cached
+        raise SourceError(NO_CACHE_MESSAGE)
     url = gviz_csv_url(sid, gid)  # 금지 문서면 여기서 SourceError
     try:
         rows = fetch_csv(url)

@@ -61,9 +61,10 @@ def test_plan_slots_창밖이면_다음날_창시작():
     )
     rolled = [x for x in slots if x.day == 20]
     assert rolled, "창을 넘으면 다음 날로 이월되어야 한다"
-    assert (rolled[0].hour, rolled[0].minute) == (9, 0)  # 다음 날 창 시작
+    # 다음 날 첫 슬롯도 첫 글 규칙(+5~15분)을 따른다
+    assert rolled[0].hour == 9 and 5 <= rolled[0].minute <= 15
     _, end = window_bounds(date(2026, 9, 19), "09:00", "09:20")
-    assert all(x < end or x.day == 20 for x in slots)
+    assert all(x < end or x.day > 19 for x in slots)
 
 
 def test_plan_slots_카페별_독립체인():

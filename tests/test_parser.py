@@ -120,7 +120,77 @@ def test_json_input():
     assert spec is not None
     assert spec.task == "publish_daily"
     assert spec.count == 3
+    # JSON으로도 모의 실행 규칙을 우회할 수 없다
+    assert spec.dry_run is True
+
+
+def test_json_input_real_publish_needs_phrase_in_notes():
+    payload = (
+        '{"task": "publish_daily", "count": 1, "dry_run": false,'
+        ' "notes": "씨씨앙 실제 발행"}'
+    )
+    spec = parse_korean_command(payload, now=NOW)
     assert spec.dry_run is False
+    # 문구가 있어도 dry_run을 명시하지 않으면 기본값(True) 유지
+    spec2 = parse_korean_command(
+        '{"task": "publish_daily", "notes": "실제 발행"}', now=NOW
+    )
+    assert spec2.dry_run is True
+
+
+def test_second_clock_inherits_meridiem():
+    spec = parse_korean_command(
+        "정보성 글 내일 오후 2시부터 5시까지 2개 아이디 abc,def 로", now=NOW
+    )
+    assert (spec.window_start, spec.window_end) == ("14:00", "17:00")
+    assert spec.count == 2
+
+
+def test_second_clock_without_meridiem_rolls_to_afternoon():
+    spec = parse_korean_command("일상 글 3개 12시부터 3시까지", now=NOW)
+    assert (spec.window_start, spec.window_end) == ("12:00", "15:00")
+
+
+def test_explicit_meridiem_crosses_midnight():
+    spec = parse_korean_command("일상 글 10개 오후 11시부터 오전 2시까지", now=NOW)
+    assert (spec.window_start, spec.window_end) == ("23:00", "02:00")
+
+
+def test_hours_later_is_not_a_clock():
+    spec = parse_korean_command("일상 글 3개 2시간 후에 올려줘", now=NOW)
+    assert spec.window_start == "09:00"  # 기본값 유지
+
+
+def test_status_does_not_hijack_publish_sentence():
+    spec = parse_korean_command("일상 글 5개 발행 진행해", now=NOW)
+    assert spec.task == "publish_daily"
+    assert spec.count == 5
+
+
+def test_catalog_not_hijacked_by_status():
+    assert parse_korean_command("카페 목록 진행 중인거", now=NOW).task == "catalog"
+
+
+def test_status_sentence_still_status():
+    assert parse_korean_command("정보성 글 발행 상태 알려줘", now=NOW).task == "status"
+    assert parse_korean_command("발행 중지", now=NOW).task == "stop"
+
+
+def test_count_without_geul_keyword():
+    spec = parse_korean_command("일상 글 수집해줘 10개", now=NOW)
+    assert spec.task == "collect_daily" and spec.count == 10
+
+
+def test_account_count_not_taken_as_count():
+    spec = parse_korean_command("정보성 글 아이디 5개로 올려줘", now=NOW)
+    assert spec.account_count == 5
+    assert spec.count == 0
+
+
+def test_sync_task_does_not_take_source_slot():
+    spec = parse_korean_command("시트 갱신해줘", now=NOW)
+    assert spec.task == "sync_sources"
+    assert spec.source == ""
 
 
 def test_unparsable_returns_none():

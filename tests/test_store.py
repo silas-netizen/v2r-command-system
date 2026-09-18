@@ -113,6 +113,10 @@ def test_publications_exists_includes_uncertain(conn):
     pub.mark("일상글목록", 4, "h2", "skipped")
     assert pub.exists("일상글목록", 4, "h2") is False
 
+    # done → uncertain 역행은 막는다
+    pub.mark("일상글목록", 3, "h1", "uncertain", "daily_submitting")
+    assert pub.by_source_id("s-1")["status"] == "done"
+
     with pytest.raises(ValueError):
         pub.mark("일상글목록", 5, "h3", "done", None, 없는열="x")
 
@@ -132,6 +136,20 @@ def test_account_state_restrict_and_lru(conn):
     used = acc.last_used_map()
     assert set(used) == {"abc01", "abc02"}
     assert used["abc01"] < used["abc02"]
+
+
+def test_account_state_naive_datetime(conn):
+    """naive datetime은 KST로 간주하며 TypeError로 죽지 않는다."""
+    acc = AccountStateStore(conn)
+    acc.restrict("abc03", datetime(2030, 1, 1))
+    assert acc.is_restricted("abc03") is True
+    assert acc.is_restricted("abc03", datetime(2030, 1, 2)) is False
+    assert acc.is_restricted("abc03", datetime(2029, 12, 31, tzinfo=KST)) is True
+    # 해석 불가 값은 보수적으로 "제한 중"
+    conn.execute(
+        "UPDATE account_state SET restricted_until = '언젠가' WHERE login_id = 'abc03'"
+    )
+    assert acc.is_restricted("abc03") is True
 
 
 def test_source_cache(conn):

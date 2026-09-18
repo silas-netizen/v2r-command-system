@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import threading
 import time
 from typing import Any, Iterator
@@ -110,17 +111,30 @@ class V2RClient:
         params: dict | None = None,
         json: Any = None,
         retry_auth: bool = True,
+        idempotent: bool | None = None,
         **kwargs: Any,
     ) -> dict:
-        """API 호출 후 JSON dict 반환. 429/5xx 재시도, 토큰 만료 시 1회 재로그인."""
+        """API 호출 후 JSON dict 반환.
+
+        `idempotent`가 참이면 429/5xx를 최대 3회까지 재시도한다. 기본값은
+        GET이면 True, 그 외(POST/PUT 등)는 False다. 비멱등 요청은 **한 번만**
+        보내고, 5xx/타임아웃처럼 서버 처리 여부를 알 수 없는 응답은
+        `kind="ambiguous"`인 `V2RApiError`로 올려 호출자가 이력 조회 등으로
+        복구할 수 있게 한다(중복 발행 방지, api-spec §4).
+        토큰 만료(403 TOKEN_ERROR)는 서버가 요청을 처리하지 않은 것이므로
+        비멱등 요청도 1회 재로그인 후 재전송한다.
+        """
         method = method.upper()
+        if idempotent is None:
+            idempotent = method == "GET"
         cache_key = self._cache_key(path, params) if method == "GET" else None
         if cache_key:
             with _cache_lock:
                 hit = _cache.get(cache_key)
                 if hit and (time.monotonic() - hit[0]) < CACHE_TTL:
-                    return hit[1]
+                    return copy.deepcopy(hit[1])
 
+        extra_headers = kwargs.pop("headers", None)
         attempt = 0
         relogin_used = not retry_auth
         while True:
@@ -129,7 +143,6 @@ class V2RClient:
             headers = {"Authorization": f"Bearer {token}"}
             if method != "GET":
                 headers.update(self.auth.device.signal_headers())
-            extra_headers = kwargs.pop("headers", None)
             if extra_headers:
                 headers.update(extra_headers)
 
@@ -141,7 +154,7 @@ class V2RClient:
                 data = _as_dict(response)
                 if cache_key:
                     with _cache_lock:
-                        _cache[cache_key] = (time.monotonic(), data)
+                        _cache[cache_key] = (time.monotonic(), copy.deepcopy(data))
                 return data
 
             err = V2RApiError.from_response(response, f"{method} {path} 실패")
@@ -153,10 +166,24 @@ class V2RClient:
                 attempt -= 1  # 재로그인은 재시도 횟수에서 제외
                 continue
 
-            if kind in {"rate_limited", "server"} and attempt < MAX_ATTEMPTS:
-                time.sleep(self._retry_wait(err, attempt))
-                continue
+            if kind in {"rate_limited", "server"}:
+                if idempotent and attempt < MAX_ATTEMPTS:
+                    time.sleep(self._retry_wait(err, attempt))
+                    continue
+                if not idempotent and kind == "server":
+                    # 서버가 이미 처리했을 수 있다 → 재전송 금지, 복구는 호출자 몫
+                    raise V2RApiError(
+                        f"{method} {path} 응답 불확실(HTTP {err.status}) — 재시도하지 않음",
+                        status=err.status,
+                        code=err.code,
+                        reason=err.reason,
+                        extra=err.extra,
+                        body=err.body,
+                        kind="ambiguous",
+                        retry_after=err.retry_after,
+                    ) from err
 
+            err.kind = kind
             raise err
 
     @staticmethod

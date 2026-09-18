@@ -17,6 +17,14 @@ API_BASE = "https://slack.com/api"
 TIMEOUT = 30.0
 
 
+def _ts(value: str) -> float:
+    """슬랙 `ts`를 수치로. 문자열 비교는 자릿수가 바뀌면 틀린다."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 class SlackChannel:
     """슬랙 봇 채널. webhook만 있으면 발신 전용으로 동작한다."""
 
@@ -113,9 +121,9 @@ class SlackChannel:
             newest = last_ts or "0"
             for message in reversed(data.get("messages") or []):
                 ts = str(message.get("ts", "0"))
-                if ts > newest:
+                if _ts(ts) > _ts(newest):
                     newest = ts
-                if last_ts and ts <= last_ts:
+                if last_ts and _ts(ts) <= _ts(last_ts):
                     continue
                 if message.get("bot_id") or message.get("subtype"):
                     continue  # 봇/시스템 메시지는 명령으로 보지 않는다

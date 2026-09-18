@@ -31,6 +31,7 @@ class Settings:
     v2r_api: str = "https://api-v2r.daboja.im"
     telegram_bot_token: str = ""
     telegram_allowed_chat_ids: list[str] = field(default_factory=list)
+    telegram_allowed_user_ids: list[str] = field(default_factory=list)
     slack_bot_token: str = ""
     slack_allowed_channel_ids: list[str] = field(default_factory=list)
     slack_webhook_url: str = ""
@@ -51,6 +52,27 @@ class Settings:
 
     __str__ = __repr__
 
+    #: 로그·보고에 절대 넣지 않는 비밀 필드
+    SECRET_FIELDS = (
+        "v2r_password",
+        "telegram_bot_token",
+        "slack_bot_token",
+        "slack_webhook_url",
+        "anthropic_api_key",
+    )
+
+    def to_public_dict(self) -> dict:
+        """비밀 필드를 뺀 설정 dict.
+
+        주의: `dataclasses.asdict(settings)` / `vars(settings)`는 비밀값을 그대로
+        노출한다. 로그·보고 코드에서는 반드시 이 메서드를 쓸 것.
+        """
+        return {
+            name: (str(value) if isinstance(value, Path) else value)
+            for name, value in self.__dict__.items()
+            if name not in self.SECRET_FIELDS
+        }
+
 
 def _build_settings() -> Settings:
     load_dotenv(REPO_ROOT / ".env")
@@ -66,6 +88,7 @@ def _build_settings() -> Settings:
         v2r_api=os.getenv("V2R_API", "https://api-v2r.daboja.im"),
         telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", ""),
         telegram_allowed_chat_ids=_split_ids(os.getenv("TELEGRAM_ALLOWED_CHAT_IDS")),
+        telegram_allowed_user_ids=_split_ids(os.getenv("TELEGRAM_ALLOWED_USER_IDS")),
         slack_bot_token=os.getenv("SLACK_BOT_TOKEN", ""),
         slack_allowed_channel_ids=_split_ids(os.getenv("SLACK_ALLOWED_CHANNEL_IDS")),
         slack_webhook_url=os.getenv("SLACK_WEBHOOK_URL", ""),

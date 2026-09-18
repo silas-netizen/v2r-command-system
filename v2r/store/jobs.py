@@ -43,6 +43,43 @@ class JobStore:
         )
         return int(cur.lastrowid)
 
+    def find_by_idem(self, idem_key: str) -> dict | None:
+        """멱등 키로 작업 1건 조회(가장 최근)."""
+        row = self.conn.execute(
+            "SELECT * FROM jobs WHERE idem_key = ? ORDER BY id DESC LIMIT 1",
+            (idem_key,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def has_open_job(self, idem_key: str) -> bool:
+        """같은 키로 아직 끝나지 않은(queued/running) 작업이 있는가."""
+        row = self.conn.execute(
+            "SELECT 1 FROM jobs WHERE idem_key = ? AND status IN ('queued', 'running')",
+            (idem_key,),
+        ).fetchone()
+        return row is not None
+
+    def reap_stale_running(self, error: str = "실행기 중단") -> int:
+        """리스가 만료된 running 작업을 uncertain으로 정리한다."""
+        rows = self.conn.execute(
+            "SELECT id, lease_until FROM jobs WHERE status = 'running'"
+        ).fetchall()
+        stale = []
+        for row in rows:
+            until = _parse(row["lease_until"])
+            if until is None or until <= datetime.now(KST):
+                stale.append(int(row["id"]))
+        if not stale:
+            return 0
+        ts = now_iso()
+        for job_id in stale:
+            self.conn.execute(
+                "UPDATE jobs SET status = 'uncertain', error = ?, lease_owner = NULL,"
+                " lease_until = NULL, updated_at = ? WHERE id = ?",
+                (error, ts, job_id),
+            )
+        return len(stale)
+
     # --- 리스 ---
     def _take_lease(self, owner: str, lease_seconds: int) -> bool:
         """비었거나 만료됐거나 내 것이면 리스 획득."""

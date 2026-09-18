@@ -91,9 +91,10 @@ def plan_slots(
             _, w_end = window_for(chain_days[key])
             nxt = chains[key] + timedelta(minutes=rng.randint(interval_min, interval_max))
             if nxt >= w_end:
+                # 다음 날로 이월할 때도 첫 글 규칙(+5~15분)을 적용한다
                 chain_days[key] += 1
                 w_start, w_end = window_for(chain_days[key])
-                nxt = w_start
+                nxt = first_for(w_start)
         chains[key] = nxt
         slots.append(nxt)
 
