@@ -25,6 +25,8 @@ TASK_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("wash_photos", re.compile(r"사진.*(세탁|변형)\s*(\d+)?")),
     ("learn_guides", re.compile(r"(메이크|make|지침).*(학습|읽어|가져와)", re.I)),
     ("cleanup_orphans", re.compile(r"(고아|찌꺼기).*(정리|삭제)")),
+    # 예약 수정글의 댓글 역할 복구 (`댓글 … 다시 세팅` / `댓글 재설정` / `댓글 복구`)
+    ("repair_comments", re.compile(r"댓글.*(복구|재설정|다시)")),
     ("open_login", re.compile(r"로그인\s*(창|세션|준비)")),
     ("stop", re.compile(r"(중지|멈춰|중단|취소)")),
     # `진행`은 "진행 상황/중/률"처럼 명사형일 때만 상태 조회로 본다(발행 문장 가로채기 방지)
@@ -135,6 +137,7 @@ _NO_SLOT_TASKS = frozenset(
         "inspect_failures",
         "catalog",
         "cleanup_orphans",
+        "repair_comments",
         "gpt_keepalive",
     }
 )
@@ -337,6 +340,7 @@ TASK_LABELS: dict[str, str] = {
     "wash_photos": "사진 세탁",
     "learn_guides": "지침 학습",
     "cleanup_orphans": "고아 글 정리",
+    "repair_comments": "댓글 복구",
     "open_login": "로그인 창 열기",
     "stop": "작업 중지",
     "status": "상태 조회",

@@ -28,6 +28,7 @@ ALLOWED_TASKS: frozenset[str] = frozenset(
         "wash_photos",
         "learn_guides",
         "cleanup_orphans",
+        "repair_comments",
         "open_login",
         "stop",
         "status",

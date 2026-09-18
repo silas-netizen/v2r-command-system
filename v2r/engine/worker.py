@@ -685,6 +685,10 @@ def dispatch(rt: Runtime, job: Any, owner: str | None = None) -> dict:
         from v2r.engine.cleanup import cleanup_orphans
 
         return cleanup_orphans(rt, spec)
+    if task == "repair_comments":
+        from v2r.engine.repair import repair_comments
+
+        return repair_comments(rt, spec, job_id=job_id)
     if task == "learn_guides":
         from v2r.knowledge.make_import import learn_make_guides
 

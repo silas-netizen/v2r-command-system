@@ -151,6 +151,10 @@ idx cid    parent login start  reply_member  라벨
 스스로 "222 저도 효과 봤어요"를 다는 모양이 됐다. `reply_member`도 전부
 자기 자신(작성자)을 가리켰다.
 
+**수리 완료(2026-09-19).** 세 건 모두 지우고 같은 내용으로 다시 등록해 기준대로
+맞췄다. 새 source_id와 수리 전/후 표는 `docs/reports/comment-repair-2026-09-19.md`.
+복구기는 `v2r/engine/repair.py::repair_revision_comments`(작업 `repair_comments`).
+
 → 수정: `v2r/content/comments.py::assign_comment_accounts`가 `manuscript_type`을
 받아 질문형/후기형별로 대대댓글2·대대대댓글2 계정을 배정하고, 여분 댓글풀 계정을
 한 개 남겨둔다. 순서는 `DEFAULT_TREE`를 읽는 순서로 고정한다.

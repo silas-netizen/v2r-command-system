@@ -624,6 +624,20 @@ def _count_images(components: Iterable[dict]) -> int:
     return count
 
 
+def body_lines_of(detail: dict) -> list[str]:
+    """글 상세 응답의 본문을 `verify_article(body_lines=...)`용 줄 목록으로.
+
+    같은 본문을 그대로 다시 등록할 때(댓글 복구 등) 기대값을 원본에서 그대로
+    뽑아 쓰기 위한 공개 헬퍼다.
+    """
+    return _paragraph_lines(_iter_components(detail))
+
+
+def image_count_of(detail: dict) -> int:
+    """글 상세 응답의 유효 이미지 컴포넌트 수."""
+    return _count_images(_iter_components(detail))
+
+
 def verify_article(
     detail: dict,
     *,
@@ -725,7 +739,9 @@ __all__ = [
     "PendingError",
     "article_url",
     "board_histories",
+    "body_lines_of",
     "build_destination",
+    "image_count_of",
     "count_comment_nodes",
     "create_article",
     "delete_article",
