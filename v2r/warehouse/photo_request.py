@@ -105,7 +105,11 @@ def brand_context(brand: str, cfg: dict | None = None, guides_dir: str | Path | 
     folders = [str(f) for f in (entry.get("known_folders") or []) if str(f).strip()]
     if folders:
         parts.append("사진 폴더: " + ", ".join(folders[:8]))
-    if guides_dir is not None:
+    desc = str(entry.get("description") or "").strip()
+    if desc:
+        # 설정의 한 줄 설명이 있으면 그것만 쓴다(지침 폴더 전문 검색은 목차를 긁어 오는 문제가 있었다)
+        parts.append("제품 설명: " + desc)
+    elif guides_dir is not None:
         guide = _read_guides(guides_dir, brand)
         if guide:
             parts.append("제품 설명: " + guide)

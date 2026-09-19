@@ -44,6 +44,7 @@ defaults:
 
 brands:
   우아덤:
+    description: 그린커피 아하바하 — 피부 착색·미백·색소침착 케어 제품. 사진은 제품 사용 장면이나 제품 자체 클로즈업(제품명·로고 없이)
     folder: 우아덤             # 창고/인박스 폴더명
     drive_folder: 우아덤
     aliases: []
@@ -55,6 +56,7 @@ brands:
     sheets: [1QYhQFnZznQ-NjIjwiIlmJcf6zkQlb6t3TBK-W6OwJm0]   # 원고 시트 (config/sources.yaml brand_sheets)
 
   코숨핏:
+    description: 코숨핏 — 코골이·비염 개선(기도 근육 강화) 제품. 사진은 제품 자체나 사용 장면 클로즈업(제품명·로고 없이)
     folder: 코숨핏
     drive_folder: 코숨핏
     aliases: []
@@ -83,6 +85,7 @@ brands:
     sheets: [1Ey_laLK5-yJx2malh8s0vbmECpVW7CZQklCGKT3x0ek]   # 원고 시트 (config/sources.yaml brand_sheets)
 
   뉴더미스:
+    description: 뉴더미스 — 항문·사타구니 부위 케어 제품. 사진은 제품 자체 클로즈업(제품명·로고 없이, 신체 노출 없이)
     folder: 뉴더미스
     drive_folder: 뉴더미스
     # 같은 브랜드의 다른 표기. 지침(SUMMARY §8)에서는 `자연방패 항문세정제`로 부른다.
@@ -96,6 +99,7 @@ brands:
     sheets: [1mgqghfeNrSZ1bTSrfTYWojtPGMc0u-K4VXEikxrHLOw]   # 원고 시트 (config/sources.yaml brand_sheets)
 
   장으뜸:
+    description: 장으뜸 장어즙 — 장어 추출 건강즙(파우치·즙 형태). 사진은 즙 파우치·컵에 따른 모습 등 음식 클로즈업
     folder: 장으뜸
     drive_folder: 장으뜸
     aliases: [장으뜸 장어즙]
@@ -108,6 +112,7 @@ brands:
     sheets: [1J8Nq-UQxLzrt3fOqIkZ2HRskZJTFQlOjmFjIh3wlzBs]   # 원고 시트 (config/sources.yaml brand_sheets)
 
   팥순이:
+    description: 팥순이 — 팥순 추출물 다이어트 식품. 사진은 팥·분말·차·스틱 등 음식 클로즈업
     folder: 팥순이
     drive_folder: 팥순이
     aliases: [팥순추출물, 팥순ㅇㅣ]
