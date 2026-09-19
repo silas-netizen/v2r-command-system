@@ -111,6 +111,7 @@ def cleanup_emoji(
     manual: list[dict] = []
     clean: int = 0
     errors: list[str] = []
+    unreadable: list[str] = []
 
     for index, pub in enumerate(pubs):
         source_id = str(pub.get("source_id") or "")
@@ -124,7 +125,8 @@ def cleanup_emoji(
         try:
             detail = api_articles.get_article(rt.client, source_id)
         except Exception as exc:
-            errors.append(f"{source_id}: 읽기 실패 {exc}")
+            # 지워진 글(고아 글 정리 등)은 읽을 수 없다 → 실패가 아니라 건너뜀으로 기록
+            unreadable.append(f"{source_id}: 읽기 실패 {str(exc)[:80]}")
             continue
 
         found = inspect(detail)
@@ -192,6 +194,7 @@ def cleanup_emoji(
 
     return {
         "ok": not errors,
+        "unreadable": unreadable,
         "dry_run": spec.dry_run,
         "scope": "전체" if scope_all else spec.start_date,
         "checked": len(pubs),
@@ -238,7 +241,8 @@ def report(
 
 def report_path(rt: Runtime, spec: TaskSpec):
     """보고서 경로 (`docs/reports/emoji-cleanup-<날짜>.md`)."""
-    return rt.settings.repo_root / "docs" / "reports" / f"emoji-cleanup-{spec.start_date}.md"
+    # data_dir의 부모 = 저장소 루트(실행) / 임시 폴더(테스트) → 테스트가 실제 docs/에 파일을 남기지 않는다
+    return Path(rt.settings.data_dir).parent / "docs" / "reports" / f"emoji-cleanup-{spec.start_date}.md"
 
 
 def write_report(rt: Runtime, spec: TaskSpec, text: str) -> str:
