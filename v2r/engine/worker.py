@@ -154,6 +154,12 @@ def handle_text(rt: Runtime, text: str, *, via_channel: bool = False) -> dict:
             "message": f"중지 요청 처리: 작업 {cancelled}건 취소",
         }
 
+    # 새 명령이 들어오면 이전 '중지' 플래그는 해제한다 (남아 있으면 실행기가 영영 작업을 안 잡는다 — 2026-09-19 실측)
+    try:
+        stop_flag_path(rt).unlink(missing_ok=True)
+        rt.scratch.pop("stop_requested", None)
+    except Exception:
+        pass
     job_id = rt.jobs.enqueue(spec, _enqueue_key(rt, text, spec.task))
     rt.events.log(job_id, "info", f"명령 접수: {description}")
     return {"ok": True, "job_id": job_id, "description": description}

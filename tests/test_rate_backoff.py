@@ -181,3 +181,17 @@ def test_레이트_제한은_원고를_소모하지_않는다(tmp_path, monkeypa
     assert rt.publications.list_uncertain() == []
     assert rt.publications.exists(m.source, m.source_row, m.content_hash) is False
     rt.close()
+
+
+def test_new_command_clears_stop_flag(tmp_path, monkeypatch):
+    """'중지' 뒤 새 명령이 오면 STOP 플래그가 지워져 실행기가 다시 작업을 잡는다."""
+    from tests.test_engine import make_runtime
+    from v2r.engine import worker
+
+    rt = make_runtime(tmp_path)
+    worker.stop_flag_path(rt).parent.mkdir(parents=True, exist_ok=True)
+    worker.stop_flag_path(rt).touch()
+    assert worker.stop_requested(rt)
+    out = worker.handle_text(rt, "현황")
+    assert out.get("ok") is not False
+    assert not worker.stop_requested(rt)
