@@ -106,9 +106,7 @@ def generate_texts(
             purpose="daily_comment",
             system=DAILY_RANDOM_COMMENT_SYSTEM,
             user=_user_prompt(title, body, count)
-            + ("
-
-주의: 각 댓글은 반드시 공백 포함 10~28자. 이보다 길면 안 된다." if _retry else ""),
+            + ("\n\n주의: 각 댓글은 반드시 공백 포함 10~28자. 이보다 길면 안 된다." if _retry else ""),
             max_tokens=400,
         )
         data = extract_json(raw)
