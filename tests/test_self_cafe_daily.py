@@ -482,4 +482,31 @@ def test_generate_texts_retries_once_when_all_rejected():
 
     out = dc.generate_texts(_LLM(), "제목", "본문", 1)
     assert out == ["두 번째엔 짧게 답했어요 ㅋㅋ"]
-    assert len(calls) == 2 and "10~28자" in calls[1]
+    assert len(calls) == 2 and "재시도 1회째" in calls[1]
+
+
+def test_generate_texts_keeps_retrying_until_count_filled():
+    calls = []
+
+    class _LLM:
+        def complete(self, purpose, system, user, max_tokens=0):
+            calls.append(user)
+            n = len(calls)
+            if n < 4:
+                return '["' + "가" * 45 + '"]'
+            return '["드디어 규칙에 맞는 댓글이에요"]'
+
+    out = dc.generate_texts(_LLM(), "제목", "본문", 1)
+    assert out == ["드디어 규칙에 맞는 댓글이에요"] and len(calls) == 4
+
+
+def test_generate_texts_stops_at_max_attempts():
+    calls = []
+
+    class _LLM:
+        def complete(self, purpose, system, user, max_tokens=0):
+            calls.append(user)
+            return '["' + "가" * 45 + '"]'
+
+    out = dc.generate_texts(_LLM(), "제목", "본문", 2)
+    assert out == [] and len(calls) == dc.MAX_ATTEMPTS + 1

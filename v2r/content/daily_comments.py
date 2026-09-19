@@ -21,6 +21,8 @@ DELAY_RANGES: list[tuple[int, int]] = [(3, 25), (15, 60), (40, 120)]
 #: 댓글 한 줄 길이 (공백 포함)
 MIN_LEN = 10
 MAX_LEN = 30
+#: 규칙 위반 시 다시 묻는 최대 횟수(성공할 때까지 반복하되 무한 루프는 막는다)
+MAX_ATTEMPTS = 6
 
 #: 이모지(그림문자) — 한글 이모티콘(ㅋㅋ/ㅠㅠ)은 허용한다
 _EMOJI = re.compile(
@@ -89,9 +91,14 @@ def generate_texts(
     count: int,
     *,
     on_warn=None,
-    _retry: bool = False,
+    _retry: int = 0,
 ) -> list[str]:
-    """Haiku로 댓글 문구 `count`개. 실패하거나 규칙에 안 맞으면 빈 목록(규칙 위반이면 1회 재시도)."""
+    """Haiku로 댓글 문구 `count`개.
+
+    규칙 위반이면 위반 내용을 알려 주며 **성공할 때까지** 다시 묻는다(사용자 규칙 2026-09-19:
+    실패 보고 대신 검증·수정 반복). 무한 루프 방지로 `MAX_ATTEMPTS`까지만 돌고, 그때까지도
+    안 되면 마지막에 통과한 것이 없으므로 빈 목록(경고)로 끝낸다.
+    """
     if count <= 0:
         return []
     if llm is None:
@@ -106,7 +113,12 @@ def generate_texts(
             purpose="daily_comment",
             system=DAILY_RANDOM_COMMENT_SYSTEM,
             user=_user_prompt(title, body, count)
-            + ("\n\n주의: 각 댓글은 반드시 공백 포함 10~28자. 이보다 길면 안 된다." if _retry else ""),
+            + (
+                f"\n\n주의(재시도 {_retry}회째): 각 댓글은 반드시 공백 포함 {MIN_LEN}~{MAX_LEN - 2}자,"
+                " 마침표·이모지·링크 금지. 이전 답은 이 규칙을 어겨 버렸다. 규칙에 맞게 다시 써라."
+                if _retry
+                else ""
+            ),
             max_tokens=400,
         )
         data = extract_json(raw)
@@ -128,9 +140,12 @@ def generate_texts(
             texts.append(cleaned)
         if len(texts) >= count:
             break
-    if not texts and not _retry:
-        # 전부 규칙 위반(대개 30자 초과)이면 길이를 강조해 한 번 더 묻는다
-        return generate_texts(llm, title, body, count, on_warn=on_warn, _retry=True)
+    if len(texts) < count and _retry < MAX_ATTEMPTS:
+        # 규칙 위반으로 개수가 모자라면 위반을 알리고 다시 묻는다(성공할 때까지, 상한 있음)
+        more = generate_texts(llm, title, body, count, on_warn=on_warn, _retry=_retry + 1)
+        for t in more:
+            if t not in texts and len(texts) < count:
+                texts.append(t)
     if not texts and on_warn:
         on_warn("쓸 수 있는 댓글 문구가 없어 댓글 0개로 발행합니다")
     return texts
