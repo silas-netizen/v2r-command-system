@@ -236,9 +236,7 @@ def test_affiliate_cafes_from_config():
     assert worker._affiliate_cafes(_RT()) == ["씨씨앙", "양평맘", "쌍둥이맘"]
 
 
-# --- 실발행은 ChatGPT 창에서 즉석 생성(사용자 규칙 2026-09-19) ----------------
 from v2r.engine import publish
-from v2r.content.manuscript import Manuscript
 
 
 class _FakePubs:
@@ -253,36 +251,20 @@ def _write_pool(root):
     )
 
 
-def test_take_daily_live_generates_via_gpt(tmp_path: Path, monkeypatch):
-
-    made = Manuscript(title="즉석", body="생성", cafe="씨씨앙", source="affiliate_daily_pool",
-                      source_row=1, content_hash="h1")
-    calls = []
-
-    def fake_gen(cafes, per_cafe, **kw):
-        calls.append((cafes, per_cafe))
-        return {"ok": True, "items": [made], "errors": []}
-
-    monkeypatch.setattr(dg, "generate_affiliate_pool_via_gpt", fake_gen)
-    rt = _FakeRT(tmp_path)
-    got = publish._take_daily(rt, "씨씨앙", dry_run=False)
-    assert got is made
-    assert calls == [(["씨씨앙"], 1)]
-
-
-def test_take_daily_live_fails_when_gpt_returns_nothing(tmp_path: Path, monkeypatch):
-    monkeypatch.setattr(dg, "generate_affiliate_pool_via_gpt",
-                        lambda *a, **k: {"ok": False, "items": [], "errors": ["x"]})
-    with pytest.raises(publish.PublishError):
-        publish._take_daily(_FakeRT(tmp_path), "양평맘", dry_run=False)
-
-
-def test_take_daily_dry_run_does_not_open_gpt(tmp_path: Path, monkeypatch):
+# --- 발행 시 풀에서 꺼내 쓴다(사용자 최종 결정 2026-09-19) -----------------
+def test_take_daily_prefers_same_cafe_from_pool(tmp_path: Path, monkeypatch):
     def boom(*a, **k):
-        raise AssertionError("dry_run에서 GPT를 열면 안 된다")
+        raise AssertionError("발행 중에는 GPT를 열지 않는다")
 
-    _write_pool(tmp_path)  # 풀은 먼저 채우고(진짜 함수) 그 다음 GPT 호출을 막는다
+    _write_pool(tmp_path)
     monkeypatch.setattr(dg, "generate_affiliate_pool_via_gpt", boom)
     rt = _FakeRT(tmp_path)
-    got = publish._take_daily(rt, "씨씨앙", dry_run=True)
-    assert got.source == "affiliate_daily_pool"
+    got = publish._take_daily(rt, "씨씨앙", dry_run=False)
+    assert got.source == "affiliate_daily_pool" and got.cafe == "씨씨앙"
+    with pytest.raises(publish.PublishError):
+        publish._take_daily(rt, "씨씨앙", dry_run=False)  # 같은 실행 안 재사용 금지
+
+
+def test_take_daily_empty_pool_fails(tmp_path: Path):
+    with pytest.raises(publish.PublishError):
+        publish._take_daily(_FakeRT(tmp_path), "양평맘", dry_run=False)

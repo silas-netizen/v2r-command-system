@@ -537,3 +537,34 @@ def test_delete_and_get_article(httpx_mock, api) -> None:
     httpx_mock.add_response(url=f"{BASE}{articles.PATH_DELETE}", json={"ok": 2})
     assert articles.get_article(api, "S") == {"ok": 1}
     assert articles.delete_article(api, "S") == {"ok": 2}
+
+
+def test_update_article_sends_flat_body():
+    from v2r.api import articles
+
+    class _C:
+        def __init__(self):
+            self.sent = None
+
+        def get(self, path, params=None, **k):
+            return {
+                "naver_cafe_article_source": {"tag_list": ["a"], "parent_source_id": None},
+                "naver_cafe_article_destination": {
+                    "write_options": {"open": False}, "cafe_id": 1, "menu_id": 2, "head_id": None,
+                    "naver_login_id": "u", "start_at": "2026-09-19T00:13:00Z",
+                    "target_view_count": 0, "target_comment_count": 0,
+                },
+            }
+
+        def put(self, path, json=None, **k):
+            self.sent = (path, json)
+            return {"is_success": True}
+
+    c = _C()
+    out = articles.update_article(c, "SID", title="새 제목", content_json="{}")
+    assert out["is_success"] is True
+    path, body = c.sent
+    assert path == "/naver_cafe_articles/article"
+    assert body["source_id"] == "SID" and body["menu_id"] == 2 and body["cafe_id"] == 1
+    assert body["title"] == "새 제목" and body["tag_list"] == ["a"]
+    assert "destination" not in body

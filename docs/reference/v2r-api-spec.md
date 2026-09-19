@@ -241,3 +241,18 @@ GET /naver_cafes/heads?cafe_id=…&naver_login_id=…&menu_id=…  → 말머리
 
 → 결론: 예약 댓글만 골라 취소/추가하는 경로는 **확정하지 못했다**. 실제 수리는
 바디 모양을 한 번 캡처(브라우저 CDP)해 확정한 뒤에 하는 것이 안전하다.
+
+
+## 10. 글 수정 (실측 확정 2026-09-19)
+
+`PUT /naver_cafe_articles/article` — 바디는 **평면**(POST의 `destination` 묶음과 다름):
+
+```
+{ source_id, title, content_json, tag_list, cafe_write_options,
+  cafe_id, menu_id, head_id, naver_login_id, start_at,
+  target_view_count, target_comment_count, comments: [], likes: [], parent_source_id }
+```
+
+- 빠진 필드는 422 `{"detail":[{"type":"missing","loc":["body","menu_id"]...}]}` 로 알려준다.
+- 이미 발행(SUCCESS)된 글도 제목·본문 교체가 통과했다 (씨씨앙 01M2VDPPA8P01A73GMYPFY9Y29). 재조회로 반영 확인.
+- 코드: `v2r/api/articles.py::update_article`.

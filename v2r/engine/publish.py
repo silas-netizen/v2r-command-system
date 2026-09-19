@@ -988,28 +988,13 @@ def _daily_pool(rt: Runtime) -> list[Manuscript]:
 
 
 def _take_daily(rt: Runtime, cafe_name: str = "", dry_run: bool = True) -> Manuscript:
-    """제휴 카페 일상 글 1건.
+    """제휴 카페 일상 글 1건 — **미리 만들어 둔 풀(`affiliate_daily_pool.jsonl`)에서 꺼내 쓴다.**
 
-    사용자 규칙(2026-09-19): 실발행 때는 **ChatGPT 창에서 그 카페용 일상 글을 즉석 생성**해서 쓴다.
-    풀 파일은 기록용일 뿐 발행 원고를 미리 쌓아 두고 꺼내 쓰지 않는다.
-    모의 실행(dry_run)은 브라우저를 열지 않고 풀(없으면 옛 시트)에서 하나 보여 주기만 한다.
+    사용자 결정(2026-09-19 최종): 발행 때마다 GPT로 즉석 생성하지 않는다. 풀은
+    `제휴 일상 글 N개 생성` 명령으로 미리 채워 두고(약 100개 단위), 발행 시 그 카페 글을 우선 고른다.
+    같은 실행 안·이미 발행한 글은 다시 쓰지 않는다. 풀이 비면 실패로 알려 채우게 한다.
     """
     used: set = rt.scratch.setdefault("daily_used", set())
-    if not dry_run:
-        from v2r.warehouse.daily_generator import generate_affiliate_pool_via_gpt
-
-        target = (cafe_name or "").strip() or "제휴 카페"
-        result = generate_affiliate_pool_via_gpt([target], 1, warehouse_dir=rt.warehouse.root)
-        items = list(result.get("items") or [])
-        if result.get("login_pending"):
-            raise PublishError("ChatGPT 로그인이 풀려 일상 글을 만들 수 없습니다 (scripts\gpt-login-hold.cmd)")
-        if not items:
-            errs = "; ".join(str(e) for e in result.get("errors") or []) or "응답 없음"
-            raise PublishError(f"ChatGPT 창에서 일상 글 생성 실패: {errs}")
-        picked = items[0]
-        used.add((picked.source, picked.source_row))
-        return picked
-
     pool = _daily_pool(rt)
     left = [
         m
@@ -1017,12 +1002,14 @@ def _take_daily(rt: Runtime, cafe_name: str = "", dry_run: bool = True) -> Manus
         if (m.source, m.source_row) not in used
         and not rt.publications.exists(m.source, m.source_row, m.content_hash)
     ]
-    if not left:
+    target = _norm(cafe_name) if cafe_name else ""
+    same_cafe = [m for m in left if target and _norm(m.cafe or "") == target]
+    candidates = same_cafe or left
+    if not candidates:
         raise PublishError(
-            "모의 실행용 제휴 일상 글 예시가 없습니다"
-            " (실발행은 ChatGPT 창에서 즉석 생성하므로 풀이 비어도 됩니다)"
+            "제휴 일상 글 풀이 비었습니다 ('제휴 일상 글 100개 생성'으로 채우세요)"
         )
-    picked = random.choice(left)
+    picked = random.choice(candidates)
     used.add((picked.source, picked.source_row))
     return picked
 

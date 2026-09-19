@@ -460,6 +460,46 @@ def get_article(client: V2RClient, source_id: str) -> dict:
     return client.get(PATH_ARTICLE, params={"source_id": source_id})
 
 
+PATH_UPDATE = "/naver_cafe_articles/article"
+
+
+def update_article(
+    client: V2RClient,
+    source_id: str,
+    *,
+    title: str,
+    content_json: str,
+    tags: list[str] | None = None,
+) -> dict:
+    """등록/발행된 글의 제목·본문·태그를 바꾼다 (`PUT /naver_cafe_articles/article`).
+
+    실측(2026-09-19): 바디는 **평면**이다 — `destination` 묶음이 아니라 `menu_id`,
+    `cafe_id`, `naver_login_id`, `start_at` 등이 최상위에 온다. 나머지 값은 현재 글에서
+    그대로 가져온다. 성공 시 `{"is_success": true}`. 이미 발행된 글(SUCCESS)도 통과했다.
+    """
+    detail = get_article(client, source_id)
+    dest = detail.get("naver_cafe_article_destination") or {}
+    src = detail.get("naver_cafe_article_source") or {}
+    payload = {
+        "source_id": source_id,
+        "title": title,
+        "content_json": content_json,
+        "tag_list": list(tags if tags is not None else (src.get("tag_list") or [])),
+        "cafe_write_options": dest.get("write_options") or dict(DEFAULT_WRITE_OPTIONS),
+        "cafe_id": dest.get("cafe_id"),
+        "menu_id": dest.get("menu_id"),
+        "head_id": dest.get("head_id"),
+        "naver_login_id": dest.get("naver_login_id"),
+        "start_at": dest.get("start_at"),
+        "target_view_count": dest.get("target_view_count") or 0,
+        "target_comment_count": dest.get("target_comment_count") or 0,
+        "comments": [],
+        "likes": [],
+        "parent_source_id": src.get("parent_source_id"),
+    }
+    return client.put(PATH_UPDATE, json=payload)
+
+
 def delete_article(client: V2RClient, source_id: str) -> dict:
     """글 삭제."""
     return client.post(PATH_DELETE, json={"source_id": source_id})
