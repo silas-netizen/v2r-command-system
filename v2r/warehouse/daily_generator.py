@@ -42,8 +42,10 @@ def affiliate_pool_path(warehouse_dir: str | Path) -> Path:
 
 
 def clean_line(text: str) -> str:
-    """한 줄로 합치고 금지 문장부호를 제거한다."""
-    one = _WS.sub(" ", str(text or "").replace("\n", " ")).strip()
+    """한 줄로 합치고 금지 문장부호와 이모지를 제거한다."""
+    from v2r.content.sanitize import strip_emoji
+
+    one = _WS.sub(" ", strip_emoji(text).replace("\n", " ")).strip()
     one = _BANNED_PUNCT.sub("", one)
     return _WS.sub(" ", one).strip()
 
@@ -56,6 +58,10 @@ def is_valid(title: str, body: str) -> bool:
         return False
     if "{" in title or "{" in body or "}" in title or "}" in body:
         return False
+    from v2r.content.sanitize import has_emoji
+
+    if has_emoji(title) or has_emoji(body):
+        return False  # 이모지는 모든 원고에서 제외(사용자 절대 규칙)
     return True
 
 

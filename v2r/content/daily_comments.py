@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import logging
 import random
-import re
 from datetime import datetime, timedelta
+
+from v2r.content import sanitize
 
 log = logging.getLogger(__name__)
 
@@ -24,10 +25,7 @@ MAX_LEN = 30
 #: 규칙 위반 시 다시 묻는 최대 횟수(성공할 때까지 반복하되 무한 루프는 막는다)
 MAX_ATTEMPTS = 6
 
-#: 이모지(그림문자) — 한글 이모티콘(ㅋㅋ/ㅠㅠ)은 허용한다
-_EMOJI = re.compile(
-    "[\U0001f300-\U0001faff\U00002600-\U000027bf\U0001f000-\U0001f2ff️←-⇿]"
-)
+#: 이모지 판단은 `content/sanitize.py` 한곳에서 한다 (한글 이모티콘 ㅋㅋ/ㅠㅠ는 허용)
 #: 광고·링크로 보는 조각
 _BANNED = ("http://", "https://", "www.", "@", "010-", "카톡", "문의주세요")
 
@@ -62,7 +60,9 @@ def clean_text(raw: object) -> str:
     text = " ".join(str(raw or "").split())
     if not text:
         return ""
-    text = _EMOJI.sub("", text).strip()
+    text = sanitize.strip_emoji(text).strip()
+    if sanitize.has_emoji(text):  # 지웠는데도 남았다 → 통째로 버린다
+        return ""
     text = text.rstrip(".·…")  # 마침표 없음
     text = text.strip()
     if not text:

@@ -48,6 +48,7 @@ def test_legacy_example_sentence():
         ("사진 세탁 30장", "wash_photos"),
         ("메이크 지침 학습해줘", "learn_guides"),
         ("고아 글 정리해줘", "cleanup_orphans"),
+        ("오늘 이모지 정리", "cleanup_emoji"),
         ("찌꺼기 삭제", "cleanup_orphans"),
         ("로그인 창 열어줘", "open_login"),
         ("작업 중지", "stop"),
@@ -71,8 +72,8 @@ def test_each_task_pattern(text, task):
 
 
 def test_all_tasks_covered_by_tests():
-    # 26 + 사진 승인 흐름 2건(approve_photos·reject_photos)
-    assert len(ALLOWED_TASKS) == 28
+    # 26 + 사진 승인 흐름 2건(approve_photos·reject_photos) + 이모지 정리 1건
+    assert len(ALLOWED_TASKS) == 29
 
 
 def test_wash_photos_count():

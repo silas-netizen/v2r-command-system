@@ -1246,6 +1246,10 @@ def dispatch(rt: Runtime, job: Any, owner: str | None = None) -> dict:
         from v2r.engine.cleanup import cleanup_orphans
 
         return cleanup_orphans(rt, spec)
+    if task == "cleanup_emoji":
+        from v2r.engine.emoji_cleanup import cleanup_emoji
+
+        return cleanup_emoji(rt, spec, job_id=job_id)
     if task == "repair_comments":
         from v2r.engine.repair import repair_comments
 

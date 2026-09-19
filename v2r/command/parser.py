@@ -35,6 +35,9 @@ TASK_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("wash_photos", re.compile(r"사진.*(세탁|변형)\s*(\d+)?")),
     ("learn_guides", re.compile(r"(메이크|make|지침).*(학습|읽어|가져와)", re.I)),
     ("cleanup_orphans", re.compile(r"(고아|찌꺼기).*(정리|삭제)")),
+    # 이미 올라간 글의 이모지 뒷정리 (`오늘 이모지 정리`, `이모지 정리 전체`).
+    # `발행`이 든 문장도 가로채이지 않게 publish_* 패턴보다 앞에 둔다.
+    ("cleanup_emoji", re.compile(r"이모지.*(정리|제거|삭제)")),
     # 예약 수정글의 댓글 역할 복구 (`댓글 … 다시 세팅` / `댓글 재설정` / `댓글 복구`)
     ("repair_comments", re.compile(r"댓글.*(복구|재설정|다시)")),
     ("open_login", re.compile(r"로그인\s*(창|세션|준비)")),
@@ -177,6 +180,7 @@ _NO_SLOT_TASKS = frozenset(
         "inspect_failures",
         "catalog",
         "cleanup_orphans",
+        "cleanup_emoji",
         "repair_comments",
         "gpt_keepalive",
     }
@@ -392,6 +396,10 @@ def parse_korean_command(text: str, now: datetime | None = None) -> TaskSpec | N
     # 날짜 / 실제 발행 / 즉시
     spec["start_date"] = _parse_date(raw, now)
     spec["dry_run"] = RE_REAL.search(raw) is None
+    if task == "cleanup_emoji" and "실제" in raw:
+        # 이모지 정리는 새 글을 올리지 않고 이미 나간 글의 이모지만 지운다 →
+        # `실제 발행`까지 요구하지 않고 `실제` 한 낱말이면 진짜 고친다.
+        spec["dry_run"] = False
     spec["immediate"] = RE_IMMEDIATE.search(raw) is not None
 
     # 자사 카페 일상 글: `카페별 N건` / `댓글 랜덤` (self-cafe-daily-rules §1·§5)
@@ -433,6 +441,7 @@ TASK_LABELS: dict[str, str] = {
     "wash_photos": "사진 세탁",
     "learn_guides": "지침 학습",
     "cleanup_orphans": "고아 글 정리",
+    "cleanup_emoji": "이모지 정리",
     "repair_comments": "댓글 복구",
     "open_login": "로그인 창 열기",
     "stop": "작업 중지",

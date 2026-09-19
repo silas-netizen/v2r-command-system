@@ -93,6 +93,7 @@ def parse_daily_xlsx_rows(
 ) -> list:
     """A~F열만 읽어 일상 글 원고 목록으로. 이미 발행된 행은 건너뛴다."""
     from v2r.content.manuscript import Manuscript, content_hash
+    from v2r.content.sanitize import strip_emoji
     from v2r.sources.sheets import _canonical_cafe
 
     if not rows:
@@ -111,6 +112,12 @@ def parse_daily_xlsx_rows(
             continue
         if _is_published(registered_at, status):
             continue
+        # 이모지는 읽을 때 지운다 → 모의 실행에도 실제로 올라갈 깨끗한 글이 보인다.
+        # 다만 `content_hash`는 **지우기 전 원문**으로 계산한다. 해시는 "이 글을 이미
+        # 올렸는가"를 판단하는 열쇠라, 규칙이 바뀌었다고 해시가 달라지면 이미 발행한
+        # 글이 새 글로 보여 두 번 올라간다.
+        raw_hash = content_hash(title, body)
+        title, body = strip_emoji(title), strip_emoji(body)
         out.append(
             Manuscript(
                 title=title,
@@ -121,7 +128,7 @@ def parse_daily_xlsx_rows(
                 source=source,
                 source_row=index,
                 images_enabled=False,  # 일상 글은 사진 없음
-                content_hash=content_hash(title, body),
+                content_hash=raw_hash,
             )
         )
     return out

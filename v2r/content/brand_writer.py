@@ -946,6 +946,33 @@ def validate(
             )
         )
 
+    # --- 이모지 금지 (사용자 절대 규칙: 이모지는 모든 원고에서 제외)
+    from v2r.content.sanitize import has_emoji
+
+    title_body = [
+        name
+        for name, value in (("제목", manuscript.title), ("본문", body))
+        if has_emoji(value)
+    ]
+    checks.append(
+        _check(
+            "이모지 포함",
+            "제목·본문에 이모지 없음",
+            ", ".join(title_body) + "에 이모지" if title_body else "없음",
+            not title_body,
+        )
+    )
+    emoji_comments = [c.label for c in manuscript.comments if has_emoji(c.text)]
+    checks.append(
+        _check(
+            "댓글 이모지 포함",
+            "댓글에 이모지 없음",
+            ", ".join(emoji_comments) if emoji_comments else "없음",
+            not emoji_comments,
+            scope="댓글",
+        )
+    )
+
     product = rule.product_in_comment or rule.product
     before = COMMENT_LABELS[: COMMENT_LABELS.index(rule.first_mention_label)]
     early = [
