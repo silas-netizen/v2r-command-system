@@ -786,3 +786,18 @@ def test_generate_texts_stops_at_max_attempts():
 
     out = dc.generate_texts(_LLM(), "제목", "본문", 2)
     assert out == [] and len(calls) == dc.MAX_ATTEMPTS + 1
+
+
+def test_declump_breaks_runs_of_three_and_keeps_order_otherwise():
+    items = list(range(8))
+    seq = [{"cafe": c} for c in ["A", "A", "A", "A", "B", "C", "B", "C"]]
+    out, out_seq = publish_mod.declump_by_cafe(items, seq)
+    cafes = [e["cafe"] for e in out_seq]
+    assert sorted(out) == items
+    # 같은 카페 3연속 없음
+    assert all(not (cafes[i] == cafes[i - 1] == cafes[i - 2]) for i in range(2, len(cafes)))
+    # 카페 내부 순서 보존
+    assert [x for x, e in zip(out, out_seq) if e["cafe"] == "A"] == [0, 1, 2, 3]
+    # 몰림 없는 시트는 그대로
+    seq2 = [{"cafe": c} for c in ["A", "B", "A", "B"]]
+    assert publish_mod.declump_by_cafe([0, 1, 2, 3], seq2)[0] == [0, 1, 2, 3]

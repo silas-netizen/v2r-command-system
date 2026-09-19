@@ -520,7 +520,44 @@ def prepare_per_cafe(
             report[cafe]["planned"] += 1
             if requested:
                 targets_left[cafe] -= 1
+    # 사용자 규칙(2026-09-20): 같은 카페가 몰린 구간이 있으면 섞는다.
+    # 카페 안 순서(파일→행)는 그대로 두고, 카페끼리만 번갈아 나오게 재배열한다.
+    picked, sequence = declump_by_cafe(picked, sequence)
+    for i, entry in enumerate(sequence, start=1):
+        entry["seq"] = i
+    rt.scratch["per_cafe_sequence"] = sequence
     return picked
+
+
+def declump_by_cafe(items: list, sequence: list[dict], max_run: int = MAX_SAME_CAFE_RUN) -> tuple[list, list[dict]]:
+    """같은 카페가 `max_run`건 이상 연속되는 '몰림'만 푼다. 시트 순서는 그 밖에서 그대로.
+
+    앞에서부터 훑다가 같은 카페가 `max_run`번째 연속될 자리가 오면, 뒤쪽에서 가장 가까운
+    다른 카페 원고를 끌어와 끼운다(그 원고의 카페 내부 순서는 보존). 끌어올 게 없으면 허용.
+    """
+    n = len(items)
+    if n != len(sequence) or n == 0:
+        return items, sequence
+    idx = list(range(n))
+    out: list[int] = []
+    run_cafe, run_len = None, 0
+    while idx:
+        cur = idx[0]
+        cafe = str(sequence[cur].get("cafe") or "")
+        if cafe == run_cafe and run_len >= max_run - 1:
+            alt = next((j for j in idx if str(sequence[j].get("cafe") or "") != cafe), None)
+            if alt is not None:
+                idx.remove(alt)
+                out.append(alt)
+                run_cafe, run_len = str(sequence[alt].get("cafe") or ""), 1
+                continue
+        idx.pop(0)
+        out.append(cur)
+        if cafe == run_cafe:
+            run_len += 1
+        else:
+            run_cafe, run_len = cafe, 1
+    return [items[i] for i in out], [sequence[i] for i in out]
 
 
 def prepare_manuscripts(
@@ -1029,6 +1066,9 @@ def next_self_window(at: datetime) -> datetime:
         return at
     return local.replace(hour=SELF_WINDOW_OPEN_HOUR, minute=0, second=0, microsecond=0)
 
+
+#: 같은 카페 연속 허용 상한(이 수 이상 몰리면 다른 카페 원고를 끌어와 섞는다, 사용자 규칙 2026-09-20)
+MAX_SAME_CAFE_RUN = 3
 
 #: 자사 카페 일상 글에서 카페마다 고정해 두는 계정 수 (규칙 §4).
 #: 사용자 규칙: **정확히 10개를 무작위로** 골라 고정한다 (풀이 10개 미만이면 있는 만큼).
