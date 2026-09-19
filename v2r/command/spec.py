@@ -69,6 +69,10 @@ class TaskSpec(BaseModel):
     source: str = ""
     dry_run: bool = True
     immediate: bool = False
+    #: `카페별 N건` / `카페마다 N건` — 자사 카페 전부에 각각 count건 (self-cafe-daily-rules §1)
+    per_cafe: bool = False
+    #: `댓글 랜덤` / `댓글 0~3개` — 글마다 0~3개 랜덤 댓글 (self-cafe-daily-rules §5)
+    random_comments: bool = False
     notes: str = ""
     manuscripts: list[dict] = Field(default_factory=list)
 

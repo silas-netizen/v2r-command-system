@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import itertools
 import logging
+import random
 import re
 import socket
 import time
@@ -513,6 +514,104 @@ def _catalog_report(rt: Runtime, spec: TaskSpec) -> dict:
     return {"ok": True, "report": "\n".join(lines)}
 
 
+#: 대기 중 리스를 연장하는 주기(초)
+SLEEP_CHUNK_S = 30.0
+
+
+def order_round_robin(slots: list[Any]) -> list[Any]:
+    """카페별 줄을 만들어 번갈아 꺼낸다 — 카페끼리 나란히 진행 (규칙 §4)."""
+    queues: dict[str, list] = {}
+    order: list[str] = []
+    for slot in slots:
+        key = publish_mod._norm(getattr(slot, "cafe", ""))
+        if key not in queues:
+            queues[key] = []
+            order.append(key)
+        queues[key].append(slot)
+    out: list[Any] = []
+    while any(queues[k] for k in order):
+        for key in order:
+            if queues[key]:
+                out.append(queues[key].pop(0))
+    return out
+
+
+def _sleep_with_beat(seconds: float, beat: Any, sleep: Any = time.sleep) -> None:
+    """리스를 연장하며 나눠 쉰다 (긴 대기 중 작업을 뺏기지 않게)."""
+    remaining = max(0.0, float(seconds))
+    while remaining > 0:
+        chunk = min(SLEEP_CHUNK_S, remaining)
+        sleep(chunk)
+        remaining -= chunk
+        beat()
+
+
+def _daily_report_path(rt: Runtime, spec: TaskSpec):
+    """자사 카페 일상 글 보고서 경로 (`docs/reports/self-daily-<날짜>.md`)."""
+    return rt.settings.repo_root / "docs" / "reports" / f"self-daily-{spec.start_date}.md"
+
+
+def write_daily_report(
+    rt: Runtime,
+    spec: TaskSpec,
+    results: list[dict],
+    failed: list[tuple[Any, str]],
+) -> str:
+    """카페별 발행 결과 표를 보고서 파일로 남기고 경로를 돌려준다."""
+    path = _daily_report_path(rt, spec)
+    rows: list[str] = []
+    for r in results:
+        rows.append(
+            "| {cafe} | {board} | {account} | {at} | {comments} | {status} |".format(
+                cafe=r.get("cafe", ""),
+                board=r.get("board", ""),
+                account=publish_mod.mask_login(r.get("account", "")),
+                at=r.get("scheduled_at", ""),
+                comments=r.get("comments", 0),
+                status=r.get("url") or r.get("status", ""),
+            )
+        )
+    for slot, error in failed:
+        rows.append(
+            "| {cafe} | {board} | {account} | {at} | - | 실패: {err} |".format(
+                cafe=slot.cafe,
+                board=slot.board,
+                account=publish_mod.mask_login(slot.account),
+                at=slot.scheduled_at.isoformat() if slot.scheduled_at else "즉시",
+                err=" ".join(str(error).split())[:120],
+            )
+        )
+    text = "\n".join(
+        [
+            f"# 자사 카페 일상 글 발행 보고 ({spec.start_date})",
+            "",
+            f"- 모드: {'모의 실행' if spec.dry_run else '실제 발행'}",
+            f"- 성공 {len(results)}건 / 실패 {len(failed)}건",
+            "",
+            "| 카페 | 게시판 | 계정 | 발행 시각 | 댓글 | URL/상태 |",
+            "|---|---|---|---|---|---|",
+            *rows,
+            "",
+        ]
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return str(path)
+
+
+def per_cafe_counts(
+    results: list[dict], failed: list[tuple[Any, str]]
+) -> dict[str, dict[str, int]]:
+    """카페별 성공/실패 건수."""
+    out: dict[str, dict[str, int]] = {}
+    for r in results:
+        cafe = str(r.get("cafe") or "")
+        out.setdefault(cafe, {"ok": 0, "fail": 0})["ok"] += 1
+    for slot, _error in failed:
+        out.setdefault(str(slot.cafe or ""), {"ok": 0, "fail": 0})["fail"] += 1
+    return out
+
+
 def _other_account(rt: Runtime, spec: TaskSpec, slot: Any) -> str | None:
     """계정 제한 뒤 같은 슬롯에 쓸 다른 계정 1개."""
     try:
@@ -581,9 +680,15 @@ def _run_publish(
             "dry_run": spec.dry_run,
             "message": str(exc),
         }
+    paced = bool(getattr(spec, "per_cafe", False))
+    if paced:
+        # 카페끼리 나란히 진행하도록 카페별로 번갈아 실행한다 (규칙 §4)
+        slots = order_round_robin(slots)
     need_browser = (not spec.dry_run) and any(s.images for s in slots)
     results: list[dict] = []
     failures: list[str] = []
+    failed_slots: list[tuple[Any, str]] = []
+    next_allowed: dict[str, float] = {}
     touched: list[tuple] = []
     retried: set[int] = set()
     playwright = context = page = None
@@ -613,7 +718,14 @@ def _run_publish(
                 beat()
             except publish_mod.PublishError as exc:
                 failures.append(f"{m.title}: {exc}")
+                failed_slots.append((slot, str(exc)))
                 break
+            if paced and not spec.dry_run:
+                # 그 카페의 다음 발행 허용 시각까지 쉰다 (글 사이 2~3분 랜덤)
+                key = publish_mod._norm(slot.cafe)
+                wait = next_allowed.get(key, 0.0) - time.monotonic()
+                if wait > 0:
+                    _sleep_with_beat(wait, beat)
             try:
                 results.append(
                     publish_mod.run_slot(
@@ -634,11 +746,18 @@ def _run_publish(
                         )
                     except (publish_mod.RetryWithOtherAccount, publish_mod.PublishError) as exc2:
                         failures.append(f"{m.title}: {exc2}")
+                        failed_slots.append((slot, str(exc2)))
                 else:
                     failures.append(f"{m.title}: {exc}")
+                    failed_slots.append((slot, str(exc)))
             except publish_mod.PublishError as exc:
                 failures.append(f"{m.title}: {exc}")
-            if not spec.dry_run:
+                failed_slots.append((slot, str(exc)))
+            if paced and not spec.dry_run:
+                next_allowed[publish_mod._norm(slot.cafe)] = time.monotonic() + 60.0 * random.uniform(
+                    float(spec.interval_min), float(max(spec.interval_max, spec.interval_min))
+                )
+            if not spec.dry_run and (not paced or index % 10 == 0 or index == len(slots)):
                 notify_all(
                     rt.channels,
                     format_report(
@@ -676,6 +795,22 @@ def _run_publish(
     if stopped:
         out["stopped"] = True
         out["message"] = "중지 요청으로 남은 슬롯을 건너뛰었습니다"
+    if paced:
+        # 카페별 성공/실패 수 + 보고서 파일 (규칙 §6)
+        counts = per_cafe_counts(results, failed_slots)
+        out["per_cafe"] = counts
+        try:
+            out["report_file"] = write_daily_report(rt, spec, results, failed_slots)
+        except Exception as exc:  # 보고서 실패는 발행 결과를 바꾸지 않는다
+            log.warning("일상 글 보고서 기록 실패: %s", exc)
+            out["report_file"] = ""
+        summary = ", ".join(
+            f"{cafe} 성공 {c['ok']}/실패 {c['fail']}" for cafe, c in counts.items()
+        )
+        notify_all(
+            rt.channels,
+            f"자사 카페 일상 글 완료 — {summary}\n보고서: {out.get('report_file') or '(없음)'}",
+        )
     return out
 
 

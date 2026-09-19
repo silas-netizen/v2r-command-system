@@ -96,6 +96,25 @@ def test_finish_failed_and_cancel_open(conn):
         store.finish(1, "이상한상태")
 
 
+def test_publications_exists_hash_is_global(conn):
+    """본문 해시 전역 검사 — 다른 파일·다른 행이라도 본문이 같으면 이미 발행됨."""
+    pub = PublicationStore(conn)
+    assert pub.exists_hash("hash-a") is False
+    assert pub.exists_hash("") is False
+
+    pub.mark("각색_전체_1", 2, "hash-a", "done", "done")
+    assert pub.exists_hash("hash-a") is True
+    # 같은 본문이 다른 파일 다른 행으로 들어와도 (파일, 행) 검사는 통과한다
+    assert pub.exists("각색_전체_2", 77, "hash-a") is False
+    assert pub.exists_hash("hash-a") is True
+
+    pub.mark("각색_전체_2", 5, "hash-b", "uncertain", "submitting")
+    assert pub.exists_hash("hash-b") is True
+
+    pub.mark("각색_전체_2", 6, "hash-c", "skipped")
+    assert pub.exists_hash("hash-c") is False  # 건너뛴 글은 다시 쓸 수 있다
+
+
 def test_publications_exists_includes_uncertain(conn):
     pub = PublicationStore(conn)
     assert pub.exists("일상글목록", 3, "h1") is False

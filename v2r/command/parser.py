@@ -70,8 +70,17 @@ BRAND_PATTERNS = [(n, _loose(n)) for n in BRAND_NAMES]
 
 # `2시간`의 `2시`를 시각으로 오인하지 않도록 `간`을 부정 전방탐색으로 제외
 RE_CLOCK = re.compile(r"(오전|오후)?\s*(\d{1,2})\s*시(?!간)(?:\s*(\d{1,2})\s*분)?")
-RE_COUNT = re.compile(r"(?:일상\s*글|글)\s*(\d+)\s*개")
-RE_ANY_COUNT = re.compile(r"(\d+)\s*개")
+RE_COUNT = re.compile(r"(?:일상\s*글|글)\s*(\d+)\s*(?:개|건)")
+#: `50개` / `50건` 둘 다 개수로 본다
+RE_ANY_COUNT = re.compile(r"(\d+)\s*(?:개|건)")
+#: `카페별` / `카페마다` — 자사 카페마다 count건
+RE_PER_CAFE = re.compile(r"카페\s*(?:별|마다)")
+#: `댓글 랜덤` / `댓글 무작위` / `댓글 0~3개`
+RE_RANDOM_COMMENTS = re.compile(r"댓글\s*(?:랜덤|무작위|\d+\s*~\s*\d+\s*개)")
+#: 개수 인식 전에 지우는 댓글 개수 표현 (`댓글 0~3개`가 글 수로 잡히지 않게)
+RE_COMMENT_COUNT = re.compile(r"댓글\s*\d+\s*(?:~\s*\d+\s*)?개")
+#: 자사 카페 일상 글의 기본 글 사이 대기(분) — self-cafe-daily-rules §4
+SELF_DAILY_INTERVAL = (2, 3)
 RE_SHEETS = re.compile(r"(\d+)\s*장")
 RE_ACCOUNT_COUNT = re.compile(r"(?:아이디|계정)\s*(\d+)\s*개")
 RE_INTERVAL_RANGE = re.compile(r"(\d+)\s*~\s*(\d+)\s*분")
@@ -232,8 +241,9 @@ def parse_korean_command(text: str, now: datetime | None = None) -> TaskSpec | N
             clocks[0][0] or None, int(clocks[0][1]), int(clocks[0][2] or 0)
         )
 
-    # 개수
-    m = RE_COUNT.search(raw)
+    # 개수 (`댓글 0~3개`는 글 수가 아니므로 미리 지운다)
+    counting = RE_COMMENT_COUNT.sub(" ", raw)
+    m = RE_COUNT.search(counting)
     if m:
         spec["count"] = int(m.group(1))
     elif task in PUBLISH_TASKS | {
@@ -244,7 +254,7 @@ def parse_korean_command(text: str, now: datetime | None = None) -> TaskSpec | N
         "generate_photos",
     }:
         # `글` 없이 `N개`만 있어도 개수로 인정. 단 계정 수 표현은 먼저 제거한다.
-        m = RE_ANY_COUNT.search(RE_ACCOUNT_COUNT.sub(" ", raw))
+        m = RE_ANY_COUNT.search(RE_ACCOUNT_COUNT.sub(" ", counting))
         if m:
             spec["count"] = int(m.group(1))
     if task == "generate_photos" and not spec.get("count"):
@@ -267,13 +277,16 @@ def parse_korean_command(text: str, now: datetime | None = None) -> TaskSpec | N
         spec["account_count"] = int(m_acc_count.group(1))
 
     # 간격
+    explicit_interval = False
     m = RE_INTERVAL_RANGE.search(raw)
     if m:
         spec["interval_min"], spec["interval_max"] = int(m.group(1)), int(m.group(2))
+        explicit_interval = True
     else:
         m = RE_INTERVAL_FIXED.search(raw)
         if m:
             spec["interval_min"] = spec["interval_max"] = int(m.group(1))
+            explicit_interval = True
 
     # 카페 / 브랜드
     for name, pattern in CAFE_PATTERNS:
@@ -329,6 +342,17 @@ def parse_korean_command(text: str, now: datetime | None = None) -> TaskSpec | N
     spec["dry_run"] = RE_REAL.search(raw) is None
     spec["immediate"] = RE_IMMEDIATE.search(raw) is not None
 
+    # 자사 카페 일상 글: `카페별 N건` / `댓글 랜덤` (self-cafe-daily-rules §1·§5)
+    if task in PUBLISH_TASKS:
+        spec["per_cafe"] = RE_PER_CAFE.search(raw) is not None
+        spec["random_comments"] = RE_RANDOM_COMMENTS.search(raw) is not None
+        if spec["per_cafe"] or task == "publish_daily":
+            # 규칙 §4: 자사 카페 일상 글은 (카페별이든 카페 하나든) 예약하지 않고 항상 즉시 발행하며,
+            # 글과 글 사이를 기본 2~3분 쉰다(`N~M분 간격`을 적으면 그 값).
+            spec["immediate"] = True
+            if not explicit_interval:
+                spec["interval_min"], spec["interval_max"] = SELF_DAILY_INTERVAL
+
     try:
         return TaskSpec(**spec)
     except Exception:
@@ -369,6 +393,8 @@ _PUBLISH_TASKS = PUBLISH_TASKS
 def describe_spec(spec: TaskSpec) -> str:
     """명세 한 줄 한국어 요약."""
     parts: list[str] = [TASK_LABELS.get(spec.task, spec.task)]
+    if getattr(spec, "per_cafe", False):
+        parts.append("카페별")
     if spec.cafe:
         parts.append(f"카페 {spec.cafe}")
     if spec.brand:
@@ -394,6 +420,8 @@ def describe_spec(spec: TaskSpec) -> str:
             parts.append(
                 f"자동 계정 {spec.account_count}개" if spec.account_count else "자동 계정"
             )
+    if getattr(spec, "random_comments", False):
+        parts.append("댓글 랜덤")
     if spec.immediate:
         parts.append("즉시")
     parts.append("모의 실행" if spec.dry_run else "실제 발행")

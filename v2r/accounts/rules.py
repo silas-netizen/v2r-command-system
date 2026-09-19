@@ -55,6 +55,15 @@ def is_manager(a: Account) -> bool:
     return (a.grade or "").strip().casefold() in _MANAGER
 
 
+_STAFF_WORDS = ("스탭", "스텝", "스태프", "staff", "매니저", "운영진")
+
+
+def is_staff_level(level_name: str | None) -> bool:
+    """V2R 카페 회원 조회의 등급 이름이 스텝(운영진)인지. 자사 카페 계정은 스텝 등급만 쓴다(사용자 결정 2026-09-19)."""
+    text = (level_name or "").strip().casefold()
+    return any(w.casefold() in text for w in _STAFF_WORDS)
+
+
 def work_type_for(task: str, cafe: str, cafes_cfg: dict) -> str:
     """작업·카페 → 필요한 work_type."""
     if find_affiliate(cafe, cafes_cfg) is not None:

@@ -34,6 +34,20 @@ class PublicationStore:
         ).fetchone()
         return row is not None
 
+    def exists_hash(self, content_hash: str) -> bool:
+        """본문 해시 전역 검사 — 다른 파일·다른 행이라도 같은 본문이면 이미 발행된 것.
+
+        각색 엑셀끼리 같은 글이 겹쳐 두 번 올라가는 것을 막는다
+        (docs/reference/self-cafe-daily-rules.md §3).
+        """
+        if not content_hash:
+            return False
+        row = self.conn.execute(
+            "SELECT 1 FROM publications WHERE content_hash = ? AND status IN (?, ?)",
+            (content_hash, *BLOCKING_STATUSES),
+        ).fetchone()
+        return row is not None
+
     def mark(
         self,
         source_key: str,

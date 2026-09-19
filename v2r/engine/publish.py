@@ -12,7 +12,7 @@ from typing import Any
 
 from v2r.accounts.assign import AssignError, assign, rotate
 from v2r.accounts.loader import Account, load_from_rows
-from v2r.accounts.rules import eligible, find_affiliate, work_type_for
+from v2r.accounts.rules import eligible, find_affiliate, is_staff_level, work_type_for
 from v2r.api import articles as api_articles
 from v2r.api.errors import V2RApiError, classify
 from v2r.command.spec import TaskSpec
@@ -169,7 +169,13 @@ def select_source_entries(rt: Runtime, spec: TaskSpec) -> list[dict]:
     if spec.task == "publish_daily":
         # 일상 글 원본: 인박스 각색 xlsx(먼저) + 생성한 짧은 일상 글 풀
         daily = [e for e in entries if (e.get("kind") or "sheet") in DAILY_KINDS]
-        daily.sort(key=lambda e: 0 if (e.get("kind") or "") == XLSX_DAILY_KIND else 1)
+        # 각색 xlsx 먼저(파일 이름 오름차순 = 오래된 것부터), 그다음 일상 글 풀
+        daily.sort(
+            key=lambda e: (
+                0 if (e.get("kind") or "") == XLSX_DAILY_KIND else 1,
+                str(e.get("name") or ""),
+            )
+        )
         if daily:
             return daily
         for wanted in ("일상글목록", DAILY_POOL_SOURCE):
@@ -316,11 +322,96 @@ def _done_history(rt: Runtime, source_key: str) -> list[Manuscript]:
     return out
 
 
+def self_cafe_names(rt: Runtime, include_excluded: bool = False) -> list[str]:
+    """자사 카페(`self_owned`) 중 `excluded`가 아닌 카페 이름 목록 (규칙 §1)."""
+    out: list[str] = []
+    for entry in (rt.cafes_cfg or {}).get("self_owned") or []:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("name") or "").strip()
+        if name and (include_excluded or not entry.get("excluded")) and name not in out:
+            out.append(name)
+    return out
+
+
+def prepare_per_cafe(
+    rt: Runtime, spec: TaskSpec, skipped: list[dict] | None = None
+) -> list[Manuscript]:
+    """`카페별 N건` — 자사 카페마다 `spec.count`건씩 고른다 (규칙 §1~§3).
+
+    원고 출처 순서: 각색 xlsx(파일 이름 오름차순, 행 순서) → 일상 글 풀.
+    이미 발행한 (파일, 행)뿐 아니라 **본문 해시 전역 검사**로도 건너뛴다.
+    """
+    skipped = skipped if skipped is not None else []
+    targets = [spec.cafe] if spec.cafe else self_cafe_names(rt)
+    targets = [c for c in targets if not is_excluded_cafe(rt, c)]
+    if not targets:
+        raise PublishError("발행할 자사 카페가 없습니다 (cafes.yaml self_owned 확인)")
+
+    loaded: list[tuple[str, list[Manuscript]]] = []
+    attempted = failed = 0
+    for entry in select_source_entries(rt, spec):
+        name = str(entry.get("name") or "")
+        attempted += 1
+        try:
+            items = load_manuscripts(rt, entry, prefer_cache=bool(spec.dry_run))
+        except Exception as exc:
+            failed += 1
+            skipped.append({"source": name, "reason": f"원본 적재 실패: {exc}"})
+            continue
+        loaded.append((name, items))
+    rt.scratch["source_load"] = {"attempted": attempted, "failed": failed}
+
+    want = int(spec.count or 0)
+    used_keys: set[tuple[str, int]] = set()
+    used_hashes: set[str] = set()
+    picked: list[Manuscript] = []
+
+    for cafe in targets:
+        got = 0
+        for name, items in loaded:
+            if want and got >= want:
+                break
+            for m in items:
+                if want and got >= want:
+                    break
+                if (m.source, m.source_row) in used_keys:
+                    continue
+                # 원고에 카페가 적혀 있으면 그 카페 글만, 비어 있으면 어느 카페든 쓴다
+                if m.cafe and not cafe_matches(cafe, m.cafe):
+                    continue
+                if m.cafe and is_excluded_cafe(rt, m.cafe):
+                    continue
+                if m.content_hash and m.content_hash in used_hashes:
+                    skipped.append(
+                        {"source": name, "row": m.source_row, "reason": "중복(본문 해시)"}
+                    )
+                    continue
+                if rt.publications.exists(name, m.source_row, m.content_hash):
+                    skipped.append({"source": name, "row": m.source_row, "reason": "이미 발행됨"})
+                    continue
+                if rt.publications.exists_hash(m.content_hash):
+                    skipped.append(
+                        {"source": name, "row": m.source_row, "reason": "중복(본문 해시 전역)"}
+                    )
+                    continue
+                used_keys.add((m.source, m.source_row))
+                if m.content_hash:
+                    used_hashes.add(m.content_hash)
+                if not m.cafe:
+                    m.cafe = cafe
+                picked.append(m)
+                got += 1
+    return picked
+
+
 def prepare_manuscripts(
     rt: Runtime, spec: TaskSpec, skipped: list[dict] | None = None
 ) -> list[Manuscript]:
     """발행할 원고를 고른다. 이미 발행됐거나 중복인 행은 건너뛴다."""
     skipped = skipped if skipped is not None else []
+    if getattr(spec, "per_cafe", False) and not spec.manuscripts:
+        return prepare_per_cafe(rt, spec, skipped)
     if spec.cafe and is_excluded_cafe(rt, spec.cafe):
         entry = find_cafe_entry(spec.cafe, rt.cafes_cfg) or {}
         label = str(entry.get("name") or spec.cafe)
@@ -704,9 +795,18 @@ def _cafe_members(rt: Runtime, cafe_name: str) -> tuple[Any, list[str]]:
     key = _norm(cafe_name)
     if key not in cache:
         cafe = match_name(cafe_name, rt.catalog.cafes(), key=lambda c: c.name)
-        members = [ca.login_id for ca in rt.catalog.cafe_accounts(cafe.cafe_id)]
+        accounts = list(rt.catalog.cafe_accounts(cafe.cafe_id))
+        if is_self_cafe(rt, cafe_name):
+            # 자사 카페 계정은 카페 등급이 '스탭'인 것만 쓴다 (V2R 회원 조회의 등급 이름으로 확인)
+            accounts = [ca for ca in accounts if is_staff_level(ca.level_name)]
+        members = [ca.login_id for ca in accounts]
         cache[key] = (cafe, members)
     return cache[key]
+
+
+def is_self_cafe(rt: Runtime, cafe_name: str) -> bool:
+    """설정 `self_owned`에 있는 카페인지(제외 표시 포함)."""
+    return any(cafe_matches(cafe_name, n) for n in self_cafe_names(rt, include_excluded=True))
 
 
 def writable_logins(
@@ -763,6 +863,33 @@ def _pool_for_cafe(
     return narrowed, False
 
 
+#: 자사 카페 일상 글에서 카페마다 고정해 두는 계정 수 (규칙 §4, 부족하면 있는 만큼)
+SELF_DAILY_ACCOUNTS_MIN = 5
+SELF_DAILY_ACCOUNTS_MAX = 10
+
+
+def _avoid_consecutive(
+    cafes: list[str], assigned: dict[int, str], chosen_by_cafe: dict[str, list[str]]
+) -> None:
+    """같은 카페에서 같은 계정이 연속으로 쓰이지 않게 자리를 민다 (규칙 §4).
+
+    계정 풀이 1개뿐이면 바꿀 수 없으므로 그대로 둔다.
+    """
+    previous: dict[str, str] = {}
+    for i, cafe in enumerate(cafes):
+        key = _norm(cafe)
+        account = assigned.get(i)
+        if not account:
+            continue
+        if previous.get(key, "").casefold() == account.casefold():
+            pool = chosen_by_cafe.get(key) or []
+            alternatives = [a for a in pool if a.casefold() != account.casefold()]
+            if alternatives:
+                account = alternatives[0]
+                assigned[i] = account
+        previous[key] = account
+
+
 def plan(rt: Runtime, spec: TaskSpec, manuscripts: list[Manuscript]) -> list[Slot]:
     """원고 목록 → 슬롯 목록(계정·카페·시각·이미지 확정)."""
     if not manuscripts:
@@ -780,6 +907,7 @@ def plan(rt: Runtime, spec: TaskSpec, manuscripts: list[Manuscript]) -> list[Slo
     restricted = set(restricted_accounts(rt)) | set(rt.scratch.get("restricted_now") or set())
     comment_only = all_comment_accounts(rt)
     assigned: dict[int, str] = {}
+    chosen_by_cafe: dict[str, list[str]] = {}
     need_assign = [i for i, m in enumerate(manuscripts) if not m.account]
     if need_assign:
         # 카페·게시판마다 쓸 수 있는 계정이 다르다 → (work_type, 카페, 게시판)으로 묶는다
@@ -798,6 +926,12 @@ def plan(rt: Runtime, spec: TaskSpec, manuscripts: list[Manuscript]) -> list[Slo
                     assigned[i] = DEFERRED_ACCOUNT
                 continue
             need = spec.account_count or len(idxs)
+            if getattr(spec, "per_cafe", False) and not spec.account_count:
+                # 규칙 §4: 카페마다 5~10개만 골라 고정하고 돌려 쓴다
+                need = max(
+                    min(SELF_DAILY_ACCOUNTS_MAX, len(pool)),
+                    min(SELF_DAILY_ACCOUNTS_MIN, len(pool)),
+                )
             if spec.account_mode == "manual":
                 if not pool:
                     raise AssignError(
@@ -820,10 +954,17 @@ def plan(rt: Runtime, spec: TaskSpec, manuscripts: list[Manuscript]) -> list[Slo
                 )
             for position, i in enumerate(idxs):
                 assigned[i] = rotate(chosen, position)
+            chosen_by_cafe.setdefault(_norm(cafe_name), []).extend(
+                a for a in chosen if a not in chosen_by_cafe.get(_norm(cafe_name), [])
+            )
+        # 같은 카페에서 같은 계정을 연속으로 쓰지 않는다 (규칙 §4)
+        _avoid_consecutive(cafes, assigned, chosen_by_cafe)
 
     # --- 시각 계획 ---
     immediate_flags = [spec.immediate or is_test_cafe(rt, c) for c in cafes]
     timed_idx = [i for i, imm in enumerate(immediate_flags) if not imm]
+    # 자사 카페 일상 글(`카페별`)은 예약하지 않는다: 전부 즉시 발행이고, 글과 글
+    # 사이 간격은 실행기가 쉬면서 만든다 (규칙 §4, worker._pace_slots)
     times: dict[int, datetime] = {}
     if timed_idx:
         start_date = datetime.strptime(spec.start_date, "%Y-%m-%d").date()
@@ -912,6 +1053,86 @@ def build_comments(rt: Runtime, slot: Slot, root_start: datetime, cafe_id: Any) 
             members[ca.login_id] = {"member_key": ca.member_key or "", "nick": ca.nick or ""}
     except Exception:
         members = {}
+    return comment_mod.to_api_payload(items, members)
+
+
+def build_daily_comments(
+    rt: Runtime,
+    slot: Slot,
+    root_start: datetime,
+    cafe_id: Any,
+    *,
+    job_id: int | None = None,
+    rng: random.Random | None = None,
+) -> list[dict]:
+    """자사 카페 일상 글의 랜덤 댓글 페이로드 (루트 댓글만, 규칙 §5).
+
+    실패하면 빈 목록을 돌려주고 경고만 남긴다 — 글은 그대로 발행된다.
+    """
+    from v2r.content import daily_comments as dc
+
+    rng = rng or random.Random()
+    count = dc.draw_count(rng)
+    if count <= 0:
+        return []
+
+    def warn(message: str) -> None:
+        try:
+            rt.events.log(job_id, "warn", message)
+        except Exception:  # 이벤트 기록 실패가 발행을 막지 않는다
+            log.warning("%s", message)
+
+    try:
+        members_list = list(rt.catalog.cafe_accounts(cafe_id))
+    except Exception as exc:
+        warn(f"카페 회원 목록을 읽지 못해 댓글 0개로 발행합니다: {exc}")
+        return []
+    author = str(slot.account or "").casefold()
+    # 자사·제휴 계정 구분(사용자 규칙): 시트 작업 구분이 '자사 댓글'인 계정만, 그리고 카페 등급이 스탭인 것만
+    from v2r.accounts.loader import LINKED_V2R, SELF_COMMENT_WORK_TYPE
+
+    sheet_ok = {
+        a.login_id.casefold()
+        for a in load_accounts(rt, prefer_cache=True)
+        if (a.work_type or "").strip() == SELF_COMMENT_WORK_TYPE
+        and (a.linked or "").strip().upper() == LINKED_V2R
+        and not a.excluded
+    }
+    pool = [
+        ca
+        for ca in members_list
+        if str(ca.login_id).casefold() != author
+        and str(ca.login_id).casefold() in sheet_ok
+        and is_staff_level(ca.level_name)
+    ]
+    if not pool:
+        warn("'자사 댓글' 구분 + 스탭 등급인 댓글 계정이 이 카페에 없어 댓글 0개로 발행합니다")
+        return []
+
+    count = min(count, len(pool))
+    chosen = rng.sample(pool, count)
+    m = slot.manuscript
+    texts = dc.generate_texts(rt.llm, m.title, m.body, count, on_warn=warn)
+    if not texts:
+        return []
+    count = min(count, len(texts))
+    times = dc.plan_times(root_start, count, rng)
+    items = [
+        {
+            "label": f"일상댓글{i + 1}",
+            "depth": 0,
+            "parent": None,
+            "role": "comment",
+            "account": chosen[i].login_id,
+            "text": texts[i],
+            "start_at": times[i],
+        }
+        for i in range(count)
+    ]
+    members = {
+        ca.login_id: {"member_key": ca.member_key or "", "nick": ca.nick or ""}
+        for ca in members_list
+    }
     return comment_mod.to_api_payload(items, members)
 
 
@@ -1159,6 +1380,12 @@ def run_slot(
     }
     if spec.dry_run:
         planned["manuscript_type"] = m.manuscript_type
+        if getattr(spec, "random_comments", False) and slot.workflow != "affiliate":
+            # 모의 실행은 모델을 부르지 않는다 → 개수만 뽑아 보여준다 (규칙 §5)
+            from v2r.content import daily_comments as dc
+
+            planned["comments"] = dc.draw_count()
+            return {**planned, "status": "planned", "dry_run": True}
         try:
             planned["comment_roles"] = comment_role_rows(rt, slot)
         except Exception as exc:  # 역할 표는 참고용이라 모의 실행을 막지 않는다
@@ -1308,7 +1535,13 @@ def run_slot(
             )
             planned["daily_source_id"] = daily_id
         else:
-            payload = build_comments(rt, slot, root_start, getattr(cafe, "cafe_id", None))
+            if getattr(spec, "random_comments", False):
+                payload = build_daily_comments(
+                    rt, slot, root_start, getattr(cafe, "cafe_id", None), job_id=job_id
+                )
+            else:
+                payload = build_comments(rt, slot, root_start, getattr(cafe, "cafe_id", None))
+            planned["comments"] = len(payload)
             rt.publications.mark(
                 *key,
                 "uncertain",
@@ -1392,6 +1625,7 @@ __all__ = [
     "PublishError",
     "RetryWithOtherAccount",
     "Slot",
+    "build_daily_comments",
     "cafe_default_board",
     "cafe_matches",
     "canonical_board",
@@ -1400,6 +1634,8 @@ __all__ = [
     "load_manuscripts",
     "plan",
     "prepare_manuscripts",
+    "prepare_per_cafe",
+    "self_cafe_names",
     "refresh_source",
     "resolve_board",
     "resolve_cafe",

@@ -11,6 +11,9 @@ DEFAULT_COLUMNS = {"id": "B", "work_type": "H", "linked": "I", "grade": "J"}
 
 SELF_WORK_TYPE = "자사 카페"
 AFFILIATE_WORK_TYPE = "제휴 작업"
+#: 댓글 전용 계정의 작업 구분(시트 H열). 자사·제휴는 절대 섞어 쓰지 않는다(사용자 규칙 2026-09-19).
+SELF_COMMENT_WORK_TYPE = "자사 댓글"
+AFFILIATE_COMMENT_WORK_TYPE = "제휴 댓글"
 LINKED_V2R = "V2R"
 
 #: CSV 헤더 별칭
