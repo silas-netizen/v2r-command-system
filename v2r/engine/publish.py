@@ -21,6 +21,9 @@ from v2r.content import duplicate, sanitize as sanitize_mod, seone
 from v2r.content.manuscript import Manuscript
 from v2r.engine.context import Runtime
 from v2r.engine.scheduler import KST, plan_slots, revision_at
+
+#: 같은 카페 연속 허용 상한(이 수 이상 몰리면 다른 카페 원고를 끌어와 섞는다, 사용자 규칙 2026-09-20)
+MAX_SAME_CAFE_RUN = 3
 from v2r.sources import sheets
 
 log = logging.getLogger(__name__)
@@ -1066,9 +1069,6 @@ def next_self_window(at: datetime) -> datetime:
         return at
     return local.replace(hour=SELF_WINDOW_OPEN_HOUR, minute=0, second=0, microsecond=0)
 
-
-#: 같은 카페 연속 허용 상한(이 수 이상 몰리면 다른 카페 원고를 끌어와 섞는다, 사용자 규칙 2026-09-20)
-MAX_SAME_CAFE_RUN = 3
 
 #: 자사 카페 일상 글에서 카페마다 고정해 두는 계정 수 (규칙 §4).
 #: 사용자 규칙: **정확히 10개를 무작위로** 골라 고정한다 (풀이 10개 미만이면 있는 만큼).
