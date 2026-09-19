@@ -97,6 +97,17 @@ class V2RClient:
         """내부 httpx 클라이언트 종료."""
         self._client.close()
 
+    # ---- 세션 ----
+    def maintain_auth(self, tick: float | None = None) -> str:
+        """토큰 주기 점검 1회분(serve가 30분마다 부른다). 결과 문자열을 돌려준다."""
+        from .auth import MAINTAIN_TICK_S
+
+        return self.auth.maintain(self._client, MAINTAIN_TICK_S if tick is None else tick)
+
+    def session_report(self) -> dict:
+        """세션 상태(비밀값 없음)."""
+        return self.auth.report()
+
     # ---- 캐시 ----
     def _cache_key(self, path: str, params: dict | None) -> str | None:
         if path not in CACHED_PATHS:
@@ -160,6 +171,12 @@ class V2RClient:
             err = V2RApiError.from_response(response, f"{method} {path} 실패")
             kind = err.kind or classify(err)
 
+            if response.status_code == 429 and _is_long_limit(err):
+                # 로그인 횟수 제한(20/일/지문) 등 장기 제한 → 재시도 금지.
+                # 대기·재개는 상위(worker)가 retry_after를 보고 결정한다.
+                err.kind = "rate_limited_long"
+                raise err
+
             if kind == "token_expired" and not relogin_used:
                 relogin_used = True
                 self.auth.invalidate()
@@ -205,6 +222,18 @@ class V2RClient:
     def put(self, path: str, json: Any = None, **kwargs: Any) -> dict:
         """PUT 호출."""
         return self.request("PUT", path, json=json, **kwargs)
+
+
+#: 즉시 포기해야 하는 429 사유(시간 단위 제한).
+LONG_LIMIT_TOKENS = ("RATE_LIMIT_LOGIN",)
+
+
+def _is_long_limit(err: V2RApiError) -> bool:
+    """429가 장기 제한인가 — 로그인 횟수 제한이거나 `retry_after`가 15분 초과."""
+    text = " ".join(str(x) for x in (err.code, err.reason, err.body) if x).upper()
+    if any(token in text for token in LONG_LIMIT_TOKENS):
+        return True
+    return err.retry_after is not None and float(err.retry_after) > MAX_RETRY_WAIT
 
 
 def _as_dict(response: httpx.Response) -> dict:

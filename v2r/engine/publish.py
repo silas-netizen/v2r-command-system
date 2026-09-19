@@ -45,8 +45,27 @@ DEFINITIVE_REJECTIONS = {
 }
 
 
+#: 서버가 "지금은 안 된다"고 한 것뿐인 오류들. 글이 만들어지지 않았고,
+#: 제한이 풀리면 같은 원고로 그대로 다시 시도할 수 있다.
+RATE_KINDS = {"rate_limited", "rate_limited_long", "login_budget"}
+
+
 class PublishError(RuntimeError):
-    """발행 실패(복구 불가)."""
+    """발행 실패(복구 불가).
+
+    `kind`/`retry_after`는 상위(worker)가 레이트 제한 대기를 결정할 때 쓴다.
+    """
+
+    def __init__(
+        self,
+        message: str = "",
+        *,
+        kind: str | None = None,
+        retry_after: float | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.kind = kind
+        self.retry_after = retry_after
 
 
 class RetryWithOtherAccount(RuntimeError):
@@ -1610,7 +1629,19 @@ def run_slot(
             )
 
     except V2RApiError as exc:
-        kind = classify(exc)
+        # `rate_limited_long`/`login_budget`은 classify()가 되살릴 수 없으므로
+        # 예외가 들고 온 kind를 우선한다.
+        kind = exc.kind or classify(exc)
+        if kind in RATE_KINDS and not created_any:
+            # 서버가 요청을 아예 받지 않았다 → 원고를 소모하지 않도록 재시도 가능한
+            # failed로 내려 둔다(uncertain으로 남기면 다음 시도에서 건너뛴다).
+            _mark_precreate_failed(f"{kind}: {exc}")
+            rt.events.log(job_id, "warn", f"레이트 제한({kind}): {m.title}")
+            raise PublishError(
+                f"발행 보류({kind}): {exc}",
+                kind=kind,
+                retry_after=exc.retry_after,
+            ) from exc
         if kind in DEFINITIVE_REJECTIONS and not created_any:
             # 서버가 요청을 거부해 글이 생기지 않았다 → 다른 계정으로 재시도 가능하게 failed
             rt.publications.mark(*key, "failed", f"거부({kind})")

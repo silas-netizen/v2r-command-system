@@ -1,4 +1,4 @@
-"""CLI: python -m v2r "<한국어 명령>" | status | dashboard | serve | run | reconcile."""
+"""CLI: python -m v2r "<한국어 명령>" | status | session | dashboard | serve | run | reconcile."""
 
 from __future__ import annotations
 
@@ -56,6 +56,43 @@ def _print_result(out: dict | None) -> None:
         print("  " + json.dumps(leftovers, ensure_ascii=False, default=str))
 
 
+def _span(seconds: float | None) -> str:
+    """남은 시간을 사람 말로. 음수면 '만료됨'."""
+    if seconds is None:
+        return "알 수 없음"
+    if seconds <= 0:
+        return "만료됨"
+    hours, rest = divmod(int(seconds), 3600)
+    return f"{hours}시간 {rest // 60}분 남음" if hours else f"{rest // 60}분 남음"
+
+
+def session_report_text(info: dict) -> str:
+    """세션 상태를 한국어 여러 줄로. 토큰·쿠키 값은 절대 넣지 않는다."""
+    token_line = (
+        f"액세스 토큰: 있음 ({_span(info.get('token_expires_in_s'))})"
+        if info["has_token"]
+        else "액세스 토큰: 없음 (다음 사용 때 로그인합니다)"
+    )
+    cookie_line = (
+        f"갱신 쿠키: 있음 ({_span(info.get('refresh_expires_in_s'))})"
+        if info["has_refresh_cookie"]
+        else "갱신 쿠키: 없음"
+    )
+    lines = [
+        f"세션 파일: {info['session_file']}",
+        token_line,
+        cookie_line,
+        f"최근 24시간 로그인: {info['logins_24h']}회 / 자체 한도 {info['login_budget']}회"
+        " (서버 한도 20회)",
+    ]
+    return "\n".join(lines)
+
+
+def _session_report(rt: Runtime) -> str:
+    """`python -m v2r session` 출력."""
+    return session_report_text(rt.client.session_report())
+
+
 def _cmd_command(rt: Runtime, text: str) -> int:
     from v2r.engine import worker
 
@@ -86,7 +123,10 @@ def _cmd_command(rt: Runtime, text: str) -> int:
 def main(argv: list[str] | None = None) -> int:
     args = list(argv if argv is not None else sys.argv[1:])
     if not args:
-        print('사용법: python -m v2r "<한국어 명령>" | status | dashboard | serve | run | reconcile')
+        print(
+            '사용법: python -m v2r "<한국어 명령>" | status | session | dashboard'
+            " | serve | run | reconcile"
+        )
         return 2
 
     rt = Runtime.open()
@@ -103,6 +143,9 @@ def main(argv: list[str] | None = None) -> int:
             from v2r.engine.dashboard import build_dashboard
 
             print(build_dashboard(rt))
+            return 0
+        if head == "session":
+            print(_session_report(rt))
             return 0
         if head == "serve":
             worker.serve(rt)

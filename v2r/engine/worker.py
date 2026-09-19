@@ -10,7 +10,7 @@ import re
 import socket
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +21,7 @@ from v2r.engine import publish as publish_mod
 from v2r.engine import reconcile as reconcile_mod
 from v2r.engine import status as status_mod
 from v2r.engine.context import Runtime
+from v2r.api.auth import MAINTAIN_TICK_S
 from v2r.engine.publish import KST
 
 log = logging.getLogger(__name__)
@@ -809,6 +810,43 @@ def _sleep_with_beat(seconds: float, beat: Any, sleep: Any = time.sleep) -> None
         beat()
 
 
+#: 레이트 제한 대기 상한(6시간)과 리스 연장 간격(30초).
+RATE_WAIT_CAP_S = 6 * 3600.0
+RATE_BEAT_S = 30.0
+#: 기본 대기(서버가 `retry_after`를 안 줄 때) 1시간.
+RATE_WAIT_DEFAULT_S = 3600.0
+#: 슬롯 하나당 레이트 대기 재시도 횟수 상한.
+RATE_MAX_WAITS = 3
+
+
+def rate_wait_seconds(exc: Any) -> float:
+    """예외의 `retry_after`(초). 없으면 1시간. 상한 6시간."""
+    value = getattr(exc, "retry_after", None)
+    try:
+        seconds = float(value) if value is not None else RATE_WAIT_DEFAULT_S
+    except (TypeError, ValueError):
+        seconds = RATE_WAIT_DEFAULT_S
+    return min(max(seconds, 0.0), RATE_WAIT_CAP_S)
+
+
+def _wait_for_rate_limit(
+    rt: Runtime, seconds: float, beat: Any, sleep: Any = time.sleep
+) -> bool:
+    """제한이 풀릴 때까지 30초씩 쉬며 리스를 연장한다.
+
+    중지 요청이 오면 즉시 False. 끝까지 기다렸으면 True(같은 슬롯 재시도).
+    """
+    remaining = min(max(float(seconds), 0.0), RATE_WAIT_CAP_S)
+    while remaining > 0:
+        if stop_requested(rt):
+            return False
+        chunk = min(RATE_BEAT_S, remaining)
+        sleep(chunk)
+        remaining -= chunk
+        beat()
+    return not stop_requested(rt)
+
+
 def _daily_report_path(rt: Runtime, spec: TaskSpec):
     """자사 카페 일상 글 보고서 경로 (`docs/reports/self-daily-<날짜>.md`)."""
     return rt.settings.repo_root / "docs" / "reports" / f"self-daily-{spec.start_date}.md"
@@ -953,6 +991,7 @@ def _run_publish(
     failed_slots: list[tuple[Any, str]] = []
     next_allowed: dict[str, float] = {}
     window_notified = False
+    rate_notified = False  # 레이트 제한 안내는 작업당 한 번만
     touched: list[tuple] = []
     retried: set[int] = set()
     playwright = context = page = None
@@ -972,7 +1011,7 @@ def _run_publish(
     stopped = False
     try:
         for index, slot in enumerate(slots, start=1):
-            if stop_requested(rt):  # 슬롯 사이에서 중지 확인 (M-9)
+            if stopped or stop_requested(rt):  # 슬롯 사이에서 중지 확인 (M-9)
                 stopped = True
                 failures.append(f"{slot.manuscript.title}: 중지 요청으로 건너뜀")
                 continue
@@ -1002,33 +1041,59 @@ def _run_publish(
                 wait = next_allowed.get(key, 0.0) - time.monotonic()
                 if wait > 0:
                     _sleep_with_beat(wait, beat)
-            try:
-                results.append(
-                    publish_mod.run_slot(
-                        rt, spec, slot, browser_page=page, job_id=job_id, heartbeat=beat
-                    )
-                )
-            except publish_mod.RetryWithOtherAccount as exc:
-                other = None if index in retried else _other_account(rt, spec, slot)
-                if other:
-                    retried.add(index)
-                    rt.events.log(job_id, "info", f"다른 계정으로 재시도: {other}")
-                    slot.account = other
-                    try:
-                        results.append(
-                            publish_mod.run_slot(
-                                rt, spec, slot, browser_page=page, job_id=job_id, heartbeat=beat
-                            )
+            rate_waits = 0
+            while True:
+                try:
+                    results.append(
+                        publish_mod.run_slot(
+                            rt, spec, slot, browser_page=page, job_id=job_id, heartbeat=beat
                         )
-                    except (publish_mod.RetryWithOtherAccount, publish_mod.PublishError) as exc2:
-                        failures.append(f"{m.title}: {exc2}")
-                        failed_slots.append((slot, str(exc2)))
-                else:
+                    )
+                except publish_mod.RetryWithOtherAccount as exc:
+                    other = None if index in retried else _other_account(rt, spec, slot)
+                    if other:
+                        retried.add(index)
+                        rt.events.log(job_id, "info", f"다른 계정으로 재시도: {other}")
+                        slot.account = other
+                        try:
+                            results.append(
+                                publish_mod.run_slot(
+                                    rt, spec, slot, browser_page=page, job_id=job_id, heartbeat=beat
+                                )
+                            )
+                        except (publish_mod.RetryWithOtherAccount, publish_mod.PublishError) as exc2:
+                            failures.append(f"{m.title}: {exc2}")
+                            failed_slots.append((slot, str(exc2)))
+                    else:
+                        failures.append(f"{m.title}: {exc}")
+                        failed_slots.append((slot, str(exc)))
+                except publish_mod.PublishError as exc:
+                    kind = getattr(exc, "kind", None)
+                    if kind in publish_mod.RATE_KINDS and rate_waits < RATE_MAX_WAITS:
+                        # 남은 슬롯을 줄줄이 실패시키지 않는다. 제한이 풀릴 때까지
+                        # 기다렸다가 **같은 슬롯**부터 이어서 간다 (장애 2026-09-19).
+                        rate_waits += 1
+                        wait = rate_wait_seconds(exc)
+                        until = datetime.now(KST) + timedelta(seconds=wait)
+                        if not rate_notified:
+                            notify_all(
+                                rt.channels,
+                                f"V2R 로그인 제한: {until:%H:%M}까지 대기 후 이어갑니다",
+                            )
+                            rate_notified = True
+                        rt.events.log(
+                            job_id, "warn", f"레이트 제한 대기 {int(wait)}초 ({kind}) — {m.title}"
+                        )
+                        if _wait_for_rate_limit(rt, wait, beat):
+                            continue  # 같은 슬롯 재시도 (원고는 소모되지 않는다)
+                        stopped = True
+                        failures.append(f"{m.title}: 중지 요청으로 대기를 멈췄습니다")
+                        break
                     failures.append(f"{m.title}: {exc}")
                     failed_slots.append((slot, str(exc)))
-            except publish_mod.PublishError as exc:
-                failures.append(f"{m.title}: {exc}")
-                failed_slots.append((slot, str(exc)))
+                break
+            if stopped:
+                continue
             if paced and not spec.dry_run:
                 next_allowed[publish_mod._norm(slot.cafe)] = time.monotonic() + 60.0 * random.uniform(
                     float(spec.interval_min), float(max(spec.interval_max, spec.interval_min))
@@ -1340,6 +1405,23 @@ def serve_poll(rt: Runtime, owner: str | None = None) -> dict:
 SERVE_HELLO = "실행기 시작됨. '상태' 라고 보내보세요"
 
 
+def maintain_session(rt: Runtime) -> str:
+    """토큰 주기 점검 1회분. 실패해도 serve 루프를 죽이지 않는다.
+
+    하루 20회 로그인 제한(장애 2026-09-19) 때문에 serve가 30분마다 불러
+    액세스 토큰은 갱신으로 이어 쓰고, 리프레시 쿠키가 끝나갈 때만
+    **하루 한 번** 로그인한다.
+    """
+    try:
+        result = rt.client.maintain_auth()
+    except Exception as exc:
+        log.warning("세션 점검 실패(계속 진행): %s", exc)
+        return "error"
+    if result in ("login", "refresh"):
+        log.info("세션 점검: %s", result)
+    return result
+
+
 def serve(rt: Runtime, poll_seconds: int = 5, announce: bool = True) -> None:  # pragma: no cover - 장시간 루프
     """채널을 폴링하며 명령을 받아 실행한다. 어떤 예외로도 멈추지 않는다."""
     owner = default_owner()
@@ -1347,8 +1429,12 @@ def serve(rt: Runtime, poll_seconds: int = 5, announce: bool = True) -> None:  #
     log.info("serve 시작: 채널 %d개", len(rt.channels))
     if announce:
         notify_all(rt.channels, SERVE_HELLO)
+    next_maintain = 0.0
     while True:
         try:
+            if time.monotonic() >= next_maintain:
+                next_maintain = time.monotonic() + MAINTAIN_TICK_S
+                maintain_session(rt)
             serve_poll(rt, owner)
         except KeyboardInterrupt:
             print("serve 중지", flush=True)
@@ -1364,6 +1450,7 @@ __all__ = [
     "drain",
     "handle_text",
     "idem_key",
+    "maintain_session",
     "run_once",
     "serve",
 ]
