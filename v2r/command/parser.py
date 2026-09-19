@@ -31,6 +31,8 @@ TASK_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("repair_comments", re.compile(r"댓글.*(복구|재설정|다시)")),
     ("open_login", re.compile(r"로그인\s*(창|세션|준비)")),
     ("stop", re.compile(r"(중지|멈춰|중단|취소)")),
+    # 현황판(HTML)은 `현황`/`상태` 조회(status)보다 먼저 봐야 가로채이지 않는다
+    ("dashboard", re.compile(r"(현황판|대시\s*보드|dashboard)", re.I)),
     # `진행`은 "진행 상황/중/률"처럼 명사형일 때만 상태 조회로 본다(발행 문장 가로채기 방지)
     ("status", re.compile(r"(상태|현황|진행\s*(?:상황|중|률))")),
     ("catalog", re.compile(r"(카페|게시판|계정)\s*(목록|카탈로그)")),
@@ -145,6 +147,7 @@ _NO_SLOT_TASKS = frozenset(
         "sync_sources",
         "sync_all_sources",
         "status",
+        "dashboard",
         "stop",
         "reconcile",
         "inspect_failures",
@@ -380,6 +383,7 @@ TASK_LABELS: dict[str, str] = {
     "open_login": "로그인 창 열기",
     "stop": "작업 중지",
     "status": "상태 조회",
+    "dashboard": "현황판 갱신",
     "catalog": "카탈로그 조회",
     "publish_brand": "브랜드(수정) 글 발행",
     "publish_info": "정보성 글 발행",

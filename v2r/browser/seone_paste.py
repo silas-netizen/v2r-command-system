@@ -151,6 +151,9 @@ def _select_by_text(page, label: str, value: str, retries: int = 3) -> None:
                 opener.click(timeout=3000)
                 page.wait_for_timeout(300)
             item = page.get_by_text(value, exact=True).first
+            if item.count() == 0:
+                # 정확 일치가 없으면 부분 일치(이모지·부제가 붙은 이름)로
+                item = page.get_by_text(value, exact=False).first
             item.click(timeout=3000)
             page.wait_for_timeout(400)
             return

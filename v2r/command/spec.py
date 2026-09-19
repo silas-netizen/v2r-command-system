@@ -32,6 +32,7 @@ ALLOWED_TASKS: frozenset[str] = frozenset(
         "repair_comments",
         "open_login",
         "stop",
+        "dashboard",
         "status",
         "catalog",
         "publish_brand",

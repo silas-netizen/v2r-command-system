@@ -1,4 +1,4 @@
-"""CLI: python -m v2r "<한국어 명령>" | status | serve | run | reconcile."""
+"""CLI: python -m v2r "<한국어 명령>" | status | dashboard | serve | run | reconcile."""
 
 from __future__ import annotations
 
@@ -86,7 +86,7 @@ def _cmd_command(rt: Runtime, text: str) -> int:
 def main(argv: list[str] | None = None) -> int:
     args = list(argv if argv is not None else sys.argv[1:])
     if not args:
-        print('사용법: python -m v2r "<한국어 명령>" | status | serve | run | reconcile')
+        print('사용법: python -m v2r "<한국어 명령>" | status | dashboard | serve | run | reconcile')
         return 2
 
     rt = Runtime.open()
@@ -98,6 +98,11 @@ def main(argv: list[str] | None = None) -> int:
         head = args[0]
         if head == "status":
             print(status_report(rt))
+            return 0
+        if head == "dashboard":
+            from v2r.engine.dashboard import build_dashboard
+
+            print(build_dashboard(rt))
             return 0
         if head == "serve":
             worker.serve(rt)

@@ -58,6 +58,7 @@ def test_legacy_example_sentence():
         ("일괄 발행 해줘", "publish_batch"),
         ("일상 글 5개 올려줘", "publish_daily"),
         ("댓글 다시 세팅해줘", "repair_comments"),
+        ("현황판 갱신", "dashboard"),
     ],
 )
 def test_each_task_pattern(text, task):
@@ -69,7 +70,7 @@ def test_each_task_pattern(text, task):
 
 
 def test_all_tasks_covered_by_tests():
-    assert len(ALLOWED_TASKS) == 24
+    assert len(ALLOWED_TASKS) == 25
 
 
 def test_wash_photos_count():

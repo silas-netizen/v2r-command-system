@@ -829,6 +829,24 @@ def _run_publish(
     return out
 
 
+def _dashboard(rt: Runtime) -> dict:
+    """운영 현황판 HTML을 새로 만들고 파일 경로를 알려준다."""
+    from v2r.engine.dashboard import build_dashboard
+
+    path = build_dashboard(rt)
+    return {"ok": True, "path": str(path), "message": f"현황판을 갱신했습니다: {path}"}
+
+
+def refresh_dashboard(rt: Runtime) -> None:
+    """현황판 자동 갱신(최선 노력). 실패해도 작업 결과에는 영향을 주지 않는다."""
+    try:
+        from v2r.engine.dashboard import build_dashboard
+
+        build_dashboard(rt)
+    except Exception as exc:  # pragma: no cover - 방어용
+        log.warning("현황판 갱신 실패: %s", exc)
+
+
 def dispatch(rt: Runtime, job: Any, owner: str | None = None) -> dict:
     """작업 1건 실행. 결과 딕셔너리 반환."""
     job_id = int(job["id"]) if job is not None else None
@@ -839,6 +857,8 @@ def dispatch(rt: Runtime, job: Any, owner: str | None = None) -> dict:
         return _run_publish(rt, job_id, spec, owner)
     if task == "status":
         return {"ok": True, "report": status_mod.status_report(rt, exclude_job_id=job_id)}
+    if task == "dashboard":
+        return _dashboard(rt)
     if task == "inspect_failures":
         return {"ok": True, "report": status_mod.inspect_failures(rt)}
     if task == "reconcile":
@@ -944,6 +964,8 @@ def run_once(rt: Runtime, owner: str | None = None) -> dict | None:
 
     rt.jobs.finish(job_id, status, result, error)
     rt.events.log(job_id, "info", f"작업 종료({status}): {description}")
+    if spec.task in PUBLISH_TASKS or spec.task == "reconcile":
+        refresh_dashboard(rt)  # 발행·점검이 끝날 때마다 현황판을 새로 그린다
     notify_all(rt.channels, format_report(job_id, status, description))
     return {"job_id": job_id, "status": status, "result": result, "description": description}
 

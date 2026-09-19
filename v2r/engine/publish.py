@@ -1261,12 +1261,20 @@ def _attach_images(rt: Runtime, slot: Slot, browser_page: Any) -> list[dict]:
         raise PublishError("이미지 첨부에는 브라우저 세션이 필요합니다")
     from v2r.browser.seone_paste import attach_images_via_paste
 
+    # 화면의 선택창은 정식 이름을 쓴다 → 줄임말(쌍둥이맘)이 아니라 카탈로그 이름(쌍둥이맘 모여라)을 넘긴다
+    cafe_name, board_name = slot.cafe, slot.board
+    try:
+        cafe_obj, menu_obj, _head = rt.catalog.resolve(slot.cafe, slot.board, slot.account)
+        cafe_name = getattr(cafe_obj, "name", None) or cafe_name
+        board_name = getattr(menu_obj, "name", None) or board_name
+    except Exception:
+        pass
     return attach_images_via_paste(
         browser_page,
         rt.settings.v2r_site,
-        slot.cafe,
+        cafe_name,
         slot.account,
-        slot.board,
+        board_name,
         list(slot.images),
     )
 

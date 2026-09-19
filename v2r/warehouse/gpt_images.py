@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import logging
 import random
@@ -532,6 +533,10 @@ def _download_bytes(page, timeout_ms: int = 60000) -> bytes | None:
     return None
 
 
+#: 같은 프로세스 안에서 최근 받은 이미지 해시(중복 감지용)
+_RECENT_DIGESTS: list[str] = []
+
+
 def generate_image(
     page,
     prompt: str,
@@ -573,11 +578,21 @@ def generate_image(
         raise GptImageError(f"{timeout}초 안에 생성 이미지를 찾지 못했습니다.")
 
     _img_loc, src = found
-    raw = _download_bytes(page)
-    if not raw:
+    # 대화를 이어 쓰면 '내려받기' 버튼이 이전 이미지 것일 수 있다 → 찾은 이미지 주소로 먼저 받는다
+    raw = b""
+    try:
         raw = _fetch_bytes(page, src)
+    except Exception:
+        raw = b""
+    if not raw:
+        raw = _download_bytes(page)
     if not raw:
         raise GptImageError("이미지 바이트를 받지 못했습니다.")
+    digest = hashlib.sha256(raw).hexdigest()
+    if digest in _RECENT_DIGESTS:
+        raise GptImageError("이전 생성과 같은 이미지가 잡혔습니다(중복) — 다시 시도하세요")
+    _RECENT_DIGESTS.append(digest)
+    del _RECENT_DIGESTS[:-20]
 
     name = stem or f"gpt_{int(time.time())}_{random.randint(100, 999)}"
     png = out / f"{name}.png"
