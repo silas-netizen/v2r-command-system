@@ -16,6 +16,10 @@ MODELS: dict[str, str] = {
     "daily_comment": "claude-haiku-4-5",
     "promo_comment": "claude-sonnet-5",
     "daily_adapt": "claude-sonnet-5",
+    # 브랜드(제휴) 바이럴 원고. 지침의 모델 분리(본문/댓글)를 그대로 따른다.
+    # 2026-09-19 품질 시험: 본문도 잠시 Sonnet으로 내린다(되돌리려면 claude-opus-5).
+    "brand_body": "claude-sonnet-5",
+    "brand_comments": "claude-sonnet-5",
 }
 
 DEFAULT_MODEL = "claude-haiku-4-5"

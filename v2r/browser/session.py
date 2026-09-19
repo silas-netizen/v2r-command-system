@@ -73,17 +73,29 @@ def ensure_logged_in(
     """로그인 상태를 확인한다. 로그인 폼이 보이면 사용자가 직접 로그인할 때까지 대기."""
     base = (site or default_site()).rstrip("/")
     page.goto(f"{base}/nc/board?view=list", wait_until="domcontentloaded")
+    # SPA가 /login 으로 갈아타는 데 잠깐 걸린다 → 바로 판정하면 '로그인됨'으로 오판한다
+    page.wait_for_timeout(1500)
 
-    if not _password_visible(page):
+    if not _login_needed(page):
         return True
 
     print(LOGIN_PROMPT)
     deadline = time.monotonic() + max_wait_seconds
     while time.monotonic() < deadline:
         time.sleep(poll_seconds)
-        if not _password_visible(page):
+        if not _login_needed(page):
             return True
     raise TimeoutError(f"로그인 대기 시간 초과({max_wait_seconds}초). {LOGIN_PROMPT}.")
+
+
+def _login_needed(page) -> bool:
+    """로그인 페이지에 있거나 비밀번호 입력란이 보이면 True."""
+    try:
+        if "/login" in str(page.url or ""):
+            return True
+    except Exception:
+        pass
+    return _password_visible(page)
 
 
 def _password_visible(page) -> bool:

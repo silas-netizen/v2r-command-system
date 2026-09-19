@@ -163,6 +163,33 @@ def _select_by_text(page, label: str, value: str, retries: int = 3) -> None:
     raise PasteError(f"{label} 선택 실패: {value} ({last_error})")
 
 
+def _open_editor_page(page, base: str, attempts: int = 3) -> None:
+    """`/nc/seone`을 연다. SPA가 즉시 다른 경로로 갈아타면 `net::ERR_ABORTED`가 나는데,
+    그때는 실패가 아니라 페이지가 이미 바뀐 것이므로 잠시 기다렸다 주소만 확인한다."""
+    last: Exception | None = None
+    for i in range(attempts):
+        try:
+            page.goto(f"{base}/nc/seone", wait_until="domcontentloaded")
+            page.wait_for_timeout(1200)
+            return
+        except Exception as exc:
+            last = exc
+            if "ERR_ABORTED" in str(exc):
+                page.wait_for_timeout(1500 * (i + 1))
+                try:
+                    page.wait_for_load_state("domcontentloaded", timeout=5000)
+                except Exception:
+                    pass
+                if "/nc/" in (page.url or ""):
+                    if "seone" in page.url:
+                        return
+                    # 로그인/목록으로 튕겼다면 한 번 더 시도
+                    continue
+            else:
+                page.wait_for_timeout(1000 * (i + 1))
+    raise PasteError(f"SE-ONE 페이지 열기 실패: {last}")
+
+
 def _focus_editor(page) -> str | None:
     """편집기 본문을 클릭해 포커스를 준다. 사용한 선택자를 돌려준다."""
     for selector in EDITOR_BODY_SELECTORS:
@@ -240,8 +267,7 @@ def attach_images_via_paste(
         return []
 
     base = str(site).rstrip("/")
-    page.goto(f"{base}/nc/seone", wait_until="domcontentloaded")
-    page.wait_for_timeout(1200)
+    _open_editor_page(page, base)
 
     # 순서 고정: 카페 → 계정 → 게시판 (계정 선택 전 게시판 비활성)
     _select_by_text(page, "카페", cafe_name)

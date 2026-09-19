@@ -692,6 +692,17 @@ def generate_batch(
     wh.ensure_dirs()
     cfg = load_brands_config()
     brand_name = brand_folder_name(brand, cfg) or brand
+    entry = ((cfg.get("brands") or {}).get(brand_name) or {}) if isinstance(cfg, dict) else {}
+    if entry.get("gpt_generate") is False:
+        return {
+            "ok": False,
+            "brand": brand_name,
+            "keyword": keyword,
+            "requested": 0,
+            "files": [],
+            "errors": [f"{brand_name}은(는) GPT 생성 금지 브랜드입니다 — 키워드 폴더 사진을 랜덤 사용합니다"],
+            "generated": 0,
+        }
     folder = (keyword or "").strip() or KEYWORD_FOLDER
 
     count = max(int(n or 0), 0)

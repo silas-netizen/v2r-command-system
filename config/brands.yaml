@@ -102,6 +102,7 @@ brands:
     description: 장으뜸 장어즙 — 장어 추출 건강즙(파우치·즙 형태). 사진은 즙 파우치·컵에 따른 모습 등 음식 클로즈업
     folder: 장으뜸
     drive_folder: 장으뜸
+    gpt_generate: false   # 사용자 지시(2026-09-19): 장으뜸은 GPT 생성 없이 키워드 폴더 사진을 랜덤 선택·세탁해 사용
     aliases: [장으뜸 장어즙]
     placeholder_rules:
       keyword: {folder: 키워드, select: random}
