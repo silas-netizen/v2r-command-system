@@ -468,3 +468,18 @@ def test_daily_comments_shift_out_of_window(tmp_path):
     for node in payload:
         at = datetime.fromisoformat(node["start_at"].replace("Z", "+00:00"))
         assert in_self_window(at)
+
+
+def test_generate_texts_retries_once_when_all_rejected():
+    calls = []
+
+    class _LLM:
+        def complete(self, purpose, system, user, max_tokens=0):
+            calls.append(user)
+            if len(calls) == 1:
+                return '["' + "가" * 45 + '"]'  # 전부 30자 초과 → 탈락
+            return '["두 번째엔 짧게 답했어요 ㅋㅋ"]'
+
+    out = dc.generate_texts(_LLM(), "제목", "본문", 1)
+    assert out == ["두 번째엔 짧게 답했어요 ㅋㅋ"]
+    assert len(calls) == 2 and "10~28자" in calls[1]

@@ -383,6 +383,19 @@ def build_body_prompt(
             f"- 병행 효과를 말하는 문단 뒤에 줄 하나에 `{rule.extra_placeholder}` 만 단독으로 적는다"
         )
     lines.append("")
+    lines.append("<자리표시자 보기 — body 값 안에서 이렇게 생겨야 한다>")
+    lines.append("```")
+    example = ["...첫 번째 문단 마지막 줄", ""]
+    if rule.placeholder_after_paragraph >= 2:
+        example += ["두 번째 문단 첫 줄", "두 번째 문단 마지막 줄", ""]
+    example += ["{키워드}", "", "다음 문단 첫 줄"]
+    lines.extend(example)
+    lines.append("```")
+    lines.append(
+        "즉 `{키워드}` 는 앞뒤가 빈 줄인 **자기 혼자만 있는 줄**이다. "
+        "문장 안에 섞어 넣으면 안 되고 다른 글자를 같은 줄에 붙이면 안 된다"
+    )
+    lines.append("")
     lines.append("<본문 구조>")
     lines.extend(f"- {s}" for s in rule.body_structure)
     lines.append("")
@@ -606,7 +619,7 @@ def generate_manuscript(
                 f"- {e}" for e in last_error
             )
         try:
-            data = llm.complete_json("brand_body", body_sys, user, max_tokens=1600)
+            data = llm.complete_json("brand_body", body_sys, user, max_tokens=2500)
         except Exception as exc:  # 모델 오류
             raise BrandWriteError(f"본문 생성 실패({brand}/{keyword}): {exc}") from exc
         if not isinstance(data, dict):
@@ -649,7 +662,7 @@ def generate_manuscript(
                 f"- {e}" for e in comment_error
             )
         try:
-            payload = llm.complete_json("brand_comments", cmt_sys, user, max_tokens=2000)
+            payload = llm.complete_json("brand_comments", cmt_sys, user, max_tokens=3000)
         except Exception as exc:
             raise BrandWriteError(f"댓글 생성 실패({brand}/{keyword}): {exc}") from exc
         draft.comments = _comment_nodes(payload)

@@ -24,6 +24,11 @@ MODELS: dict[str, str] = {
 
 DEFAULT_MODEL = "claude-haiku-4-5"
 
+#: 생각(thinking)을 꺼야 하는 용도. 최신 모델은 기본이 adaptive라 글쓰기 용도에서
+#: max_tokens를 전부 생각에 써 버리고 본문이 비어 돌아온다.
+NO_THINKING_PURPOSES = frozenset({"brand_body", "brand_comments"})
+THINKING_DISABLED = {"type": "disabled"}
+
 __all__ = ["MODELS", "LLMRouter", "LLMDisabled", "extract_json"]
 
 
@@ -101,7 +106,13 @@ class LLMRouter:
         model = self.model_for(purpose)
         log.debug("LLM 호출 용도=%s 모델=%s", purpose, model)
         return create_message(
-            client, model, system, user, max_tokens=max_tokens, usage_out=self.usage
+            client,
+            model,
+            system,
+            user,
+            max_tokens=max_tokens,
+            usage_out=self.usage,
+            thinking=THINKING_DISABLED if purpose in NO_THINKING_PURPOSES else None,
         )
 
     def complete_json(

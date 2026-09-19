@@ -27,17 +27,27 @@ def create_message(
     user: str,
     max_tokens: int = 1200,
     usage_out: dict | None = None,
+    thinking: dict | None = None,
 ) -> str:
     """messages.create 한 번 호출하고 본문 텍스트만 돌려준다.
 
     `usage_out`을 주면 입력/출력 토큰 수를 그 dict에 더한다(비용 집계용).
+
+    `thinking`: 생각(thinking) 설정. Sonnet 5 같은 최신 모델은 **기본이 adaptive**라
+    `max_tokens`를 생각에 다 써 버리고 텍스트 블록이 하나도 안 오는 일이 생긴다
+    (원고 생성이 "모델 응답이 비어 있습니다"로 줄줄이 실패했다). 글쓰기처럼
+    생각이 필요 없는 용도는 `{"type": "disabled"}`를 넘긴다. Make 지침도 전부
+    thinking을 disabled로 두고 있다.
     """
-    response = client.messages.create(
-        model=model,
-        max_tokens=max_tokens,
-        system=system,
-        messages=[{"role": "user", "content": user}],
-    )
+    kwargs: dict = {
+        "model": model,
+        "max_tokens": max_tokens,
+        "system": system,
+        "messages": [{"role": "user", "content": user}],
+    }
+    if thinking is not None:
+        kwargs["thinking"] = thinking
+    response = client.messages.create(**kwargs)
     if usage_out is not None:
         usage = getattr(response, "usage", None)
         usage_out["input_tokens"] = usage_out.get("input_tokens", 0) + int(

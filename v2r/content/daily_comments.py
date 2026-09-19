@@ -89,8 +89,9 @@ def generate_texts(
     count: int,
     *,
     on_warn=None,
+    _retry: bool = False,
 ) -> list[str]:
-    """Haiku로 댓글 문구 `count`개. 실패하거나 규칙에 안 맞으면 빈 목록."""
+    """Haiku로 댓글 문구 `count`개. 실패하거나 규칙에 안 맞으면 빈 목록(규칙 위반이면 1회 재시도)."""
     if count <= 0:
         return []
     if llm is None:
@@ -104,7 +105,10 @@ def generate_texts(
         raw = llm.complete(
             purpose="daily_comment",
             system=DAILY_RANDOM_COMMENT_SYSTEM,
-            user=_user_prompt(title, body, count),
+            user=_user_prompt(title, body, count)
+            + ("
+
+주의: 각 댓글은 반드시 공백 포함 10~28자. 이보다 길면 안 된다." if _retry else ""),
             max_tokens=400,
         )
         data = extract_json(raw)
@@ -126,6 +130,9 @@ def generate_texts(
             texts.append(cleaned)
         if len(texts) >= count:
             break
+    if not texts and not _retry:
+        # 전부 규칙 위반(대개 30자 초과)이면 길이를 강조해 한 번 더 묻는다
+        return generate_texts(llm, title, body, count, on_warn=on_warn, _retry=True)
     if not texts and on_warn:
         on_warn("쓸 수 있는 댓글 문구가 없어 댓글 0개로 발행합니다")
     return texts
