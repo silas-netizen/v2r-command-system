@@ -38,7 +38,7 @@ COMMENTS = {
     "대댓글1": "아 그렇군요 처음 알았어요ㅠㅠ",
     "댓글2": "비타민C 발라도 각질이 두꺼우면 흡수가 안된대요 각질 정돈되는걸로 바꿔보세요",
     "대댓글2": "헉 그런건 어떤 성분 봐야되요?",
-    "대대댓글2": "그린커피 아하바하 찾아보세요 각질이랑 멜라닌 같이 잡아줘요",
+    "대대댓글2": "그린커피 아하바하 찾아보세요 흡수가 달라요",
     "대대대댓글2": "222 저도 그거 쓰고 확실히 나아졌어요",
     "댓글3": "저도 작년에 똑같이 고민했어요ㅠㅠ",
     "대댓글3": "저만 그런게 아니였네요ㅎㅎ",
@@ -209,32 +209,87 @@ def test_generate_manuscript_with_fake_llm():
     assert purposes == ["brand_body", "brand_comments"]
 
 
-def test_generate_retries_once_then_succeeds():
+def test_generate_keeps_retrying_until_it_passes():
+    """한 번 어긋났다고 포기하지 않고 구체적 위반을 짚어 다시 시킨다."""
     bad_body = BODY.replace("{키워드}", "음")
 
     class Flaky(FakeLLM):
-        def __init__(self):
+        def __init__(self, good_at: int):
             super().__init__()
             self.n = 0
+            self.good_at = good_at
 
         def complete_json(self, purpose, system, user, max_tokens=1200):
             if purpose == "brand_body":
                 self.n += 1
                 self.calls.append((purpose, system, user))
-                return {"title": "제목", "body": bad_body if self.n == 1 else BODY}
+                return {
+                    "title": "제목",
+                    "body": BODY if self.n >= self.good_at else bad_body,
+                }
             return super().complete_json(purpose, system, user, max_tokens)
 
-    llm = Flaky()
-    m = bw.generate_manuscript(llm, "우아덤", KEYWORD)
-    assert llm.n == 2 and "{키워드}" in m.body
+    llm = Flaky(good_at=4)
+    stats: dict = {}
+    m = bw.generate_manuscript(llm, "우아덤", KEYWORD, stats=stats)
+    assert llm.n == 4 and "{키워드}" in m.body
+    assert stats["body_attempts"] == 4 and stats["unresolved"] == []
+    note = llm.calls[1][2]
+    assert "직전 시도에서 어긴 규칙" in note
+    assert "{키워드} 자리표시자" in note  # 무엇이 어긋났는지 구체적으로 알려 준다
+
+
+def test_generate_stops_at_attempt_cap_and_records_rules():
+    """상한(6회)까지 가면 실패로 보고하지 않고 남은 규칙만 적어 둔다."""
+    llm = FakeLLM(body=BODY.replace("{키워드}", "음"))
+    stats: dict = {}
+    m = bw.generate_manuscript(llm, "우아덤", KEYWORD, stats=stats)
+    assert stats["body_attempts"] == bw.MAX_ATTEMPTS == 6
+    assert stats["hit_cap"] is True
+    assert any("{키워드} 자리표시자" in r for r in stats["unresolved"])
+    assert m.title and len(m.comments) == 12  # 원고는 버리지 않는다
+
+
+def test_generate_regenerates_only_comments_when_body_passed():
+    """본문이 통과했으면 본문은 그대로 두고 댓글만 다시 만든다."""
+
+    class BadComments(FakeLLM):
+        def __init__(self):
+            super().__init__()
+            self.body_calls = 0
+            self.comment_calls = 0
+
+        def complete_json(self, purpose, system, user, max_tokens=1200):
+            if purpose == "brand_body":
+                self.body_calls += 1
+                return {"title": "제목", "body": BODY}
+            self.comment_calls += 1
+            self.calls.append((purpose, system, user))
+            if self.comment_calls < 3:
+                return {k: "" for k in bw.COMMENT_LABELS}
+            return dict(COMMENTS)
+
+    llm = BadComments()
+    stats: dict = {}
+    bw.generate_manuscript(llm, "우아덤", KEYWORD, stats=stats)
+    assert llm.body_calls == 1  # 본문은 한 번만 만들었다
+    assert stats["comment_attempts"] == 3
     assert "직전 시도에서 어긴 규칙" in llm.calls[1][2]
 
 
-def test_generate_raises_after_retry():
-    llm = FakeLLM(body=BODY.replace("{키워드}", "음"))
-    with pytest.raises(bw.BrandWriteError) as err:
-        bw.generate_manuscript(llm, "우아덤", KEYWORD)
-    assert "검증 실패" in str(err.value)
+def test_generate_raises_when_model_errors():
+    class Broken(FakeLLM):
+        def complete_json(self, *a, **k):
+            raise RuntimeError("네트워크 오류")
+
+    with pytest.raises(bw.BrandWriteError):
+        bw.generate_manuscript(Broken(), "우아덤", KEYWORD)
+
+
+def test_violations_are_concrete():
+    bad = _manuscript(body=BODY.replace("비타민C", "그거", 2))
+    items = bw.violations(bw.validate(bad), scope="본문")
+    assert any("키워드 포함 횟수" in i and "3회 이상" in i and "1회" in i for i in items)
 
 
 def test_generate_requires_keyword():
@@ -272,12 +327,17 @@ def test_review_md_account_roles_follow_manuscript_type(tmp_path):
 
 
 def test_save_json(tmp_path):
-    path = bw.save_json(_manuscript(), tmp_path / "우아덤" / f"{KEYWORD}.json")
+    path = bw.save_json(
+        _manuscript(),
+        tmp_path / "우아덤" / f"{KEYWORD}.json",
+        {"attempts": 3, "unresolved": []},
+    )
     data = json.loads(path.read_text(encoding="utf-8"))
     assert data["brand"] == "우아덤"
     assert data["keyword"] == KEYWORD
     assert "제목 :" in data["sheet_text"]
     assert len(data["comments"]) == 12
+    assert data["stats"]["attempts"] == 3
     assert all(c["통과"] for c in data["checks"] if c["필수"])
 
 
@@ -324,6 +384,7 @@ def test_worker_generate_brand(tmp_path, monkeypatch):
     spec = parse_korean_command("우아덤 원고 1개 만들어줘")
     out = worker._generate_brand(rt, spec)
     assert out["ok"] is True and out["generated"] == 1
+    assert out["attempts"][KEYWORD] == 2 and out["unresolved"] == []
     saved = tmp_path / "warehouse" / "manuscripts" / "generated" / "우아덤" / f"{KEYWORD}.json"
     assert saved.exists()
     report = Path(out["report"])

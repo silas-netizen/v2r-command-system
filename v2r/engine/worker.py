@@ -358,8 +358,10 @@ def _generate_brand(rt: Runtime, spec: TaskSpec) -> dict:
     guide = _brand_guide_text(rt, brand, spec.manuscript_type)
     made: list[Any] = []
     failed: list[dict] = []
+    unresolved: list[dict] = []
     out_dir = Path(rt.settings.warehouse_dir) / "manuscripts" / "generated" / brand
     for item in todo:
+        stats: dict = {}
         try:
             m = bw.generate_manuscript(
                 rt,
@@ -368,12 +370,22 @@ def _generate_brand(rt: Runtime, spec: TaskSpec) -> dict:
                 item.get("cafe", ""),
                 spec.manuscript_type,
                 guide_text=guide,
+                stats=stats,
             )
         except Exception as exc:
             failed.append({"keyword": item["keyword"], "error": str(exc)})
             continue
-        bw.save_json(m, out_dir / f"{item['keyword']}.json")
-        made.append(m)
+        bw.save_json(m, out_dir / f"{item['keyword']}.json", stats)
+        if stats.get("unresolved"):
+            # 포기하지 않고 최대 횟수까지 다시 시켰는데도 남은 규칙 (사용자 지시 2026-09-19)
+            unresolved.append(
+                {
+                    "keyword": item["keyword"],
+                    "attempts": stats.get("attempts", 0),
+                    "rules": stats["unresolved"],
+                }
+            )
+        made.append((m, stats))
 
     report = (
         Path(rt.settings.repo_root)
@@ -382,13 +394,19 @@ def _generate_brand(rt: Runtime, spec: TaskSpec) -> dict:
         / f"brand-draft-{brand}-{spec.start_date}.md"
     )
     if made:
-        bw.write_review_md(made, report, title=f"브랜드 원고 초안 — {brand} ({spec.start_date})")
+        bw.write_review_md(
+            [m for m, _ in made],
+            report,
+            title=f"브랜드 원고 초안 — {brand} ({spec.start_date})",
+        )
     return {
         "ok": bool(made),
         "brand": brand,
         "generated": len(made),
         "failed": failed,
-        "keywords": [m.keyword for m in made],
+        "unresolved": unresolved,
+        "attempts": {m.keyword: s.get("attempts", 0) for m, s in made},
+        "keywords": [m.keyword for m, _ in made],
         "report": str(report) if made else "",
         "message": (
             f"{brand} 원고 {len(made)}건을 만들었습니다. 검토용 문서: {report}"

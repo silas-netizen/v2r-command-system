@@ -55,6 +55,9 @@ ACCOUNT_ROLES_BY_TYPE: dict[str, dict[str, str]] = {
     "후기형": {"대대댓글2": "여분 댓글풀 계정(A6)", "대대대댓글2": "본문 작성자"},
 }
 
+#: 원고 한 건당 최대 시도 횟수 (본문·댓글 각각). 사용자 지시 2026-09-19
+MAX_ATTEMPTS = 6
+
 #: 본문 글자 수 허용 오차 (지침 상한의 몇 배까지 통과로 볼지)
 LENGTH_TOLERANCE = 1.15
 
@@ -447,8 +450,22 @@ def build_comments_prompt(
 
 
 # ------------------------------------------------------------------ 검증
-def _check(item: str, expected: str, actual: str, ok: bool, hard: bool = True) -> dict:
-    return {"항목": item, "기준": expected, "실제": actual, "통과": ok, "필수": hard}
+def _check(
+    item: str,
+    expected: str,
+    actual: str,
+    ok: bool,
+    hard: bool = True,
+    scope: str = "본문",
+) -> dict:
+    return {
+        "항목": item,
+        "기준": expected,
+        "실제": actual,
+        "통과": ok,
+        "필수": hard,
+        "구간": scope,
+    }
 
 
 def validate(manuscript: Manuscript, rule: BrandRule | None = None) -> list[dict]:
@@ -495,8 +512,15 @@ def validate(manuscript: Manuscript, rule: BrandRule | None = None) -> list[dict
 
     labels = [re.sub(r"\s+", "", c.label) for c in manuscript.comments]
     ok_labels = labels == list(COMMENT_LABELS)
+    empty = [c.label for c in manuscript.comments if not (c.text or "").strip()]
     checks.append(
-        _check("댓글 12개 구조", " ".join(COMMENT_LABELS), f"{len(labels)}개", ok_labels)
+        _check(
+            "댓글 12개 구조",
+            " ".join(COMMENT_LABELS),
+            f"{len(labels)}개" + (f" (빈 칸: {', '.join(empty)})" if empty else ""),
+            ok_labels and not empty,
+            scope="댓글",
+        )
     )
 
     # 글자 수·최초 언급은 경고(필수 아님)
@@ -512,6 +536,7 @@ def validate(manuscript: Manuscript, rule: BrandRule | None = None) -> list[dict
             ", ".join(too_long) if too_long else "모두 통과",
             not too_long,
             hard=False,
+            scope="댓글",
         )
     )
 
@@ -530,6 +555,7 @@ def validate(manuscript: Manuscript, rule: BrandRule | None = None) -> list[dict
             ", ".join(early) + " 에서 먼저 나옴" if early else "규칙대로",
             not early,
             hard=False,
+            scope="댓글",
         )
     )
     return checks
@@ -542,6 +568,24 @@ def failures(checks: list[dict]) -> list[str]:
         for c in checks
         if c["필수"] and not c["통과"]
     ]
+
+
+def violations(checks: list[dict], scope: str = "", include_warnings: bool = True) -> list[str]:
+    """모델에게 다시 시킬 때 들이밀 구체적인 위반 목록.
+
+    사용자 지시(2026-09-19): 한 번 어긋났다고 포기하지 말고, **무엇이 어떻게**
+    어긋났는지(`본문 312자 > 250자` 같은 형태로) 짚어서 될 때까지 다시 시킨다.
+    """
+    out: list[str] = []
+    for c in checks:
+        if c["통과"]:
+            continue
+        if scope and c.get("구간") != scope:
+            continue
+        if not include_warnings and not c["필수"]:
+            continue
+        out.append(f"{c['항목']} — 기준 {c['기준']} 인데 실제 {c['실제']}")
+    return out
 
 
 def brand_of(manuscript: Manuscript) -> str:
@@ -592,6 +636,15 @@ def _clean_body(body: str) -> str:
     return out.strip("\n")
 
 
+def _retry_note(items: list[str]) -> str:
+    """다시 시킬 때 붙이는 구체적 위반 목록."""
+    return (
+        "\n\n<직전 시도에서 어긴 규칙 — 이번에는 반드시 전부 지킬 것>\n"
+        + "\n".join(f"- {e}" for e in items)
+        + "\n같은 실수를 되풀이하지 말고 위 항목을 하나하나 확인하면서 다시 써라"
+    )
+
+
 def generate_manuscript(
     rt: Any,
     brand: str,
@@ -599,35 +652,48 @@ def generate_manuscript(
     cafe: str = "",
     manuscript_type: str = "",
     guide_text: str = "",
+    stats: dict | None = None,
+    max_attempts: int = MAX_ATTEMPTS,
 ) -> Manuscript:
-    """키워드 한 개로 제목·본문·댓글 12개를 만든다. 검증 실패 시 한 번 재시도."""
+    """키워드 한 개로 제목·본문·댓글 12개를 만든다.
+
+    검증에 걸리면 **무엇이 어떻게 어긋났는지 짚어서 될 때까지 다시 시킨다**
+    (사용자 지시 2026-09-19). 안전장치로 본문·댓글 각각 `max_attempts`번까지만
+    시도하고, 그래도 남은 위반은 포기 대신 `stats["unresolved"]`에 적어 둔다.
+    본문이 통과했으면 본문은 그대로 두고 **댓글만** 다시 만든다.
+
+    `stats`를 주면 시도 횟수(`body_attempts`/`comment_attempts`/`attempts`)와
+    끝내 못 지킨 규칙(`unresolved`)을 그 dict에 담아 준다.
+    """
     llm = getattr(rt, "llm", None) or rt
     if llm is None:
         raise BrandWriteError("모델을 쓸 수 없습니다 (ANTHROPIC_API_KEY를 확인하세요)")
     rule = rule_for(brand, manuscript_type)
     if not (keyword or "").strip():
         raise BrandWriteError("작성 키워드가 비어 있습니다")
+    cap = max(1, int(max_attempts))
 
     body_sys, body_user = build_body_prompt(
         brand, keyword, cafe, guide_text, rule.manuscript_type
     )
-    last_error: list[str] = []
-    for attempt in (1, 2):
-        user = body_user
-        if last_error:
-            user += "\n\n<직전 시도에서 어긴 규칙 — 이번에는 반드시 지킬 것>\n" + "\n".join(
-                f"- {e}" for e in last_error
-            )
+    draft: Manuscript | None = None
+    body_bad: list[str] = []
+    body_attempts = 0
+    for body_attempts in range(1, cap + 1):
+        user = body_user + (_retry_note(body_bad) if body_bad else "")
         try:
             data = llm.complete_json("brand_body", body_sys, user, max_tokens=2500)
-        except Exception as exc:  # 모델 오류
+        except Exception as exc:  # 모델 오류는 재시도로 풀리지 않는다
             raise BrandWriteError(f"본문 생성 실패({brand}/{keyword}): {exc}") from exc
         if not isinstance(data, dict):
-            last_error = ["JSON 객체 하나만 출력해야 합니다"]
+            body_bad = ["출력 형식 — 기준 JSON 객체 하나 인데 실제 다른 형식"]
             continue
         title = _as_text(data.get("title") or data.get("제목"))
         body = _clean_body(_as_text(data.get("body") or data.get("본문")))
-        draft = Manuscript(
+        if not body:
+            body_bad = ["본문 — 기준 내용이 있어야 함 인데 실제 비어 있음"]
+            continue
+        candidate = Manuscript(
             title=title,
             body=body,
             cafe=cafe,
@@ -638,49 +704,47 @@ def generate_manuscript(
             comments=_comment_nodes({}),
             content_hash=content_hash(title, body),
         )
-        body_fail = [
-            f
-            for f in failures(validate(draft, rule))
-            if not f.startswith("댓글 12개")
-        ]
-        if not body_fail:
+        bad = violations(validate(candidate, rule), scope="본문")
+        # 위반이 적은 쪽을 들고 간다 (끝내 못 지켜도 버리지 않기 위해)
+        if draft is None or len(bad) < len(body_bad):
+            draft, body_bad = candidate, bad
+        if not bad:
             break
-        last_error = body_fail
-    else:
-        raise BrandWriteError(
-            f"본문 검증 실패({brand}/{keyword}): " + " / ".join(last_error)
-        )
+    if draft is None:
+        raise BrandWriteError(f"본문 생성 실패({brand}/{keyword}): 쓸 만한 본문을 받지 못했습니다")
 
     cmt_sys, cmt_user = build_comments_prompt(
         brand, keyword, draft.title, draft.body, rule.manuscript_type, guide_text
     )
-    comment_error: list[str] = []
-    for attempt in (1, 2):
-        user = cmt_user
-        if comment_error:
-            user += "\n\n<직전 시도에서 어긴 규칙 — 이번에는 반드시 지킬 것>\n" + "\n".join(
-                f"- {e}" for e in comment_error
-            )
+    best_comments: list[CommentNode] = []
+    comment_bad: list[str] = []
+    comment_attempts = 0
+    for comment_attempts in range(1, cap + 1):
+        user = cmt_user + (_retry_note(comment_bad) if comment_bad else "")
         try:
             payload = llm.complete_json("brand_comments", cmt_sys, user, max_tokens=3000)
         except Exception as exc:
             raise BrandWriteError(f"댓글 생성 실패({brand}/{keyword}): {exc}") from exc
         draft.comments = _comment_nodes(payload)
-        missing = [c.label for c in draft.comments if not c.text]
-        if not missing:
+        bad = violations(validate(draft, rule), scope="댓글")
+        if not best_comments or len(bad) < len(comment_bad):
+            best_comments, comment_bad = list(draft.comments), bad
+        if not bad:
             break
-        comment_error = ["빠진 댓글: " + ", ".join(missing)]
-    else:
-        raise BrandWriteError(
-            f"댓글 검증 실패({brand}/{keyword}): " + " / ".join(comment_error)
-        )
+    draft.comments = best_comments
+    if all(not c.text for c in draft.comments):
+        raise BrandWriteError(f"댓글 생성 실패({brand}/{keyword}): 댓글을 하나도 받지 못했습니다")
 
-    problems = failures(validate(draft, rule))
-    if problems:
-        raise BrandWriteError(
-            f"원고 검증 실패({brand}/{keyword}): " + " / ".join(problems)
-        )
     draft.content_hash = content_hash(draft.title, draft.body)
+    unresolved = violations(validate(draft, rule))
+    if stats is not None:
+        stats["body_attempts"] = body_attempts
+        stats["comment_attempts"] = comment_attempts
+        stats["attempts"] = body_attempts + comment_attempts
+        stats["unresolved"] = unresolved
+        stats["hit_cap"] = bool(unresolved) and (
+            body_attempts >= cap or comment_attempts >= cap
+        )
     return draft
 
 
@@ -695,21 +759,24 @@ def sheet_text(manuscript: Manuscript) -> str:
     return "\n".join(lines).strip() + "\n"
 
 
-def to_dict(manuscript: Manuscript) -> dict:
-    """저장용 dict (원고 + 시트 텍스트 + 검증 결과)."""
+def to_dict(manuscript: Manuscript, stats: dict | None = None) -> dict:
+    """저장용 dict (원고 + 시트 텍스트 + 검증 결과 + 시도 횟수)."""
     data = manuscript.model_dump()
     data["brand"] = brand_of(manuscript)
     data["sheet_text"] = sheet_text(manuscript)
     data["checks"] = validate(manuscript)
+    if stats:
+        data["stats"] = dict(stats)
     return data
 
 
-def save_json(manuscript: Manuscript, path: str | Path) -> Path:
+def save_json(manuscript: Manuscript, path: str | Path, stats: dict | None = None) -> Path:
     """원고 1건을 JSON으로 저장."""
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(
-        json.dumps(to_dict(manuscript), ensure_ascii=False, indent=2), encoding="utf-8"
+        json.dumps(to_dict(manuscript, stats), ensure_ascii=False, indent=2),
+        encoding="utf-8",
     )
     return target
 
@@ -799,5 +866,7 @@ __all__ = [
     "save_json",
     "sheet_text",
     "validate",
+    "violations",
+    "MAX_ATTEMPTS",
     "write_review_md",
 ]
