@@ -189,12 +189,183 @@ def test_validate_rejects_low_keyword_count():
 
 
 def test_validate_flags_long_comment_as_warning():
-    long_text = "가" * 120
-    m = _manuscript(comments=_nodes({"댓글3": long_text}))
+    """상한(30자)을 넘어도 1.5배(45자) 안이면 경고로만 잡는다."""
+    m = _manuscript(comments=_nodes({"댓글3": "가" * 40}))
     checks = bw.validate(m)
     row = next(c for c in checks if c["항목"] == "댓글 글자 수")
     assert row["통과"] is False and row["필수"] is False
+    assert "댓글3 40자 → 30자로 줄일 것" in row["실제"]  # 목표 글자 수를 짚어 준다
     assert bw.failures(checks) == []  # 경고는 실패가 아니다
+
+
+def test_validate_hard_fails_beyond_1_5x_length():
+    """1.5배를 넘기면 경고가 아니라 실패다."""
+    m = _manuscript(comments=_nodes({"댓글3": "가" * 60}))
+    problems = bw.failures(bw.validate(m))
+    assert any("심각 초과" in p and "30자로 줄일 것" in p for p in problems)
+
+
+def test_soft_limits_off_makes_every_excess_hard():
+    m = _manuscript(comments=_nodes({"댓글3": "가" * 40}))
+    problems = bw.failures(bw.validate(m, soft_limits=False))
+    assert any(p.startswith("댓글 글자 수:") for p in problems)
+
+
+def test_comment_limits_are_configurable_per_brand():
+    viral = bw.rule_for("우아덤")
+    patsooni = bw.rule_for("팥순이", "질문형")
+    assert (viral.root_max, viral.comment2_max) == (30, 70)
+    assert (patsooni.root_max, patsooni.comment2_max) == (50, 50)
+    assert viral.comment_max == viral.root_max  # 옛 이름도 그대로 읽힌다
+    loose = bw.BrandRule(brand="우아덤", root_max=45, comment2_max=90)
+    m = _manuscript(comments=_nodes({"댓글3": "가" * 40}))
+    assert bw.validate(m, loose)[0] is not None
+    row = next(c for c in bw.validate(m, loose) if c["항목"] == "댓글 글자 수")
+    assert row["통과"] is True
+
+
+# --- 내부 용어 누출 --------------------------------------------
+def test_validate_rejects_internal_terms_in_body():
+    bad = _manuscript(body=BODY.replace("별로 달라지는게 없더라구요", "프레임이 아예 다르더라구요"))
+    assert any("내부 용어" in p for p in bw.failures(bw.validate(bad)))
+
+
+def test_validate_rejects_internal_terms_in_comments():
+    bad = _manuscript(comments=_nodes({"대대댓글2": "그린커피 아하바하요 프레임이 달라요"}))
+    problems = bw.failures(bw.validate(bad))
+    assert any("댓글 내부 용어" in p and "프레임" in p for p in problems)
+
+
+def test_placeholder_is_not_counted_as_internal_term():
+    assert bw.failures(bw.validate(_manuscript())) == []  # 본문의 {키워드}는 봐준다
+
+
+# --- 대대댓글2 물러서기 금지 -----------------------------------
+@pytest.mark.parametrize(
+    "text",
+    [
+        "그린커피 아하바하 쓰는데 제품보다 방법이 중요한거같아요",
+        "그린커피 아하바하요 근데 결국은 습관이더라구요",
+        "그린커피 아하바하 써보세요 개인차 있으니 참고만 하세요",
+    ],
+)
+def test_validate_rejects_retreat_phrases_in_first_mention(text):
+    bad = _manuscript(comments=_nodes({"대대댓글2": text}))
+    problems = bw.failures(bw.validate(bad))
+    assert any("물러서기 금지" in p for p in problems)
+
+
+def test_comments_prompt_forbids_retreat_and_gives_examples():
+    system, user = bw.build_comments_prompt("우아덤", KEYWORD, "제목", BODY)
+    assert "물러서지" in system and "좋은 보기 1)" in system and "좋은 보기 2)" in system
+    assert "쓰게 된 계기" in system and "느낀 변화" in system
+    assert "제품보다 방법이 중요" in user and "참고만" in user
+    assert "프레임" in user  # 금칙어로 명시
+
+
+def test_prompts_forbid_internal_terms():
+    body_sys, _ = bw.build_body_prompt("우아덤", KEYWORD)
+    cmt_sys, _ = bw.build_comments_prompt("우아덤", KEYWORD, "제목", BODY)
+    for text in (body_sys, cmt_sys):
+        assert "내부 용어 누출 금지" in text
+
+
+# --- 페르소나 다양화 --------------------------------------------
+def test_body_prompt_injects_persona_seed():
+    _, user = bw.build_body_prompt("우아덤", KEYWORD)
+    who = bw.persona_for("우아덤", KEYWORD, "질문형")
+    assert "이 인물로만 써라" in user
+    for value in who.values():
+        assert value in user
+
+
+def test_persona_pool_is_big_and_stable():
+    assert len(bw.PERSONA_SEEDS) >= 12
+    assert bw.persona_for("우아덤", KEYWORD) == bw.persona_for("우아덤", KEYWORD)
+    for seed in bw.PERSONA_SEEDS:
+        assert {"나이대", "상황", "말투", "시각"} == set(seed)
+
+
+def test_two_keywords_of_same_brand_get_different_personas():
+    a = bw.persona_for("우아덤", "비타민C", "질문형")
+    b = bw.persona_for("우아덤", "편평사마귀", "질문형")
+    assert a != b
+
+
+# --- 후기형 댓글 역할 -------------------------------------------
+def test_review_type_comments_prompt_states_roles():
+    _, user = bw.build_comments_prompt(
+        "팥순이", "카무트효소", "제목", BODY, manuscript_type="후기형"
+    )
+    assert "대댓글2 = 본문 작성자" in user
+    assert "대대댓글2 = 여분 댓글풀 계정" in user
+    assert "대대대댓글2 = 본문 작성자" in user
+    assert "되묻지 않는다" in user
+
+
+def test_author_labels_differ_by_manuscript_type():
+    assert "대대대댓글2" in bw.author_labels("후기형")
+    assert "대대대댓글2" not in bw.author_labels("질문형")
+
+
+def _review_manuscript(**table) -> Manuscript:
+    base = {
+        "대댓글2": "저는 팥순ㅇㅣ 먹고 있어요 두 달째에요",
+        "대대댓글2": "저도 이거 먹는중인데 확실히 다르더라구요",
+        "대대대댓글2": "맞아욬ㅋㅋ 같이 하시는 분들 많더라구요",
+    }
+    base.update(table)
+    return _manuscript(
+        manuscript_type="후기형",
+        source="generated:팥순이",
+        keyword="카무트효소",
+        comments=_nodes(base),
+    )
+
+
+def test_review_type_rejects_author_asking_about_own_product():
+    bad = _review_manuscript(대대대댓글2="오 그거 어디서 사요?")
+    problems = bw.failures(bw.validate(bad))
+    assert any("작성자 되묻기 금지" in p for p in problems)
+
+
+def test_review_type_rejects_author_asking_about_effect():
+    bad = _review_manuscript(대댓글2="그럼 어떤 성분을 같이 하신거예요?")
+    assert any("작성자 되묻기" in p for p in bw.failures(bw.validate(bad)))
+
+
+def test_review_type_allows_pool_account_to_ask():
+    """여분 풀 계정(대대댓글2)이 묻는 것은 막지 않는다."""
+    ok = _review_manuscript(대대댓글2="저도 이거 먹는중이에요 효과 어때요?")
+    assert not any("작성자 되묻기" in p for p in bw.failures(bw.validate(ok)))
+
+
+def test_question_type_author_may_ask_back():
+    """질문형 작성자는 원래 되묻는 자리라 막지 않는다."""
+    assert bw.failures(bw.validate(_manuscript())) == []
+
+
+def test_retry_note_tells_exact_length_target():
+    """길이로 다시 시킬 때 노드별 목표 글자 수를 그대로 넘긴다."""
+
+    class LongComments(FakeLLM):
+        def __init__(self):
+            super().__init__()
+            self.n = 0
+
+        def complete_json(self, purpose, system, user, max_tokens=1200):
+            if purpose == "brand_body":
+                return {"title": "제목", "body": BODY}
+            self.n += 1
+            self.calls.append((purpose, system, user))
+            if self.n == 1:
+                return dict(COMMENTS, 댓글3="가" * 60)
+            return dict(COMMENTS)
+
+    llm = LongComments()
+    bw.generate_manuscript(llm, "우아덤", KEYWORD)
+    note = llm.calls[1][2]
+    assert "댓글3 60자 → 30자로 줄일 것" in note
 
 
 # --- 생성 -------------------------------------------------------

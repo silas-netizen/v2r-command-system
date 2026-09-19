@@ -11,6 +11,7 @@ Make 시나리오 지침(`warehouse/guides/★NEW 카페 바이럴★/`)을 브�
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from dataclasses import dataclass, field
@@ -18,7 +19,13 @@ from pathlib import Path
 from typing import Any
 
 from v2r.content.manuscript import CommentNode, Manuscript, content_hash, tags_from_keyword
-from v2r.llm.prompts import BRAND_BODY_SYSTEM, BRAND_COMMENTS_SYSTEM, HUMAN_TONE_RULES
+from v2r.llm.prompts import (
+    BRAND_BODY_SYSTEM,
+    BRAND_COMMENTS_SYSTEM,
+    BRAND_FIRST_MENTION_RULE,
+    HUMAN_TONE_RULES,
+    NO_INTERNAL_TERMS_RULE,
+)
 
 #: 댓글 12개 라벨 (읽는 순서 = live-comment-order.md §1)
 COMMENT_LABELS: tuple[str, ...] = (
@@ -61,6 +68,92 @@ MAX_ATTEMPTS = 6
 #: 본문 글자 수 허용 오차 (지침 상한의 몇 배까지 통과로 볼지)
 LENGTH_TOLERANCE = 1.15
 
+#: 댓글 길이 `soft_limits` 모드에서 이 배수까지는 경고, 넘으면 실패
+SOFT_LIMIT_FACTOR = 1.5
+
+#: 결과물에 새어 나오면 안 되는 작업용 내부 용어 (평가 2026-09-19 공통문제 7)
+INTERNAL_TERMS: tuple[str, ...] = (
+    "프레임",
+    "페르소나",
+    "키워드",
+    "본문",
+    "원고",
+    "댓글1",
+    "대댓글",
+    "규칙",
+)
+
+#: 브랜드를 꺼낸 뒤 스스로 힘을 빼는 말 (평가 2026-09-19 공통문제 2)
+RETREAT_PHRASES: tuple[str, ...] = (
+    "제품보다",
+    "제품얘기랑은별개로",
+    "제품얘기가아니라",
+    "제품이라기보단",
+    "관리법개념",
+    "결국은습관",
+    "개인차",
+    "참고만",
+    "헷갈리지마시고",
+    "따로검색",
+)
+
+#: 후기형에서 작성자가 자기 제품을 두고 물으면 안 되는 말 (평가 2026-09-19 공통문제 11)
+AUTHOR_QUESTION_TERMS: tuple[str, ...] = (
+    "어디서사",
+    "어디서파",
+    "어디서구입",
+    "어디서구매",
+    "어떤제품",
+    "제품이름",
+    "어떤성분",
+    "성분이어떻게",
+    "어떤방법",
+    "무슨성분",
+    "효과있나",
+    "효과어때",
+    "효과가어떤",
+    "얼마나빠지",
+)
+
+#: 본문 작성자가 쓰는 라벨 (원고유형별)
+def author_labels(manuscript_type: str) -> tuple[str, ...]:
+    """해당 원고유형에서 **본문 작성자**가 쓰는 댓글 라벨."""
+    roles = dict(ACCOUNT_ROLES_COMMON)
+    roles.update(ACCOUNT_ROLES_BY_TYPE.get(manuscript_type or "질문형", {}))
+    return tuple(label for label in COMMENT_LABELS if roles.get(label) == "본문 작성자")
+
+
+#: 페르소나 씨앗 풀 — 나이대 / 상황 / 말투 특징 / 글 쓰는 시각 (평가 2026-09-19 공통문제 6)
+PERSONA_SEEDS: tuple[dict[str, str], ...] = (
+    {"나이대": "20대 후반", "상황": "자취 3년차 직장인 혼자 사는 원룸", "말투": "ㅋㅋ를 자주 붙이고 문장이 짧다", "시각": "퇴근하고 밤 11시쯤"},
+    {"나이대": "30대 초반", "상황": "결혼 1년차 맞벌이 신혼", "말투": "ㅠㅠ가 많고 조심스럽게 묻는다", "시각": "점심시간 짬내서"},
+    {"나이대": "30대 중반", "상황": "다섯 살 아이 키우는 워킹맘", "말투": "말이 빨라서 문장이 자주 끊긴다", "시각": "아이 재우고 새벽 1시"},
+    {"나이대": "40대 초반", "상황": "중학생 아이 둘 키우는 전업주부", "말투": "ㅎㅎ를 붙이고 존댓말이 반듯하다", "시각": "아침에 아이 보내고"},
+    {"나이대": "20대 중반", "상황": "취준 끝나고 막 입사한 신입", "말투": "요즘 말 섞고 감탄이 잦다", "시각": "주말 낮에 누워서"},
+    {"나이대": "30대 후반", "상황": "야근 잦은 사무직 직장맘", "말투": "담담하게 사실만 적는다", "시각": "출근 지하철에서"},
+    {"나이대": "40대 중반", "상황": "자영업 하며 가게 지키는 사람", "말투": "말끝을 흐리고 사투리가 살짝 섞인다", "시각": "가게 한산한 오후"},
+    {"나이대": "20대 후반", "상황": "교대 근무라 잠 시간이 들쑥날쑥한 간호직", "말투": "줄임말을 자주 쓴다", "시각": "야간 근무 끝나고 아침"},
+    {"나이대": "30대 초반", "상황": "임신 준비 2년차", "말투": "조심스럽고 되묻는 말이 많다", "시각": "자기 전 침대에서"},
+    {"나이대": "40대 후반", "상황": "다 큰 자녀 독립시키고 부부만 사는 집", "말투": "천천히 길게 쓰고 옛날 얘기를 곁들인다", "시각": "저녁 설거지 끝내고"},
+    {"나이대": "20대 초반", "상황": "기숙사 사는 대학생", "말투": "ㅋㅋㅋㅋ를 길게 쓰고 가볍다", "시각": "수업 사이 비는 시간"},
+    {"나이대": "30대 중반", "상황": "재택 근무로 하루 종일 앉아 있는 프리랜서", "말투": "자조 섞인 농담을 한 번 넣는다", "시각": "일 끝난 밤 10시"},
+    {"나이대": "40대 초반", "상황": "출퇴근 왕복 세 시간 지방 근무", "말투": "짧게 끊어 쓰고 느낌표가 잦다", "시각": "주말 아침 일찍"},
+    {"나이대": "50대 초반", "상황": "손주 봐 주는 일이 잦은 사람", "말투": "존댓말이 정중하고 이모티콘이 적다", "시각": "낮 시간 한가할 때"},
+    {"나이대": "20대 후반", "상황": "결혼 준비하며 드레스 앞두고 있는 예비신부", "말투": "들뜬 말투에 물음이 많다", "시각": "퇴근길 버스에서"},
+    {"나이대": "30대 후반", "상황": "운동 시작했다 그만두기를 반복하는 사람", "말투": "솔직하게 실패담부터 꺼낸다", "시각": "일요일 밤"},
+)
+
+
+def persona_for(brand: str, keyword: str, manuscript_type: str = "") -> dict[str, str]:
+    """브랜드·키워드로 고정된 페르소나 씨앗 하나를 고른다.
+
+    같은 키워드는 늘 같은 인물이 나오고(테스트 재현 가능), 같은 브랜드의
+    다른 키워드는 다른 인물이 나오도록 키워드까지 섞어 해시한다.
+    """
+    seed = f"{brand}/{manuscript_type or ''}/{keyword}".encode()
+    index = int(hashlib.blake2s(seed, digest_size=8).hexdigest(), 16) % len(PERSONA_SEEDS)
+    return PERSONA_SEEDS[index]
+
 
 class BrandWriteError(RuntimeError):
     """브랜드 원고 생성/검증 실패."""
@@ -83,8 +176,12 @@ class BrandRule:
     authority: str = ""
     body_max: int = 250
     keyword_count: int = 3
-    comment_max: int = 30
+    #: 댓글2를 뺀 나머지 댓글의 글자 수 상한 (브랜드별로 조정 가능)
+    root_max: int = 30
+    #: 댓글2 글자 수 상한 (브랜드별로 조정 가능)
     comment2_max: int = 70
+    #: True면 상한 초과는 경고, 상한의 1.5배를 넘겨야 실패로 본다
+    soft_limits: bool = True
     #: `{키워드}`를 몇 번째 문단 뒤에 둘지
     placeholder_after_paragraph: int = 2
     #: 추가 자리표시자 (팥순이 후기형의 `{B/A}`)
@@ -94,6 +191,11 @@ class BrandRule:
     body_structure: tuple[str, ...] = ()
     body_notes: tuple[str, ...] = ()
     comment_notes: tuple[str, ...] = ()
+
+    @property
+    def comment_max(self) -> int:
+        """예전 이름(`comment_max`)으로도 읽히게 둔 별칭."""
+        return self.root_max
 
     @property
     def key(self) -> str:
@@ -121,12 +223,21 @@ _VIRAL_COMMENT_NOTES = (
     "댓글1과 댓글2 안에는 작성 키워드가 한 글자도 빠짐없이 들어가야 한다",
     "댓글2는 권위재를 근거로 원씽 이동을 제시한다 제품명은 절대 쓰지 않는다",
     "대댓글2는 작성자가 제품이 아니라 성분이나 방법을 되묻는 질문이다",
-    "대대댓글2에서 제품명을 처음 꺼내고 프레임을 분리한 뒤 검색해보라고 유도한다",
+    "대대댓글2에서 제품명을 처음 꺼내고 쓰게 된 계기와 느낀 변화 한 가지를 적은 뒤"
+    " 다른 방법은 왜 안 되는지 한 마디 덧붙이고 검색해보라고 유도한다",
     "대대대댓글2는 제3자가 222 저도 효과 봤어요 식으로 여론을 만든다",
     "댓글3은 비슷한 고민 경험 공유 대댓글3은 맞장구다",
     "댓글4는 작성자가 시도한 잘못된 방법을 가볍게 짚어 준다 (두 문장 내외)",
     "댓글5는 제3자 여론 보강이다 수치와 기간을 구체적으로 쓰고 다른 제품을 언급하지 않는다",
     "대댓글5는 효과에 호기심을 보이는 반응이다",
+)
+
+
+#: 후기형은 댓글2 스레드 역할이 질문형과 반대라 그 세 줄을 빼고 쓴다
+_REVIEW_COMMENT_BASE = tuple(
+    n
+    for n in _VIRAL_COMMENT_NOTES
+    if not n.startswith(("대댓글2", "대대댓글2", "대대대댓글2"))
 )
 
 
@@ -224,7 +335,7 @@ _register(
         authority="다이어트 카페 추천 후기",
         body_max=200,
         keyword_count=3,
-        comment_max=50,
+        root_max=50,
         comment2_max=50,
         placeholder_after_paragraph=2,
         body_structure=(
@@ -263,7 +374,7 @@ _register(
         authority="다이어트 카페 추천 후기",
         body_max=300,
         keyword_count=4,
-        comment_max=50,
+        root_max=50,
         comment2_max=50,
         placeholder_after_paragraph=1,
         extra_placeholder="{B/A}",
@@ -284,10 +395,11 @@ _register(
             "모바일 기준으로 한 줄 20자 이내 한 문단 4줄 이내로 문단을 자주 나눈다",
             "마무리의 감량 수치는 -10.0kg~-12.0kg 사이에서 소수 첫째 자리까지 매번 다르게 쓴다",
         ),
-        comment_notes=_VIRAL_COMMENT_NOTES
+        comment_notes=_REVIEW_COMMENT_BASE
         + (
             "모든 댓글은 50자를 넘지 않는다",
             "작성자는 이미 써 본 사람이라 대댓글2에서 작성자가 직접 팥순ㅇㅣ 를 꺼낸다",
+            "작성자는 자기가 이미 쓴 제품을 두고 되묻지 않는다 (어디서 사요 어떤 성분이에요 금지)",
             "대대댓글2는 여분 댓글 계정이 저도 이거 먹는 중이라고 거든다",
             "대대대댓글2는 작성자가 맞장구치며 마무리한다",
             "네이버 를 언급하지 않는다",
@@ -355,12 +467,21 @@ def build_body_prompt(
 ) -> tuple[str, str]:
     """본문 생성용 (system, user) 프롬프트."""
     rule = rule_for(brand, manuscript_type)
-    system = BRAND_BODY_SYSTEM.format(tone=HUMAN_TONE_RULES)
+    system = BRAND_BODY_SYSTEM.format(tone=HUMAN_TONE_RULES, internal=NO_INTERNAL_TERMS_RULE)
+    who = persona_for(rule.brand, keyword, rule.manuscript_type)
 
     lines: list[str] = [
         f"브랜드: {rule.brand} (원고유형 {rule.manuscript_type})",
         f"작성 키워드: {keyword}",
         f"타겟: {rule.target}",
+        "",
+        "<글쓴이 — 이 인물로만 써라>",
+        f"- 나이대: {who['나이대']}",
+        f"- 상황: {who['상황']}",
+        f"- 말투 특징: {who['말투']}",
+        f"- 글 쓰는 시각: {who['시각']}",
+        "이 인물로만 써라. 다른 나이대나 다른 상황으로 바꾸지 말고"
+        " 이 사람의 하루가 글에 묻어나게 한 줄 이상 구체적인 정황을 적는다",
     ]
     if cafe:
         lines.append(f"올릴 카페: {cafe}")
@@ -419,7 +540,11 @@ def build_comments_prompt(
 ) -> tuple[str, str]:
     """댓글 12개 생성용 (system, user) 프롬프트."""
     rule = rule_for(brand, manuscript_type)
-    system = BRAND_COMMENTS_SYSTEM.format(tone=HUMAN_TONE_RULES)
+    system = BRAND_COMMENTS_SYSTEM.format(
+        tone=HUMAN_TONE_RULES,
+        internal=NO_INTERNAL_TERMS_RULE,
+        first_mention=BRAND_FIRST_MENTION_RULE,
+    )
     product = rule.product_in_comment or rule.product
 
     lines: list[str] = [
@@ -444,6 +569,33 @@ def build_comments_prompt(
         f"- 제품명({product})은 {rule.first_mention_label} 에서 처음 나온다."
         f" 그 앞 댓글에는 절대 제품명을 쓰지 않는다",
     ]
+    lines.append(
+        f"- {rule.first_mention_label} 은 {product} 를 꺼낸 뒤 물러서지 않는다."
+        " 쓰게 된 계기 한 가지와 쓰고 나서 느낀 변화 한 가지를 꼭 적고"
+        " 제품보다 방법이 중요 / 결국은 습관 / 개인차 / 참고만 같은 말은 쓰지 않는다"
+    )
+    lines.append(
+        "- 프레임 페르소나 키워드 본문 원고 댓글1 대댓글 규칙 같은 낱말은"
+        " 댓글 어디에도 쓰지 않는다 (작업용 용어라 실제 회원 말투가 아니다)"
+    )
+    if rule.manuscript_type == "후기형":
+        writer = ", ".join(author_labels(rule.manuscript_type))
+        lines.append("")
+        lines.append("<후기형 — 노드별 작성 계정 역할 (질문형과 다르다)>")
+        lines.append(f"- 본문 작성자가 쓰는 자리: {writer}")
+        lines.append(
+            f"- 대댓글2 = 본문 작성자다. 작성자는 이미 써 본 사람이라 여기서 직접"
+            f" {product} 를 꺼내 알려 준다 (되묻지 않는다)"
+        )
+        lines.append(
+            "- 대대댓글2 = 여분 댓글풀 계정이다. 저도 이거 먹는 중이라고 거든다"
+            " (제품명을 다시 쓰지 말고 이거 로 받는다)"
+        )
+        lines.append("- 대대대댓글2 = 본문 작성자다. 맞장구치며 마무리한다")
+        lines.append(
+            "- 작성자 자리에서는 자기가 이미 쓴 제품을 두고"
+            " 그거 어디서 사요 / 어떤 성분이에요 / 효과 있나요 처럼 절대 되묻지 않는다"
+        )
     lines.extend(f"- {s}" for s in rule.comment_notes)
     lines.append(_guide_excerpt(guide_text, 2500))
     return system, "\n".join(lines)
@@ -468,9 +620,18 @@ def _check(
     }
 
 
-def validate(manuscript: Manuscript, rule: BrandRule | None = None) -> list[dict]:
-    """원고를 검증해 항목별 결과를 돌려준다 (예외를 던지지 않는다)."""
+def validate(
+    manuscript: Manuscript,
+    rule: BrandRule | None = None,
+    soft_limits: bool | None = None,
+) -> list[dict]:
+    """원고를 검증해 항목별 결과를 돌려준다 (예외를 던지지 않는다).
+
+    `soft_limits`가 켜져 있으면 댓글 길이는 상한의 1.5배까지 **경고**이고
+    그 위부터 실패다 (평가 2026-09-19 제안 3). 지정하지 않으면 브랜드 규칙값을 쓴다.
+    """
     rule = rule or rule_for(brand_of(manuscript), manuscript.manuscript_type)
+    soft = rule.soft_limits if soft_limits is None else bool(soft_limits)
     body = manuscript.body or ""
     keyword = manuscript.keyword or ""
     checks: list[dict] = []
@@ -494,6 +655,17 @@ def validate(manuscript: Manuscript, rule: BrandRule | None = None) -> list[dict
             "없음" if not rule.banned_in_body else ", ".join(rule.banned_in_body) + " 금지",
             ", ".join(found) if found else "없음",
             not found,
+        )
+    )
+
+    bare = _squash(strip_placeholders(body))
+    leaked = [w for w in INTERNAL_TERMS if w in bare]
+    checks.append(
+        _check(
+            "내부 용어 미노출",
+            ", ".join(INTERNAL_TERMS) + " 금지",
+            ", ".join(leaked) if leaked else "없음",
+            not leaked,
         )
     )
 
@@ -523,22 +695,106 @@ def validate(manuscript: Manuscript, rule: BrandRule | None = None) -> list[dict
         )
     )
 
-    # 글자 수·최초 언급은 경고(필수 아님)
-    too_long = [
-        f"{c.label}({len(c.text)}자)"
-        for c in manuscript.comments
-        if len(c.text) > (rule.comment2_max if c.label == "댓글2" else rule.comment_max)
-    ]
+    # --- 댓글 글자 수: soft_limits면 1.5배까지 경고, 그 위는 실패
+    def _limit_of(label: str) -> int:
+        return rule.comment2_max if re.sub(r"\s+", "", label) == "댓글2" else rule.root_max
+
+    over: list[str] = []
+    way_over: list[str] = []
+    for c in manuscript.comments:
+        cap = _limit_of(c.label)
+        size = len(c.text)
+        if size <= cap:
+            continue
+        note = f"{c.label} {size}자 → {cap}자로 줄일 것"
+        over.append(note)
+        if size > cap * SOFT_LIMIT_FACTOR:
+            way_over.append(note)
     checks.append(
         _check(
             "댓글 글자 수",
-            f"댓글2 {rule.comment2_max}자 그 외 {rule.comment_max}자 이하",
-            ", ".join(too_long) if too_long else "모두 통과",
-            not too_long,
-            hard=False,
+            f"댓글2 {rule.comment2_max}자 그 외 {rule.root_max}자 이하",
+            ", ".join(over) if over else "모두 통과",
+            not over,
+            hard=not soft,
             scope="댓글",
         )
     )
+    if soft:
+        factor = int(SOFT_LIMIT_FACTOR * 100)
+        checks.append(
+            _check(
+                "댓글 글자 수 심각 초과",
+                f"상한의 {factor}%(댓글2 {int(rule.comment2_max * SOFT_LIMIT_FACTOR)}자"
+                f" 그 외 {int(rule.root_max * SOFT_LIMIT_FACTOR)}자) 이하",
+                ", ".join(way_over) if way_over else "없음",
+                not way_over,
+                scope="댓글",
+            )
+        )
+
+    # --- 댓글에 내부 용어가 새지 않았는가
+    leaked_c = sorted(
+        {
+            f"{c.label}({w})"
+            for c in manuscript.comments
+            for w in INTERNAL_TERMS
+            if w in _squash(c.text)
+        }
+    )
+    checks.append(
+        _check(
+            "댓글 내부 용어 미노출",
+            ", ".join(INTERNAL_TERMS) + " 금지",
+            ", ".join(leaked_c) if leaked_c else "없음",
+            not leaked_c,
+            scope="댓글",
+        )
+    )
+
+    # --- 브랜드를 처음 꺼내는 댓글이 스스로 물러서지 않는가
+    first_node = next(
+        (
+            c
+            for c in manuscript.comments
+            if re.sub(r"\s+", "", c.label) == rule.first_mention_label
+        ),
+        None,
+    )
+    retreat = (
+        [w for w in RETREAT_PHRASES if w in _squash(first_node.text)] if first_node else []
+    )
+    checks.append(
+        _check(
+            f"{rule.first_mention_label} 물러서기 금지",
+            "제품보다 방법이 중요 / 결국은 습관 / 개인차 / 참고만 같은 말 금지"
+            " (사용 계기와 느낀 변화 1가지를 쓴다)",
+            ", ".join(retreat) if retreat else "없음",
+            not retreat,
+            scope="댓글",
+        )
+    )
+
+    # --- 후기형: 작성자는 자기가 쓴 제품을 두고 되묻지 않는다
+    if rule.manuscript_type == "후기형":
+        mine = set(author_labels(rule.manuscript_type))
+        asking = [
+            f"{c.label}({w})"
+            for c in manuscript.comments
+            if re.sub(r"\s+", "", c.label) in mine
+            and "?" in (c.text or "")
+            for w in AUTHOR_QUESTION_TERMS
+            if w in _squash(c.text)
+        ]
+        checks.append(
+            _check(
+                "작성자 되묻기 금지(후기형)",
+                "작성자 댓글(" + ", ".join(sorted(mine)) + ")에 구매·효과 되묻기 금지",
+                ", ".join(asking) if asking else "없음",
+                not asking,
+                scope="댓글",
+            )
+        )
 
     product = rule.product_in_comment or rule.product
     before = COMMENT_LABELS[: COMMENT_LABELS.index(rule.first_mention_label)]
@@ -855,12 +1111,18 @@ __all__ = [
     "BrandRule",
     "BrandWriteError",
     "COMMENT_LABELS",
+    "INTERNAL_TERMS",
+    "PERSONA_SEEDS",
+    "RETREAT_PHRASES",
+    "SOFT_LIMIT_FACTOR",
+    "author_labels",
     "body_length",
     "build_body_prompt",
     "build_comments_prompt",
     "failures",
     "generate_manuscript",
     "keyword_hits",
+    "persona_for",
     "review_block",
     "rule_for",
     "save_json",
