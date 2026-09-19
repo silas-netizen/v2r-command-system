@@ -275,7 +275,6 @@ def test_build_daily_comments_roots_only(tmp_path, monkeypatch):
     rt = make_runtime(tmp_path)
     rt._catalog = _CommentCatalog()
     rt._llm = _FakeLLM('["저도 어제 딱 그랬어요ㅋㅋ", "오늘 날씨 진짜 좋더라구요", "저녁은 뭐 드셨어요"]')
-    monkeypatch.setattr(publish_mod, "load_accounts", lambda rt_, prefer_cache=False: _self_comment_accounts())
     slot = publish_mod.Slot(
         manuscript=_m("고요한 아침", 0),
         account="member0",

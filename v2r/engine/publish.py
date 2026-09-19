@@ -1088,25 +1088,15 @@ def build_daily_comments(
         warn(f"카페 회원 목록을 읽지 못해 댓글 0개로 발행합니다: {exc}")
         return []
     author = str(slot.account or "").casefold()
-    # 자사·제휴 계정 구분(사용자 규칙): 시트 작업 구분이 '자사 댓글'인 계정만, 그리고 카페 등급이 스탭인 것만
-    from v2r.accounts.loader import LINKED_V2R, SELF_COMMENT_WORK_TYPE
-
-    sheet_ok = {
-        a.login_id.casefold()
-        for a in load_accounts(rt, prefer_cache=True)
-        if (a.work_type or "").strip() == SELF_COMMENT_WORK_TYPE
-        and (a.linked or "").strip().upper() == LINKED_V2R
-        and not a.excluded
-    }
+    # 일상 글 댓글은 시트의 '자사 댓글' 계정(브랜드 원고 댓글용)을 쓰지 않는다(사용자 규칙 2026-09-19).
+    # 그 카페의 스탭 등급 회원 중 글쓴이를 뺀 계정에서 랜덤으로 고른다.
     pool = [
         ca
         for ca in members_list
-        if str(ca.login_id).casefold() != author
-        and str(ca.login_id).casefold() in sheet_ok
-        and is_staff_level(ca.level_name)
+        if str(ca.login_id).casefold() != author and is_staff_level(ca.level_name)
     ]
     if not pool:
-        warn("'자사 댓글' 구분 + 스탭 등급인 댓글 계정이 이 카페에 없어 댓글 0개로 발행합니다")
+        warn("글쓴이 말고 스탭 등급 댓글 계정이 이 카페에 없어 댓글 0개로 발행합니다")
         return []
 
     count = min(count, len(pool))
