@@ -80,6 +80,9 @@ class TaskSpec(BaseModel):
     immediate: bool = False
     #: `카페별 N건` / `카페마다 N건` — 자사 카페 전부에 각각 count건 (self-cafe-daily-rules §1)
     per_cafe: bool = False
+    #: `카페별 N건`의 뜻. 빈 값 = 오늘 그 카페의 일상 글이 N건이 되게 모자란 만큼만,
+    #: `추가로` = 오늘 몇 건을 올렸든 지금 N건을 더 올린다 (self-cafe-daily-rules §7)
+    per_cafe_mode: str = ""
     #: `댓글 랜덤` / `댓글 0~3개` — 글마다 0~3개 랜덤 댓글 (self-cafe-daily-rules §5)
     random_comments: bool = False
     notes: str = ""

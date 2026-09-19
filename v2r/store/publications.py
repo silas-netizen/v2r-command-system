@@ -19,6 +19,21 @@ _FIELDS = (
 )
 
 
+def _same_cafe(query: str, name: str) -> bool:
+    """카페 이름 두 개가 같은 카페인가 (`publish.cafe_matches`와 같은 규칙)."""
+    from v2r.api.catalog import korean_only, normalize_name
+
+    q, n = normalize_name(query), normalize_name(name)
+    if not q or not n:
+        return False
+    if q == n:
+        return True
+    kq, kn = korean_only(query), korean_only(name)
+    if kq and kq == kn:
+        return True
+    return q in n or n in q
+
+
 class PublicationStore:
     """publications 테이블 조작."""
 
@@ -98,6 +113,35 @@ class PublicationStore:
             (source_key,),
         ).fetchone()
         return int(row["n"])
+
+    def count_today(
+        self,
+        cafe: str,
+        kst_date: str,
+        *,
+        exclude_sources: "set[str] | None" = None,
+    ) -> int:
+        """오늘(KST `kst_date`) 그 카페에 이미 올라간 글 수 (uncertain/done).
+
+        `exclude_sources`에 든 `source_key`(브랜드 원고 시트 등)는 세지 않는다.
+        일상 글만 세기 위한 장치다 (self-cafe-daily-rules §7).
+        `created_at`은 `now_iso()`가 남긴 KST ISO 문자열이라 앞 10글자가 날짜다.
+        """
+        if not cafe or not kst_date:
+            return 0
+        rows = self.conn.execute(
+            "SELECT cafe, source_key FROM publications"
+            " WHERE status IN (?, ?) AND substr(created_at, 1, 10) = ?",
+            (*BLOCKING_STATUSES, kst_date),
+        ).fetchall()
+        skip = {str(s) for s in (exclude_sources or set())}
+        n = 0
+        for r in rows:
+            if str(r["source_key"] or "") in skip:
+                continue
+            if _same_cafe(cafe, str(r["cafe"] or "")):
+                n += 1
+        return n
 
     def by_source_id(self, source_id: str) -> dict | None:
         """V2R source_id로 조회."""

@@ -132,6 +132,90 @@ def test_prepare_per_cafe_skips_global_hash_duplicate(tmp_path, monkeypatch):
     assert "중복(본문 해시 전역)" in reasons or "이미 발행됨" in reasons
 
 
+# --- 오늘 목표 빼기 (규칙 §7) ---
+def _mark_today(rt, cafe: str, n: int, source: str = "각색_전체_9", status: str = "done") -> None:
+    """오늘 날짜로 발행 기록 n건을 심는다."""
+    for i in range(n):
+        rt.publications.mark(source, 1000 + i, f"h{cafe}{i}", status, None, cafe=cafe)
+
+
+def test_count_today_counts_only_daily_and_today(tmp_path):
+    rt = make_runtime(tmp_path)
+    rt.sources_cfg = {"brand_sheets": {"팥순이": {"spreadsheet_id": "x"}}}
+    _mark_today(rt, "고요한 아침", 3)
+    _mark_today(rt, "글로시 마이", 2)
+    # 브랜드 시트 글은 일상 글이 아니다 → 세지 않는다
+    rt.publications.mark("팥순이", 1, "hb", "done", None, cafe="고요한 아침")
+    # 실패한 건도 세지 않는다
+    rt.publications.mark("각색_전체_9", 2000, "hf", "failed", None, cafe="고요한 아침")
+    # 어제 올린 건도 세지 않는다
+    rt.publications.mark("각색_전체_9", 2001, "hy", "done", None, cafe="고요한 아침")
+    rt.conn.execute(
+        "UPDATE publications SET created_at = ? WHERE content_hash = ?",
+        ("2000-01-01T09:00:00+09:00", "hy"),
+    )
+
+    assert publish_mod.count_today_for_cafe(rt, "고요한 아침") == 3
+    assert publish_mod.count_today_for_cafe(rt, "글로시 마이") == 2
+    assert publish_mod.count_today_for_cafe(rt, "없는 카페") == 0
+
+
+def test_prepare_per_cafe_subtracts_today_count(tmp_path, monkeypatch):
+    rt = make_runtime(tmp_path)
+    rt.cafes_cfg = {
+        "self_owned": [
+            {"name": "고요한 아침", "cafe_id": 1, "board": "반말일기"},
+            {"name": "글로시 마이", "cafe_id": 2, "board": "자유 톡"},
+        ]
+    }
+    _mark_today(rt, "고요한 아침", 4)  # 오늘 이미 4건 → 1건만 더
+    items = [_m("고요한 아침", i) for i in range(6)] + [_m("글로시 마이", i + 10) for i in range(6)]
+    _fake_sources(monkeypatch, [("각색_전체_1", items)])
+
+    spec = TaskSpec(task="publish_daily", count=5, per_cafe=True)
+    picked = publish_mod.prepare_per_cafe(rt, spec, [])
+    assert [m.cafe for m in picked] == ["고요한 아침"] + ["글로시 마이"] * 5
+
+    plan_info = rt.scratch["per_cafe_plan"]
+    assert plan_info["고요한 아침"] == {"requested": 5, "already": 4, "planned": 1}
+    assert plan_info["글로시 마이"] == {"requested": 5, "already": 0, "planned": 5}
+
+
+def test_prepare_per_cafe_target_met_picks_nothing(tmp_path, monkeypatch):
+    rt = make_runtime(tmp_path)
+    rt.cafes_cfg = {"self_owned": [{"name": "고요한 아침", "cafe_id": 1, "board": "반말일기"}]}
+    _mark_today(rt, "고요한 아침", 7)  # 목표 5건을 이미 넘었다
+    _fake_sources(monkeypatch, [("각색_전체_1", [_m("고요한 아침", i) for i in range(3)])])
+
+    skipped: list[dict] = []
+    spec = TaskSpec(task="publish_daily", count=5, per_cafe=True)
+    assert publish_mod.prepare_per_cafe(rt, spec, skipped) == []
+    assert any("목표 달성" in str(s.get("reason")) for s in skipped)
+    assert rt.scratch["per_cafe_plan"]["고요한 아침"]["planned"] == 0
+
+
+def test_prepare_per_cafe_add_mode_ignores_today(tmp_path, monkeypatch):
+    rt = make_runtime(tmp_path)
+    rt.cafes_cfg = {"self_owned": [{"name": "고요한 아침", "cafe_id": 1, "board": "반말일기"}]}
+    _mark_today(rt, "고요한 아침", 4)
+    _fake_sources(monkeypatch, [("각색_전체_1", [_m("고요한 아침", i) for i in range(6)])])
+
+    spec = TaskSpec(task="publish_daily", count=5, per_cafe=True, per_cafe_mode="추가로")
+    picked = publish_mod.prepare_per_cafe(rt, spec, [])
+    assert len(picked) == 5
+    assert rt.scratch["per_cafe_plan"]["고요한 아침"] == {
+        "requested": 5, "already": 0, "planned": 5
+    }
+
+
+def test_parse_per_cafe_add_mode():
+    spec = parse_korean_command("자사 카페 일상 글 카페별 50건 추가로 실제 발행")
+    assert spec.per_cafe is True
+    assert spec.per_cafe_mode == "추가로"
+    assert spec.count == 50
+    assert parse_korean_command("자사 카페 일상 글 카페별 50건 실제 발행").per_cafe_mode == ""
+
+
 def test_prepare_manuscripts_routes_to_per_cafe(tmp_path, monkeypatch):
     rt = make_runtime(tmp_path)
     rt.cafes_cfg = CAFES_CFG
@@ -368,6 +452,16 @@ def test_per_cafe_counts_and_report_file(tmp_path):
     ]
     counts = worker.per_cafe_counts(results, failed)
     assert counts == {"고요한 아침": {"ok": 1, "fail": 0}, "글로시 마이": {"ok": 0, "fail": 1}}
+
+    # 모의 실행 결과에도 요청/오늘 올린 수/이번 계획이 같이 나온다 (규칙 §7)
+    rt.cafes_cfg = {"self_owned": [{"name": "고요한 아침", "cafe_id": 1, "board": "반말일기"}]}
+    _mark_today(rt, "고요한 아침", 50)
+    dry = TaskSpec(task="publish_daily", count=50, per_cafe=True, dry_run=True)
+    out = worker._run_publish(rt, None, dry)
+    assert out["slots"] == 0
+    assert out["per_cafe"]["고요한 아침"] == {
+        "ok": 0, "fail": 0, "requested": 50, "already": 50, "planned": 0
+    }
 
     path = worker.write_daily_report(rt, spec, results, failed)
     assert path.endswith("self-daily-2026-09-19.md")

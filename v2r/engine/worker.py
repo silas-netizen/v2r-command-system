@@ -967,13 +967,20 @@ def _run_publish(
                 "dry_run": spec.dry_run,
                 "message": "원본 적재에 모두 실패했습니다",
             }
-        return {
+        out0 = {
             "ok": True,
             "slots": 0,
             "skipped": skipped,
             "dry_run": spec.dry_run,
             "message": "발행할 원고가 없습니다",
         }
+        plan_info = rt.scratch.get("per_cafe_plan") if getattr(spec, "per_cafe", False) else None
+        if plan_info:
+            out0["per_cafe"] = {
+                cafe: {"ok": 0, "fail": 0, **info} for cafe, info in plan_info.items()
+            }
+            out0["message"] = "오늘 목표를 이미 채웠거나 올릴 원고가 없습니다"
+        return out0
 
     from v2r.warehouse.store import NoPhotoError
 
@@ -1151,6 +1158,9 @@ def _run_publish(
     if paced:
         # 카페별 성공/실패 수 + 보고서 파일 (규칙 §6)
         counts = per_cafe_counts(results, failed_slots)
+        # 목표 계산 근거(요청/오늘 이미 올림/이번에 계획)를 같이 보여준다 (규칙 §7)
+        for cafe, plan_info in (rt.scratch.get("per_cafe_plan") or {}).items():
+            counts.setdefault(cafe, {"ok": 0, "fail": 0}).update(plan_info)
         out["per_cafe"] = counts
         try:
             out["report_file"] = write_daily_report(rt, spec, results, failed_slots)

@@ -17,7 +17,7 @@ from v2r.api import articles as api_articles
 from v2r.api.errors import V2RApiError, classify
 from v2r.command.spec import TaskSpec
 from v2r.content import comments as comment_mod
-from v2r.content import duplicate, seone
+from v2r.content import duplicate, sanitize as sanitize_mod, seone
 from v2r.content.manuscript import Manuscript
 from v2r.engine.context import Runtime
 from v2r.engine.scheduler import KST, plan_slots, revision_at
@@ -353,10 +353,36 @@ def self_cafe_names(rt: Runtime, include_excluded: bool = False) -> list[str]:
     return out
 
 
+def brand_source_keys(rt: Runtime) -> set[str]:
+    """브랜드 원고 시트 이름 집합(= 일상 글이 아닌 `source_key`).
+
+    `sources.yaml: brand_sheets` 키 + `config/brands.yaml: brands` 키.
+    오늘 올린 **일상 글**만 세기 위해 쓴다 (규칙 §7).
+    """
+    out = {str(name) for name in (rt.sources_cfg.get("brand_sheets") or {})}
+    try:
+        from v2r.warehouse.store import load_brands_config
+
+        out |= {str(name) for name in (load_brands_config().get("brands") or {})}
+    except Exception:  # 설정이 없어도 세는 일은 계속한다
+        pass
+    return out
+
+
+def count_today_for_cafe(rt: Runtime, cafe: str, kst_date: str = "") -> int:
+    """오늘(KST) 그 카페에 이미 올라간 **일상 글** 수 (규칙 §7)."""
+    date = kst_date or datetime.now(KST).date().isoformat()
+    return rt.publications.count_today(cafe, date, exclude_sources=brand_source_keys(rt))
+
+
 def prepare_per_cafe(
     rt: Runtime, spec: TaskSpec, skipped: list[dict] | None = None
 ) -> list[Manuscript]:
-    """`카페별 N건` — 자사 카페마다 `spec.count`건씩 고른다 (규칙 §1~§3).
+    """`카페별 N건` — 자사 카페마다 **오늘 N건이 되게** 모자란 만큼 고른다 (규칙 §1~§3, §7).
+
+    `spec.count`는 "오늘 이 카페의 일상 글 총량"이다. 오늘 이미 올린 만큼을 빼고
+    (`목표 = max(0, N - 오늘 올린 수)`) 고른다. `spec.per_cafe_mode == "추가로"`면
+    예전처럼 오늘 올린 수와 무관하게 N건을 더 고른다.
 
     원고 출처 순서: 각색 xlsx(파일 이름 오름차순, 행 순서) → 일상 글 풀.
     이미 발행한 (파일, 행)뿐 아니라 **본문 해시 전역 검사**로도 건너뛴다.
@@ -381,13 +407,29 @@ def prepare_per_cafe(
         loaded.append((name, items))
     rt.scratch["source_load"] = {"attempted": attempted, "failed": failed}
 
-    want = int(spec.count or 0)
+    requested = int(spec.count or 0)
+    add_mode = str(getattr(spec, "per_cafe_mode", "") or "") == "추가로"
+    today = datetime.now(KST).date().isoformat()
+    # 카페마다 목표를 먼저 정한다: 오늘 이미 올린 일상 글을 뺀 나머지 (규칙 §7)
+    targets_left: dict[str, int] = {}
+    report: dict[str, dict[str, int]] = {}
+    for cafe in targets:
+        already = 0 if add_mode else count_today_for_cafe(rt, cafe, today)
+        want_cafe = requested if (add_mode or not requested) else max(0, requested - already)
+        targets_left[cafe] = want_cafe
+        report[cafe] = {"requested": requested, "already": already, "planned": 0}
+    rt.scratch["per_cafe_plan"] = report
+
     used_keys: set[tuple[str, int]] = set()
     used_hashes: set[str] = set()
     picked: list[Manuscript] = []
 
     for cafe in targets:
         got = 0
+        want = targets_left[cafe]
+        if requested and want <= 0:
+            skipped.append({"source": cafe, "reason": f"오늘 이미 {report[cafe]['already']}건 — 목표 달성"})
+            continue
         for name, items in loaded:
             if want and got >= want:
                 break
@@ -421,6 +463,7 @@ def prepare_per_cafe(
                     m.cafe = cafe
                 picked.append(m)
                 got += 1
+        report[cafe]["planned"] = got
     return picked
 
 
@@ -1299,6 +1342,11 @@ def _take_daily(rt: Runtime, cafe_name: str = "", dry_run: bool = True) -> Manus
         )
     picked = random.choice(candidates)
     used.add((picked.source, picked.source_row))
+    # 제휴 일상 글도 이모지 거름망을 지난다 (content_hash는 그대로 둔다 → 중복 판정 유지)
+    spots = sanitize_mod.emoji_spots(picked)
+    if spots:
+        log.warning("이모지 제거: 제목/본문/댓글 %d곳 (제휴 일상 글)", len(spots))
+        picked = sanitize_mod.sanitize_manuscript(picked)
     return picked
 
 
@@ -1417,6 +1465,43 @@ def _create_and_verify(
     return str(source_id), None
 
 
+def sanitize_slot(rt: Runtime, slot: Slot, job_id: int | None = None) -> Manuscript:
+    """발행 직전 이모지 거름망 (사용자 절대 규칙: 이모지는 모든 원고에서 제외).
+
+    어느 경로로 온 원고든(엑셀·시트·모델 생성) 여기서 한 번 더 지운다. 2026-09-19
+    자사 카페 일상 글 18건이 제목 이모지를 달고 나간 사고의 재발 방지막이다.
+    `slot.manuscript`도 바꿔 둬야 `build_comments`가 깨끗한 댓글을 만든다.
+    """
+    m = slot.manuscript
+    spots = sanitize_mod.emoji_spots(m)
+    if not spots:
+        return m
+    cleaned = sanitize_mod.sanitize_manuscript(m)
+    slot.manuscript = cleaned
+    message = f"이모지 제거: 제목/본문/댓글 {len(spots)}곳 ({', '.join(spots)})"
+    try:
+        rt.events.log(job_id, "warn", message)
+    except Exception:  # 이벤트 기록 실패가 발행을 막지 않는다
+        log.warning("%s", message)
+    return cleaned
+
+
+def assert_no_emoji(title: str, body: str, comments: list[dict] | None = None) -> None:
+    """등록 직전 마지막 확인. 이모지가 남아 있으면 발행을 멈춘다(이중 안전장치)."""
+    spots: list[str] = []
+    if sanitize_mod.has_emoji(title):
+        spots.append("제목")
+    if sanitize_mod.has_emoji(body):
+        spots.append("본문")
+    for node in api_articles.flatten_comment_nodes(comments or []):
+        text = node.get("contents") or node.get("text") or ""
+        if sanitize_mod.has_emoji(text):
+            spots.append("댓글")
+            break
+    if spots:
+        raise PublishError("이모지가 남아 있어 발행을 멈췄습니다: " + ", ".join(spots))
+
+
 def run_slot(
     rt: Runtime,
     spec: TaskSpec,
@@ -1427,7 +1512,8 @@ def run_slot(
     heartbeat: Any = None,
 ) -> dict:
     """슬롯 1건 실행. dry_run이면 계획만 돌려준다."""
-    m = slot.manuscript
+    # 이모지 거름망 — 내용이 만들어지기 전에 원고부터 깨끗하게 한다(사용자 절대 규칙)
+    m = sanitize_slot(rt, slot, job_id)
     planned = {
         "source": m.source,
         "row": m.source_row,
@@ -1539,6 +1625,9 @@ def run_slot(
                 )
             rev_body, rev_content = _prepare_content(m.body, components)
             payload = build_comments(rt, slot, rev_at, getattr(cafe, "cafe_id", None))
+            # 마지막 확인: 여기까지 이모지가 남아 있으면 발행하지 않는다
+            assert_no_emoji(m.title, rev_body, payload)
+            assert_no_emoji(daily.title, daily.body, [])
             rt.publications.mark(
                 *key,
                 "uncertain",
@@ -1603,6 +1692,8 @@ def run_slot(
                 )
             else:
                 payload = build_comments(rt, slot, root_start, getattr(cafe, "cafe_id", None))
+            # 마지막 확인: 여기까지 이모지가 남아 있으면 발행하지 않는다
+            assert_no_emoji(m.title, m.body, payload)
             planned["comments"] = len(payload)
             rt.publications.mark(
                 *key,
@@ -1699,6 +1790,8 @@ __all__ = [
     "PublishError",
     "RetryWithOtherAccount",
     "Slot",
+    "assert_no_emoji",
+    "sanitize_slot",
     "build_daily_comments",
     "cafe_default_board",
     "cafe_matches",
@@ -1710,6 +1803,8 @@ __all__ = [
     "plan",
     "prepare_manuscripts",
     "prepare_per_cafe",
+    "brand_source_keys",
+    "count_today_for_cafe",
     "self_cafe_names",
     "refresh_source",
     "resolve_board",

@@ -85,6 +85,8 @@ RE_COUNT = re.compile(r"(?:일상\s*글|글)\s*(\d+)\s*(?:개|건)")
 RE_ANY_COUNT = re.compile(r"(\d+)\s*(?:개|건)")
 #: `카페별` / `카페마다` — 자사 카페마다 count건
 RE_PER_CAFE = re.compile(r"카페\s*(?:별|마다)")
+#: `추가로` / `더` — 오늘 올린 수와 무관하게 N건을 더 올린다 (self-cafe-daily-rules §7)
+RE_PER_CAFE_ADD = re.compile(r"추가로|추가\s*발행|더\s*(?:올려|발행)")
 #: `댓글 랜덤` / `댓글 무작위` / `댓글 0~3개`
 RE_RANDOM_COMMENTS = re.compile(r"댓글\s*(?:랜덤|무작위|\d+\s*~\s*\d+\s*개)")
 #: 개수 인식 전에 지우는 댓글 개수 표현 (`댓글 0~3개`가 글 수로 잡히지 않게)
@@ -395,6 +397,8 @@ def parse_korean_command(text: str, now: datetime | None = None) -> TaskSpec | N
     # 자사 카페 일상 글: `카페별 N건` / `댓글 랜덤` (self-cafe-daily-rules §1·§5)
     if task in PUBLISH_TASKS:
         spec["per_cafe"] = RE_PER_CAFE.search(raw) is not None
+        if spec["per_cafe"] and RE_PER_CAFE_ADD.search(raw):
+            spec["per_cafe_mode"] = "추가로"
         spec["random_comments"] = RE_RANDOM_COMMENTS.search(raw) is not None
         if spec["per_cafe"] or task == "publish_daily":
             # 규칙 §4: 자사 카페 일상 글은 (카페별이든 카페 하나든) 예약하지 않고 항상 즉시 발행하며,
