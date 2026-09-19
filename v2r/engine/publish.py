@@ -863,6 +863,25 @@ def _pool_for_cafe(
     return narrowed, False
 
 
+#: 자사 카페 글 허용 시간대(KST): 08:00 ~ 다음날 02:00. 그 밖에는 발행·예약 모두 금지(사용자 규칙 2026-09-19).
+SELF_WINDOW_OPEN_HOUR = 8
+SELF_WINDOW_CLOSE_HOUR = 2
+
+
+def in_self_window(at: datetime) -> bool:
+    """`at`(KST)이 자사 카페 허용 시간대(08:00~02:00) 안인가."""
+    hour = at.astimezone(KST).hour
+    return hour >= SELF_WINDOW_OPEN_HOUR or hour < SELF_WINDOW_CLOSE_HOUR
+
+
+def next_self_window(at: datetime) -> datetime:
+    """허용 시간대 밖이면 다음 08:00(KST), 안이면 그대로."""
+    local = at.astimezone(KST)
+    if in_self_window(local):
+        return at
+    return local.replace(hour=SELF_WINDOW_OPEN_HOUR, minute=0, second=0, microsecond=0)
+
+
 #: 자사 카페 일상 글에서 카페마다 고정해 두는 계정 수 (규칙 §4, 부족하면 있는 만큼)
 SELF_DAILY_ACCOUNTS_MIN = 5
 SELF_DAILY_ACCOUNTS_MAX = 10
@@ -1107,6 +1126,15 @@ def build_daily_comments(
         return []
     count = min(count, len(texts))
     times = dc.plan_times(root_start, count, rng)
+    # 허용 시간대 밖(02:00~08:00)으로 떨어진 댓글은 다음 08:00 이후로 민다
+    shifted: list[datetime] = []
+    for at in times:
+        if not in_self_window(at):
+            at = next_self_window(at) + timedelta(minutes=rng.randint(5, 40))
+        if shifted and at <= shifted[-1]:
+            at = shifted[-1] + timedelta(minutes=1)
+        shifted.append(at)
+    times = shifted
     items = [
         {
             "label": f"일상댓글{i + 1}",

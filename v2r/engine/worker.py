@@ -10,6 +10,7 @@ import re
 import socket
 import time
 import uuid
+from datetime import datetime
 from typing import Any
 
 from v2r.channels import format_report, notify_all
@@ -19,6 +20,7 @@ from v2r.engine import publish as publish_mod
 from v2r.engine import reconcile as reconcile_mod
 from v2r.engine import status as status_mod
 from v2r.engine.context import Runtime
+from v2r.engine.publish import KST
 
 log = logging.getLogger(__name__)
 
@@ -689,6 +691,7 @@ def _run_publish(
     failures: list[str] = []
     failed_slots: list[tuple[Any, str]] = []
     next_allowed: dict[str, float] = {}
+    window_notified = False
     touched: list[tuple] = []
     retried: set[int] = set()
     playwright = context = page = None
@@ -720,6 +723,18 @@ def _run_publish(
                 failures.append(f"{m.title}: {exc}")
                 failed_slots.append((slot, str(exc)))
                 break
+            if not spec.dry_run and publish_mod.is_self_cafe(rt, slot.cafe):
+                # 자사 카페 글은 08:00~02:00(KST)에만 올린다. 밖이면 다음 08:00까지 기다린다.
+                now_kst = datetime.now(KST)
+                if not publish_mod.in_self_window(now_kst):
+                    open_at = publish_mod.next_self_window(now_kst)
+                    if not window_notified:
+                        notify_all(
+                            rt.channels,
+                            f"자사 카페 허용 시간대(08:00~02:00) 밖이라 {open_at:%H:%M}까지 대기합니다",
+                        )
+                        window_notified = True
+                    _sleep_with_beat((open_at - now_kst).total_seconds(), beat)
             if paced and not spec.dry_run:
                 # 그 카페의 다음 발행 허용 시각까지 쉰다 (글 사이 2~3분 랜덤)
                 key = publish_mod._norm(slot.cafe)

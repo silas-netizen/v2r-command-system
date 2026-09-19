@@ -429,3 +429,42 @@ def test_affiliate_cafe_members_not_filtered_by_staff():
     )
     _, logins = publish._cafe_members(rt, "씨씨앙")
     assert logins == ["a", "b"]
+
+
+# --------------------------------------------------------------------
+# 허용 시간대 08:00~02:00 (2026-09-19)
+# --------------------------------------------------------------------
+def test_self_window_boundaries():
+    from v2r.engine.publish import KST, in_self_window, next_self_window
+
+    assert in_self_window(datetime(2026, 9, 19, 8, 0, tzinfo=KST))
+    assert in_self_window(datetime(2026, 9, 19, 23, 30, tzinfo=KST))
+    assert in_self_window(datetime(2026, 9, 20, 1, 59, tzinfo=KST))
+    assert not in_self_window(datetime(2026, 9, 20, 2, 0, tzinfo=KST))
+    assert not in_self_window(datetime(2026, 9, 20, 7, 59, tzinfo=KST))
+    nxt = next_self_window(datetime(2026, 9, 20, 3, 15, tzinfo=KST))
+    assert (nxt.hour, nxt.minute) == (8, 0) and nxt.day == 20
+    same = datetime(2026, 9, 20, 10, 0, tzinfo=KST)
+    assert next_self_window(same) == same
+
+
+def test_daily_comments_shift_out_of_window(tmp_path):
+    from v2r.engine.publish import KST, in_self_window
+
+    rt = make_runtime(tmp_path)
+    rt._catalog = _CommentCatalog()
+    rt._llm = _FakeLLM('["저도 어제 딱 그랬어요ㅋㅋ", "오늘 날씨 진짜 좋더라구요", "저녁은 뭐 드셨어요"]')
+    slot = publish_mod.Slot(
+        manuscript=_m("고요한 아침", 0), account="member0", cafe="고요한 아침", board="반말일기"
+    )
+    start = datetime(2026, 9, 20, 1, 30, tzinfo=KST)  # 새벽 1:30 글 → 댓글이 2시 넘길 수 있다
+
+    class _Rng3(random.Random):
+        def choices(self, population, weights=None, k=1):
+            return [3]
+
+    payload = publish_mod.build_daily_comments(rt, slot, start, 1, rng=_Rng3(3))
+    assert len(payload) == 3
+    for node in payload:
+        at = datetime.fromisoformat(node["start_at"].replace("Z", "+00:00"))
+        assert in_self_window(at)
