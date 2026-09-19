@@ -198,9 +198,9 @@ def test_validate_flags_long_comment_as_warning():
     assert bw.failures(checks) == []  # 경고는 실패가 아니다
 
 
-def test_validate_hard_fails_beyond_1_5x_length():
-    """1.5배를 넘기면 경고가 아니라 실패다."""
-    m = _manuscript(comments=_nodes({"댓글3": "가" * 60}))
+def test_validate_hard_fails_beyond_2x_length():
+    """상한의 100%(2배)를 넘기면 경고가 아니라 실패다 (사용자 결정 2026-09-19)."""
+    m = _manuscript(comments=_nodes({"댓글3": "가" * 61}))
     problems = bw.failures(bw.validate(m))
     assert any("심각 초과" in p and "30자로 줄일 것" in p for p in problems)
 

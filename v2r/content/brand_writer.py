@@ -69,7 +69,7 @@ MAX_ATTEMPTS = 6
 LENGTH_TOLERANCE = 1.15
 
 #: 댓글 길이 `soft_limits` 모드에서 이 배수까지는 경고, 넘으면 실패
-SOFT_LIMIT_FACTOR = 1.5
+SOFT_LIMIT_FACTOR = 2.0  # 사용자 결정(2026-09-19): 상한의 100% 초과만 실패, 그 이하는 경고
 
 #: 결과물에 새어 나오면 안 되는 작업용 내부 용어 (평가 2026-09-19 공통문제 7)
 INTERNAL_TERMS: tuple[str, ...] = (
