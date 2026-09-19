@@ -124,3 +124,102 @@ def test_make_client_without_key():
 
     with pytest.raises(LLMDisabled):
         make_client("")
+
+
+# --- 프롬프트 캐싱 / 비용 추정 (2026-09-19 비용 절감) -------------
+class _UsageMessages(_FakeMessages):
+    """usage에 캐시 항목까지 실어 주는 대역."""
+
+    def __init__(self, text: str, usage: dict):
+        super().__init__(text)
+        self._usage = usage
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        block = type("Block", (), {"type": "text", "text": self.text})()
+        usage = type("Usage", (), dict(self._usage))()
+        return type(
+            "Resp", (), {"content": [block], "stop_reason": "end_turn", "usage": usage}
+        )()
+
+
+def test_system_goes_as_cached_content_block():
+    router = _router("좋아요")
+    router.complete("brand_body", "고정 규칙", "키워드 비타민C")
+    sent = router._client.messages.calls[0]["system"]
+    assert sent == [
+        {"type": "text", "text": "고정 규칙", "cache_control": {"type": "ephemeral"}}
+    ]
+    # 바뀌는 부분은 user 쪽에만
+    assert sent[0]["text"] == "고정 규칙"
+    assert router._client.messages.calls[0]["messages"][0]["content"] == "키워드 비타민C"
+
+
+def test_system_block_list_is_passed_through():
+    from v2r.llm.anthropic import system_blocks
+
+    blocks = [{"type": "text", "text": "가", "cache_control": {"type": "ephemeral"}}]
+    assert system_blocks(blocks) == blocks
+    assert system_blocks("나", cache=False) == [{"type": "text", "text": "나"}]
+    assert system_blocks("") == [{"type": "text", "text": ""}]
+
+
+def test_usage_records_cache_fields_and_per_model():
+    client = _FakeClient("좋아요")
+    client.messages = _UsageMessages(
+        "좋아요",
+        {
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cache_read_input_tokens": 4000,
+            "cache_creation_input_tokens": 0,
+        },
+    )
+    router = LLMRouter(api_key="k", client=client)
+    router.complete("brand_body", "고정", "키워드")
+    router.complete("brand_body", "고정", "키워드2")
+    assert router.usage["input_tokens"] == 200
+    assert router.usage["output_tokens"] == 100
+    assert router.usage["cache_read_input_tokens"] == 8000
+    assert router.usage["cache_creation_input_tokens"] == 0
+    assert router.usage["calls"] == 2
+    assert router.usage["by_model"]["claude-sonnet-5"]["cache_read_input_tokens"] == 8000
+
+
+def test_estimate_cost_arithmetic():
+    from v2r.llm.router import estimate_cost
+
+    usage = {
+        "input_tokens": 1_000_000,
+        "output_tokens": 1_000_000,
+        "cache_creation_input_tokens": 1_000_000,
+        "cache_read_input_tokens": 1_000_000,
+    }
+    # Sonnet 5: 3 + 15 + 3.75 + 0.30
+    assert estimate_cost(usage, "claude-sonnet-5") == pytest.approx(22.05)
+    # Haiku 4.5: 1 + 5 (+ 1.25 + 0.10)
+    assert estimate_cost(usage, "claude-haiku-4-5") == pytest.approx(7.35)
+    # Opus 5: 15 + 75 (+ 18.75 + 1.50)
+    assert estimate_cost(usage, "claude-opus-5") == pytest.approx(110.25)
+    assert estimate_cost({}, "claude-sonnet-5") == 0.0
+    assert estimate_cost(None) == 0.0
+
+
+def test_estimate_cost_sums_per_model():
+    from v2r.llm.router import estimate_cost
+
+    usage = {
+        "by_model": {
+            "claude-sonnet-5": {"input_tokens": 1_000_000, "output_tokens": 0},
+            "claude-haiku-4-5": {"input_tokens": 1_000_000, "output_tokens": 0},
+        }
+    }
+    assert estimate_cost(usage) == pytest.approx(4.0)
+
+
+def test_router_estimated_cost_helper():
+    client = _FakeClient("좋아요")
+    client.messages = _UsageMessages("좋아요", {"input_tokens": 1_000_000, "output_tokens": 0})
+    router = LLMRouter(api_key="k", client=client)
+    router.complete("brand_body", "고정", "키워드")
+    assert router.estimated_cost() == pytest.approx(3.0)

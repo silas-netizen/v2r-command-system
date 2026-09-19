@@ -21,8 +21,10 @@ from typing import Any
 from v2r.content.manuscript import CommentNode, Manuscript, content_hash, tags_from_keyword
 from v2r.llm.prompts import (
     BRAND_BODY_SYSTEM,
+    BRAND_COMBINED_SYSTEM,
     BRAND_COMMENTS_SYSTEM,
     BRAND_FIRST_MENTION_RULE,
+    BRAND_PARTIAL_RETRY_SYSTEM,
     HUMAN_TONE_RULES,
     NO_INTERNAL_TERMS_RULE,
 )
@@ -64,6 +66,10 @@ ACCOUNT_ROLES_BY_TYPE: dict[str, dict[str, str]] = {
 
 #: 원고 한 건당 최대 시도 횟수 (본문·댓글 각각). 사용자 지시 2026-09-19
 MAX_ATTEMPTS = 6
+
+#: 기본 생성 방식. `single` = 본문 호출 + 댓글 호출(2번), `combined` = 한 번에(1번).
+#: 명령에서 `한번에` 라고 적으면 combined 로 바뀐다.
+DEFAULT_MODE = "single"
 
 #: 본문 글자 수 허용 오차 (지침 상한의 몇 배까지 통과로 볼지)
 LENGTH_TOLERANCE = 1.15
@@ -458,41 +464,17 @@ def _guide_excerpt(guide_text: str, max_chars: int = 3500) -> str:
     return "\n<지침 원문 참고>\n" + text[:max_chars] + "\n"
 
 
-def build_body_prompt(
-    brand: str,
-    keyword: str,
-    cafe: str = "",
-    guide_text: str = "",
-    manuscript_type: str = "",
-) -> tuple[str, str]:
-    """본문 생성용 (system, user) 프롬프트."""
-    rule = rule_for(brand, manuscript_type)
-    system = BRAND_BODY_SYSTEM.format(tone=HUMAN_TONE_RULES, internal=NO_INTERNAL_TERMS_RULE)
-    who = persona_for(rule.brand, keyword, rule.manuscript_type)
-
+def _body_rules_block(rule: BrandRule, guide_text: str = "") -> list[str]:
+    """본문 규칙 중 **키워드와 상관없이 늘 같은** 부분 (프롬프트 캐시 대상)."""
     lines: list[str] = [
         f"브랜드: {rule.brand} (원고유형 {rule.manuscript_type})",
-        f"작성 키워드: {keyword}",
         f"타겟: {rule.target}",
         "",
-        "<글쓴이 — 이 인물로만 써라>",
-        f"- 나이대: {who['나이대']}",
-        f"- 상황: {who['상황']}",
-        f"- 말투 특징: {who['말투']}",
-        f"- 글 쓰는 시각: {who['시각']}",
-        "이 인물로만 써라. 다른 나이대나 다른 상황으로 바꾸지 말고"
-        " 이 사람의 하루가 글에 묻어나게 한 줄 이상 구체적인 정황을 적는다",
+        "<반드시 지켜야 할 규칙>",
+        f"- 본문 글자 수는 공백 제외 {rule.body_max}자를 넘지 않는다",
+        "- 분량을 맞추려고 중간에 끊지 말고 반드시 끝을 맺는다",
+        f"- 작성 키워드를 한 글자도 빼먹지 말고 본문에 정확히 {rule.keyword_count}번 넣는다",
     ]
-    if cafe:
-        lines.append(f"올릴 카페: {cafe}")
-    lines.append("")
-    lines.append("<반드시 지켜야 할 규칙>")
-    lines.append(f"- 본문 글자 수는 공백 제외 {rule.body_max}자를 넘지 않는다")
-    lines.append("- 분량을 맞추려고 중간에 끊지 말고 반드시 끝을 맺는다")
-    lines.append(
-        f"- 작성 키워드 `{keyword}` 를 한 글자도 빼먹지 말고 본문에 정확히 "
-        f"{rule.keyword_count}번 넣는다"
-    )
     if rule.banned_in_body:
         lines.append(
             "- 본문에 다음 낱말을 절대 쓰지 않는다: " + ", ".join(rule.banned_in_body)
@@ -526,37 +508,64 @@ def build_body_prompt(
     lines.append("<작성 지침>")
     lines.extend(f"- {s}" for s in rule.body_notes)
     lines.append(_guide_excerpt(guide_text))
-    lines.append('출력: {"title": "제목", "body": "본문"}')
-    return system, "\n".join(lines)
+    return lines
 
 
-def build_comments_prompt(
+def _body_dynamic_block(rule: BrandRule, keyword: str, cafe: str = "") -> list[str]:
+    """본문 프롬프트 중 **키워드마다 달라지는** 부분 (캐시하지 않는다)."""
+    who = persona_for(rule.brand, keyword, rule.manuscript_type)
+    lines = [
+        f"작성 키워드: {keyword}",
+        f"- 작성 키워드 `{keyword}` 를 한 글자도 빼먹지 말고 본문에 정확히 "
+        f"{rule.keyword_count}번 넣는다",
+        "",
+        "<글쓴이 — 이 인물로만 써라>",
+        f"- 나이대: {who['나이대']}",
+        f"- 상황: {who['상황']}",
+        f"- 말투 특징: {who['말투']}",
+        f"- 글 쓰는 시각: {who['시각']}",
+        "이 인물로만 써라. 다른 나이대나 다른 상황으로 바꾸지 말고"
+        " 이 사람의 하루가 글에 묻어나게 한 줄 이상 구체적인 정황을 적는다",
+    ]
+    if cafe:
+        lines.append(f"올릴 카페: {cafe}")
+    return lines
+
+
+def build_body_prompt(
     brand: str,
     keyword: str,
-    title: str,
-    body: str,
-    manuscript_type: str = "",
+    cafe: str = "",
     guide_text: str = "",
+    manuscript_type: str = "",
 ) -> tuple[str, str]:
-    """댓글 12개 생성용 (system, user) 프롬프트."""
+    """본문 생성용 `(고정 system, 키워드별 user)` 프롬프트.
+
+    system에는 브랜드 규칙·구조·예시·지침처럼 **키워드가 바뀌어도 똑같은** 내용만
+    담는다. 그래야 프롬프트 캐시가 걸려 두 번째 키워드부터 입력 비용이 1/10로
+    떨어진다. 키워드·카페·페르소나 씨앗은 user로 간다.
+    """
     rule = rule_for(brand, manuscript_type)
-    system = BRAND_COMMENTS_SYSTEM.format(
-        tone=HUMAN_TONE_RULES,
-        internal=NO_INTERNAL_TERMS_RULE,
-        first_mention=BRAND_FIRST_MENTION_RULE,
+    system = "\n".join(
+        [
+            BRAND_BODY_SYSTEM.format(tone=HUMAN_TONE_RULES, internal=NO_INTERNAL_TERMS_RULE),
+            "",
+            *_body_rules_block(rule, guide_text),
+            '출력: {"title": "제목", "body": "본문"}',
+        ]
     )
+    return system, "\n".join(_body_dynamic_block(rule, keyword, cafe))
+
+
+def _comments_rules_block(rule: BrandRule, guide_text: str = "") -> list[str]:
+    """댓글 규칙 중 **키워드·본문과 상관없이 늘 같은** 부분 (프롬프트 캐시 대상)."""
     product = rule.product_in_comment or rule.product
 
     lines: list[str] = [
         f"브랜드: {rule.brand} (원고유형 {rule.manuscript_type})",
-        f"작성 키워드: {keyword}",
         f"댓글에서 쓸 제품 표기: {product}",
         f"원씽 이동(설득 논리): {rule.one_thing}",
         f"쓸 수 있는 권위재: {rule.authority}",
-        "",
-        "<본문>",
-        f"제목: {title}",
-        strip_placeholders(body).strip(),
         "",
         "<댓글 글자 수>",
         f"- 댓글2를 뺀 모든 댓글은 {rule.comment_max}자를 넘지 않는다",
@@ -598,7 +607,148 @@ def build_comments_prompt(
         )
     lines.extend(f"- {s}" for s in rule.comment_notes)
     lines.append(_guide_excerpt(guide_text, 2500))
-    return system, "\n".join(lines)
+    return lines
+
+
+def build_comments_prompt(
+    brand: str,
+    keyword: str,
+    title: str,
+    body: str,
+    manuscript_type: str = "",
+    guide_text: str = "",
+) -> tuple[str, str]:
+    """댓글 12개 생성용 `(고정 system, 본문별 user)` 프롬프트.
+
+    브랜드 규칙·12개 구조·역할 설명은 늘 같으니 system에 넣어 캐시하고,
+    user에는 키워드와 이번 본문(제목·본문)만 담는다.
+    """
+    rule = rule_for(brand, manuscript_type)
+    system = "\n".join(
+        [
+            BRAND_COMMENTS_SYSTEM.format(
+                tone=HUMAN_TONE_RULES,
+                internal=NO_INTERNAL_TERMS_RULE,
+                first_mention=BRAND_FIRST_MENTION_RULE,
+            ),
+            "",
+            *_comments_rules_block(rule, guide_text),
+        ]
+    )
+    user = "\n".join(
+        [
+            f"작성 키워드: {keyword}",
+            "",
+            "<본문>",
+            f"제목: {title}",
+            strip_placeholders(body).strip(),
+        ]
+    )
+    return system, user
+
+
+def build_combined_prompt(
+    brand: str,
+    keyword: str,
+    cafe: str = "",
+    guide_text: str = "",
+    manuscript_type: str = "",
+) -> tuple[str, str]:
+    """본문 + 댓글 12개를 **한 번에** 받는 `(고정 system, 키워드별 user)` 프롬프트."""
+    rule = rule_for(brand, manuscript_type)
+    system = "\n".join(
+        [
+            BRAND_COMBINED_SYSTEM.format(
+                tone=HUMAN_TONE_RULES,
+                internal=NO_INTERNAL_TERMS_RULE,
+                first_mention=BRAND_FIRST_MENTION_RULE,
+            ),
+            "",
+            "## 본문 규칙",
+            *_body_rules_block(rule, guide_text),
+            "",
+            "## 댓글 규칙",
+            *_comments_rules_block(rule, guide_text),
+        ]
+    )
+    return system, "\n".join(_body_dynamic_block(rule, keyword, cafe))
+
+
+def build_partial_retry_prompt(
+    brand: str,
+    keyword: str,
+    labels: list[str],
+    problems: list[str],
+    manuscript_type: str = "",
+    guide_text: str = "",
+) -> tuple[str, str]:
+    """검증에 걸린 **그 자리만** 다시 받는 `(system, user)` 프롬프트.
+
+    직전 출력 12개를 통째로 되보내지 않는다. 고친 자리만 JSON으로 받아
+    `merge_comments`로 갈아 끼운다 (재시도 입력 토큰이 크게 줄어든다).
+    """
+    rule = rule_for(brand, manuscript_type)
+    system = "\n".join(
+        [
+            BRAND_PARTIAL_RETRY_SYSTEM.format(
+                tone=HUMAN_TONE_RULES,
+                internal=NO_INTERNAL_TERMS_RULE,
+                first_mention=BRAND_FIRST_MENTION_RULE,
+            ),
+            "",
+            *_comments_rules_block(rule, guide_text),
+        ]
+    )
+    want = [label for label in COMMENT_LABELS if label in set(labels)] or list(COMMENT_LABELS)
+    user = "\n".join(
+        [
+            f"작성 키워드: {keyword}",
+            "",
+            "<다시 쓸 자리>",
+            " ".join(want),
+            "",
+            "<어긴 규칙 — 이번에는 반드시 지킬 것>",
+            *(f"- {p}" for p in problems),
+            "",
+            f"이 자리만 다시 써서 같은 JSON 형식으로 돌려라 (키는 {' '.join(want)} 뿐이다)",
+        ]
+    )
+    return system, user
+
+
+def failing_comment_labels(checks: list[dict]) -> list[str]:
+    """검증 결과에서 **문제가 있는 댓글 라벨**만 추려 낸다."""
+    found: set[str] = set()
+    for c in checks:
+        if c["통과"] or c.get("구간") != "댓글":
+            continue
+        text = f"{c.get('항목', '')} {c.get('실제', '')}"
+        for label in COMMENT_LABELS:
+            # `댓글2` 가 `대댓글2` 안에서 잡히지 않도록 앞 글자 `대` 를 막는다
+            if re.search(r"(?<!대)" + label, text):
+                found.add(label)
+    return [label for label in COMMENT_LABELS if label in found]
+
+
+def merge_comments(current: list[CommentNode], payload: Any) -> list[CommentNode]:
+    """부분 재시도 응답(`{"댓글2": "...", ...}`)을 기존 12개에 라벨로 갈아 끼운다."""
+    patch = {
+        node.label: node.text
+        for node in _comment_nodes(payload)
+        if (node.text or "").strip()
+    }
+    merged: list[CommentNode] = []
+    for node in current:
+        text = patch.get(node.label, "")
+        merged.append(
+            CommentNode(
+                label=node.label,
+                text=text or node.text,
+                depth=node.depth,
+                role=node.role,
+            )
+        )
+    return merged
 
 
 # ------------------------------------------------------------------ 검증
@@ -910,6 +1060,7 @@ def generate_manuscript(
     guide_text: str = "",
     stats: dict | None = None,
     max_attempts: int = MAX_ATTEMPTS,
+    mode: str = "",
 ) -> Manuscript:
     """키워드 한 개로 제목·본문·댓글 12개를 만든다.
 
@@ -917,9 +1068,17 @@ def generate_manuscript(
     (사용자 지시 2026-09-19). 안전장치로 본문·댓글 각각 `max_attempts`번까지만
     시도하고, 그래도 남은 위반은 포기 대신 `stats["unresolved"]`에 적어 둔다.
     본문이 통과했으면 본문은 그대로 두고 **댓글만** 다시 만든다.
+    댓글 재시도는 직전 12개를 통째로 되보내지 않고 **걸린 자리만** 다시 받아
+    라벨로 갈아 끼운다 (입력 토큰 절약).
+
+    `mode`:
+    - `single` (기본): 본문 1회 + 댓글 1회로 나눠 부른다
+    - `combined`: 본문과 댓글 12개를 **한 번에** 받는다. 댓글만 어긋나면
+      위의 부분 재시도로 이어 붙인다
 
     `stats`를 주면 시도 횟수(`body_attempts`/`comment_attempts`/`attempts`)와
-    끝내 못 지킨 규칙(`unresolved`)을 그 dict에 담아 준다.
+    끝내 못 지킨 규칙(`unresolved`), 토큰 사용량(`usage`)과 어림 비용
+    (`estimated_usd`)을 그 dict에 담아 준다.
     """
     llm = getattr(rt, "llm", None) or rt
     if llm is None:
@@ -928,6 +1087,13 @@ def generate_manuscript(
     if not (keyword or "").strip():
         raise BrandWriteError("작성 키워드가 비어 있습니다")
     cap = max(1, int(max_attempts))
+    mode = (mode or DEFAULT_MODE).strip() or "single"
+    before = _usage_snapshot(llm)
+
+    if mode == "combined":
+        return _generate_combined(
+            llm, rule, brand, keyword, cafe, guide_text, stats, cap, before
+        )
 
     body_sys, body_user = build_body_prompt(
         brand, keyword, cafe, guide_text, rule.manuscript_type
@@ -969,38 +1135,204 @@ def generate_manuscript(
     if draft is None:
         raise BrandWriteError(f"본문 생성 실패({brand}/{keyword}): 쓸 만한 본문을 받지 못했습니다")
 
+    comment_attempts = _fill_comments(llm, draft, rule, brand, keyword, guide_text, cap)
+    if all(not c.text for c in draft.comments):
+        raise BrandWriteError(f"댓글 생성 실패({brand}/{keyword}): 댓글을 하나도 받지 못했습니다")
+
+    _finish(draft, rule, stats, body_attempts, comment_attempts, cap, llm, before, "single")
+    return draft
+
+
+def _usage_snapshot(llm: Any) -> dict:
+    """호출 전 토큰 누계를 복사해 둔다 (이 원고가 쓴 몫만 빼내기 위해)."""
+    usage = getattr(llm, "usage", None)
+    if not isinstance(usage, dict):
+        return {}
+    # `by_model` 안쪽까지 복사해야 나중에 뺄 때 같은 dict를 보는 일이 없다
+    import copy
+
+    return copy.deepcopy(usage)
+
+
+def _usage_delta(llm: Any, before: dict) -> dict:
+    """이 원고 한 건이 쓴 토큰만 빼낸다 (모델별 누계 `by_model`도 같이 뺀다)."""
+    usage = getattr(llm, "usage", None)
+    if not isinstance(usage, dict):
+        return {}
+    out: dict = {}
+    for key, value in usage.items():
+        if isinstance(value, int):
+            out[key] = value - int(before.get(key, 0) or 0)
+    now_models = usage.get("by_model")
+    if isinstance(now_models, dict):
+        old_models = before.get("by_model")
+        old_models = old_models if isinstance(old_models, dict) else {}
+        per: dict = {}
+        for name, counts in now_models.items():
+            old = old_models.get(name) or {}
+            per[name] = {
+                k: int(v) - int(old.get(k, 0) or 0)
+                for k, v in counts.items()
+                if isinstance(v, int)
+            }
+        out["by_model"] = per
+    return out
+
+
+def _finish(
+    draft: Manuscript,
+    rule: BrandRule,
+    stats: dict | None,
+    body_attempts: int,
+    comment_attempts: int,
+    cap: int,
+    llm: Any,
+    before: dict,
+    mode: str,
+) -> None:
+    """해시를 다시 찍고 `stats`(시도 횟수·남은 위반·토큰·어림 비용)를 채운다."""
+    draft.content_hash = content_hash(draft.title, draft.body)
+    unresolved = violations(validate(draft, rule))
+    if stats is None:
+        return
+    from v2r.llm.router import estimate_cost
+
+    stats["mode"] = mode
+    stats["body_attempts"] = body_attempts
+    stats["comment_attempts"] = comment_attempts
+    stats["attempts"] = body_attempts + comment_attempts
+    stats["unresolved"] = unresolved
+    stats["hit_cap"] = bool(unresolved) and (
+        body_attempts >= cap or comment_attempts >= cap
+    )
+    usage = _usage_delta(llm, before)
+    stats["usage"] = usage
+    stats["input_tokens"] = usage.get("input_tokens", 0)
+    stats["output_tokens"] = usage.get("output_tokens", 0)
+    stats["cache_read_input_tokens"] = usage.get("cache_read_input_tokens", 0)
+    stats["cache_creation_input_tokens"] = usage.get("cache_creation_input_tokens", 0)
+    stats["estimated_usd"] = estimate_cost(usage)
+
+
+def _fill_comments(
+    llm: Any,
+    draft: Manuscript,
+    rule: BrandRule,
+    brand: str,
+    keyword: str,
+    guide_text: str,
+    cap: int,
+    seed: bool = False,
+) -> int:
+    """본문이 정해진 뒤 댓글 12개를 채운다. 두 번째 시도부터는 **걸린 자리만** 다시 받는다.
+
+    `seed=True`면 원고에 이미 들어 있는 댓글을 출발점으로 삼아 **첫 시도부터**
+    부분 재시도를 쓴다 (`combined` 모드에서 댓글만 어긋났을 때).
+    """
     cmt_sys, cmt_user = build_comments_prompt(
         brand, keyword, draft.title, draft.body, rule.manuscript_type, guide_text
     )
     best_comments: list[CommentNode] = []
     comment_bad: list[str] = []
     comment_attempts = 0
+    if seed and any((c.text or "").strip() for c in draft.comments):
+        best_comments = list(draft.comments)
+        comment_bad = violations(validate(draft, rule), scope="댓글")
     for comment_attempts in range(1, cap + 1):
-        user = cmt_user + (_retry_note(comment_bad) if comment_bad else "")
-        try:
-            payload = llm.complete_json("brand_comments", cmt_sys, user, max_tokens=3000)
-        except Exception as exc:
-            raise BrandWriteError(f"댓글 생성 실패({brand}/{keyword}): {exc}") from exc
-        draft.comments = _comment_nodes(payload)
+        if not best_comments:
+            try:
+                payload = llm.complete_json(
+                    "brand_comments", cmt_sys, cmt_user, max_tokens=3000
+                )
+            except Exception as exc:
+                raise BrandWriteError(f"댓글 생성 실패({brand}/{keyword}): {exc}") from exc
+            draft.comments = _comment_nodes(payload)
+        else:
+            labels = failing_comment_labels(validate(draft, rule))
+            sys_p, user_p = build_partial_retry_prompt(
+                brand, keyword, labels, comment_bad, rule.manuscript_type, guide_text
+            )
+            try:
+                payload = llm.complete_json("brand_comments", sys_p, user_p, max_tokens=1500)
+            except Exception as exc:
+                raise BrandWriteError(f"댓글 생성 실패({brand}/{keyword}): {exc}") from exc
+            draft.comments = merge_comments(best_comments, payload)
         bad = violations(validate(draft, rule), scope="댓글")
         if not best_comments or len(bad) < len(comment_bad):
             best_comments, comment_bad = list(draft.comments), bad
         if not bad:
             break
     draft.comments = best_comments
+    return comment_attempts
+
+
+def _generate_combined(
+    llm: Any,
+    rule: BrandRule,
+    brand: str,
+    keyword: str,
+    cafe: str,
+    guide_text: str,
+    stats: dict | None,
+    cap: int,
+    before: dict,
+) -> Manuscript:
+    """본문 + 댓글 12개를 한 번에 받는 방식 (`mode="combined"`).
+
+    본문이 어긋나면 통째로 다시, 댓글만 어긋나면 **걸린 자리만** 다시 받는다.
+    """
+    sys_p, user_p = build_combined_prompt(
+        brand, keyword, cafe, guide_text, rule.manuscript_type
+    )
+    draft: Manuscript | None = None
+    bad_all: list[str] = []
+    attempts = 0
+    for attempts in range(1, cap + 1):
+        user = user_p + (_retry_note(bad_all) if bad_all else "")
+        try:
+            data = llm.complete_json("brand_body", sys_p, user, max_tokens=4500)
+        except Exception as exc:
+            raise BrandWriteError(f"원고 생성 실패({brand}/{keyword}): {exc}") from exc
+        if not isinstance(data, dict):
+            bad_all = ["출력 형식 — 기준 JSON 객체 하나 인데 실제 다른 형식"]
+            continue
+        title = _as_text(data.get("title") or data.get("제목"))
+        body = _clean_body(_as_text(data.get("body") or data.get("본문")))
+        if not body:
+            bad_all = ["본문 — 기준 내용이 있어야 함 인데 실제 비어 있음"]
+            continue
+        candidate = Manuscript(
+            title=title,
+            body=body,
+            cafe=cafe,
+            keyword=keyword,
+            tags=tags_from_keyword(keyword),
+            manuscript_type=rule.manuscript_type,
+            source=f"generated:{rule.brand}",
+            comments=_comment_nodes(data.get("comments") or data.get("댓글") or {}),
+            content_hash=content_hash(title, body),
+        )
+        checks = validate(candidate, rule)
+        body_bad = violations(checks, scope="본문")
+        bad = violations(checks)
+        if draft is None or len(bad) < len(bad_all):
+            draft, bad_all = candidate, bad
+        if not body_bad:
+            break
+    if draft is None:
+        raise BrandWriteError(f"원고 생성 실패({brand}/{keyword}): 쓸 만한 본문을 받지 못했습니다")
+
+    comment_attempts = 0
+    if violations(validate(draft, rule), scope="댓글") or all(
+        not c.text for c in draft.comments
+    ):
+        comment_attempts = _fill_comments(
+            llm, draft, rule, brand, keyword, guide_text, cap, seed=True
+        )
     if all(not c.text for c in draft.comments):
         raise BrandWriteError(f"댓글 생성 실패({brand}/{keyword}): 댓글을 하나도 받지 못했습니다")
 
-    draft.content_hash = content_hash(draft.title, draft.body)
-    unresolved = violations(validate(draft, rule))
-    if stats is not None:
-        stats["body_attempts"] = body_attempts
-        stats["comment_attempts"] = comment_attempts
-        stats["attempts"] = body_attempts + comment_attempts
-        stats["unresolved"] = unresolved
-        stats["hit_cap"] = bool(unresolved) and (
-            body_attempts >= cap or comment_attempts >= cap
-        )
+    _finish(draft, rule, stats, attempts, comment_attempts, cap, llm, before, "combined")
     return draft
 
 

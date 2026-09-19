@@ -29,7 +29,50 @@ DEFAULT_MODEL = "claude-haiku-4-5"
 NO_THINKING_PURPOSES = frozenset({"brand_body", "brand_comments"})
 THINKING_DISABLED = {"type": "disabled"}
 
-__all__ = ["MODELS", "LLMRouter", "LLMDisabled", "extract_json"]
+#: 백만 토큰당 미국 달러 단가. **2026-09 기준 추정, 실제 요금표 확인 필요.**
+#: cache_write는 입력의 1.25배, cache_read는 입력의 0.1배라는 공개 비율을 따랐다.
+PRICES_USD_PER_MTOK: dict[str, dict[str, float]] = {
+    # 2026-09 기준 추정, 실제 요금표 확인 필요
+    "claude-sonnet-5": {"input": 3.0, "output": 15.0, "cache_write": 3.75, "cache_read": 0.30},
+    "claude-haiku-4-5": {"input": 1.0, "output": 5.0, "cache_write": 1.25, "cache_read": 0.10},
+    "claude-opus-5": {"input": 15.0, "output": 75.0, "cache_write": 18.75, "cache_read": 1.50},
+}
+
+#: 표에 없는 모델에 쓰는 기본 단가 (Sonnet 기준)
+DEFAULT_PRICE = PRICES_USD_PER_MTOK["claude-sonnet-5"]
+
+__all__ = [
+    "MODELS",
+    "LLMRouter",
+    "LLMDisabled",
+    "extract_json",
+    "estimate_cost",
+    "PRICES_USD_PER_MTOK",
+]
+
+
+def _cost_one(usage: dict, model: str) -> float:
+    price = PRICES_USD_PER_MTOK.get(model, DEFAULT_PRICE)
+    return (
+        int(usage.get("input_tokens", 0) or 0) * price["input"]
+        + int(usage.get("output_tokens", 0) or 0) * price["output"]
+        + int(usage.get("cache_creation_input_tokens", 0) or 0) * price["cache_write"]
+        + int(usage.get("cache_read_input_tokens", 0) or 0) * price["cache_read"]
+    ) / 1_000_000
+
+
+def estimate_cost(usage: dict | None, model: str = "") -> float:
+    """토큰 누계를 달러로 어림한다 (2026-09 기준 추정, 실제 요금표 확인 필요).
+
+    `usage`에 모델별 누계(`by_model`)가 들어 있으면 모델마다 제 단가를 적용해
+    더한다. 없으면 `model` 하나의 단가로 계산한다.
+    """
+    if not usage:
+        return 0.0
+    per_model = usage.get("by_model")
+    if isinstance(per_model, dict) and per_model:
+        return round(sum(_cost_one(u, name) for name, u in per_model.items()), 6)
+    return round(_cost_one(usage, model), 6)
 
 
 def extract_json(text: str) -> dict | list:
@@ -88,6 +131,10 @@ class LLMRouter:
 
             settings = get_settings()
         return cls(api_key=getattr(settings, "anthropic_api_key", "") or "")
+
+    def estimated_cost(self) -> float:
+        """이 라우터로 쓴 토큰의 어림 비용(USD)."""
+        return estimate_cost(self.usage)
 
     def model_for(self, purpose: str) -> str:
         """용도에 해당하는 모델 ID."""

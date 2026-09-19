@@ -100,6 +100,8 @@ RE_SOURCE = re.compile(r"시트\s*(\S+)")
 RE_BRAND_SLOT = re.compile(r"브랜드\s+(\S+)")
 #: 원고유형 슬롯 (시트 E열). 발행 계열 명령에서만 읽는다.
 RE_MANUSCRIPT_TYPE = re.compile(r"(질문형|후기형)")
+#: `한번에` / `한 번에` — 본문과 댓글을 모델 호출 한 번으로 받는다 (비용 절감)
+RE_COMBINED_MODE = re.compile(r"한\s*번에")
 RE_KEYWORD_SLOT = re.compile(r"키워드\s+(\S+)")
 #: 사진 생성 승인 문구 (`사진 생성 승인 우아덤 키워드 2장`)
 RE_PHOTO_APPROVE_GEN = re.compile(r"사진\s*생성\s*승인")
@@ -358,6 +360,10 @@ def parse_korean_command(text: str, now: datetime | None = None) -> TaskSpec | N
         m = RE_MANUSCRIPT_TYPE.search(raw)
         if m:
             spec["manuscript_type"] = m.group(1)
+
+    # 생성 방식 (`한번에` → 본문+댓글을 한 번의 호출로 받는다)
+    if task == "generate_brand" and RE_COMBINED_MODE.search(raw):
+        spec["generate_mode"] = "combined"
 
     # 게시판 / 시트
     m = RE_BOARD.search(raw)

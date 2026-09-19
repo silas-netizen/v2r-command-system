@@ -340,6 +340,7 @@ def _generate_brand(rt: Runtime, spec: TaskSpec) -> dict:
     import re as _re
 
     from v2r.content import brand_writer as bw
+    from v2r.llm.router import estimate_cost
     from v2r.sources.keyword_list import load_pushed_keywords
 
     brand = (spec.brand or "").strip()
@@ -378,6 +379,7 @@ def _generate_brand(rt: Runtime, spec: TaskSpec) -> dict:
                 spec.manuscript_type,
                 guide_text=guide,
                 stats=stats,
+                mode=(spec.generate_mode or "").strip(),
             )
         except Exception as exc:
             failed.append({"keyword": item["keyword"], "error": str(exc)})
@@ -394,6 +396,7 @@ def _generate_brand(rt: Runtime, spec: TaskSpec) -> dict:
             )
         made.append((m, stats))
 
+    tokens = dict(getattr(rt.llm, "usage", {}) or {})
     report = (
         Path(rt.settings.repo_root)
         / "docs"
@@ -420,7 +423,10 @@ def _generate_brand(rt: Runtime, spec: TaskSpec) -> dict:
             if made
             else f"{brand} 원고를 만들지 못했습니다"
         ),
-        "tokens": dict(getattr(rt.llm, "usage", {}) or {}),
+        "tokens": tokens,
+        # 2026-09 기준 추정 단가로 어림한 값이다 (실제 요금표 확인 필요)
+        "estimated_usd": estimate_cost(tokens),
+        "mode": (spec.generate_mode or bw.DEFAULT_MODE),
     }
 
 

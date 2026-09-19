@@ -69,6 +69,9 @@ class TaskSpec(BaseModel):
     brand: str = ""
     #: 원고유형 필터(시트 E열). `질문형` / `후기형` / 빈 값(전부)
     manuscript_type: str = ""
+    #: 브랜드 원고 생성 방식. 빈 값 = 기본(`brand_writer.DEFAULT_MODE`),
+    #: `combined` = 본문과 댓글 12개를 모델 호출 한 번으로 받는다 (`한번에`)
+    generate_mode: str = ""
     keyword: str = ""
     source: str = ""
     dry_run: bool = True

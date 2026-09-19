@@ -118,39 +118,45 @@ def test_load_pushed_keywords_limit(tmp_path):
 
 # --- 프롬프트 ---------------------------------------------------
 def test_body_prompt_carries_brand_rules():
+    # 브랜드 규칙은 캐시되는 고정부(system)에, 키워드·카페는 user에 들어간다
     system, user = build = bw.build_body_prompt("우아덤", KEYWORD, "씨씨앙")
     assert "쉼표" in system and "마침표" in system
-    assert "250자" in user
-    assert "3번" in user
-    assert "그린커피 아하바하" in user  # 본문 금칙어로 명시
-    assert "{키워드}" in user
-    assert "2번째 문단" in user
+    assert "250자" in system
+    assert "3번" in system
+    assert "그린커피 아하바하" in system  # 본문 금칙어로 명시
+    assert "{키워드}" in system
+    assert "2번째 문단" in system
+    assert KEYWORD in user and "씨씨앙" in user
+    assert KEYWORD not in system  # 키워드가 고정부에 섞이면 캐시가 깨진다
     assert build is not None
 
 
 def test_body_prompt_patsooni_review_type():
-    _, user = bw.build_body_prompt("팥순이", "곤약젤리", manuscript_type="후기형")
-    assert "300자" in user
-    assert "4번" in user
-    assert "{B/A}" in user
-    assert "1번째 문단" in user
+    system, user = bw.build_body_prompt("팥순이", "곤약젤리", manuscript_type="후기형")
+    assert "300자" in system
+    assert "4번" in system
+    assert "{B/A}" in system
+    assert "1번째 문단" in system
+    assert "곤약젤리" in user
 
 
 def test_comments_prompt_has_12_labels_and_limits():
-    _, user = bw.build_comments_prompt("우아덤", KEYWORD, "제목", BODY)
+    system, user = bw.build_comments_prompt("우아덤", KEYWORD, "제목", BODY)
     for label in bw.COMMENT_LABELS:
-        assert label in user
-    assert "30자를 넘지 않는다" in user
-    assert "70자를 넘지 않는다" in user
-    assert "대대댓글2 에서 처음 나온다" in user
+        assert label in system
+    assert "30자를 넘지 않는다" in system
+    assert "70자를 넘지 않는다" in system
+    assert "대대댓글2 에서 처음 나온다" in system
+    # user에는 이번 본문과 키워드만 (나머지는 캐시되는 고정부)
+    assert KEYWORD in user and "제목" in user
 
 
 def test_comments_prompt_brand_specific_bans():
-    _, user = bw.build_comments_prompt("장으뜸", "배란일 계산기", "제목", BODY)
-    assert "제품 이라는 낱말을 절대 쓰지 않는다" in user
-    assert "대대대댓글2에는 장으뜸" in user
+    system, _ = bw.build_comments_prompt("장으뜸", "배란일 계산기", "제목", BODY)
+    assert "제품 이라는 낱말을 절대 쓰지 않는다" in system
+    assert "대대대댓글2에는 장으뜸" in system
 
-    _, patsooni = bw.build_comments_prompt(
+    patsooni, _ = bw.build_comments_prompt(
         "팥순이", "곤약젤리", "제목", BODY, manuscript_type="질문형"
     )
     assert "50자를 넘지 않는다" in patsooni
@@ -259,8 +265,9 @@ def test_comments_prompt_forbids_retreat_and_gives_examples():
     system, user = bw.build_comments_prompt("우아덤", KEYWORD, "제목", BODY)
     assert "물러서지" in system and "좋은 보기 1)" in system and "좋은 보기 2)" in system
     assert "쓰게 된 계기" in system and "느낀 변화" in system
-    assert "제품보다 방법이 중요" in user and "참고만" in user
-    assert "프레임" in user  # 금칙어로 명시
+    assert "제품보다 방법이 중요" in system and "참고만" in system
+    assert "프레임" in system  # 금칙어로 명시
+    assert user
 
 
 def test_prompts_forbid_internal_terms():
@@ -294,13 +301,13 @@ def test_two_keywords_of_same_brand_get_different_personas():
 
 # --- 후기형 댓글 역할 -------------------------------------------
 def test_review_type_comments_prompt_states_roles():
-    _, user = bw.build_comments_prompt(
+    system, _ = bw.build_comments_prompt(
         "팥순이", "카무트효소", "제목", BODY, manuscript_type="후기형"
     )
-    assert "대댓글2 = 본문 작성자" in user
-    assert "대대댓글2 = 여분 댓글풀 계정" in user
-    assert "대대대댓글2 = 본문 작성자" in user
-    assert "되묻지 않는다" in user
+    assert "대댓글2 = 본문 작성자" in system
+    assert "대대댓글2 = 여분 댓글풀 계정" in system
+    assert "대대대댓글2 = 본문 작성자" in system
+    assert "되묻지 않는다" in system
 
 
 def test_author_labels_differ_by_manuscript_type():
@@ -445,7 +452,10 @@ def test_generate_regenerates_only_comments_when_body_passed():
     bw.generate_manuscript(llm, "우아덤", KEYWORD, stats=stats)
     assert llm.body_calls == 1  # 본문은 한 번만 만들었다
     assert stats["comment_attempts"] == 3
-    assert "직전 시도에서 어긴 규칙" in llm.calls[1][2]
+    # 재시도는 직전 12개를 되보내지 않고 걸린 자리만 다시 받는다
+    assert "<다시 쓸 자리>" in llm.calls[1][2]
+    assert "<어긴 규칙" in llm.calls[1][2]
+    assert BODY not in llm.calls[1][2]
 
 
 def test_generate_raises_when_model_errors():
@@ -577,3 +587,187 @@ def test_generate_brand_task_is_allowed():
     from v2r.command.spec import ALLOWED_TASKS
 
     assert "generate_brand" in ALLOWED_TASKS
+
+
+# --- 비용 절감: 부분 재시도 / 한 번에 모드 / 비용 표시 (2026-09-19) ---
+def test_failing_comment_labels_picks_only_broken_nodes():
+    m = _manuscript()
+    m.comments[2].text = "가" * 300  # 댓글2 길이 초과
+    labels = bw.failing_comment_labels(bw.validate(m))
+    assert "댓글2" in labels
+    assert "대댓글2" not in labels  # `댓글2`가 `대댓글2`를 끌고 오면 안 된다
+
+
+def test_merge_comments_replaces_only_given_labels():
+    m = _manuscript()
+    before = {c.label: c.text for c in m.comments}
+    merged = bw.merge_comments(m.comments, {"댓글2": "새로 쓴 댓글2", "대댓글4": "새 대댓글4"})
+    table = {c.label: c.text for c in merged}
+    assert table["댓글2"] == "새로 쓴 댓글2"
+    assert table["대댓글4"] == "새 대댓글4"
+    assert table["댓글1"] == before["댓글1"]
+    assert [c.label for c in merged] == list(bw.COMMENT_LABELS)
+    assert [c.depth for c in merged] == [c.depth for c in m.comments]
+
+
+def test_partial_retry_prompt_asks_only_for_failing_nodes():
+    system, user = bw.build_partial_retry_prompt(
+        "우아덤", KEYWORD, ["댓글2", "대댓글4"], ["댓글 글자 수 — 기준 30자, 실제 90자"]
+    )
+    assert "댓글2 대댓글4" in user
+    assert "90자" in user
+    assert "댓글1" not in user  # 멀쩡한 자리는 되보내지 않는다
+    assert BODY not in user
+    assert "30자를 넘지 않는다" in system  # 고정 규칙은 캐시되는 system 쪽
+
+
+def test_partial_retry_merges_instead_of_resending_everything():
+    """길이를 어긴 자리만 다시 받아 갈아 끼운다."""
+
+    class OneBadComment(FakeLLM):
+        def __init__(self):
+            super().__init__()
+            self.payloads = 0
+
+        def complete_json(self, purpose, system, user, max_tokens=1200):
+            if purpose == "brand_body":
+                return {"title": "제목", "body": BODY}
+            self.calls.append((purpose, system, user))
+            self.payloads += 1
+            if self.payloads == 1:
+                bad = dict(COMMENTS)
+                bad["댓글2"] = "가" * 300
+                return bad
+            return {"댓글2": COMMENTS["댓글2"]}  # 걸린 자리만 돌려준다
+
+    llm = OneBadComment()
+    stats: dict = {}
+    m = bw.generate_manuscript(llm, "우아덤", KEYWORD, stats=stats)
+    assert stats["comment_attempts"] == 2
+    table = {c.label: c.text for c in m.comments}
+    assert table["댓글2"] == COMMENTS["댓글2"]
+    assert table["댓글1"] == COMMENTS["댓글1"]  # 나머지는 그대로 남았다
+    assert not bw.violations(bw.validate(m), scope="댓글")
+
+
+def test_combined_mode_makes_one_call_and_validates_both():
+    class Combined(FakeLLM):
+        def __init__(self):
+            super().__init__()
+            self.n = 0
+
+        def complete_json(self, purpose, system, user, max_tokens=1200):
+            self.n += 1
+            self.calls.append((purpose, system, user))
+            return {
+                "title": "비타민C 잡티에 진짜 효과 있나요?ㅠㅠ",
+                "body": BODY,
+                "comments": dict(COMMENTS),
+            }
+
+    llm = Combined()
+    stats: dict = {}
+    m = bw.generate_manuscript(llm, "우아덤", KEYWORD, stats=stats, mode="combined")
+    assert llm.n == 1  # 본문 + 댓글을 한 번에
+    assert stats["mode"] == "combined"
+    assert len(m.comments) == 12 and m.body
+    assert not bw.failures(bw.validate(m))
+
+
+def test_combined_mode_falls_back_to_partial_retry():
+    class CombinedBadComment(FakeLLM):
+        def __init__(self):
+            super().__init__()
+            self.n = 0
+
+        def complete_json(self, purpose, system, user, max_tokens=1200):
+            self.n += 1
+            self.calls.append((purpose, system, user))
+            if self.n == 1:
+                bad = dict(COMMENTS)
+                bad["댓글2"] = "가" * 300
+                return {"title": "제목", "body": BODY, "comments": bad}
+            return {"댓글2": COMMENTS["댓글2"]}
+
+    llm = CombinedBadComment()
+    stats: dict = {}
+    m = bw.generate_manuscript(llm, "우아덤", KEYWORD, stats=stats, mode="combined")
+    assert llm.n == 2
+    assert "<다시 쓸 자리>" in llm.calls[-1][2]  # 두 번째는 부분 재시도였다
+    assert {c.label: c.text for c in m.comments}["댓글2"] == COMMENTS["댓글2"]
+    assert stats["body_attempts"] == 1 and stats["comment_attempts"] == 1
+
+
+def test_combined_prompt_holds_both_rule_sets():
+    system, user = bw.build_combined_prompt("우아덤", KEYWORD)
+    assert "## 본문 규칙" in system and "## 댓글 규칙" in system
+    assert "250자" in system and "30자를 넘지 않는다" in system
+    assert KEYWORD in user and KEYWORD not in system
+
+
+def test_default_mode_is_single():
+    assert bw.DEFAULT_MODE == "single"
+
+
+def test_stats_carry_tokens_and_cost():
+    class Counting(FakeLLM):
+        def __init__(self):
+            super().__init__()
+            self.usage = {"by_model": {}}
+
+        def complete_json(self, purpose, system, user, max_tokens=1200):
+            slot = self.usage["by_model"].setdefault(
+                "claude-sonnet-5",
+                {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                },
+            )
+            slot["input_tokens"] += 1000
+            slot["output_tokens"] += 500
+            slot["cache_read_input_tokens"] += 4000
+            self.usage["input_tokens"] = self.usage.get("input_tokens", 0) + 1000
+            self.usage["output_tokens"] = self.usage.get("output_tokens", 0) + 500
+            self.usage["cache_read_input_tokens"] = (
+                self.usage.get("cache_read_input_tokens", 0) + 4000
+            )
+            return super().complete_json(purpose, system, user, max_tokens)
+
+    llm = Counting()
+    stats: dict = {}
+    bw.generate_manuscript(llm, "우아덤", KEYWORD, stats=stats)
+    assert stats["input_tokens"] == 2000
+    assert stats["output_tokens"] == 1000
+    assert stats["cache_read_input_tokens"] == 8000
+    assert stats["cache_creation_input_tokens"] == 0
+    # 2 * (1000*3 + 500*15 + 4000*0.30) / 1e6 = 2 * 11700 / 1e6
+    assert stats["estimated_usd"] == pytest.approx(0.0234)
+
+
+def test_parser_reads_combined_mode():
+    assert parse_korean_command("우아덤 원고 2개 한번에 만들어줘").generate_mode == "combined"
+    assert parse_korean_command("우아덤 원고 2개 만들어줘").generate_mode == ""
+
+
+def test_worker_reply_has_estimated_cost(tmp_path, monkeypatch):
+    from tests.test_engine import make_runtime
+
+    rt = make_runtime(tmp_path)
+    rt.settings.repo_root = tmp_path
+    llm = FakeLLM()
+    llm.usage = {"input_tokens": 1_000_000, "output_tokens": 0, "by_model": {}}
+    rt._llm = llm
+    rt._llm_ready = True
+    monkeypatch.setattr(
+        "v2r.sources.keyword_list.load_pushed_keywords",
+        lambda brand, cfg=None, xlsx_path=None, limit=0: [
+            {"keyword": KEYWORD, "cafe": "씨씨앙"}
+        ],
+    )
+    out = worker._generate_brand(rt, parse_korean_command("우아덤 원고 1개 만들어줘"))
+    assert out["ok"] is True
+    assert out["estimated_usd"] == pytest.approx(3.0)
+    assert out["mode"] == "single"
+    rt.close()
