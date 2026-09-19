@@ -730,6 +730,33 @@ def _match_by_filename(originals: list[Path], keyword: str) -> list[Path]:
     return [p for p in originals if re.sub(r"\s+", "", p.stem).casefold() == key]
 
 
+def notify_photo_shortage(
+    rt: Runtime, spec: TaskSpec, brand: str, folder: str, need: int, have: int
+) -> bool:
+    """사진이 모자랄 때 "생성할까요?" 안내를 보낸다 (자동 생성하지 않는다).
+
+    사용자 규칙(2026-09-19): 사진은 폴더에 있는 걸 먼저 쓰고, 모자랄 때만 생성하되
+    **생성 전에 먼저 물어본다.** 같은 브랜드/폴더는 한 실행에서 한 번만 알린다.
+    모의 실행에서는 알리지 않는다.
+    """
+    if getattr(spec, "dry_run", True):
+        return False
+    seen = rt.scratch.setdefault("photo_shortage_notified", set())
+    key = (str(brand), str(folder))
+    if key in seen:
+        return False
+    seen.add(key)
+    from v2r.channels import notify_all
+
+    command = f"사진 생성 승인 {brand} {folder} {max(int(need or 1), 1)}장"
+    notify_all(
+        rt.channels,
+        f"사진 부족: 브랜드 {brand} / {folder} 폴더 — 필요 {need}장, 사용 가능 {have}장."
+        f" 생성하려면 '{command}' 이라고 보내세요.",
+    )
+    return True
+
+
 def pick_images(rt: Runtime, m: Manuscript, spec: TaskSpec, need: int) -> list[Path]:
     """플레이스홀더 토큰별로 키워드/토큰 폴더에서 미사용 세탁본을 고른다.
 
@@ -773,6 +800,7 @@ def pick_images(rt: Runtime, m: Manuscript, spec: TaskSpec, need: int) -> list[P
             break
         if picked is None:
             folder = wh.keyword_folder(brand, m.keyword or token, cfg=cfg, token=token)
+            notify_photo_shortage(rt, spec, brand, folder.name, need, len(out))
             raise PublishError(
                 f"사진이 부족합니다 (브랜드 {brand} '{token}' 폴더 {folder.name}의"
                 " 미사용 세탁본 없음)"
@@ -780,6 +808,8 @@ def pick_images(rt: Runtime, m: Manuscript, spec: TaskSpec, need: int) -> list[P
         out.append(picked)
 
     if len(out) < need:
+        folder = wh.keyword_folder(brand, m.keyword or "", cfg=cfg)
+        notify_photo_shortage(rt, spec, brand, folder.name, need, len(out))
         raise PublishError(f"사진이 부족합니다 (필요 {need}장, 사용 가능 {len(out)}장)")
     return out
 
@@ -1253,30 +1283,17 @@ def _take_daily(rt: Runtime, cafe_name: str = "", dry_run: bool = True) -> Manus
     return picked
 
 
-def _attach_images(rt: Runtime, slot: Slot, browser_page: Any) -> list[dict]:
-    """이미지가 있으면 SE-ONE 붙여넣기로 컴포넌트를 얻는다."""
+def _attach_images(rt: Runtime, slot: Slot, browser_page: Any = None) -> list[dict]:
+    """이미지가 있으면 **업로드 API**로 올려 SE-ONE 이미지 컴포넌트를 얻는다.
+
+    (2026-09-19) 브라우저 SE-ONE 붙여넣기는 V2R의 자동화 감지에 막혀 쓰지 않는다.
+    `POST /naver_cafe_articles/upload_image` → S3 → 컴포넌트 (`v2r/api/images.py`).
+    """
     if not slot.images:
         return []
-    if browser_page is None:
-        raise PublishError("이미지 첨부에는 브라우저 세션이 필요합니다")
-    from v2r.browser.seone_paste import attach_images_via_paste
+    from v2r.api.images import upload_images
 
-    # 화면의 선택창은 정식 이름을 쓴다 → 줄임말(쌍둥이맘)이 아니라 카탈로그 이름(쌍둥이맘 모여라)을 넘긴다
-    cafe_name, board_name = slot.cafe, slot.board
-    try:
-        cafe_obj, menu_obj, _head = rt.catalog.resolve(slot.cafe, slot.board, slot.account)
-        cafe_name = getattr(cafe_obj, "name", None) or cafe_name
-        board_name = getattr(menu_obj, "name", None) or board_name
-    except Exception:
-        pass
-    return attach_images_via_paste(
-        browser_page,
-        rt.settings.v2r_site,
-        cafe_name,
-        slot.account,
-        board_name,
-        list(slot.images),
-    )
+    return upload_images(rt.client, list(slot.images))
 
 
 def _keyword_tags(m: Manuscript) -> list[str]:
@@ -1658,6 +1675,7 @@ __all__ = [
     "find_cafe_entry",
     "load_accounts",
     "load_manuscripts",
+    "notify_photo_shortage",
     "plan",
     "prepare_manuscripts",
     "prepare_per_cafe",

@@ -256,3 +256,13 @@ GET /naver_cafes/heads?cafe_id=…&naver_login_id=…&menu_id=…  → 말머리
 - 빠진 필드는 422 `{"detail":[{"type":"missing","loc":["body","menu_id"]...}]}` 로 알려준다.
 - 이미 발행(SUCCESS)된 글도 제목·본문 교체가 통과했다 (씨씨앙 01M2VDPPA8P01A73GMYPFY9Y29). 재조회로 반영 확인.
 - 코드: `v2r/api/articles.py::update_article`.
+
+## 11. 이미지 업로드 (실측 확정 2026-09-19) — 브라우저 불필요
+
+1. `POST /naver_cafe_articles/upload_image` `{"file_extension":"jpg","file_name":"<이름>"}` → `{"result":{"url":"https://v2r-s3-prod.s3.amazonaws.com/","fields":{key, policy, x-amz-*}}}`
+2. `fields` 전부 + `file`을 그 `url`에 multipart POST → 204. 최종 주소 = `url + fields.key`.
+3. `content_json`의 이미지 컴포넌트: `@ctype: image`, `src`(S3 주소), `domain`, `path`, `fileName`, `fileSize`, `width/height/originalWidth/originalHeight`, `origin.srcFrom: local` (실물 글 구조와 동일). 코드 `v2r/api/images.py`.
+4. 검증: 실발행 01M2VN6X1VXBTXH3RXYJJH4H1Q 재조회 시 이미지 1장 확인.
+
+### 브라우저(SE-ONE 붙여넣기) 경로는 폐기
+- V2R가 자동화 브라우저 지문을 감지해 로그인·토큰 갱신을 403(AUTOMATION_DETECTED)으로 거부한다. 감지 우회는 하지 않는다(보안 규칙). 이미지는 위 API로 첨부한다.

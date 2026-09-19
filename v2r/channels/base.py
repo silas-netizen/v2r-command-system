@@ -36,6 +36,14 @@ class Channel(Protocol):
         """허용된 모든 대화방에 보고 문장을 보낸다. 성공 건수 반환."""
         ...
 
+    def send_photo(self, chat_id: str, path: Any, caption: str = "") -> bool:
+        """사진 파일 한 장을 보낸다. 사진을 못 보내는 채널은 그냥 False."""
+        return False
+
+    def broadcast_photo(self, path: Any, caption: str = "") -> int:
+        """허용된 모든 대화방에 사진을 보낸다. 사진 미지원 채널은 0."""
+        return 0
+
 
 def format_report(
     job_id: int | str,

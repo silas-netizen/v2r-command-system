@@ -197,10 +197,23 @@ def request_photos(rt: Any, brand: str, keyword: str, n: int = DEFAULT_PROMPT_CO
     }
 
 
-def collect_new(wh: Warehouse | None = None, variants: int = NEW_PHOTO_VARIANTS) -> dict:
+def _same_name(a: str, b: str) -> bool:
+    """폴더 이름 비교 (공백·안전이름 차이를 무시한다)."""
+    return safe_name(str(a or "")).replace(" ", "") == safe_name(str(b or "")).replace(" ", "")
+
+
+def collect_new(
+    wh: Warehouse | None = None,
+    variants: int = NEW_PHOTO_VARIANTS,
+    brand: str = "",
+    keyword: str = "",
+) -> dict:
     """`inbox/new/<브랜드>/<키워드>/**`를 원본으로 적재하고 즉시 세탁한다.
 
     적재한 파일은 `inbox/new/_done/` 아래로 옮겨 다음 실행에서 다시 읽지 않는다.
+
+    `brand`(그리고 `keyword`)를 주면 그 폴더만 적재한다 — 사진 승인 흐름에서
+    "방금 승인한 폴더만" 세탁·적재하기 위한 필터다.
     """
     from v2r.warehouse.photo_washer import make_variants
 
@@ -223,11 +236,23 @@ def collect_new(wh: Warehouse | None = None, variants: int = NEW_PHOTO_VARIANTS)
     if not base.is_dir():
         return stats
 
+    want_brand = (brand_folder_name(brand, cfg) or brand) if brand else ""
+    want_folder = (keyword or "").strip()
+    if want_brand:
+        stats["brand"] = want_brand
+    if want_folder:
+        stats["folder"] = want_folder
+
     done_root = base / "_done"
     for brand_dir in sorted(p for p in base.iterdir() if p.is_dir()):
         if brand_dir.name.startswith("_"):
             continue
-        brand = brand_folder_name(brand_dir.name, cfg) or brand_dir.name
+        brand_name = brand_folder_name(brand_dir.name, cfg) or brand_dir.name
+        if want_brand and not (
+            _same_name(brand_dir.name, want_brand) or _same_name(brand_name, want_brand)
+        ):
+            continue
+        brand = brand_name
         targets = [(p, p.name) for p in sorted(brand_dir.iterdir()) if p.is_dir()]
         if any(
             p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES for p in brand_dir.iterdir()
@@ -235,6 +260,8 @@ def collect_new(wh: Warehouse | None = None, variants: int = NEW_PHOTO_VARIANTS)
             # 브랜드 폴더 바로 아래 놓인 파일은 키워드 폴더로 본다
             targets.append((brand_dir, KEYWORD_FOLDER))
         for keyword_dir, folder in targets:
+            if want_folder and not _same_name(folder, want_folder):
+                continue
             added = made = 0
             scan = keyword_dir.iterdir() if keyword_dir == brand_dir else keyword_dir.rglob("*")
             for path in sorted(p for p in scan if p.is_file()):
@@ -270,6 +297,54 @@ def collect_new(wh: Warehouse | None = None, variants: int = NEW_PHOTO_VARIANTS)
     return stats
 
 
+def reject_new(wh: Warehouse | None = None, brand: str = "", keyword: str = "") -> dict:
+    """반려된 사진을 지운다. **`inbox/new/` 안에서만** 지우고 원본·세탁본은 건드리지 않는다."""
+    wh = wh or Warehouse()
+    wh.ensure_dirs()
+    cfg = load_brands_config()
+    brand_name = (brand_folder_name(brand, cfg) or brand or "").strip()
+    folder = (keyword or "").strip() or KEYWORD_FOLDER
+    out: dict[str, Any] = {
+        "ok": True,
+        "brand": brand_name,
+        "folder": folder,
+        "removed": 0,
+        "errors": [],
+    }
+    if not brand_name:
+        out["ok"] = False
+        out["errors"].append("반려할 브랜드를 알 수 없습니다")
+        return out
+
+    target = drop_folder(wh.root, brand_name, folder)
+    out["path"] = str(target)
+    inbox_root = wh.root
+    for part in NEW_INBOX:
+        inbox_root = inbox_root / part
+    try:
+        # 안전장치: 반드시 inbox/new 아래여야 한다
+        target.resolve().relative_to(inbox_root.resolve())
+    except Exception:
+        out["ok"] = False
+        out["errors"].append("인박스 밖 폴더는 지우지 않습니다")
+        return out
+    if not target.is_dir():
+        out["message"] = "지울 사진이 없습니다 (인박스 폴더 없음)"
+        return out
+
+    for path in sorted(p for p in target.rglob("*") if p.is_file()):
+        if path.suffix.lower() not in IMAGE_SUFFIXES:
+            continue
+        try:
+            path.unlink()
+        except OSError as exc:
+            out["errors"].append(f"{path.name}: {exc}")
+        else:
+            out["removed"] += 1
+    out["ok"] = not out["errors"]
+    return out
+
+
 def _archive(path: Path, source_root: Path, done_dir: Path) -> None:
     """처리한 인박스 파일을 `_done` 폴더로 옮긴다 (실패해도 무시)."""
     try:
@@ -295,5 +370,6 @@ __all__ = [
     "build_gpt_prompts",
     "collect_new",
     "drop_folder",
+    "reject_new",
     "request_photos",
 ]

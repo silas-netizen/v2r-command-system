@@ -150,6 +150,44 @@ class TelegramChannel:
         """허용된 모든 chat_id에 보고를 보낸다."""
         return sum(1 for chat_id in sorted(self.allowed_chat_ids) if self.send(chat_id, text))
 
+    def send_photo(self, chat_id: str, path: Any, caption: str = "") -> bool:
+        """sendPhoto(multipart)로 사진 한 장을 보낸다. 실패하면 False."""
+        if not self.enabled:
+            return False
+        chat_id = str(chat_id)
+        if chat_id not in self.allowed_chat_ids:
+            log.warning("허용되지 않은 텔레그램 chat_id 발신 차단: %s", chat_id)
+            return False
+        photo = Path(path)
+        if not photo.is_file():
+            log.warning("보낼 사진 파일이 없습니다: %s", photo.name)
+            return False
+        url = f"{API_BASE}/bot{self.token}/sendPhoto"
+        data = {"chat_id": chat_id, "caption": (caption or "")[:1024]}
+        try:
+            with photo.open("rb") as fh:
+                files = {"photo": (photo.name, fh, "image/jpeg")}
+                if self._client is not None:
+                    resp = self._client.post(url, data=data, files=files, timeout=TIMEOUT)
+                else:
+                    with httpx.Client(timeout=TIMEOUT) as client:
+                        resp = client.post(url, data=data, files=files, timeout=TIMEOUT)
+            resp.raise_for_status()
+            payload = resp.json()
+        except httpx.HTTPStatusError as exc:
+            log.warning("텔레그램 sendPhoto HTTP %s", exc.response.status_code)
+            return False
+        except Exception as exc:
+            log.warning("텔레그램 sendPhoto 실패: %s", self._mask(str(exc)))
+            return False
+        return isinstance(payload, dict) and bool(payload.get("ok"))
+
+    def broadcast_photo(self, path: Any, caption: str = "") -> int:
+        """허용된 모든 chat_id에 사진을 보낸다. 성공 건수 반환."""
+        return sum(
+            1 for chat_id in sorted(self.allowed_chat_ids) if self.send_photo(chat_id, path, caption)
+        )
+
 
 def _default_data_dir() -> Path:
     """설정의 data 폴더. 설정 로드 실패 시 저장소 기준 기본값."""

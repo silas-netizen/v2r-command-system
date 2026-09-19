@@ -20,6 +20,7 @@ __all__ = [
     "TelegramChannel",
     "build_channels",
     "notify_all",
+    "notify_photo_all",
 ]
 
 
@@ -83,4 +84,18 @@ def notify_all(channels: list[Channel], text: str) -> int:
             sent += int(channel.broadcast(sanitize(text)) or 0)
         except Exception as exc:  # 알림 실패로 본 작업이 죽지 않게
             log.warning("채널 %s 보고 실패: %s", getattr(channel, "name", "?"), exc)
+    return sent
+
+
+def notify_photo_all(channels: list[Channel], path: Any, caption: str = "") -> int:
+    """모든 채널에 사진 한 장을 보낸다. 사진을 못 보내는 채널은 건너뛴다."""
+    sent = 0
+    for channel in channels or []:
+        fn = getattr(channel, "broadcast_photo", None)
+        if not callable(fn):
+            continue
+        try:
+            sent += int(fn(path, sanitize(caption)) or 0)
+        except Exception as exc:  # 사진 전송 실패로 본 작업이 죽지 않게
+            log.warning("채널 %s 사진 전송 실패: %s", getattr(channel, "name", "?"), exc)
     return sent

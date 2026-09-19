@@ -79,6 +79,11 @@ def ensure_logged_in(
     if not _login_needed(page):
         return True
 
+    # 규칙(2026-09-19): 로그인은 프로그램이 스스로 처리한다 — 비밀번호를 화면에 치지 않고,
+    # API 로그인으로 받은 갱신 쿠키(refresh_token)를 브라우저에 넣어 세션을 만든다.
+    if inject_api_session(page, base):
+        return True
+
     print(LOGIN_PROMPT)
     deadline = time.monotonic() + max_wait_seconds
     while time.monotonic() < deadline:
@@ -86,6 +91,46 @@ def ensure_logged_in(
         if not _login_needed(page):
             return True
     raise TimeoutError(f"로그인 대기 시간 초과({max_wait_seconds}초). {LOGIN_PROMPT}.")
+
+
+API_HOST = "api-v2r.daboja.im"
+
+
+def inject_api_session(page, base: str) -> bool:
+    """API 로그인 → `refresh_token` 쿠키를 브라우저 컨텍스트에 넣고 사이트를 다시 연다.
+
+    값은 기록하지 않는다. 성공하면 True(로그인 화면이 사라짐), 실패하면 False.
+    """
+    try:
+        from v2r.config import get_settings
+        from v2r.engine.context import Runtime
+
+        st = get_settings()
+        rt = Runtime.open(st)
+        http = rt.client._client
+        rt.client.auth.login(http, st.v2r_email, st.v2r_password)
+        cookies = [
+            {
+                "name": c.name,
+                "value": c.value,
+                "domain": c.domain,
+                "path": c.path or "/",
+                "httpOnly": True,
+                "secure": True,
+                "sameSite": "None",
+            }
+            for c in http.cookies.jar
+            if c.name == "refresh_token"
+        ]
+        if not cookies:
+            return False
+        page.context.add_cookies(cookies)
+        page.goto(f"{base}/nc/board?view=list", wait_until="domcontentloaded")
+        page.wait_for_timeout(2500)
+        return not _login_needed(page)
+    except Exception as exc:  # 실패하면 사용자 로그인 대기로 넘어간다
+        print(f"자동 로그인 실패: {type(exc).__name__}")
+        return False
 
 
 def _login_needed(page) -> bool:

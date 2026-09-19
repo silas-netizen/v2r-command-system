@@ -11,6 +11,7 @@ import socket
 import time
 import uuid
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from v2r.channels import format_report, notify_all
@@ -280,6 +281,124 @@ def _generate_affiliate_daily(rt: Runtime, spec: TaskSpec) -> dict:
     return out
 
 
+#: 브랜드 지침 파일 이름에 들어가는 브랜드 표시 (지침 폴더에서 원문을 찾을 때 쓴다)
+BRAND_GUIDE_DIR = "★NEW 카페 바이럴★"
+
+
+def _brand_guide_text(rt: Runtime, brand: str, manuscript_type: str = "") -> str:
+    """브랜드 지침 원문. 못 찾으면 빈 문자열."""
+    root = Path(rt.warehouse.guides_dir) / BRAND_GUIDE_DIR
+    if not root.exists():
+        return ""
+    want_review = (manuscript_type or "").strip() == "후기형"
+    best = ""
+    for path in sorted(root.glob("*.md")):
+        if brand not in path.name:
+            continue
+        is_review = "후기형" in path.name
+        if want_review != is_review and best:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if want_review == is_review:
+            return text
+        best = best or text
+    return best
+
+
+def _existing_brand_keywords(rt: Runtime, brand: str) -> set[str]:
+    """이미 원고가 있는 키워드 (시트 캐시 + 생성 폴더)."""
+    import re as _re
+
+    from v2r.sources.sheets import parse_affiliate_rows
+
+    out: set[str] = set()
+    cached = rt.sources_cache.get(brand)
+    rows = (cached or {}).get("rows") if isinstance(cached, dict) else None
+    if rows:
+        for m in parse_affiliate_rows(rows, source=brand):
+            if m.keyword:
+                out.add(_re.sub(r"\s+", "", m.keyword))
+    folder = Path(rt.settings.warehouse_dir) / "manuscripts" / "generated" / brand
+    if folder.exists():
+        for path in folder.glob("*.json"):
+            out.add(_re.sub(r"\s+", "", path.stem))
+    return out
+
+
+def _generate_brand(rt: Runtime, spec: TaskSpec) -> dict:
+    """브랜드 시트 `노출 현황`의 `밀려남` 키워드로 새 원고를 만든다 (발행·시트 쓰기 없음)."""
+    import re as _re
+
+    from v2r.content import brand_writer as bw
+    from v2r.sources.keyword_list import load_pushed_keywords
+
+    brand = (spec.brand or "").strip()
+    if not brand:
+        return {"ok": False, "error": "브랜드를 알 수 없습니다 (예: `우아덤 원고 1개 만들어줘`)"}
+    if rt.llm is None:
+        return {"ok": False, "error": "ANTHROPIC_API_KEY가 없어 원고를 생성할 수 없습니다"}
+
+    count = spec.count or 1
+    xlsx = Path(rt.settings.repo_root) / "data" / f"brand_sheet_{brand}.xlsx"
+    try:
+        pool = load_pushed_keywords(
+            brand, rt.sources_cfg, xlsx_path=str(xlsx) if xlsx.exists() else None
+        )
+    except Exception as exc:
+        return {"ok": False, "error": f"키워드 목록을 읽지 못했습니다: {exc}"}
+
+    done = _existing_brand_keywords(rt, brand)
+    todo = [p for p in pool if _re.sub(r"\s+", "", p["keyword"]) not in done][:count]
+    if not todo:
+        return {"ok": False, "error": f"{brand}: 새로 쓸 `밀려남` 키워드가 없습니다"}
+
+    guide = _brand_guide_text(rt, brand, spec.manuscript_type)
+    made: list[Any] = []
+    failed: list[dict] = []
+    out_dir = Path(rt.settings.warehouse_dir) / "manuscripts" / "generated" / brand
+    for item in todo:
+        try:
+            m = bw.generate_manuscript(
+                rt,
+                brand,
+                item["keyword"],
+                item.get("cafe", ""),
+                spec.manuscript_type,
+                guide_text=guide,
+            )
+        except Exception as exc:
+            failed.append({"keyword": item["keyword"], "error": str(exc)})
+            continue
+        bw.save_json(m, out_dir / f"{item['keyword']}.json")
+        made.append(m)
+
+    report = (
+        Path(rt.settings.repo_root)
+        / "docs"
+        / "reports"
+        / f"brand-draft-{brand}-{spec.start_date}.md"
+    )
+    if made:
+        bw.write_review_md(made, report, title=f"브랜드 원고 초안 — {brand} ({spec.start_date})")
+    return {
+        "ok": bool(made),
+        "brand": brand,
+        "generated": len(made),
+        "failed": failed,
+        "keywords": [m.keyword for m in made],
+        "report": str(report) if made else "",
+        "message": (
+            f"{brand} 원고 {len(made)}건을 만들었습니다. 검토용 문서: {report}"
+            if made
+            else f"{brand} 원고를 만들지 못했습니다"
+        ),
+        "tokens": dict(getattr(rt.llm, "usage", {}) or {}),
+    }
+
+
 def _generate_daily(rt: Runtime, spec: TaskSpec) -> dict:
     """짧은 일상 글을 만들어 창고 풀에 쌓는다 (결정 2)."""
     from v2r.warehouse import daily_generator
@@ -428,16 +547,101 @@ def _request_photos(rt: Runtime, spec: TaskSpec) -> dict:
     return request_photos(rt, brand, getattr(spec, "keyword", "") or spec.source or "")
 
 
+def _photo_stock(rt: Runtime, brand: str, folder: str) -> dict:
+    """브랜드/폴더의 사진 재고 (원본·세탁본·미사용). 없으면 0."""
+    from v2r.warehouse import stock
+    from v2r.warehouse.store import _squash
+
+    try:
+        used = stock.used_variants(rt.conn)
+    except Exception:  # pragma: no cover - DB가 없을 때
+        used = set()
+    rows = stock.inventory(rt.warehouse, used)
+    want_brand, want_folder = _squash(brand), _squash(folder)
+    for row in rows:
+        if _squash(row["brand"]) != want_brand:
+            continue
+        if want_folder and _squash(row["folder"]) != want_folder:
+            continue
+        return row
+    return {"brand": brand, "folder": folder, "originals": 0, "variants": 0, "used": 0, "unused": 0}
+
+
+def photo_approval_command(brand: str, folder: str, count: int) -> str:
+    """사진 생성 승인 명령 문구 (부족 알림·재고 보고에서 같은 문장을 쓴다)."""
+    return f"사진 생성 승인 {brand} {folder} {max(int(count or 1), 1)}장"
+
+
 def _generate_photos(rt: Runtime, spec: TaskSpec) -> dict:
-    """ChatGPT 웹앱(구독)으로 사진을 직접 만들고 적재 + 세탁까지 한다."""
+    """사진 생성. **승인(`사진 생성 승인 …`)이 있어야만** 실제로 만든다.
+
+    승인이 없으면 만들지 않고 그 폴더의 재고만 알려 준다 (사용자 규칙 2026-09-19).
+    승인이 있으면 `collect=False`로 만들어 인박스에 둔 채 사진 승인을 다시 받는다.
+    """
+    from v2r.channels import notify_photo_all
     from v2r.warehouse.gpt_images import generate_batch
+    from v2r.warehouse.store import KEYWORD_FOLDER
 
     brand = spec.brand or ""
     if not brand:
         return {"ok": False, "error": "사진을 만들 브랜드를 알 수 없습니다 (`브랜드 X`를 넣어 주세요)"}
     keyword = getattr(spec, "keyword", "") or spec.source or ""
+    folder = keyword or KEYWORD_FOLDER
     count = spec.count or 1
-    out = generate_batch(brand, keyword, count, warehouse=rt.warehouse)
+
+    if not getattr(spec, "approved", False):
+        # 승인 전 — 만들지 않는다. 재고만 알려 주고 승인 명령을 안내한다.
+        row = _photo_stock(rt, brand, folder)
+        lines = [
+            f"사진 재고: 브랜드 {brand} / {folder} 폴더 — 원본 {row['originals']}장,"
+            f" 세탁본 {row['variants']}장, 미사용 세탁본 {row['unused']}장"
+        ]
+        enough = int(row["unused"]) >= count
+        if enough:
+            lines.append(f"필요 {count}장은 지금 재고로 충분합니다. 생성하지 않았습니다.")
+        else:
+            lines.append(
+                f"필요 {count}장보다 모자랍니다. 생성하려면"
+                f" '{photo_approval_command(brand, folder, count)}' 이라고 보내세요."
+            )
+        message = "\n".join(lines)
+        notify_all(rt.channels, message)
+        return {
+            "ok": True,
+            "approved": False,
+            "generated": 0,
+            "brand": brand,
+            "keyword": folder,
+            "stock": row,
+            "enough": enough,
+            "message": message,
+        }
+
+    out = generate_batch(brand, folder, count, warehouse=rt.warehouse, collect=False)
+    files = [str(p) for p in (out.get("files") or [])]
+    if files:
+        # 세탁·적재 전이다. 사용자에게 사진을 보여 주고 승인/반려를 받는다.
+        brand_name = out.get("brand") or brand
+        folder_name = out.get("keyword") or folder
+        photo_sent = 0
+        for index, path in enumerate(files, start=1):
+            caption = (
+                f"{brand_name}/{folder_name} {index}/{len(files)}"
+                f" — 승인: '사진 승인 {brand_name} {folder_name}'"
+                f" / 반려: '사진 반려 {brand_name} {folder_name}'"
+            )
+            sent_one = notify_photo_all(rt.channels, path, caption)
+            if not sent_one:
+                # 사진 전송이 안 되는 채널뿐이면 경로만 글로 알린다
+                notify_all(rt.channels, f"{caption}\n{path}")
+            photo_sent += sent_one
+        out["photo_sent"] = photo_sent
+        out["pending_approval"] = True
+        out["message"] = (
+            f"사진 {len(files)}장을 만들었습니다 (아직 세탁·적재 전)."
+            f" 승인: '사진 승인 {brand_name} {folder_name}'"
+            f" / 반려: '사진 반려 {brand_name} {folder_name}'"
+        )
     if out.get("login_pending"):
         notify_all(rt.channels, f"ChatGPT {out['message']}")
     elif out.get("limited"):
@@ -445,8 +649,47 @@ def _generate_photos(rt: Runtime, spec: TaskSpec) -> dict:
     elif out.get("generated"):
         notify_all(
             rt.channels,
-            f"GPT 사진 {out['generated']}장 생성 (브랜드 {out['brand']} / {out['keyword']})",
+            out.get("message")
+            or f"GPT 사진 {out['generated']}장 생성 (브랜드 {out['brand']} / {out['keyword']})",
         )
+    return out
+
+
+def _approve_photos(rt: Runtime, spec: TaskSpec) -> dict:
+    """`사진 승인 <브랜드> <키워드>` — 그 인박스 폴더만 적재 + 세탁한다."""
+    from v2r.warehouse.photo_request import collect_new
+    from v2r.warehouse.store import KEYWORD_FOLDER
+
+    brand = spec.brand or ""
+    if not brand:
+        return {"ok": False, "error": "승인할 브랜드를 알 수 없습니다 (`사진 승인 우아덤 키워드`)"}
+    folder = getattr(spec, "keyword", "") or KEYWORD_FOLDER
+    stats = collect_new(rt.warehouse, brand=brand, keyword=folder)
+    stats["brand"] = brand
+    stats["folder"] = folder
+    stats["message"] = (
+        f"사진 승인: 브랜드 {brand} / {folder} 폴더 — 원본 {stats.get('added', 0)}장 적재,"
+        f" 세탁본 {stats.get('variants', 0)}장 생성"
+    )
+    notify_all(rt.channels, stats["message"])
+    return stats
+
+
+def _reject_photos(rt: Runtime, spec: TaskSpec) -> dict:
+    """`사진 반려 <브랜드> <키워드>` — 그 인박스 폴더의 사진만 지운다."""
+    from v2r.warehouse.photo_request import reject_new
+    from v2r.warehouse.store import KEYWORD_FOLDER
+
+    brand = spec.brand or ""
+    if not brand:
+        return {"ok": False, "error": "반려할 브랜드를 알 수 없습니다 (`사진 반려 우아덤 키워드`)"}
+    folder = getattr(spec, "keyword", "") or KEYWORD_FOLDER
+    out = reject_new(rt.warehouse, brand=brand, keyword=folder)
+    out["message"] = (
+        f"사진 반려: 브랜드 {out.get('brand') or brand} / {out.get('folder') or folder} 폴더 —"
+        f" {out.get('removed', 0)}장 삭제 (원본·세탁본은 그대로)"
+    )
+    notify_all(rt.channels, out["message"])
     return out
 
 
@@ -686,7 +929,7 @@ def _run_publish(
     if paced:
         # 카페끼리 나란히 진행하도록 카페별로 번갈아 실행한다 (규칙 §4)
         slots = order_round_robin(slots)
-    need_browser = (not spec.dry_run) and any(s.images for s in slots)
+    need_browser = False  # 이미지는 업로드 API로 첨부한다(브라우저 불필요, 2026-09-19)
     results: list[dict] = []
     failures: list[str] = []
     failed_slots: list[tuple[Any, str]] = []
@@ -870,6 +1113,8 @@ def dispatch(rt: Runtime, job: Any, owner: str | None = None) -> dict:
     if task == "sync_all_sources":
         out = _sync_entries(rt, spec, all_kinds=True)
         return {"ok": not out.get("errors"), **out}
+    if task == "generate_brand":
+        return _generate_brand(rt, spec)
     if task == "generate_affiliate_daily":
         return _generate_affiliate_daily(rt, spec)
     if task == "generate_daily":
@@ -882,6 +1127,10 @@ def dispatch(rt: Runtime, job: Any, owner: str | None = None) -> dict:
         return _collect_new_photos(rt, spec)
     if task == "generate_photos":
         return _generate_photos(rt, spec)
+    if task == "approve_photos":
+        return _approve_photos(rt, spec)
+    if task == "reject_photos":
+        return _reject_photos(rt, spec)
     if task == "gpt_keepalive":
         return _gpt_keepalive(rt, spec)
     if task == "request_photos":

@@ -18,12 +18,15 @@ ALLOWED_TASKS: frozenset[str] = frozenset(
         "reconcile",
         "sync_all_sources",
         "sync_sources",
+        "generate_brand",
         "generate_affiliate_daily",
         "generate_daily",
         "collect_daily",
         "collect_photos",
         "collect_new_photos",
         "generate_photos",
+        "approve_photos",
+        "reject_photos",
         "gpt_keepalive",
         "request_photos",
         "wash_photos",
@@ -69,6 +72,8 @@ class TaskSpec(BaseModel):
     keyword: str = ""
     source: str = ""
     dry_run: bool = True
+    #: `사진 생성 승인 …` — 사용자가 사진 생성을 명시적으로 승인했는가
+    approved: bool = False
     immediate: bool = False
     #: `카페별 N건` / `카페마다 N건` — 자사 카페 전부에 각각 count건 (self-cafe-daily-rules §1)
     per_cafe: bool = False

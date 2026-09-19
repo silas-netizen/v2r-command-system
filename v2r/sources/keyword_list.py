@@ -58,9 +58,14 @@ def rows_from_xlsx(path: str | Path, sheet: str = EXPOSURE_SHEET) -> list[dict]:
 
     book = openpyxl.load_workbook(str(path), read_only=True, data_only=True)
     try:
-        if sheet not in book.sheetnames:
-            raise SourceError(f"탭을 찾을 수 없습니다: {sheet}")
-        ws = book[sheet]
+        name = sheet
+        if name not in book.sheetnames:
+            # 코숨핏 시트처럼 `노출 현황의 사본`으로 이름이 바뀐 탭도 받아 준다
+            want = _norm(sheet)
+            name = next((s for s in book.sheetnames if want in _norm(s)), "")
+            if not name:
+                raise SourceError(f"탭을 찾을 수 없습니다: {sheet}")
+        ws = book[name]
         table = [list(r) for r in ws.iter_rows(values_only=True)]
     finally:
         book.close()

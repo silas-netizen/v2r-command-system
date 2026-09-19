@@ -14,12 +14,20 @@ TASK_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("reconcile", re.compile(r"(끊긴|미완료).*(이어|재개|점검)")),
     ("sync_all_sources", re.compile(r"전체\s*(원본|시트).*(동기화|갱신)")),
     ("sync_sources", re.compile(r"(원본|시트).*(동기화|갱신)")),
+    # 브랜드 원고 생성 (`브랜드 원고 생성 우아덤 1건` / `우아덤 원고 1개 만들어줘`).
+    # `일상 글 생성`보다 앞서지만 `원고`라는 낱말이 있어야만 잡힌다.
+    ("generate_brand", re.compile(r"원고.*(생성|만들어|작성)|(생성|만들어|작성).*원고")),
     # 제휴 카페 일상 글은 ChatGPT 웹 세션으로 만든다 (자사 xlsx 일상 글과 별개)
     ("generate_affiliate_daily", re.compile(r"제휴.*일상\s*글.*(생성|만들어)")),
     ("generate_daily", re.compile(r"일상\s*글.*(생성|만들어)")),
     ("collect_daily", re.compile(r"일상\s*글.*(수집|가져와)")),
     ("collect_new_photos", re.compile(r"새\s*(사진|이미지)\s*(수거|회수|가져오기|가져와)")),
     ("gpt_keepalive", re.compile(r"(gpt|지피티).*(유지|점검)", re.I)),
+    # 사진 승인 흐름 (사용자 규칙 2026-09-19): 생성은 반드시 승인을 받고,
+    # 만든 사진도 승인/반려를 받는다. 일반 `사진 생성` 패턴보다 먼저 본다.
+    ("generate_photos", re.compile(r"사진\s*생성\s*승인")),
+    ("approve_photos", re.compile(r"사진\s*승인")),
+    ("reject_photos", re.compile(r"사진\s*반려")),
     # GPT 웹앱으로 직접 생성 (요청서 발송인 `request_photos`보다 앞선다)
     ("generate_photos", re.compile(r"(사진|이미지).*(생성|만들어)")),
     ("request_photos", re.compile(r"(사진|이미지).*(요청|필요)")),
@@ -93,6 +101,16 @@ RE_BRAND_SLOT = re.compile(r"브랜드\s+(\S+)")
 #: 원고유형 슬롯 (시트 E열). 발행 계열 명령에서만 읽는다.
 RE_MANUSCRIPT_TYPE = re.compile(r"(질문형|후기형)")
 RE_KEYWORD_SLOT = re.compile(r"키워드\s+(\S+)")
+#: 사진 생성 승인 문구 (`사진 생성 승인 우아덤 키워드 2장`)
+RE_PHOTO_APPROVE_GEN = re.compile(r"사진\s*생성\s*승인")
+#: 승인/반려 명령의 자리값 형태 (`사진 승인 우아덤 키워드`)
+RE_PHOTO_POSITIONAL = re.compile(
+    r"사진\s*(?:생성\s*승인|승인|반려)\s+(\S+)(?:\s+(\S+))?"
+)
+#: `2장` / `3개`처럼 개수로 읽어야 할 토큰 (자리값 브랜드·키워드에서 제외)
+RE_COUNT_TOKEN = re.compile(r"^\d+\s*(?:장|개|건)?$")
+#: 키워드를 안 적었을 때 쓰는 기본 폴더 이름 (`warehouse.store.KEYWORD_FOLDER`와 같다)
+KEYWORD_FOLDER = "키워드"
 RE_ACCOUNTS = re.compile(
     r"아이디\s+([A-Za-z0-9_,\s]+?)(?=\s*(?:로|으로|써|사용|$))"
 )
@@ -136,6 +154,8 @@ _PHOTO_SLOT_TASKS = frozenset(
     {
         "request_photos",
         "generate_photos",
+        "approve_photos",
+        "reject_photos",
         "collect_new_photos",
         "collect_photos",
         "wash_photos",
@@ -250,6 +270,7 @@ def parse_korean_command(text: str, now: datetime | None = None) -> TaskSpec | N
     if m:
         spec["count"] = int(m.group(1))
     elif task in PUBLISH_TASKS | {
+        "generate_brand",
         "generate_affiliate_daily",
         "generate_daily",
         "collect_daily",
@@ -310,10 +331,30 @@ def parse_korean_command(text: str, now: datetime | None = None) -> TaskSpec | N
                 spec["brand"] = _strip_particle(m.group(1))
         m = RE_KEYWORD_SLOT.search(raw)
         if m:
-            spec["keyword"] = _strip_particle(m.group(1))
+            value = _strip_particle(m.group(1))
+            # `키워드 2장`처럼 뒤에 개수가 오면 폴더 이름이 아니라 개수다
+            if not RE_COUNT_TOKEN.match(value):
+                spec["keyword"] = value
 
-    # 원고유형 (발행 계열에서만. `후기형 브랜드 글 …` → E열이 후기형인 행만 고른다)
-    if task in PUBLISH_TASKS:
+    # 사진 승인 흐름의 자리값 형태 (`사진 승인 우아덤 키워드`)
+    if task in {"approve_photos", "reject_photos"} or (
+        task == "generate_photos" and RE_PHOTO_APPROVE_GEN.search(raw)
+    ):
+        if task == "generate_photos":
+            spec["approved"] = True
+        m = RE_PHOTO_POSITIONAL.search(raw)
+        if m:
+            first = _strip_particle(m.group(1))
+            second = _strip_particle(m.group(2) or "")
+            if not spec.get("brand") and first and not RE_COUNT_TOKEN.match(first):
+                spec["brand"] = first
+            if not spec.get("keyword") and second and not RE_COUNT_TOKEN.match(second):
+                spec["keyword"] = second
+        if not spec.get("keyword"):
+            spec["keyword"] = KEYWORD_FOLDER
+
+    # 원고유형 (발행 계열과 브랜드 원고 생성에서. `후기형 …` → 그 유형만)
+    if task in PUBLISH_TASKS | {"generate_brand"}:
         m = RE_MANUSCRIPT_TYPE.search(raw)
         if m:
             spec["manuscript_type"] = m.group(1)
@@ -368,12 +409,15 @@ TASK_LABELS: dict[str, str] = {
     "reconcile": "끊긴 작업 이어가기",
     "sync_all_sources": "전체 원본 동기화",
     "sync_sources": "원본 동기화",
+    "generate_brand": "브랜드 원고 생성",
     "generate_affiliate_daily": "제휴 일상 글 생성(GPT)",
     "generate_daily": "일상 글 생성",
     "collect_daily": "일상 글 수집",
     "collect_photos": "사진 수집",
     "collect_new_photos": "새 사진 수거",
     "generate_photos": "사진 생성(GPT)",
+    "approve_photos": "사진 승인",
+    "reject_photos": "사진 반려",
     "gpt_keepalive": "GPT 세션 점검",
     "request_photos": "사진 요청",
     "wash_photos": "사진 세탁",
@@ -426,6 +470,8 @@ def describe_spec(spec: TaskSpec) -> str:
             )
     if getattr(spec, "random_comments", False):
         parts.append("댓글 랜덤")
+    if getattr(spec, "approved", False):
+        parts.append("승인됨")
     if spec.immediate:
         parts.append("즉시")
     parts.append("모의 실행" if spec.dry_run else "실제 발행")
