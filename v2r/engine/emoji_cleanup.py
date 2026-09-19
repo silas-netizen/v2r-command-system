@@ -164,6 +164,13 @@ def cleanup_emoji(
 
         recheck = inspect(after)
         if recheck["title_dirty"] or recheck["body_dirty"]:
+            # 수정 직후 재조회가 옛 내용을 돌려주는 경우가 있다(실측 2건) → 잠시 뒤 한 번 더 본다
+            time.sleep(1.5)
+            try:
+                recheck = inspect(api_articles.get_article(rt.client, source_id))
+            except Exception:
+                pass
+        if recheck["title_dirty"] or recheck["body_dirty"]:
             errors.append(f"{source_id}: 수정했는데 이모지가 남아 있습니다")
             continue
         item["after_title"] = recheck["title"]
