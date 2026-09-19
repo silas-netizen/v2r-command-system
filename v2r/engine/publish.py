@@ -987,10 +987,30 @@ def _daily_pool(rt: Runtime) -> list[Manuscript]:
     return pool
 
 
-def _take_daily(rt: Runtime) -> Manuscript:
-    """실행 중 겹치지 않게 일상 글 1건을 뽑는다(같은 실행 안 중복 금지)."""
-    pool = _daily_pool(rt)
+def _take_daily(rt: Runtime, cafe_name: str = "", dry_run: bool = True) -> Manuscript:
+    """제휴 카페 일상 글 1건.
+
+    사용자 규칙(2026-09-19): 실발행 때는 **ChatGPT 창에서 그 카페용 일상 글을 즉석 생성**해서 쓴다.
+    풀 파일은 기록용일 뿐 발행 원고를 미리 쌓아 두고 꺼내 쓰지 않는다.
+    모의 실행(dry_run)은 브라우저를 열지 않고 풀(없으면 옛 시트)에서 하나 보여 주기만 한다.
+    """
     used: set = rt.scratch.setdefault("daily_used", set())
+    if not dry_run:
+        from v2r.warehouse.daily_generator import generate_affiliate_pool_via_gpt
+
+        target = (cafe_name or "").strip() or "제휴 카페"
+        result = generate_affiliate_pool_via_gpt([target], 1, warehouse_dir=rt.warehouse.root)
+        items = list(result.get("items") or [])
+        if result.get("login_pending"):
+            raise PublishError("ChatGPT 로그인이 풀려 일상 글을 만들 수 없습니다 (scripts\gpt-login-hold.cmd)")
+        if not items:
+            errs = "; ".join(str(e) for e in result.get("errors") or []) or "응답 없음"
+            raise PublishError(f"ChatGPT 창에서 일상 글 생성 실패: {errs}")
+        picked = items[0]
+        used.add((picked.source, picked.source_row))
+        return picked
+
+    pool = _daily_pool(rt)
     left = [
         m
         for m in pool
@@ -999,8 +1019,8 @@ def _take_daily(rt: Runtime) -> Manuscript:
     ]
     if not left:
         raise PublishError(
-            "제휴 일상 글 원고가 부족합니다"
-            " ('일상 글 30개 만들어줘'로 풀을 채우거나 랜덤일상 시트를 확인하세요)"
+            "모의 실행용 제휴 일상 글 예시가 없습니다"
+            " (실발행은 ChatGPT 창에서 즉석 생성하므로 풀이 비어도 됩니다)"
         )
     picked = random.choice(left)
     used.add((picked.source, picked.source_row))
@@ -1230,7 +1250,7 @@ def run_slot(
         components = _attach_images(rt, slot, browser_page)
 
         if slot.workflow == "affiliate":
-            daily = _take_daily(rt)
+            daily = _take_daily(rt, getattr(cafe, "name", None) or slot.cafe, bool(spec.dry_run))
             # --- 사전 점검: V2R에 글을 만들기 전에 수정글 재료를 모두 준비한다 ---
             # (사진 수 vs 자리표시, content_json, 댓글 payload) 여기서 터지면 되감기가 필요 없다.
             rev_at = slot.revision_at or (root_start + timedelta(hours=4))

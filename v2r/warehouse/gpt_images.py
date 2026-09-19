@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import logging
 import random
 import re
@@ -39,6 +40,8 @@ LOGIN_PROMPT = "브라우저 창에서 ChatGPT에 직접 로그인해 주세요"
 WAITING_NOTICE = "아직 로그인 전입니다. 창에서 로그인해 주세요"
 #: ChatGPT 웹앱 주소
 GPT_URL = "https://chatgpt.com"
+PHOTO_THREAD = "photos"
+DAILY_THREAD = "affiliate_daily"
 #: 로그인 대기 기본 한도(초)
 LOGIN_TIMEOUT = 900
 #: 이미지 1장 생성 대기 기본 한도(초)
@@ -141,6 +144,65 @@ def default_profile_dir() -> Path:
     except Exception:
         base = Path("data")
     return base / "browser-profile-gpt"
+
+
+THREADS_FILENAME = "gpt_threads.json"
+
+
+def threads_path(profile_dir: str | Path | None = None) -> Path:
+    """용도별로 이어 쓰는 ChatGPT 대화 URL 저장 파일(`data/gpt_threads.json`)."""
+    base = Path(profile_dir) if profile_dir is not None else default_profile_dir()
+    return base.parent / THREADS_FILENAME
+
+
+def load_threads(profile_dir: str | Path | None = None) -> dict[str, str]:
+    path = threads_path(profile_dir)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return {str(k): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def thread_url(name: str, profile_dir: str | Path | None = None) -> str:
+    return load_threads(profile_dir).get(name, "")
+
+
+def remember_thread(name: str, page, profile_dir: str | Path | None = None) -> str:
+    """지금 페이지가 대화 URL(`/c/...`)이면 `name` 용도로 기억한다. 새 창을 계속 여는 대신
+    같은 대화에서 이어가기 위한 것(사용자 규칙). 저장된 URL을 돌려준다."""
+    try:
+        url = str(page.url or "")
+    except Exception:
+        return ""
+    if "/c/" not in url:
+        return ""
+    data = load_threads(profile_dir)
+    if data.get(name) == url:
+        return url
+    data[name] = url
+    path = threads_path(profile_dir)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+    except Exception as exc:  # pragma: no cover
+        log.warning("대화 URL 저장 실패: %s", exc)
+    return url
+
+
+def goto_thread(name: str, page, profile_dir: str | Path | None = None) -> bool:
+    """기억해 둔 대화로 이동한다. 없거나 열리지 않으면 False(새 대화 사용)."""
+    url = thread_url(name, profile_dir)
+    if not url:
+        return False
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        page.wait_for_timeout(1500)
+        if "/c/" in str(page.url or "") and composer(page, 8000) is not None:
+            return True
+    except Exception as exc:  # pragma: no cover - 네트워크
+        log.warning("저장된 대화 열기 실패(%s): %s", name, exc)
+    return False
 
 
 def open_gpt(headless: bool = False, profile_dir: str | Path | None = None):
@@ -537,9 +599,9 @@ def postprocess(
     """긴 변 `long_side` JPEG로 만들면서 현실감 흔적을 얹는다.
 
     - 긴 변 1024px로 축소(원본이 더 작으면 그대로)
-    - 0~1도 랜덤 회전 + 가장자리 소량 랜덤 크롭 (완벽한 프레이밍 제거)
-    - 미세 가우시안 노이즈 (센서 그레인)
-    - 품질 86~93 JPEG 재압축 (약한 세대 손실)
+    - 가장자리 소량 랜덤 크롭 (완벽한 프레이밍 제거). 회전은 화질을 흐려서 하지 않는다.
+    - 아주 약한 가우시안 노이즈 (센서 그레인, 화질 손상 없는 수준)
+    - 품질 92~95 JPEG 재압축 (사용자 규칙: 화질 저하 금지)
 
     EXIF 랜덤화는 이후 `photo_washer.wash`가 맡는다 (규칙 0).
     """
@@ -560,10 +622,7 @@ def postprocess(
                 Image.LANCZOS,
             )
 
-        # 2) ≤1도 회전 + 소량 크롭
-        angle = rng.uniform(-1.0, 1.0)
-        if abs(angle) > 0.05:
-            img = img.rotate(angle, resample=Image.BICUBIC, expand=False)
+        # 2) 소량 크롭 (회전은 보간으로 화질을 흐리므로 제거 — 2026-09-19 사용자 피드백)
         width, height = img.size
         margin_x = max(int(width * rng.uniform(0.01, 0.025)), 2)
         margin_y = max(int(height * rng.uniform(0.01, 0.025)), 2)
@@ -575,10 +634,10 @@ def postprocess(
             img = img.crop((left, top, right, bottom))
 
         # 3) 미세 노이즈
-        img = add_noise(img, sigma=rng.uniform(2.5, 5.0), seed=rng.randint(0, 10**6))
+        img = add_noise(img, sigma=rng.uniform(0.8, 1.6), seed=rng.randint(0, 10**6))
 
         # 4) 재압축
-        img.save(dest, format="JPEG", quality=rng.randint(86, 93), subsampling=2)
+        img.save(dest, format="JPEG", quality=rng.randint(92, 95), subsampling=0)
         img.close()
     return dest
 
@@ -650,6 +709,8 @@ def generate_batch(
             result["login_pending"] = True
             result["message"] = "로그인 대기 — 내일 재시도"
             return result
+        # 사용자 규칙: 사진은 늘 같은 대화에서 이어서 만든다(새 대화 남발 금지)
+        result["thread_reused"] = goto_thread(PHOTO_THREAD, page)
 
         for index, prompt in enumerate(prompts):
             try:
@@ -661,6 +722,7 @@ def generate_batch(
                     stem=f"gpt_{int(time.time())}_{index + 1}",
                 )
                 result["files"].append(str(path))
+                remember_thread(PHOTO_THREAD, page)
             except GptLimitError as exc:
                 result["limited"] = True
                 result["wait_text"] = exc.wait_text

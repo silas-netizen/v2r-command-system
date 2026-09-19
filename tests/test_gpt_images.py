@@ -50,7 +50,7 @@ def test_postprocess_makes_small_jpeg_with_noise(tmp_path: Path):
         assert img.size[0] < 1024 or img.size[1] < 1024 or max(img.size) == 1024
         colors = img.convert("RGB").getcolors(maxcolors=200000)
     # 단색 PNG였는데 노이즈가 들어가 색이 여러 개가 된다
-    assert colors is None or len(colors) > 50
+    assert colors is None or len(colors) > 4  # 약한 그레인만(화질 유지 규칙)
 
 
 def test_postprocess_keeps_small_image_small(tmp_path: Path):
@@ -486,3 +486,47 @@ def test_ask_needs_composer(monkeypatch):
     monkeypatch.setattr(gpt_chat, "composer", lambda page, timeout_ms=0: None)
     with pytest.raises(gpt_chat.GptChatError):
         gpt_chat.ask(object(), "프롬프트", timeout=5)
+
+
+# --- 대화 이어쓰기(사용자 규칙: 새 창 남발 금지) ---------------------------
+class _ThreadPage:
+    def __init__(self, url=""):
+        self.url = url
+        self.visited = []
+
+    def goto(self, url, **kw):
+        self.visited.append(url)
+        self.url = url
+
+    def wait_for_timeout(self, ms):
+        pass
+
+
+def test_remember_thread_saves_conversation_url(tmp_path):
+    from v2r.warehouse import gpt_images as gi
+
+    prof = tmp_path / "profile"
+    page = _ThreadPage("https://chatgpt.com/c/abc123")
+    assert gi.remember_thread("photos", page, prof) == "https://chatgpt.com/c/abc123"
+    assert gi.thread_url("photos", prof) == "https://chatgpt.com/c/abc123"
+    assert gi.threads_path(prof) == tmp_path / "gpt_threads.json"
+
+
+def test_remember_thread_ignores_non_conversation_url(tmp_path):
+    from v2r.warehouse import gpt_images as gi
+
+    prof = tmp_path / "profile"
+    assert gi.remember_thread("photos", _ThreadPage("https://chatgpt.com/"), prof) == ""
+    assert gi.thread_url("photos", prof) == ""
+
+
+def test_goto_thread_uses_saved_url(tmp_path, monkeypatch):
+    from v2r.warehouse import gpt_images as gi
+
+    prof = tmp_path / "profile"
+    gi.remember_thread("affiliate_daily", _ThreadPage("https://chatgpt.com/c/xyz"), prof)
+    monkeypatch.setattr(gi, "composer", lambda page, timeout_ms=0: object())
+    page = _ThreadPage()
+    assert gi.goto_thread("affiliate_daily", page, prof) is True
+    assert page.visited == ["https://chatgpt.com/c/xyz"]
+    assert gi.goto_thread("photos", _ThreadPage(), prof) is False

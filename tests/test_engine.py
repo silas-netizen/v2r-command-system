@@ -260,7 +260,7 @@ def test_제휴_수정글_등록_전_실패도_failed(tmp_path, monkeypatch):
         body="일상 본문",
         content_hash="dailyhash",
     )
-    monkeypatch.setattr(publish_mod, "_take_daily", lambda rt_: daily)
+    monkeypatch.setattr(publish_mod, "_take_daily", lambda rt_, *a, **k: daily)
     monkeypatch.setattr(publish_mod, "build_comments", lambda *a, **k: [])
     monkeypatch.setattr(publish_mod.api_articles, "create_article", lambda c, **k: "DAILY-1")
     monkeypatch.setattr(publish_mod.api_articles, "get_article", lambda c, sid: {})
@@ -306,7 +306,7 @@ def _affiliate_slot(rt, spec, monkeypatch):
         body="일상 본문",
         content_hash="dailyhash",
     )
-    monkeypatch.setattr(publish_mod, "_take_daily", lambda rt_: daily)
+    monkeypatch.setattr(publish_mod, "_take_daily", lambda rt_, *a, **k: daily)
     monkeypatch.setattr(publish_mod, "build_comments", lambda *a, **k: [])
     return slot, daily
 

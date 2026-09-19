@@ -151,6 +151,7 @@ class _FakeRT:
         self.warehouse = _FakeWarehouse(root)
         self.scratch = {}
         self.sources_cfg = {}  # 폴백 경로에서 시트 목록을 훑는다
+        self.publications = _FakePubs()
 
 
 def test_daily_pool_reads_only_affiliate_pool(tmp_path: Path):
@@ -233,3 +234,55 @@ def test_affiliate_cafes_from_config():
         }
 
     assert worker._affiliate_cafes(_RT()) == ["씨씨앙", "양평맘", "쌍둥이맘"]
+
+
+# --- 실발행은 ChatGPT 창에서 즉석 생성(사용자 규칙 2026-09-19) ----------------
+from v2r.engine import publish
+from v2r.content.manuscript import Manuscript
+
+
+class _FakePubs:
+    def exists(self, *a, **k):
+        return False
+
+
+def _write_pool(root):
+    dg.generate_affiliate_pool_via_gpt(
+        ["씨씨앙"], 1, page=object(), warehouse_dir=root,
+        ask_fn=_fake_ask(["제목: 하나\n본문: 첫번째 글\n"]),
+    )
+
+
+def test_take_daily_live_generates_via_gpt(tmp_path: Path, monkeypatch):
+
+    made = Manuscript(title="즉석", body="생성", cafe="씨씨앙", source="affiliate_daily_pool",
+                      source_row=1, content_hash="h1")
+    calls = []
+
+    def fake_gen(cafes, per_cafe, **kw):
+        calls.append((cafes, per_cafe))
+        return {"ok": True, "items": [made], "errors": []}
+
+    monkeypatch.setattr(dg, "generate_affiliate_pool_via_gpt", fake_gen)
+    rt = _FakeRT(tmp_path)
+    got = publish._take_daily(rt, "씨씨앙", dry_run=False)
+    assert got is made
+    assert calls == [(["씨씨앙"], 1)]
+
+
+def test_take_daily_live_fails_when_gpt_returns_nothing(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(dg, "generate_affiliate_pool_via_gpt",
+                        lambda *a, **k: {"ok": False, "items": [], "errors": ["x"]})
+    with pytest.raises(publish.PublishError):
+        publish._take_daily(_FakeRT(tmp_path), "양평맘", dry_run=False)
+
+
+def test_take_daily_dry_run_does_not_open_gpt(tmp_path: Path, monkeypatch):
+    def boom(*a, **k):
+        raise AssertionError("dry_run에서 GPT를 열면 안 된다")
+
+    _write_pool(tmp_path)  # 풀은 먼저 채우고(진짜 함수) 그 다음 GPT 호출을 막는다
+    monkeypatch.setattr(dg, "generate_affiliate_pool_via_gpt", boom)
+    rt = _FakeRT(tmp_path)
+    got = publish._take_daily(rt, "씨씨앙", dry_run=True)
+    assert got.source == "affiliate_daily_pool"

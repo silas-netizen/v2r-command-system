@@ -259,9 +259,22 @@ def generate_affiliate_pool_via_gpt(
     owned = None  # 우리가 연 브라우저면 닫는다
     if ask_fn is None:
         from v2r.warehouse import gpt_chat
-        from v2r.warehouse.gpt_images import _close, open_gpt, wait_for_login
+        from v2r.warehouse.gpt_images import (
+            DAILY_THREAD,
+            _close,
+            goto_thread,
+            open_gpt,
+            remember_thread,
+            wait_for_login,
+        )
 
-        ask_fn = gpt_chat.ask
+        raw_ask = gpt_chat.ask
+
+        def ask_fn(pg, prompt):  # 질문 뒤 대화 URL을 기억해 다음에도 같은 대화를 쓴다
+            reply = raw_ask(pg, prompt)
+            remember_thread(DAILY_THREAD, pg)
+            return reply
+
         if page is None:
             owned = open_gpt(headless=headless)
             page = owned[2]
@@ -270,6 +283,8 @@ def generate_affiliate_pool_via_gpt(
                 result["login_pending"] = True
                 result["message"] = "로그인 대기 — 내일 재시도"
                 return result
+        # 사용자 규칙: 일상 글은 늘 같은 대화에서 이어서 만든다
+        result["thread_reused"] = goto_thread(DAILY_THREAD, page)
 
     made: list[Manuscript] = []
     seen: set[str] = {m.content_hash for m in load_pool(root, AFFILIATE_POOL_FILENAME)}
@@ -318,6 +333,7 @@ def generate_affiliate_pool_via_gpt(
             _close(*owned)
 
     result["generated"] = len(made)
+    result["items"] = list(made)  # 호출자가 방금 만든 글을 바로 쓰도록(발행 시 즉석 생성)
     result["added"] = save_pool(root, made, AFFILIATE_POOL_FILENAME)
     result["ok"] = result["added"] > 0 or not result["errors"]
     return result
