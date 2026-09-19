@@ -384,8 +384,17 @@ def prepare_per_cafe(
     (`목표 = max(0, N - 오늘 올린 수)`) 고른다. `spec.per_cafe_mode == "추가로"`면
     예전처럼 오늘 올린 수와 무관하게 N건을 더 고른다.
 
-    원고 출처 순서: 각색 xlsx(파일 이름 오름차순, 행 순서) → 일상 글 풀.
-    이미 발행한 (파일, 행)뿐 아니라 **본문 해시 전역 검사**로도 건너뛴다.
+    **순서 절대 규칙(사용자 지시)**: 각색 xlsx는 카페가 행마다 번갈아 오도록 일부러
+    그렇게 짜 둔 것이다. 그러니 파일 이름 오름차순(오래된 날짜 먼저) → 그 파일의
+    위 행부터 아래로, **카페를 가로질러 한 줄로** 고른다. 카페별로 묶거나 라운드로빈으로
+    다시 섞지 않는다. xlsx 행을 다 쓴 뒤에야 일상 글 풀을 풀 순서대로 이어 쓴다.
+
+    건너뛰는 행(이미 발행/중복/제외 카페/대상 아님/그 카페는 목표 달성)은 그냥 넘어가고
+    **나머지 행의 순서는 그대로** 이어진다. 이미 발행한 (파일, 행)뿐 아니라
+    **본문 해시 전역 검사**로도 건너뛴다.
+
+    `rt.scratch["per_cafe_sequence"]`에 `순서/파일/행/카페/제목`을 남겨 보고서가
+    사용자에게 실제 발행 순서를 그대로 보여줄 수 있게 한다.
     """
     skipped = skipped if skipped is not None else []
     targets = [spec.cafe] if spec.cafe else self_cafe_names(rt)
@@ -423,47 +432,94 @@ def prepare_per_cafe(
     used_keys: set[tuple[str, int]] = set()
     used_hashes: set[str] = set()
     picked: list[Manuscript] = []
+    sequence: list[dict] = []
+    rt.scratch["per_cafe_sequence"] = sequence
 
+    def reached(cafe: str) -> bool:
+        """그 카페가 오늘 목표를 채웠는가 (`requested`가 0이면 상한 없음)."""
+        return bool(requested) and targets_left.get(cafe, 0) <= 0
+
+    def open_cafe() -> str:
+        """카페가 비어 있는 원고(일상 글 풀)를 줄 카페 — 아직 덜 채운 곳부터."""
+        left = [c for c in targets if not reached(c)]
+        if not left:
+            return ""
+        return min(left, key=lambda c: (report[c]["planned"], targets.index(c)))
+
+    # 이미 목표를 채운 카페는 먼저 알려 둔다 (규칙 §7)
     for cafe in targets:
-        got = 0
-        want = targets_left[cafe]
-        if requested and want <= 0:
-            skipped.append({"source": cafe, "reason": f"오늘 이미 {report[cafe]['already']}건 — 목표 달성"})
-            continue
-        for name, items in loaded:
-            if want and got >= want:
+        if reached(cafe):
+            skipped.append(
+                {"source": cafe, "reason": f"오늘 이미 {report[cafe]['already']}건 — 목표 달성"}
+            )
+
+    # 파일 순서 → 행 순서 그대로 한 줄로 훑는다 (카페별로 묶지 않는다)
+    for name, items in loaded:
+        if all(reached(c) for c in targets):
+            break
+        for m in items:
+            if all(reached(c) for c in targets):
                 break
-            for m in items:
-                if want and got >= want:
+            if (m.source, m.source_row) in used_keys:
+                continue
+            if m.cafe:
+                # 원고에 카페가 적혀 있으면 그 카페 글로만 쓴다
+                if is_excluded_cafe(rt, m.cafe):
+                    skipped.append(
+                        {"source": name, "row": m.source_row, "reason": "발행 제외 카페"}
+                    )
+                    continue
+                cafe = next((c for c in targets if cafe_matches(c, m.cafe)), "")
+                if not cafe:
+                    skipped.append(
+                        {
+                            "source": name,
+                            "row": m.source_row,
+                            "reason": f"대상 카페 아님({m.cafe})",
+                        }
+                    )
+                    continue
+                if reached(cafe):
+                    # 그 카페만 목표를 채웠다 → 이 행만 건너뛰고 순서는 이어간다
+                    skipped.append(
+                        {"source": name, "row": m.source_row, "reason": f"{cafe} 목표 달성"}
+                    )
+                    continue
+            else:
+                cafe = open_cafe()
+                if not cafe:
                     break
-                if (m.source, m.source_row) in used_keys:
-                    continue
-                # 원고에 카페가 적혀 있으면 그 카페 글만, 비어 있으면 어느 카페든 쓴다
-                if m.cafe and not cafe_matches(cafe, m.cafe):
-                    continue
-                if m.cafe and is_excluded_cafe(rt, m.cafe):
-                    continue
-                if m.content_hash and m.content_hash in used_hashes:
-                    skipped.append(
-                        {"source": name, "row": m.source_row, "reason": "중복(본문 해시)"}
-                    )
-                    continue
-                if rt.publications.exists(name, m.source_row, m.content_hash):
-                    skipped.append({"source": name, "row": m.source_row, "reason": "이미 발행됨"})
-                    continue
-                if rt.publications.exists_hash(m.content_hash):
-                    skipped.append(
-                        {"source": name, "row": m.source_row, "reason": "중복(본문 해시 전역)"}
-                    )
-                    continue
-                used_keys.add((m.source, m.source_row))
-                if m.content_hash:
-                    used_hashes.add(m.content_hash)
-                if not m.cafe:
-                    m.cafe = cafe
-                picked.append(m)
-                got += 1
-        report[cafe]["planned"] = got
+            if m.content_hash and m.content_hash in used_hashes:
+                skipped.append(
+                    {"source": name, "row": m.source_row, "reason": "중복(본문 해시)"}
+                )
+                continue
+            if rt.publications.exists(name, m.source_row, m.content_hash):
+                skipped.append({"source": name, "row": m.source_row, "reason": "이미 발행됨"})
+                continue
+            if rt.publications.exists_hash(m.content_hash):
+                skipped.append(
+                    {"source": name, "row": m.source_row, "reason": "중복(본문 해시 전역)"}
+                )
+                continue
+            used_keys.add((m.source, m.source_row))
+            if m.content_hash:
+                used_hashes.add(m.content_hash)
+            if not m.cafe:
+                m.cafe = cafe
+            picked.append(m)
+            sequence.append(
+                {
+                    "seq": len(picked),
+                    "source": name,
+                    "row": m.source_row,
+                    "cafe": cafe,
+                    "title": m.title,
+                }
+            )
+            report[cafe]["planned"] += 1
+            if requested:
+                targets_left[cafe] -= 1
     return picked
 
 
@@ -974,9 +1030,36 @@ def next_self_window(at: datetime) -> datetime:
     return local.replace(hour=SELF_WINDOW_OPEN_HOUR, minute=0, second=0, microsecond=0)
 
 
-#: 자사 카페 일상 글에서 카페마다 고정해 두는 계정 수 (규칙 §4, 부족하면 있는 만큼)
-SELF_DAILY_ACCOUNTS_MIN = 5
+#: 자사 카페 일상 글에서 카페마다 고정해 두는 계정 수 (규칙 §4).
+#: 사용자 규칙: **정확히 10개를 무작위로** 골라 고정한다 (풀이 10개 미만이면 있는 만큼).
+SELF_DAILY_ACCOUNTS_MIN = 10
 SELF_DAILY_ACCOUNTS_MAX = 10
+
+
+def self_daily_rng(rt: Runtime) -> random.Random:
+    """실행 1회분 난수기 (같은 실행 안에서는 같은 흐름, 실행마다 새로 뽑는다)."""
+    rng = rt.scratch.get("self_daily_rng")
+    if not isinstance(rng, random.Random):
+        rng = random.Random()
+        rt.scratch["self_daily_rng"] = rng
+    return rng
+
+
+def pick_self_daily_accounts(
+    pool: list[Any], rng: random.Random | None = None, count: int = SELF_DAILY_ACCOUNTS_MAX
+) -> list[str]:
+    """자사 카페 일상 글에 고정해 둘 계정 — 풀에서 **무작위 10개** (규칙 §4).
+
+    풀은 이미 '자사 카페' 작업 구분 + 카페 스탭 등급 + 그 게시판 쓰기 가능으로
+    좁혀진 목록이다. 마지막 사용 시각(LRU) 순서를 쓰지 않고 그때그때 무작위로
+    고른다 — 같은 계정 묶음이 매번 반복되지 않게 하려는 것이다.
+    """
+    ids = [a if isinstance(a, str) else a.login_id for a in pool]
+    if not ids:
+        raise AssignError("사용 가능한 계정이 없습니다 (계정 시트를 확인하세요)")
+    rng = rng or random.Random()
+    want = min(int(count or SELF_DAILY_ACCOUNTS_MAX), len(ids))
+    return rng.sample(ids, want)
 
 
 def _avoid_consecutive(
@@ -1037,12 +1120,11 @@ def plan(rt: Runtime, spec: TaskSpec, manuscripts: list[Manuscript]) -> list[Slo
                     assigned[i] = DEFERRED_ACCOUNT
                 continue
             need = spec.account_count or len(idxs)
-            if getattr(spec, "per_cafe", False) and not spec.account_count:
-                # 규칙 §4: 카페마다 5~10개만 골라 고정하고 돌려 쓴다
-                need = max(
-                    min(SELF_DAILY_ACCOUNTS_MAX, len(pool)),
-                    min(SELF_DAILY_ACCOUNTS_MIN, len(pool)),
-                )
+            self_daily_pick = (
+                getattr(spec, "per_cafe", False)
+                and not spec.account_count
+                and spec.account_mode != "manual"
+            )
             if spec.account_mode == "manual":
                 if not pool:
                     raise AssignError(
@@ -1054,6 +1136,9 @@ def plan(rt: Runtime, spec: TaskSpec, manuscripts: list[Manuscript]) -> list[Slo
                     if a.login_id.casefold() not in {r.casefold() for r in restricted}
                 ]
                 chosen = assign(pool_ids, mode="manual", explicit=spec.accounts)
+            elif self_daily_pick:
+                # 규칙 §4: 카페마다 **무작위 10개**를 골라 고정하고 돌려 쓴다
+                chosen = pick_self_daily_accounts(pool, self_daily_rng(rt))
             else:
                 if not pool:
                     raise AssignError("사용 가능한 계정이 없습니다 (계정 시트를 확인하세요)")
@@ -1800,6 +1885,7 @@ __all__ = [
     "load_accounts",
     "load_manuscripts",
     "notify_photo_shortage",
+    "pick_self_daily_accounts",
     "plan",
     "prepare_manuscripts",
     "prepare_per_cafe",

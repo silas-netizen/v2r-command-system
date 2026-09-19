@@ -795,7 +795,12 @@ SLEEP_CHUNK_S = 30.0
 
 
 def order_round_robin(slots: list[Any]) -> list[Any]:
-    """카페별 줄을 만들어 번갈아 꺼낸다 — 카페끼리 나란히 진행 (규칙 §4)."""
+    """카페별 줄을 만들어 번갈아 꺼낸다 — 카페끼리 나란히 진행.
+
+    **자사 카페 일상 글(`카페별`)에는 쓰지 않는다**: 각색 xlsx가 이미 카페를 행마다
+    번갈아 배치해 두었고, 그 순서를 그대로 지키는 것이 사용자 절대 규칙이다
+    (`publish.prepare_per_cafe`). 다른 흐름을 위해 남겨 둔 도구다.
+    """
     queues: dict[str, list] = {}
     order: list[str] = []
     for slot in slots:
@@ -870,39 +875,70 @@ def write_daily_report(
     results: list[dict],
     failed: list[tuple[Any, str]],
 ) -> str:
-    """카페별 발행 결과 표를 보고서 파일로 남기고 경로를 돌려준다."""
+    """카페별 발행 결과 표를 보고서 파일로 남기고 경로를 돌려준다.
+
+    사용자가 **순서**(각색 xlsx의 파일·행 순서)를 눈으로 확인할 수 있게
+    `순서 / 파일 / 행`을 앞에 붙인다 (모의 실행 보고서도 같은 표다).
+    """
     path = _daily_report_path(rt, spec)
-    rows: list[str] = []
-    for r in results:
-        rows.append(
-            "| {cafe} | {board} | {account} | {at} | {comments} | {status} |".format(
+    seq_by_row = {
+        (str(s.get("source") or ""), int(s.get("row") or 0)): int(s.get("seq") or 0)
+        for s in (rt.scratch.get("per_cafe_sequence") or [])
+    }
+
+    def _seq(source: Any, row: Any, fallback: int) -> int:
+        try:
+            return seq_by_row.get((str(source or ""), int(row or 0)), fallback)
+        except (TypeError, ValueError):
+            return fallback
+
+    lines: list[tuple[int, str]] = []
+    for order, r in enumerate(results, start=1):
+        seq = _seq(r.get("source"), r.get("row"), order)
+        lines.append((
+            seq,
+            "| {seq} | {source} | {row} | {cafe} | {board} | {account} | {at} | {comments} |"
+            " {status} |".format(
+                seq=seq,
+                source=r.get("source", ""),
+                row=r.get("row", ""),
                 cafe=r.get("cafe", ""),
                 board=r.get("board", ""),
                 account=publish_mod.mask_login(r.get("account", "")),
                 at=r.get("scheduled_at", ""),
                 comments=r.get("comments", 0),
                 status=r.get("url") or r.get("status", ""),
-            )
-        )
-    for slot, error in failed:
-        rows.append(
-            "| {cafe} | {board} | {account} | {at} | - | 실패: {err} |".format(
+            ),
+        ))
+    for order, (slot, error) in enumerate(failed, start=len(results) + 1):
+        m = slot.manuscript
+        seq = _seq(getattr(m, "source", ""), getattr(m, "source_row", 0), order)
+        lines.append((
+            seq,
+            "| {seq} | {source} | {row} | {cafe} | {board} | {account} | {at} | - |"
+            " 실패: {err} |".format(
+                seq=seq,
+                source=getattr(m, "source", ""),
+                row=getattr(m, "source_row", ""),
                 cafe=slot.cafe,
                 board=slot.board,
                 account=publish_mod.mask_login(slot.account),
                 at=slot.scheduled_at.isoformat() if slot.scheduled_at else "즉시",
                 err=" ".join(str(error).split())[:120],
-            )
-        )
+            ),
+        ))
+    # 사용자가 각색 xlsx 순서 그대로 확인할 수 있게 순서대로 적는다
+    rows = [line for _seq_no, line in sorted(lines, key=lambda x: x[0])]
     text = "\n".join(
         [
             f"# 자사 카페 일상 글 발행 보고 ({spec.start_date})",
             "",
             f"- 모드: {'모의 실행' if spec.dry_run else '실제 발행'}",
             f"- 성공 {len(results)}건 / 실패 {len(failed)}건",
+            "- 순서: 각색 엑셀 파일 이름 오름차순 → 행 순서 그대로 (카페별로 묶지 않음)",
             "",
-            "| 카페 | 게시판 | 계정 | 발행 시각 | 댓글 | URL/상태 |",
-            "|---|---|---|---|---|---|",
+            "| 순서 | 파일 | 행 | 카페 | 게시판 | 계정 | 발행 시각 | 댓글 | URL/상태 |",
+            "|---|---|---|---|---|---|---|---|---|",
             *rows,
             "",
         ]
@@ -1001,14 +1037,15 @@ def _run_publish(
             "message": str(exc),
         }
     paced = bool(getattr(spec, "per_cafe", False))
-    if paced:
-        # 카페끼리 나란히 진행하도록 카페별로 번갈아 실행한다 (규칙 §4)
-        slots = order_round_robin(slots)
+    # 각색 xlsx의 행 순서(카페가 행마다 번갈아 옴)를 그대로 지킨다 — 라운드로빈으로
+    # 다시 섞지 않는다 (사용자 절대 규칙, 규칙 §2)
     need_browser = False  # 이미지는 업로드 API로 첨부한다(브라우저 불필요, 2026-09-19)
     results: list[dict] = []
     failures: list[str] = []
     failed_slots: list[tuple[Any, str]] = []
-    next_allowed: dict[str, float] = {}
+    #: 다음 글을 올려도 되는 시각(monotonic). 연속한 두 글은 어차피 카페가 다르므로
+    #: 카페별이 아니라 **전체 하나의 간격**으로 쉰다 (규칙 §4).
+    next_allowed = 0.0
     window_notified = False
     rate_notified = False  # 레이트 제한 안내는 작업당 한 번만
     touched: list[tuple] = []
@@ -1055,9 +1092,8 @@ def _run_publish(
                         window_notified = True
                     _sleep_with_beat((open_at - now_kst).total_seconds(), beat)
             if paced and not spec.dry_run:
-                # 그 카페의 다음 발행 허용 시각까지 쉰다 (글 사이 2~3분 랜덤)
-                key = publish_mod._norm(slot.cafe)
-                wait = next_allowed.get(key, 0.0) - time.monotonic()
+                # 앞 글에서 정한 다음 발행 허용 시각까지 쉰다 (글 사이 2~3분 랜덤)
+                wait = next_allowed - time.monotonic()
                 if wait > 0:
                     _sleep_with_beat(wait, beat)
             rate_waits = 0
@@ -1114,7 +1150,7 @@ def _run_publish(
             if stopped:
                 continue
             if paced and not spec.dry_run:
-                next_allowed[publish_mod._norm(slot.cafe)] = time.monotonic() + 60.0 * random.uniform(
+                next_allowed = time.monotonic() + 60.0 * random.uniform(
                     float(spec.interval_min), float(max(spec.interval_max, spec.interval_min))
                 )
             if not spec.dry_run and (not paced or index % 10 == 0 or index == len(slots)):
@@ -1162,6 +1198,8 @@ def _run_publish(
         for cafe, plan_info in (rt.scratch.get("per_cafe_plan") or {}).items():
             counts.setdefault(cafe, {"ok": 0, "fail": 0}).update(plan_info)
         out["per_cafe"] = counts
+        # 모의 실행에서 사용자가 순서를 확인할 수 있게 계획 순서를 그대로 싣는다
+        out["sequence"] = list(rt.scratch.get("per_cafe_sequence") or [])
         try:
             out["report_file"] = write_daily_report(rt, spec, results, failed_slots)
         except Exception as exc:  # 보고서 실패는 발행 결과를 바꾸지 않는다

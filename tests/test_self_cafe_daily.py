@@ -113,6 +113,118 @@ def test_prepare_per_cafe_fans_out_and_skips_excluded(tmp_path, monkeypatch):
     assert [m.cafe for m in picked] == ["고요한 아침"] * 2 + ["글로시 마이"] * 2
 
 
+# --- 각색 엑셀 행 순서 그대로 (사용자 절대 규칙, 규칙 §2) ---
+TWO_CAFES = {
+    "self_owned": [
+        {"name": "고요한 아침", "cafe_id": 1, "board": "반말일기"},
+        {"name": "글로시 마이", "cafe_id": 2, "board": "자유 톡"},
+    ]
+}
+
+
+def _interleaved(source: str, cafes: list[str], start: int = 0) -> list[Manuscript]:
+    """카페가 행마다 번갈아 오는 각색 엑셀 한 장."""
+    return [_m(cafe, start + i, source=source) for i, cafe in enumerate(cafes)]
+
+
+def test_prepare_per_cafe_keeps_sheet_order_across_files(tmp_path, monkeypatch):
+    rt = make_runtime(tmp_path)
+    rt.cafes_cfg = TWO_CAFES
+    first = _interleaved("각색_0901", ["고요한 아침", "글로시 마이", "고요한 아침"])
+    second = _interleaved("각색_0902", ["글로시 마이", "고요한 아침", "글로시 마이"], start=50)
+    _fake_sources(monkeypatch, [("각색_0901", first), ("각색_0902", second)])
+
+    spec = TaskSpec(task="publish_daily", count=3, per_cafe=True)
+    picked = publish_mod.prepare_per_cafe(rt, spec, [])
+    # 파일 순서 → 행 순서 그대로 한 줄. 카페별로 묶지 않는다.
+    assert [(m.source, m.source_row) for m in picked] == [
+        ("각색_0901", 1), ("각색_0901", 2), ("각색_0901", 3),
+        ("각색_0902", 51), ("각색_0902", 52), ("각색_0902", 53),
+    ]
+    assert [m.cafe for m in picked] == [
+        "고요한 아침", "글로시 마이", "고요한 아침",
+        "글로시 마이", "고요한 아침", "글로시 마이",
+    ]
+    seq = rt.scratch["per_cafe_sequence"]
+    assert [s["seq"] for s in seq] == [1, 2, 3, 4, 5, 6]
+    assert seq[3] == {
+        "seq": 4, "source": "각색_0902", "row": 51, "cafe": "글로시 마이",
+        "title": picked[3].title,
+    }
+
+
+def test_prepare_per_cafe_published_rows_skipped_without_breaking_order(tmp_path, monkeypatch):
+    rt = make_runtime(tmp_path)
+    rt.cafes_cfg = TWO_CAFES
+    items = _interleaved(
+        "각색_0901",
+        ["고요한 아침", "글로시 마이", "고요한 아침", "글로시 마이", "고요한 아침", "글로시 마이"],
+    )
+    # 2행(글로시)·3행(고요)은 이미 올렸다 → 건너뛰되 나머지 순서는 그대로
+    for m in (items[1], items[2]):
+        rt.publications.mark(m.source, m.source_row, m.content_hash, "done", "done")
+    _fake_sources(monkeypatch, [("각색_0901", items)])
+
+    skipped: list[dict] = []
+    spec = TaskSpec(task="publish_daily", count=5, per_cafe=True)
+    picked = publish_mod.prepare_per_cafe(rt, spec, skipped)
+    assert [m.source_row for m in picked] == [1, 4, 5, 6]
+    assert [m.cafe for m in picked] == ["고요한 아침", "글로시 마이", "고요한 아침", "글로시 마이"]
+    assert {s["row"] for s in skipped if s["reason"] == "이미 발행됨"} == {2, 3}
+
+
+def test_prepare_per_cafe_excluded_cafe_rows_skipped_in_place(tmp_path, monkeypatch):
+    rt = make_runtime(tmp_path)
+    rt.cafes_cfg = CAFES_CFG  # 웨딩 노트가 excluded
+    items = _interleaved(
+        "각색_0901", ["고요한 아침", "웨딩 노트", "글로시 마이", "웨딩 노트", "고요한 아침"]
+    )
+    _fake_sources(monkeypatch, [("각색_0901", items)])
+
+    skipped: list[dict] = []
+    spec = TaskSpec(task="publish_daily", count=5, per_cafe=True)
+    picked = publish_mod.prepare_per_cafe(rt, spec, skipped)
+    assert [m.cafe for m in picked] == ["고요한 아침", "글로시 마이", "고요한 아침"]
+    assert [m.source_row for m in picked] == [1, 3, 5]
+    assert {s["row"] for s in skipped if s["reason"] == "발행 제외 카페"} == {2, 4}
+
+
+def test_prepare_per_cafe_target_met_cafe_skipped_sequence_continues(tmp_path, monkeypatch):
+    rt = make_runtime(tmp_path)
+    rt.cafes_cfg = TWO_CAFES
+    _mark_today(rt, "고요한 아침", 1)  # 목표 2건 중 1건 이미 → 1건만 더
+    items = _interleaved(
+        "각색_0901",
+        ["고요한 아침", "글로시 마이", "고요한 아침", "글로시 마이", "고요한 아침", "글로시 마이"],
+    )
+    _fake_sources(monkeypatch, [("각색_0901", items)])
+
+    skipped: list[dict] = []
+    spec = TaskSpec(task="publish_daily", count=2, per_cafe=True)
+    picked = publish_mod.prepare_per_cafe(rt, spec, skipped)
+    # 고요한 아침은 1행으로 목표 달성 → 3·5행은 건너뛰고 글로시 순서는 계속 간다
+    assert [(m.source_row, m.cafe) for m in picked] == [
+        (1, "고요한 아침"), (2, "글로시 마이"), (4, "글로시 마이")
+    ]
+    assert any("목표 달성" in s["reason"] and s.get("row") == 3 for s in skipped)
+    assert rt.scratch["per_cafe_plan"]["고요한 아침"]["planned"] == 1
+
+
+def test_prepare_per_cafe_uses_daily_pool_only_after_xlsx(tmp_path, monkeypatch):
+    rt = make_runtime(tmp_path)
+    rt.cafes_cfg = TWO_CAFES
+    xlsx = _interleaved("각색_0901", ["고요한 아침", "글로시 마이"])
+    pool = [_m("", 80, source="일상풀"), _m("", 81, source="일상풀")]
+    for m in pool:
+        m.cafe = ""  # 풀 글은 카페가 비어 있다
+    _fake_sources(monkeypatch, [("각색_0901", xlsx), ("일상풀", pool)])
+
+    spec = TaskSpec(task="publish_daily", count=2, per_cafe=True)
+    picked = publish_mod.prepare_per_cafe(rt, spec, [])
+    assert [m.source for m in picked] == ["각색_0901", "각색_0901", "일상풀", "일상풀"]
+    assert sorted(m.cafe for m in picked[2:]) == ["고요한 아침", "글로시 마이"]
+
+
 def test_prepare_per_cafe_skips_global_hash_duplicate(tmp_path, monkeypatch):
     rt = make_runtime(tmp_path)
     rt.cafes_cfg = {"self_owned": [{"name": "고요한 아침", "cafe_id": 1, "board": "반말일기"}]}
@@ -248,15 +360,44 @@ def test_plan_is_always_immediate_and_rotates_accounts(tmp_path, monkeypatch):
     monkeypatch.setattr(publish_mod, "_pool_for_cafe", lambda rt, spec, c, b, p: (list(p), False))
 
     spec = TaskSpec(
-        task="publish_daily", count=6, per_cafe=True, immediate=True, dry_run=False,
+        task="publish_daily", count=14, per_cafe=True, immediate=True, dry_run=False,
         interval_min=2, interval_max=3,
     )
-    slots = publish_mod.plan(rt, spec, [_m("고요한 아침", i) for i in range(6)])
+    slots = publish_mod.plan(rt, spec, [_m("고요한 아침", i) for i in range(14)])
     assert all(s.scheduled_at is None for s in slots)  # 예약하지 않는다
     used = [s.account for s in slots]
-    assert len(set(used)) <= publish_mod.SELF_DAILY_ACCOUNTS_MAX
-    assert len(set(used)) >= min(publish_mod.SELF_DAILY_ACCOUNTS_MIN, len(pool))
+    # 규칙 §4: 정확히 10개를 골라 고정하고 돌려 쓴다 (풀 12개 → 10개)
+    assert len(set(used)) == publish_mod.SELF_DAILY_ACCOUNTS_MAX == 10
     assert all(a != b for a, b in zip(used, used[1:]))  # 같은 계정 연속 금지
+
+
+def test_self_daily_accounts_are_random_ten():
+    """계정 10개 고정은 LRU 순서가 아니라 **무작위**로 뽑는다 (규칙 §4)."""
+    pool = [_Acc(f"user{i:02d}") for i in range(30)]
+    first = publish_mod.pick_self_daily_accounts(pool, random.Random(1))
+    second = publish_mod.pick_self_daily_accounts(pool, random.Random(2))
+    assert len(first) == len(second) == publish_mod.SELF_DAILY_ACCOUNTS_MAX == 10
+    assert len(set(first)) == 10  # 서로 다른 계정
+    assert first != second  # 실행마다 다른 묶음
+    assert first != [a.login_id for a in pool[:10]]  # 시트 순서 그대로가 아니다
+    # 풀이 10개보다 적으면 있는 만큼만
+    assert len(publish_mod.pick_self_daily_accounts(pool[:4], random.Random(3))) == 4
+
+
+def test_plan_picks_ten_random_accounts_per_cafe(tmp_path, monkeypatch):
+    rt = make_runtime(tmp_path)
+    rt.cafes_cfg = {"self_owned": [{"name": "고요한 아침", "cafe_id": 1, "board": "반말일기"}]}
+    pool = [_Acc(f"user{i:02d}") for i in range(30)]
+    monkeypatch.setattr(publish_mod, "load_accounts", lambda rt, prefer_cache=False: pool)
+    monkeypatch.setattr(publish_mod, "eligible", lambda *a, **k: list(pool))
+    monkeypatch.setattr(publish_mod, "_pool_for_cafe", lambda rt, spec, c, b, p: (list(p), False))
+
+    spec = TaskSpec(task="publish_daily", count=20, per_cafe=True, dry_run=False)
+    slots = publish_mod.plan(rt, spec, [_m("고요한 아침", i) for i in range(20)])
+    used = {s.account for s in slots}
+    assert len(used) == 10
+    # LRU(시트 순서) 상위 10개를 그대로 쓰지 않는다
+    assert used != {a.login_id for a in pool[:10]}
 
 
 def test_avoid_consecutive_swaps_repeat():
@@ -427,6 +568,46 @@ def test_order_round_robin_interleaves_cafes():
     assert order == ["고요한 아침", "글로시 마이", "고요한 아침", "글로시 마이", "고요한 아침"]
 
 
+def test_run_publish_keeps_sheet_order_and_never_round_robins(tmp_path, monkeypatch):
+    """자사 카페 일상 글은 라운드로빈으로 다시 섞지 않는다 (규칙 §2)."""
+    rt = make_runtime(tmp_path)
+    rt.settings.repo_root = tmp_path
+    rt.cafes_cfg = TWO_CAFES
+    items = _interleaved(
+        "각색_0901",
+        ["고요한 아침", "고요한 아침", "글로시 마이", "고요한 아침", "글로시 마이"],
+    )
+    _fake_sources(monkeypatch, [("각색_0901", items)])
+    pool = [_Acc(f"user{i:02d}") for i in range(12)]
+    monkeypatch.setattr(publish_mod, "load_accounts", lambda rt, prefer_cache=False: pool)
+    monkeypatch.setattr(publish_mod, "eligible", lambda *a, **k: list(pool))
+    monkeypatch.setattr(publish_mod, "_pool_for_cafe", lambda rt, spec, c, b, p: (list(p), False))
+
+    def _boom(slots):
+        raise AssertionError("이 흐름에서는 라운드로빈을 쓰면 안 된다")
+
+    monkeypatch.setattr(worker, "order_round_robin", _boom)
+
+    spec = TaskSpec(
+        task="publish_daily", count=5, per_cafe=True, dry_run=True, start_date="2026-09-19"
+    )
+    out = worker._run_publish(rt, None, spec)
+    assert out["slots"] == 5
+    assert [r["row"] for r in out["results"]] == [1, 2, 3, 4, 5]
+    assert [r["cafe"] for r in out["results"]] == [
+        "고요한 아침", "고요한 아침", "글로시 마이", "고요한 아침", "글로시 마이"
+    ]
+    assert [s["seq"] for s in out["sequence"]] == [1, 2, 3, 4, 5]
+
+    # 보고서에도 순서·파일·행이 그대로 나온다 (모의 실행 포함)
+    text = (tmp_path / "docs" / "reports" / "self-daily-2026-09-19.md").read_text(
+        encoding="utf-8"
+    )
+    assert "| 순서 | 파일 | 행 | 카페 |" in text
+    body = [line for line in text.splitlines() if line.startswith("| 1 |")]
+    assert body and "각색_0901" in body[0] and "고요한 아침" in body[0]
+
+
 def test_per_cafe_counts_and_report_file(tmp_path):
     rt = make_runtime(tmp_path)
     rt.settings.repo_root = tmp_path
@@ -466,6 +647,7 @@ def test_per_cafe_counts_and_report_file(tmp_path):
     path = worker.write_daily_report(rt, spec, results, failed)
     assert path.endswith("self-daily-2026-09-19.md")
     text = (tmp_path / "docs" / "reports" / "self-daily-2026-09-19.md").read_text(encoding="utf-8")
+    assert "| 순서 | 파일 | 행 | 카페 |" in text
     assert "고요한 아침" in text and "https://example.com/1" in text
     assert "mem…" in text  # 계정은 가려서 적는다
     assert "실패: 발행 실패(network)" in text
