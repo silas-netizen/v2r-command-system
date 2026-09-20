@@ -1202,8 +1202,18 @@ def plan(rt: Runtime, spec: TaskSpec, manuscripts: list[Manuscript]) -> list[Slo
                 ]
                 chosen = assign(pool_ids, mode="manual", explicit=spec.accounts)
             elif self_daily_pick:
-                # 규칙 §4: 카페마다 **무작위 10개**를 골라 고정하고 돌려 쓴다
-                chosen = pick_self_daily_accounts(pool, self_daily_rng(rt))
+                # 규칙 §4: 카페마다 **무작위 10개**를 골라 고정하고 돌려 쓴다.
+                # 게시판이 달라도 같은 카페면 같은 10개를 쓴다 (게시판마다 새로 뽑으면
+                # 카페 전체로는 20개가 넘어가므로, 실행 1회분은 카페 단위로 기억한다).
+                fixed: dict[str, list[str]] = rt.scratch.setdefault("self_daily_fixed", {})
+                key = _norm(cafe_name)
+                if key not in fixed:
+                    fixed[key] = pick_self_daily_accounts(pool, self_daily_rng(rt))
+                pool_ids = {(a if isinstance(a, str) else a.login_id).casefold() for a in pool}
+                chosen = [a for a in fixed[key] if a.casefold() in pool_ids]
+                if not chosen:
+                    # 고정 10개가 이 게시판에 못 쓰면 이 게시판만 따로 뽑는다
+                    chosen = pick_self_daily_accounts(pool, self_daily_rng(rt))
             else:
                 if not pool:
                     raise AssignError("사용 가능한 계정이 없습니다 (계정 시트를 확인하세요)")
@@ -1213,8 +1223,13 @@ def plan(rt: Runtime, spec: TaskSpec, manuscripts: list[Manuscript]) -> list[Slo
                     count=min(need, len(pool)),
                     last_used=rt.account_state.last_used_map(),
                 )
+            # 순번은 카페 단위로 이어 간다 — 게시판마다 0부터 다시 세면 앞쪽 계정만 쓰게 된다
+            offsets: dict[str, int] = rt.scratch.setdefault("account_rotation_offset", {})
+            start = offsets.get(_norm(cafe_name), 0) if self_daily_pick else 0
             for position, i in enumerate(idxs):
-                assigned[i] = rotate(chosen, position)
+                assigned[i] = rotate(chosen, start + position)
+            if self_daily_pick:
+                offsets[_norm(cafe_name)] = start + len(idxs)
             chosen_by_cafe.setdefault(_norm(cafe_name), []).extend(
                 a for a in chosen if a not in chosen_by_cafe.get(_norm(cafe_name), [])
             )

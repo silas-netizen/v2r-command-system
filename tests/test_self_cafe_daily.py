@@ -400,6 +400,26 @@ def test_plan_picks_ten_random_accounts_per_cafe(tmp_path, monkeypatch):
     assert used != {a.login_id for a in pool[:10]}
 
 
+def test_plan_keeps_same_ten_accounts_across_boards(tmp_path, monkeypatch):
+    """게시판이 여러 개여도 같은 카페면 같은 10개 계정을 쓴다 (규칙 §4).
+
+    09-20 실측: 게시판(메뉴)마다 10개를 새로 뽑아 카페 전체로는 21~24개가 쓰였다.
+    """
+    rt = make_runtime(tmp_path)
+    rt.cafes_cfg = {"self_owned": [{"name": "고요한 아침", "cafe_id": 1, "board": "반말일기"}]}
+    pool = [_Acc(f"user{i:02d}") for i in range(30)]
+    monkeypatch.setattr(publish_mod, "load_accounts", lambda rt, prefer_cache=False: pool)
+    monkeypatch.setattr(publish_mod, "eligible", lambda *a, **k: list(pool))
+    monkeypatch.setattr(publish_mod, "_pool_for_cafe", lambda rt, spec, c, b, p: (list(p), False))
+    boards = [f"게시판{i % 20}" for i in range(60)]
+    monkeypatch.setattr(publish_mod, "resolve_board", lambda rt, m, spec, c: boards.pop(0))
+
+    spec = TaskSpec(task="publish_daily", count=60, per_cafe=True, dry_run=False)
+    slots = publish_mod.plan(rt, spec, [_m("고요한 아침", i) for i in range(60)])
+    used = {s.account for s in slots}
+    assert len(used) == 10
+
+
 def test_avoid_consecutive_swaps_repeat():
     cafes = ["A", "A", "A"]
     assigned = {0: "u1", 1: "u1", 2: "u2"}
