@@ -1347,6 +1347,16 @@ def dispatch(rt: Runtime, job: Any, owner: str | None = None) -> dict:
     if task == "sync_all_sources":
         out = _sync_entries(rt, spec, all_kinds=True)
         return {"ok": not out.get("errors"), **out}
+    if task == "sync_article_index":
+        from v2r.engine.article_sync import sync_all_self_cafes
+
+        out = sync_all_self_cafes(rt, with_bodies="본문까지" in (spec.notes or ""))
+        return {"ok": not out.get("errors"), **out}
+    if task == "duplicate_check":
+        from v2r.engine.article_sync import duplicate_check
+
+        out = duplicate_check(rt, spec)
+        return {"ok": True, **out}
     if task == "generate_brand":
         return _generate_brand(rt, spec)
     if task == "generate_affiliate_daily":

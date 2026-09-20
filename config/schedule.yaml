@@ -13,6 +13,13 @@ entries:
     enabled: true
     command: 자사 카페 일상 글 카페별 100건 실제 발행 댓글 랜덤
 
+  # V2R 글 목록을 색인에 받아 둡니다. 이게 있어야 예전(메이크/수동) 글과도 중복이 안 납니다.
+  - name: 글 목록 색인 동기화
+    time: "07:30"
+    days: daily
+    enabled: true
+    command: 자사 카페 글 목록 동기화
+
   - name: 끊긴 작업 점검
     time: "08:30"
     days: daily

@@ -208,7 +208,55 @@ def record_published(
         log.warning("글 목록 색인 기록 실패: %s", exc)
 
 
+def duplicate_check(rt: Runtime, spec: Any, limit: int = 0) -> dict:
+    """앞으로 쓸 원고 N건을 색인과 **대조만** 해 본다 (아무것도 바꾸지 않는다).
+
+    `{"checked", "duplicates", "clean", "items", "index_total"}`.
+    """
+    from v2r.content import duplicate as dup_mod
+    from v2r.engine import publish as publish_mod
+
+    want = int(limit or getattr(spec, "count", 0) or 0) or 50
+    items: list[dict] = []
+    checked = 0
+    for entry in publish_mod.select_source_entries(rt, spec):
+        name = str(entry.get("name") or "")
+        try:
+            manuscripts = publish_mod.load_manuscripts(rt, entry, prefer_cache=True)
+        except Exception as exc:
+            items.append({"source": name, "reason": f"원본 적재 실패: {exc}", "duplicate": False})
+            continue
+        for m in manuscripts:
+            if checked >= want:
+                break
+            checked += 1
+            cafe = m.cafe or getattr(spec, "cafe", "") or ""
+            dup, why = dup_mod.is_duplicate_against_index(rt, m, cafe)
+            if dup:
+                items.append(
+                    {
+                        "source": name,
+                        "row": m.source_row,
+                        "cafe": cafe,
+                        "title": m.title,
+                        "duplicate": True,
+                        "reason": why,
+                    }
+                )
+        if checked >= want:
+            break
+    dup_count = sum(1 for i in items if i.get("duplicate"))
+    return {
+        "checked": checked,
+        "duplicates": dup_count,
+        "clean": checked - dup_count,
+        "items": items,
+        "index_total": rt.article_index.count(),
+    }
+
+
 __all__ = [
+    "duplicate_check",
     "record_published",
     "sync_all_self_cafes",
     "sync_cafe_index",

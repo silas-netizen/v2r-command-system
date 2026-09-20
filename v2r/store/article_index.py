@@ -26,11 +26,15 @@ from typing import Any, Iterable
 from v2r.content.sanitize import strip_emoji
 from v2r.store.db import now_iso
 
-#: 제목 정규화에서 남기는 글자 — 숫자·영문·한글(완성형)·한글 자모(ㅋ, ㅠ …)
-_KEEP = re.compile(r"[^0-9a-z가-힣ㄱ-ㅎㅏ-ㅣ]")
+#: 한글 낱자(자모) 구간. NFKC는 호환 자모(`ㅋ` U+314B)를 조합용 자모(U+110F)로 바꾸기
+#: 때문에 두 구간을 모두 살려 둔다. 그러지 않으면 `ㅋㅋ`가 통째로 사라진다.
+_JAMO = "ᄀ-ᇿㄱ-ㆎ"
 
-#: 같은 자모가 2번 이상 이어지는 자리 (`ㅋㅋㅋㅋ`, `ㅠㅠㅠ`)
-_JAMO_RUN = re.compile(r"([ㄱ-ㅎㅏ-ㅣ])\1+")
+#: 제목 정규화에서 남기는 글자 — 숫자·영문·한글(완성형)·한글 낱자(ㅋ, ㅠ …)
+_KEEP = re.compile(f"[^0-9a-z가-힣{_JAMO}]")
+
+#: 같은 낱자가 2번 이상 이어지는 자리 (`ㅋㅋㅋㅋ`, `ㅠㅠㅠ`)
+_JAMO_RUN = re.compile(f"([{_JAMO}])\\1+")
 
 
 def normalize_title(text: str) -> str:
