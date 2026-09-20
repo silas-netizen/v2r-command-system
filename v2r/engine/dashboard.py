@@ -140,7 +140,7 @@ def _today_summary(rt: Runtime) -> dict[str, int]:
     out = {"done": 0, "failed": 0, "uncertain": 0, "running": 0, "queued": 0}
     rows = rt.conn.execute(
         "SELECT status, COUNT(*) AS n FROM publications"
-        " WHERE substr(updated_at, 1, 10) = ? GROUP BY status",
+        " WHERE substr(created_at, 1, 10) = ? GROUP BY status",  # 오늘 = 발행(생성) 시각 기준(수정으로 갱신된 행 제외)
         (today,),
     ).fetchall()
     for row in rows:
@@ -178,12 +178,12 @@ def _cafe_rows(rt: Runtime) -> list[dict]:
     today = _today()
     rows = rt.conn.execute(
         "SELECT COALESCE(NULLIF(TRIM(COALESCE(cafe, '')), ''), '(미지정)') AS cafe_name,"
-        " SUM(CASE WHEN status = 'done' AND substr(updated_at, 1, 10) = ? THEN 1 ELSE 0 END)"
+        " SUM(CASE WHEN status = 'done' AND substr(created_at, 1, 10) = ? THEN 1 ELSE 0 END)"
         "   AS today_done,"
         " SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END) AS total_done,"
         " SUM(CASE WHEN status = 'uncertain' THEN 1 ELSE 0 END) AS uncertain,"
         " SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed,"
-        " MAX(updated_at) AS last_at"
+        " MAX(created_at) AS last_at"
         " FROM publications GROUP BY cafe_name ORDER BY total_done DESC, cafe_name",
         (today,),
     ).fetchall()
