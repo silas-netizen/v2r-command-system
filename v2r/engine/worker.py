@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import itertools
 import logging
+import os
 import random
 import re
 import socket
@@ -114,11 +115,75 @@ def clear_stop(rt: Runtime) -> None:
 
 
 def default_owner() -> str:
-    """실행기 소유자 이름."""
+    """실행기 소유자 이름 — `호스트이름:프로세스번호`.
+
+    호스트 이름만 쓰면 같은 PC 의 **두 번째 실행기가 같은 리스를 자기 것으로 본다**
+    (장애 2026-09-20 B: publish_daily 65·67 동시 실행). 프로세스 번호를 붙여
+    서로 다른 실행기임이 드러나게 한다.
+    """
     try:
-        return socket.gethostname()
+        host = socket.gethostname()
     except Exception:
-        return "local"
+        host = "local"
+    return f"{host}:{os.getpid()}"
+
+
+#: 다른 실행기의 발행이 끝나기를 기다리는 최대 시간(초). 넘으면 경고만 남기고 간다.
+PARALLEL_WAIT_MAX_S = 2 * 60 * 60
+#: 기다리는 동안 다시 확인하는 간격(초) — 그 사이 내 리스도 연장한다
+PARALLEL_POLL_S = 30
+
+
+def wait_for_other_publish(
+    rt: Runtime,
+    job_id: int | None,
+    owner: str | None,
+    *,
+    max_wait_s: float = PARALLEL_WAIT_MAX_S,
+    sleep: Any = None,
+    now_fn: Any = None,
+) -> dict:
+    """다른 실행기가 발행 중이면 끝날 때까지 기다린다(리스는 계속 연장).
+
+    리스 이름(`호스트:pid`)과 `data/serve.lock` 으로 이미 막지만,
+    그래도 **두 줄로 동시에 올리는 일**만은 없어야 하므로 한 겹 더 둔다.
+    """
+    sleep = sleep or time.sleep
+    now_fn = now_fn or time.monotonic
+    started = now_fn()
+    waited = 0.0
+    notified = False
+    while True:
+        try:
+            holder = None
+            for other in rt.jobs.running_jobs(exclude_id=job_id, task_prefix="publish_"):
+                holder = rt.jobs.live_lease_holder(other, owner or "")
+                if holder:
+                    break
+        except Exception as exc:  # noqa: BLE001 - 조회 실패로 발행을 막지 않는다
+            log.warning("동시 발행 점검 실패(그냥 진행): %s", exc)
+            return {"waited_s": waited, "holder": None, "timed_out": False}
+        if holder is None:
+            if notified:
+                rt.events.log(job_id, "info", f"다른 실행기 발행이 끝나 이어서 시작합니다({int(waited)}초 대기)")
+            return {"waited_s": waited, "holder": None, "timed_out": False}
+        if not notified:
+            notified = True
+            rt.events.log(
+                job_id, "warn", f"다른 실행기({holder})가 발행 중이라 기다립니다 — 동시 발행 금지"
+            )
+        if waited >= max_wait_s:
+            rt.events.log(
+                job_id, "error", f"다른 실행기({holder}) 발행이 {int(waited)}초째 끝나지 않습니다"
+            )
+            return {"waited_s": waited, "holder": holder, "timed_out": True}
+        if owner and job_id is not None:
+            try:
+                rt.jobs.heartbeat(job_id, owner)  # 기다리는 동안 내 리스를 놓치지 않는다
+            except Exception as exc:  # noqa: BLE001
+                log.warning("대기 중 리스 연장 실패: %s", exc)
+        sleep(PARALLEL_POLL_S)
+        waited = now_fn() - started
 
 
 # --------------------------------------------------------------------
@@ -1073,6 +1138,10 @@ def _run_publish(
 ) -> dict:
     """발행 작업 한 건."""
     clear_stop(rt)  # 새 작업 시작 → 이전 중지 요청은 해제
+    if spec.task == "publish_daily" and getattr(spec, "per_cafe", False):
+        # 다른 실행기가 같은 종류의 발행을 돌고 있으면 나란히 올리지 않는다
+        # (장애 2026-09-20 B: 65·67 동시 실행). 끝날 때까지 기다린다.
+        wait_for_other_publish(rt, job_id, owner)
     skipped: list[dict] = []
     manuscripts = publish_mod.prepare_manuscripts(rt, spec, skipped)
     if not manuscripts:
@@ -1602,27 +1671,58 @@ def maintain_session(rt: Runtime) -> str:
     return result
 
 
+#: 두 번째 실행기에게 보여 주는 안내
+SECOND_SERVE_MSG = (
+    "이미 다른 실행기가 돌고 있습니다(프로세스 {pid}번)."
+    " 실행기는 한 대만 켭니다 — 이 창은 그냥 닫으세요."
+)
+
+
+def ensure_single_serve(rt: Runtime) -> Any:
+    """실행기 잠금을 잡는다. 두 번째면 안내를 남기고 None."""
+    from v2r.engine import lock as lock_mod
+
+    held = lock_mod.acquire_serve_lock(rt)
+    if held is not None:
+        return held
+    pid = lock_mod.holder_pid(rt)
+    message = SECOND_SERVE_MSG.format(pid=pid if pid is not None else "?")
+    print(message, flush=True)
+    log.error("%s", message)
+    try:
+        rt.events.log(None, "error", f"serve 중복 실행 차단: {message}")
+    except Exception as exc:  # noqa: BLE001 - 기록 실패로 종료를 막지 않는다
+        log.warning("중복 실행 이벤트 기록 실패: %s", exc)
+    return None
+
+
 def serve(rt: Runtime, poll_seconds: int = 5, announce: bool = True) -> None:  # pragma: no cover - 장시간 루프
     """채널을 폴링하며 명령을 받아 실행한다. 어떤 예외로도 멈추지 않는다."""
+    held = ensure_single_serve(rt)
+    if held is None:
+        return
     owner = default_owner()
     print(f"serve 시작: 채널 {len(rt.channels)}개, {poll_seconds}초 간격", flush=True)
     log.info("serve 시작: 채널 %d개", len(rt.channels))
     if announce:
         notify_all(rt.channels, SERVE_HELLO)
     next_maintain = 0.0
-    while True:
-        try:
-            if time.monotonic() >= next_maintain:
-                next_maintain = time.monotonic() + MAINTAIN_TICK_S
-                maintain_session(rt)
-            watch_tick(rt)  # 예약 발사 + 모든 작업 감시 + 심장박동
-            serve_poll(rt, owner)
-        except KeyboardInterrupt:
-            print("serve 중지", flush=True)
-            return
-        except Exception as exc:
-            log.exception("serve 폴링 실패(계속 진행): %s", exc)
-        time.sleep(poll_seconds)
+    try:
+        while True:
+            try:
+                if time.monotonic() >= next_maintain:
+                    next_maintain = time.monotonic() + MAINTAIN_TICK_S
+                    maintain_session(rt)
+                watch_tick(rt)  # 예약 발사 + 모든 작업 감시 + 심장박동
+                serve_poll(rt, owner)
+            except KeyboardInterrupt:
+                print("serve 중지", flush=True)
+                return
+            except Exception as exc:
+                log.exception("serve 폴링 실패(계속 진행): %s", exc)
+            time.sleep(poll_seconds)
+    finally:
+        held.release()
 
 
 def watch_tick(rt: Runtime) -> dict:
@@ -1650,12 +1750,15 @@ def watch_tick(rt: Runtime) -> dict:
 
 __all__ = [
     "ALLOWED_TASKS",
+    "default_owner",
     "dispatch",
+    "ensure_single_serve",
     "drain",
     "handle_text",
     "idem_key",
     "maintain_session",
     "run_once",
     "serve",
+    "wait_for_other_publish",
     "watch_tick",
 ]

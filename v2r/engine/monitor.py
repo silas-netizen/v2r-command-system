@@ -12,6 +12,13 @@
                     실패면 한 번 자동 재등록한다. 문법·설정 오류는 재시도하지 않는다.
 
 알림 중복을 막기 위해 상태는 ``data/monitor_state.json`` 에 남는다(재시작해도 유지).
+
+**건드리지 않는 것** (장애 2026-09-20 A, 자세히는 `docs/reference/ops-scheduling.md` §3-1)
+
+    과거      → 실행기가 켜지기 10분보다 더 전에 멈춘 작업(어제 기록)은 못 본 척한다.
+    중지·취소 → 사용자가 끊은 것은 "다시 해볼 실패"가 아니다.
+    재등록본  → 감시가 만든 작업은 또 만들지 않는다(원래 작업당 1회).
+    부분 성공 → 한 줄이라도 올라간 발행은 보고만 한다(다시 돌리면 중복 발행).
 """
 
 from __future__ import annotations
@@ -22,7 +29,7 @@ import logging
 import os
 import re
 import time as _time
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -70,6 +77,17 @@ DIAGNOSE_SYSTEM = (
 SKIP_TASKS = frozenset(
     {"stop", "status", "dashboard", "schedule_list", "monitor_status", "pending_report"}
 )
+#: 실행기가 켜지기 이 시간보다 더 전에 멈춘 작업은 **과거**로 본다(초).
+#: 장애 2026-09-20: 켜자마자 어제 실패한 작업 59·62를 알리고 60을 다시 등록했다.
+HISTORY_GRACE_S = 600
+#: 절대 다시 등록하지 않는 실패 문구(중지·취소·리스 상실은 "다시 해볼 실패"가 아니다)
+NO_RETRY_RE = re.compile(r"중지|취소|cancel|리스\s*상실|lease", re.I)
+#: 재등록으로 만들어진 작업임을 알리는 멱등 키 꼬리표
+RETRY_MARK = "|monitor-retry"
+#: 재시도 사슬 기록을 남겨 두는 최대 개수
+CHAIN_KEEP = 200
+#: publish 결과에서 실패로 세는 줄 상태
+FAILED_ROW_STATUSES = frozenset({"failed", "error", "skipped"})
 
 
 def load_config(rt: Any) -> dict:
@@ -198,6 +216,98 @@ def _retryable_rows(job: dict) -> int:
     except Exception:  # noqa: BLE001
         return 0
     return len(result.get("failures") or [])
+
+
+def _success_rows(job: dict) -> int:
+    """publish_* 결과에서 **성공한 줄** 수. 하나라도 있으면 부분 성공이다."""
+    try:
+        result = json.loads(job.get("result_json") or "{}")
+    except Exception:  # noqa: BLE001
+        return 0
+    if not isinstance(result, dict):
+        return 0
+    rows = [
+        r
+        for r in (result.get("results") or [])
+        if isinstance(r, dict) and str(r.get("status") or "") not in FAILED_ROW_STATUSES
+    ]
+    if rows:
+        return len(rows)
+    total = 0
+    for counts in (result.get("per_cafe") or {}).values():
+        if isinstance(counts, dict):
+            try:
+                total += int(counts.get("ok") or 0)
+            except (TypeError, ValueError):
+                continue
+    return total
+
+
+def root_key(job: dict) -> str:
+    """재등록 사슬의 **맨 처음 작업**을 가리키는 키."""
+    key = str(job.get("idem_key") or f"job-{job.get('id')}")
+    return key.split(RETRY_MARK)[0]
+
+
+def no_retry_reason(job: dict) -> str | None:
+    """다시 등록하면 안 되는 이유(있으면 한국어 한 줄, 없으면 None).
+
+    장애 2026-09-20: 어제 실패한 작업 60(다시 해볼 수 없는 줄 2건)을 67로,
+    사용자가 `중지` 로 끊은 67을 다시 70으로 등록했다. 아래가 그 재발 방지다.
+    """
+    status = str(job.get("status") or "")
+    if status == "cancelled":
+        return "사용자가 중지한 작업입니다"
+    error = str(job.get("error") or "")
+    if error and NO_RETRY_RE.search(error):
+        return "중지·취소·리스 상실은 다시 해볼 실패가 아닙니다"
+    if RETRY_MARK in str(job.get("idem_key") or ""):
+        return "이미 감시가 한 번 다시 등록한 작업입니다"
+    if str(job.get("task") or "").startswith("publish_"):
+        rows = _success_rows(job)
+        if rows:
+            return f"일부는 성공했습니다(성공 {rows}건) — 다시 올리면 중복이 됩니다"
+    return None
+
+
+def _chain_used(state: dict, job: dict) -> bool:
+    """이 사슬(원래 작업 기준)에서 이미 재등록을 썼는가."""
+    return int((state.get("retry_chain") or {}).get(root_key(job), 0)) > 0
+
+
+def _chain_mark(state: dict, job: dict) -> None:
+    """사슬에 재등록 1회를 기록한다(기록은 최근 것만 남긴다)."""
+    chain = state.setdefault("retry_chain", {})
+    chain[root_key(job)] = 1
+    for old in list(chain)[:-CHAIN_KEEP]:
+        chain.pop(old, None)
+
+
+def may_retry(state: dict, job: dict, js: dict) -> str | None:
+    """재등록해도 되는가. 안 되면 이유를 돌려준다."""
+    if int(js.get("retries", 0)) > 0:
+        return "이미 한 번 다시 등록했습니다"
+    if _chain_used(state, job):
+        return "같은 명령은 한 번만 다시 등록합니다"
+    return no_retry_reason(job)
+
+
+def started_at(rt: Any, state: dict, now: datetime) -> datetime:
+    """이번 실행기가 켜진 시각. 프로세스마다 첫 틱에서 정해 상태 파일에 남긴다."""
+    scratch = getattr(rt, "scratch", None)
+    cached = scratch.get("_monitor_started_at") if isinstance(scratch, dict) else None
+    if cached is None:
+        cached = now
+        if isinstance(scratch, dict):
+            scratch["_monitor_started_at"] = cached
+        state["started_at"] = cached.isoformat(timespec="seconds")
+    return cached
+
+
+def is_history(job: dict, since: datetime) -> bool:
+    """실행기가 켜지기 한참 전에 멈춘 작업(=과거 기록)인가."""
+    mark = _ts(job.get("updated_at")) or _ts(job.get("created_at"))
+    return mark is not None and mark < since
 
 
 def _requeue(rt: Any, job: dict, marker: str) -> int | None:
@@ -407,25 +517,32 @@ def _watch_running(rt: Any, state: dict, job: dict, now: datetime) -> list[dict]
         rt.events.log(job_id, "warn", f"감시: 진행 없음 {int(idle // 60)}분")
         acts.append({"job_id": job_id, "action": "stalled"})
 
-    if (
-        idle >= DEAD_S
-        and (lease_until is None or lease_until <= now)
-        and int(js.get("retries", 0)) == 0
-    ):
-        js["retries"] = 1
+    if idle >= DEAD_S and (lease_until is None or lease_until <= now) and not js.get("reaped"):
+        js["reaped"] = True
+        block = may_retry(state, job, js)
         try:
             rt.jobs.finish(job_id, "failed", None, f"감시: {int(idle // 60)}분 멈춤 — 자동 정리")
         except Exception as exc:  # noqa: BLE001
             log.warning("정체 작업 정리 실패: %s", exc)
-        new_id = _requeue(rt, job, "monitor-retry1")
+        new_id = None
+        if block is None:
+            js["retries"] = 1
+            _chain_mark(state, job)
+            new_id = _requeue(rt, job, "monitor-retry1")
+        tail = (
+            f" 같은 명령을 작업 {new_id} 로 다시 등록했습니다."
+            if new_id
+            else (f" 다시 등록하지 않았습니다: {block}" if block else " 재등록 실패")
+        )
         _alert(
             rt,
             state,
-            f"작업 {job_id} 이(가) {int(idle // 60)}분 멈춰 실패로 정리했습니다."
-            + (f" 같은 명령을 작업 {new_id} 로 다시 등록했습니다." if new_id else " 재등록 실패"),
+            f"작업 {job_id} 이(가) {int(idle // 60)}분 멈춰 실패로 정리했습니다." + tail,
         )
         rt.events.log(job_id, "error", f"감시: 멈춤 정리 + 재등록 → {new_id}")
-        acts.append({"job_id": job_id, "action": "reaped", "new_job_id": new_id})
+        acts.append(
+            {"job_id": job_id, "action": "reaped", "new_job_id": new_id, "blocked": block}
+        )
     return acts
 
 
@@ -456,13 +573,17 @@ def _watch_finished(
 
     acts: list[dict] = []
     new_id = None
-    retryable = verdict["action"] == "retry" or RETRYABLE_RE.search(error)
-    if retryable and int(js.get("retries", 0)) == 0:
+    retryable = bool(verdict["action"] == "retry" or RETRYABLE_RE.search(error))
+    block = may_retry(state, job, js) if retryable else None
+    if retryable and block is None:
         js["retries"] = 1
+        _chain_mark(state, job)
         new_id = _requeue(rt, job, "monitor-retry1")
         if new_id:
             lines.append(f"시도함: 같은 명령을 작업 {new_id} 로 한 번 더 등록했습니다")
             _daily(state, now)["recovered"] += 1
+    elif block:
+        lines.append(f"다시 등록하지 않았습니다: {block}")
     if verdict["action"] == "refresh":
         try:
             rt.client.maintain_auth()
@@ -476,7 +597,13 @@ def _watch_finished(
             lines.append(f"다시 하려면 이렇게 보내세요: {resume}")
     _alert(rt, state, "\n".join(lines))
     acts.append(
-        {"job_id": job_id, "action": "failed", "new_job_id": new_id, "rule": verdict["rule"]}
+        {
+            "job_id": job_id,
+            "action": "failed",
+            "new_job_id": new_id,
+            "rule": verdict["rule"],
+            "blocked": block,
+        }
     )
     return acts
 
@@ -504,9 +631,17 @@ def tick(rt: Any, now: datetime | None = None) -> dict:
         log.warning("감시 대상 조회 실패: %s", exc)
         return {"watched": 0, "actions": [], "error": str(exc)}
 
+    # 실행기가 켜지기 한참 전에 멈춘 작업(어제 기록)은 건드리지 않는다.
+    # 알리지도, 다시 등록하지도 않는다 (장애 2026-09-20 B안).
+    since = started_at(rt, state, now) - timedelta(seconds=HISTORY_GRACE_S)
+    skipped_history = 0
+
     open_ids = set()
     for job in open_jobs:
         if str(job.get("task")) in SKIP_TASKS:
+            continue
+        if is_history(job, since):
+            skipped_history += 1
             continue
         open_ids.add(int(job["id"]))
         watched += 1
@@ -520,6 +655,9 @@ def tick(rt: Any, now: datetime | None = None) -> dict:
 
     for job in recent:
         if str(job.get("status")) != "failed" or str(job.get("task")) in SKIP_TASKS:
+            continue
+        if is_history(job, since):
+            skipped_history += 1
             continue
         try:
             actions += _watch_finished(rt, state, job, now, cfg)
@@ -536,7 +674,13 @@ def tick(rt: Any, now: datetime | None = None) -> dict:
     except Exception as exc:  # noqa: BLE001
         log.warning("하루 요약 실패: %s", exc)
     save_state(rt, state)
-    return {"watched": watched, "actions": actions, "summary": summary}
+    return {
+        "watched": watched,
+        "actions": actions,
+        "summary": summary,
+        "skipped_history": skipped_history,
+        "started_at": state.get("started_at"),
+    }
 
 
 def monitor_report(rt: Any, now: datetime | None = None) -> str:
@@ -593,6 +737,14 @@ def monitor_report(rt: Any, now: datetime | None = None) -> str:
 
 __all__ = [
     "DEAD_S",
+    "HISTORY_GRACE_S",
+    "NO_RETRY_RE",
+    "RETRY_MARK",
+    "is_history",
+    "may_retry",
+    "no_retry_reason",
+    "root_key",
+    "started_at",
     "daily_summary",
     "diagnose",
     "error_signature",

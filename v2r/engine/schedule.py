@@ -516,7 +516,12 @@ def health_report(rt: Any, now_kst: datetime | None = None) -> str:
         beat = f"실행기 심장박동: {int(age)}초 전 — 멈춘 것 같습니다 (기준 {HEARTBEAT_STALE_SECONDS}초)"
     else:
         beat = f"실행기 심장박동: {int(age)}초 전 — 정상"
-    lines = [beat, "", schedule_report(rt, now_kst)]
+    try:
+        from v2r.engine.lock import lock_report
+
+        lines = [beat, lock_report(rt), "", schedule_report(rt, now_kst)]
+    except Exception as exc:  # noqa: BLE001 - 잠금 상태를 못 읽어도 보고는 나간다
+        lines = [beat, f"단일 실행기 잠금: 확인 실패 ({exc})", "", schedule_report(rt, now_kst)]
     try:
         from v2r.__main__ import session_report_text
 

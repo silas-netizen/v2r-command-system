@@ -32,7 +32,15 @@ def make_rt(tmp_path):
     )
     rt.settings.config_dir = cfg
     rt._channels = [RecordingChannel()]
+    # 기본은 "실행기가 진작에 켜져 있었다" — 과거 기록 무시 규칙에 걸리지 않게.
+    # 갓 켜진 상황을 보려면 set_started(rt, NOW) 로 바꾼다.
+    set_started(rt, NOW - timedelta(days=1))
     return rt
+
+
+def set_started(rt, when):
+    """이번 실행기가 켜진 시각을 정한다(과거 기록 무시 규칙의 기준)."""
+    rt.scratch["_monitor_started_at"] = when
 
 
 def add_job(rt, *, task="publish_daily", status="queued", ago_min=0, error=None, notes="일상 글 3개 올려줘"):
@@ -209,6 +217,137 @@ def test_failed_job_logic_error_is_not_retried_and_shows_resume(tmp_path):
     assert act["rule"] == "catalog_mismatch"
     assert act["new_job_id"] is None
     assert any("다시 하려면 이렇게 보내세요" in t for t in rt.channels[0].sent)
+    rt.close()
+
+
+# --------------------------------------------------------------------
+# 3-b) 장애 2026-09-20 A — 과거 기록·중지·부분 성공은 건드리지 않는다
+# --------------------------------------------------------------------
+def set_result(rt, job_id, result):
+    """작업 결과 JSON 을 심는다."""
+    rt.conn.execute(
+        "UPDATE jobs SET result_json = ? WHERE id = ?",
+        (json.dumps(result, ensure_ascii=False), job_id),
+    )
+
+
+def test_history_jobs_are_ignored_on_first_tick(tmp_path):
+    """갓 켜진 실행기는 어제 실패한 작업을 알리지도 다시 등록하지도 않는다."""
+    rt = make_rt(tmp_path)
+    rt.scratch.pop("_monitor_started_at", None)  # 방금 켜진 상태
+    old = add_job(rt, status="failed", ago_min=20 * 60, error="connection timeout")
+    out = monitor.tick(rt, NOW)
+    assert out["actions"] == []
+    assert out["skipped_history"] >= 1
+    assert rt.channels[0].sent == []
+    assert len(rt.jobs.recent(limit=10)) == 1  # 재등록 없음
+    assert monitor.load_state(rt)["started_at"].startswith("2026-09-21T12:00")
+    assert rt.jobs.get(old)["status"] == "failed"
+    rt.close()
+
+
+def test_history_cutoff_keeps_recent_jobs(tmp_path):
+    """켜지기 10분 안쪽에 움직인 작업은 과거로 보지 않는다."""
+    rt = make_rt(tmp_path)
+    rt.scratch.pop("_monitor_started_at", None)
+    add_job(rt, status="failed", ago_min=5, error="connection timeout")
+    out = monitor.tick(rt, NOW)
+    assert [a["action"] for a in out["actions"]] == ["failed"]
+    rt.close()
+
+
+def test_cancelled_job_is_never_requeued(tmp_path):
+    """사용자가 `중지` 로 끊은 작업은 다시 등록하지 않는다."""
+    rt = make_rt(tmp_path)
+    job_id = add_job(rt, status="failed", error="리스 상실: 다른 실행기가 작업을 가져갔습니다")
+    out = monitor.tick(rt, NOW)
+    act = [a for a in out["actions"] if a["action"] == "failed"][0]
+    assert act["new_job_id"] is None
+    assert "다시 등록하지 않았습니다" in "\n".join(rt.channels[0].sent)
+    assert len(rt.jobs.recent(limit=10)) == 1
+    assert rt.jobs.get(job_id)["status"] == "failed"
+    rt.close()
+
+
+@pytest.mark.parametrize(
+    "job_kwargs",
+    [
+        {"status": "cancelled", "error": None},
+        {"status": "failed", "error": "사용자 중지 요청으로 건너뜀"},
+        {"status": "failed", "error": "작업이 취소되었습니다"},
+        {"status": "failed", "error": "lease lost"},
+    ],
+)
+def test_no_retry_reason_covers_stop_and_cancel(tmp_path, job_kwargs):
+    rt = make_rt(tmp_path)
+    job_id = add_job(rt, **job_kwargs)
+    assert monitor.no_retry_reason(rt.jobs.get(job_id)) is not None
+    rt.close()
+
+
+def test_monitor_retry_child_is_not_retried_again(tmp_path):
+    """60 → 67 → 70 처럼 사슬이 길어지지 않는다(원래 작업당 재시도 1회)."""
+    rt = make_rt(tmp_path)
+    add_job(rt, status="failed", error="connection timeout")
+    out = monitor.tick(rt, NOW)
+    child = [a for a in out["actions"] if a["action"] == "failed"][0]["new_job_id"]
+    assert child
+    # 다시 등록된 작업마저 같은 이유로 실패했다
+    rt.conn.execute(
+        "UPDATE jobs SET status = 'failed', error = ?, created_at = ?, updated_at = ?"
+        " WHERE id = ?",
+        ("connection timeout", NOW.isoformat(timespec="seconds"),
+         NOW.isoformat(timespec="seconds"), child),
+    )
+    rt.channels[0].sent.clear()
+    out2 = monitor.tick(rt, NOW + timedelta(minutes=1))
+    act2 = [a for a in out2["actions"] if a["action"] == "failed" and a["job_id"] == child][0]
+    assert act2["new_job_id"] is None
+    assert act2["blocked"]
+    assert monitor.root_key(rt.jobs.get(child)) == monitor.root_key(rt.jobs.get(child - 1))
+    rt.close()
+
+
+def test_partial_success_publish_is_reported_not_retried(tmp_path):
+    """일부라도 올라간 발행은 다시 돌리지 않는다(중복 발행 방지)."""
+    rt = make_rt(tmp_path)
+    job_id = add_job(rt, status="failed", error="connection timeout")
+    set_result(
+        rt,
+        job_id,
+        {"ok": False, "results": [{"title": "가", "status": "posted"}], "failures": ["나: 실패"]},
+    )
+    out = monitor.tick(rt, NOW)
+    act = [a for a in out["actions"] if a["action"] == "failed"][0]
+    assert act["new_job_id"] is None
+    assert "일부는 성공했습니다" in "\n".join(rt.channels[0].sent)
+    rt.close()
+
+
+def test_partial_success_counted_from_per_cafe(tmp_path):
+    rt = make_rt(tmp_path)
+    job_id = add_job(rt, status="failed", error="connection timeout")
+    set_result(rt, job_id, {"ok": False, "per_cafe": {"고요한 아침": {"ok": 3, "fail": 2}}})
+    out = monitor.tick(rt, NOW)
+    assert [a for a in out["actions"] if a["action"] == "failed"][0]["new_job_id"] is None
+    # 아무것도 못 올렸으면 다시 등록한다
+    rt2 = make_rt(tmp_path / "b")
+    job2 = add_job(rt2, status="failed", error="connection timeout")
+    set_result(rt2, job2, {"ok": False, "per_cafe": {"고요한 아침": {"ok": 0, "fail": 5}}})
+    out2 = monitor.tick(rt2, NOW)
+    assert [a for a in out2["actions"] if a["action"] == "failed"][0]["new_job_id"]
+    rt.close()
+    rt2.close()
+
+
+def test_reaped_stalled_cancelled_job_is_not_requeued(tmp_path):
+    """멈춘 작업 정리에도 같은 금지 규칙이 걸린다."""
+    rt = make_rt(tmp_path)
+    job_id = add_job(rt, status="running", ago_min=40, error="사용자 중지 요청")
+    out = monitor.tick(rt, NOW)
+    reaped = [a for a in out["actions"] if a["action"] == "reaped"][0]
+    assert reaped["new_job_id"] is None and reaped["blocked"]
+    assert rt.jobs.get(job_id)["status"] == "failed"
     rt.close()
 
 

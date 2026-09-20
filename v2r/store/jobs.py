@@ -22,6 +22,28 @@ def _parse(ts: str | None) -> datetime | None:
         return None
 
 
+def _owner_is_dead(owner: str | None) -> bool:
+    """`호스트:pid` 소유자가 이미 죽은 프로세스인가(같은 PC일 때만 판단).
+
+    소유자에 프로세스 번호를 붙이면서(장애 2026-09-20 B) 실행기를 껐다 켜면
+    이름이 달라진다. 앞 프로세스가 죽었다면 리스를 이어받아야 멈추지 않는다.
+    """
+    import socket
+
+    text = str(owner or "")
+    host, sep, pid_text = text.rpartition(":")
+    if not sep or not pid_text.isdigit():
+        return False
+    try:
+        if host != socket.gethostname():
+            return False
+    except Exception:  # noqa: BLE001
+        return False
+    from v2r.engine.lock import pid_alive
+
+    return not pid_alive(int(pid_text))
+
+
 class JobStore:
     """jobs + executor_lease 조작."""
 
@@ -90,7 +112,10 @@ class JobStore:
         if row is not None:
             until = _parse(row["until"])
             if row["owner"] and row["owner"] != owner and until and until > now:
-                return False
+                # 살아 있는 **다른** 실행기가 잡고 있으면 절대 가져가지 않는다.
+                # 죽은 프로세스가 남긴 이름이면 이어받는다.
+                if not _owner_is_dead(row["owner"]):
+                    return False
         until_iso = (now + timedelta(seconds=lease_seconds)).isoformat(timespec="seconds")
         ts = now_iso()
         self.conn.execute(
@@ -190,6 +215,33 @@ class JobStore:
             "SELECT * FROM jobs WHERE status IN ('queued', 'running') ORDER BY id"
         ).fetchall()
         return [dict(r) for r in rows]
+
+    def running_jobs(self, exclude_id: int | None = None, task_prefix: str = "") -> list[dict]:
+        """지금 running 인 작업들(같은 작업 두 줄 동시 실행을 막는 데 쓴다)."""
+        rows = self.conn.execute(
+            "SELECT * FROM jobs WHERE status = 'running' ORDER BY id"
+        ).fetchall()
+        out = []
+        for row in rows:
+            item = dict(row)
+            if exclude_id is not None and int(item["id"]) == int(exclude_id):
+                continue
+            if task_prefix and not str(item.get("task") or "").startswith(task_prefix):
+                continue
+            out.append(item)
+        return out
+
+    def live_lease_holder(self, job: dict, owner: str) -> str | None:
+        """그 작업의 리스를 **다른** 실행기가 아직 살아서 잡고 있으면 그 이름."""
+        holder = str(job.get("lease_owner") or "")
+        if not holder or holder == owner:
+            return None
+        until = _parse(job.get("lease_until"))
+        if until is None or until <= datetime.now(KST):
+            return None
+        if _owner_is_dead(holder):
+            return None
+        return holder
 
     def lease_info(self) -> dict | None:
         """실행기 리스 현황(owner, until). 없으면 None."""
