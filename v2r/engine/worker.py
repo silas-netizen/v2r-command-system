@@ -1420,7 +1420,7 @@ def dispatch(rt: Runtime, job: Any, owner: str | None = None) -> dict:
         from v2r.engine.article_sync import sync_all_self_cafes
 
         out = sync_all_self_cafes(rt, with_bodies="본문까지" in (spec.notes or ""))
-        return {"ok": not out.get("errors"), **out}
+        return {**out, "ok": out.get("ok", not out.get("errors"))}
     if task == "duplicate_check":
         from v2r.engine.article_sync import duplicate_check
 

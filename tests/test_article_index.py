@@ -188,12 +188,108 @@ def test_sync_all_self_cafes_제외_카페도_포함(rt):
     assert [c["cafe"] for c in out["cafes"]] == ["고요한 아침", "글로시 마이", "웨딩 노트"]
     assert out["rows"] == 18
     assert out["total"] == 18
+    assert out["ok"] is True
+    assert out["warnings"] == []
 
 
 def test_sync_cafe_index_cafe_id_없으면_오류(rt):
     _wire(rt)
     out = article_sync.sync_cafe_index(rt, "없는 카페")
     assert out["errors"] and out["rows"] == 0
+
+
+# --------------------------------------------------------------------
+# 3-1. 계정 조회 실패 → 경고로만 남기고 카페 동기화는 계속 (재시도 포함)
+# --------------------------------------------------------------------
+class FlakyClient(FakeClient):
+    """`fail_logins`에 든 계정은 매번 실패, `retry_once_logins`는 첫 시도만 실패."""
+
+    def __init__(self, fail_logins=(), retry_once_logins=()) -> None:
+        super().__init__()
+        self.fail_logins = set(fail_logins)
+        self.retry_once_logins = set(retry_once_logins)
+        self._retry_seen: set = set()
+
+    def get(self, path, params=None):
+        params = params or {}
+        if path.endswith("written_articles"):
+            login = params.get("naver_login_id")
+            if login in self.fail_logins:
+                raise RuntimeError(f"{login} 조회 실패")
+            if login in self.retry_once_logins and login not in self._retry_seen:
+                self._retry_seen.add(login)
+                raise RuntimeError(f"{login} 일시 오류")
+        return super().get(path, params=params)
+
+
+def test_sync_cafe_index_계정_실패는_재시도_후_경고로(rt, monkeypatch):
+    monkeypatch.setattr(article_sync.time, "sleep", lambda s: None)
+    client = FlakyClient(retry_once_logins={"acc1"})
+    rt._client = client
+    rt._catalog = FakeCatalog()
+
+    out = article_sync.sync_cafe_index(rt, "고요한 아침")
+
+    # acc1은 재시도(2번째 시도)로 결국 성공해 정상 계정과 동일하게 6건
+    assert out["errors"] == []
+    assert out["warnings"] == []
+    assert out["rows"] == 6
+    assert out["accounts"] == 2
+
+
+def test_sync_cafe_index_계정_재시도_후에도_실패면_경고(rt, monkeypatch):
+    monkeypatch.setattr(article_sync.time, "sleep", lambda s: None)
+    client = FlakyClient(fail_logins={"acc1"})
+    rt._client = client
+    rt._catalog = FakeCatalog()
+
+    out = article_sync.sync_cafe_index(rt, "고요한 아침")
+
+    # acc1은 계속 실패 → 경고에만 기록되고, acc2는 정상적으로 색인된다
+    assert out["errors"] == []
+    assert len(out["warnings"]) == 1
+    assert "acc1" in out["warnings"][0]
+    assert out["rows"] == 3
+    assert rt.article_index.count("고요한 아침") == 3
+
+
+def test_sync_all_self_cafes_일부_계정_실패해도_ok_True(rt, monkeypatch):
+    monkeypatch.setattr(article_sync.time, "sleep", lambda s: None)
+    client = FlakyClient(fail_logins={"acc1"})
+    rt._client = client
+    rt._catalog = FakeCatalog()
+
+    out = article_sync.sync_all_self_cafes(rt)
+
+    assert out["ok"] is True
+    assert len(out["warnings"]) == 3  # acc1은 카페 3곳 모두에서 실패
+    assert out["rows"] == 9  # 카페마다 acc2만 성공(3건)
+
+
+def test_sync_all_self_cafes_전_계정_실패면_ok_False(rt, monkeypatch):
+    monkeypatch.setattr(article_sync.time, "sleep", lambda s: None)
+    client = FlakyClient(fail_logins={"acc1", "acc2"})
+    rt._client = client
+    rt._catalog = FakeCatalog()
+
+    out = article_sync.sync_all_self_cafes(rt)
+
+    assert out["ok"] is False
+    assert out["rows"] == 0
+    assert len(out["warnings"]) == 6  # 계정 2개 x 카페 3곳
+
+
+def test_format_sync_summary_경고_없음():
+    out = {"rows": 4265, "cafes": [{}] * 5, "warnings": []}
+    assert article_sync.format_sync_summary(out) == "색인 동기화: 4,265건 (카페 5)"
+
+
+def test_format_sync_summary_경고_있음():
+    out = {"rows": 4265, "cafes": [{}] * 5, "warnings": ["a: x", "b: y", "c: z"]}
+    assert (
+        article_sync.format_sync_summary(out)
+        == "색인 동기화: 4,265건 (카페 5) — 계정 3개 조회 실패(경고)"
+    )
 
 
 # --------------------------------------------------------------------

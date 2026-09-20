@@ -192,3 +192,12 @@ def test_running_jobs_filters_by_task_and_id(tmp_path):
     rows = rt.jobs.running_jobs(exclude_id=mine, task_prefix="publish_")
     assert [int(r["id"]) for r in rows] == [other]
     rt.close()
+
+
+def test_legacy_hostname_owner_is_treated_as_dead():
+    import socket
+
+    from v2r.store import jobs as jobs_mod
+
+    assert jobs_mod._owner_is_dead(socket.gethostname()) is True
+    assert jobs_mod._owner_is_dead("other-host") is False

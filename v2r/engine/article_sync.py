@@ -34,6 +34,32 @@ BODY_SLEEP = 0.3
 #: 한 번에 본문을 채울 최대 건수 (0이면 제한 없음)
 BODY_LIMIT = 500
 
+#: 계정 `written_articles` 조회 실패 시 재시도 횟수
+ACCOUNT_RETRY_ATTEMPTS = 2
+
+#: 재시도 사이 쉬는 시간(초)
+ACCOUNT_RETRY_SLEEP = 1.0
+
+
+def _fetch_written_articles(rt: Runtime, cafe_id: Any, login_id: str) -> list:
+    """계정 1개의 글 목록을 가져온다. 실패하면 짧게 쉬었다가 한 번 더 시도한다.
+
+    한두 계정의 일시적 오류로 카페 전체 동기화가 실패로 찍히지 않도록, 마지막
+    시도까지 실패한 경우에만 예외를 그대로 올린다(호출 쪽에서 경고로 기록).
+    """
+    last_exc: Exception | None = None
+    for attempt in range(ACCOUNT_RETRY_ATTEMPTS):
+        try:
+            return api_articles.written_articles(
+                rt.client, cafe_id, login_id, pages=MAX_PAGES
+            )
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if attempt + 1 < ACCOUNT_RETRY_ATTEMPTS:
+                time.sleep(ACCOUNT_RETRY_SLEEP)
+    assert last_exc is not None
+    raise last_exc
+
 
 def _cafe_entry(rt: Runtime, cafe_name: str) -> dict:
     """`cafes.yaml`에서 카페 항목 찾기."""
@@ -68,8 +94,13 @@ def sync_cafe_index(
 ) -> dict:
     """카페 1곳의 V2R 글 목록을 색인에 모은다.
 
+    계정별 `written_articles` 조회가 실패하면(재시도 후에도) 그 계정만
+    `warnings`에 짧게 남기고 나머지 계정은 계속 돈다 — 계정 몇 개의 일시적
+    오류로 카페 전체 동기화를 실패로 찍지 않는다. `errors`는 카페 설정
+    자체가 잘못된 경우(예: cafe_id 없음) 같은 진짜 실패만 담는다.
+
     돌려주는 값: `{"cafe", "cafe_id", "accounts", "rows", "new", "updated",
-    "bodies", "errors"}`.
+    "bodies", "errors", "warnings"}`.
     """
     entry = _cafe_entry(rt, cafe_name)
     name = str(entry.get("name") or cafe_name)
@@ -83,6 +114,7 @@ def sync_cafe_index(
         "updated": 0,
         "bodies": 0,
         "errors": [],
+        "warnings": [],
     }
     if not cafe_id:
         out["errors"].append(f"cafe_id를 찾지 못했습니다: {cafe_name}")
@@ -99,11 +131,9 @@ def sync_cafe_index(
     out["accounts"] = len(logins)
     for login_id in logins:
         try:
-            rows = api_articles.written_articles(
-                rt.client, cafe_id, login_id, pages=MAX_PAGES
-            )
+            rows = _fetch_written_articles(rt, cafe_id, login_id)
         except Exception as exc:
-            out["errors"].append(f"{login_id}: {exc}")
+            out["warnings"].append(f"{login_id}: {exc}")
             beat()
             continue
         for row in rows:
@@ -158,15 +188,29 @@ def sync_all_self_cafes(
     """자사 카페 **전부**(발행 제외 카페도) 색인 동기화.
 
     제외 카페라도 V2R에는 그 카페 글이 실제로 있다. 중복을 막으려면 그 글도 알아야 한다.
+
+    일부 계정의 `written_articles` 조회가 (재시도 후에도) 실패하면 `warnings`에
+    쌓일 뿐 작업 전체를 실패로 찍지 않는다: 카페 어느 한 곳이라도 동기화됐으면
+    `ok: True`다. 등록된 모든 카페의 모든 계정이 다 실패했을 때만 `ok: False`.
     """
     from v2r.engine.publish import self_cafe_names
 
     results: list[dict] = []
     errors: list[str] = []
+    warnings: list[str] = []
     for cafe in self_cafe_names(rt, include_excluded=True):
         res = sync_cafe_index(rt, cafe, with_bodies=with_bodies, heartbeat=heartbeat)
         errors.extend(res.get("errors") or [])
+        warnings.extend(res.get("warnings") or [])
         results.append(res)
+
+    total_accounts = sum(r["accounts"] for r in results)
+    failed_accounts = len(warnings)
+    # 계정이 하나라도 등록돼 있었는데 전부 실패했으면(진짜 카페 설정 오류가 아니어도)
+    # 그 카페는 하나도 동기화되지 않은 것이다.
+    all_accounts_failed = total_accounts > 0 and failed_accounts >= total_accounts
+    ok = not errors and not all_accounts_failed
+
     return {
         "cafes": results,
         "rows": sum(r["rows"] for r in results),
@@ -174,8 +218,24 @@ def sync_all_self_cafes(
         "updated": sum(r["updated"] for r in results),
         "bodies": sum(r["bodies"] for r in results),
         "errors": errors,
+        "warnings": warnings,
+        "ok": ok,
         "total": rt.article_index.count(),
     }
+
+
+def format_sync_summary(out: dict) -> str:
+    """`sync_all_self_cafes` 결과를 알림·결과용 한 줄 요약으로.
+
+    예: ``색인 동기화: 4,265건 (카페 5) — 계정 3개 조회 실패(경고)``
+    """
+    rows = int(out.get("rows") or 0)
+    cafes = len(out.get("cafes") or [])
+    line = f"색인 동기화: {rows:,}건 (카페 {cafes})"
+    failed = len(out.get("warnings") or [])
+    if failed:
+        line += f" — 계정 {failed}개 조회 실패(경고)"
+    return line
 
 
 def record_published(
@@ -257,6 +317,7 @@ def duplicate_check(rt: Runtime, spec: Any, limit: int = 0) -> dict:
 
 __all__ = [
     "duplicate_check",
+    "format_sync_summary",
     "record_published",
     "sync_all_self_cafes",
     "sync_cafe_index",

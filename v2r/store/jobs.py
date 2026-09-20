@@ -32,12 +32,15 @@ def _owner_is_dead(owner: str | None) -> bool:
 
     text = str(owner or "")
     host, sep, pid_text = text.rpartition(":")
-    if not sep or not pid_text.isdigit():
-        return False
     try:
-        if host != socket.gethostname():
-            return False
+        me = socket.gethostname()
     except Exception:  # noqa: BLE001
+        return False
+    if not sep or not pid_text.isdigit():
+        # 옛 형식(호스트명만): 같은 PC의 이전 실행기다. 지금 실행기는 반드시 host:pid를 쓰므로
+        # 이 소유자는 죽은 것으로 보고 이어받는다(2026-09-20 실측: 큐가 영영 안 잡히던 원인).
+        return text == me
+    if host != me:
         return False
     from v2r.engine.lock import pid_alive
 
