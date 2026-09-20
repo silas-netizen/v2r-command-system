@@ -19,6 +19,7 @@ from v2r.command.spec import TaskSpec
 from v2r.content import comments as comment_mod
 from v2r.content import duplicate, sanitize as sanitize_mod, seone
 from v2r.content.manuscript import Manuscript
+from v2r.engine import article_sync
 from v2r.engine.context import Runtime
 from v2r.engine.scheduler import KST, plan_slots, revision_at
 
@@ -505,6 +506,17 @@ def prepare_per_cafe(
                     {"source": name, "row": m.source_row, "reason": "중복(본문 해시 전역)"}
                 )
                 continue
+            # V2R 글 목록 색인 대조 (사용자 절대 규칙) — 서버에 이미 있는 글이면 건너뛴다
+            dup, why = duplicate.is_duplicate_against_index(rt, m, m.cafe or cafe)
+            if dup:
+                skipped.append(
+                    {
+                        "source": name,
+                        "row": m.source_row,
+                        "reason": duplicate.index_skip_reason(why),
+                    }
+                )
+                continue
             used_keys.add((m.source, m.source_row))
             if m.content_hash:
                 used_hashes.add(m.content_hash)
@@ -644,6 +656,19 @@ def prepare_manuscripts(
                 if is_excluded_cafe(rt, m.cafe):
                     skipped.append(
                         {"source": name, "row": m.source_row, "reason": "발행 제외 카페"}
+                    )
+                    continue
+                # V2R 글 목록 색인 대조 (사용자 절대 규칙) — 서버에 이미 있는 글이면 건너뛴다
+                dup, why = duplicate.is_duplicate_against_index(
+                    rt, m, m.cafe or want_cafe
+                )
+                if dup:
+                    skipped.append(
+                        {
+                            "source": name,
+                            "row": m.source_row,
+                            "reason": duplicate.index_skip_reason(why),
+                        }
                     )
                     continue
                 if want_cafe and not cafe_matches(want_cafe, m.cafe):
@@ -1666,6 +1691,13 @@ def run_slot(
             planned["comment_note"] = f"댓글 역할 표를 만들지 못했습니다: {exc}"
         return {**planned, "status": "planned", "dry_run": True}
 
+    # 마지막 관문 — V2R 글 목록 색인에 같은 글이 있으면 등록하지 않는다(사용자 절대 규칙).
+    # 선택 단계에서 걸렀더라도, 그 사이에 다른 슬롯이 같은 글을 올렸을 수 있다.
+    _dup, _why = duplicate.is_duplicate_against_index(rt, m, slot.cafe)
+    if _dup:
+        rt.events.log(job_id, "warn", f"중복으로 발행 취소: {m.title} ({_why})")
+        raise PublishError(f"V2R 기존 글과 중복: {_why}")
+
     key = (m.source, m.source_row, m.content_hash)
     root_start = slot.scheduled_at or datetime.now(KST)
     created_any = False  # 이번 슬롯에서 V2R에 글이 실제로 만들어졌는가
@@ -1899,6 +1931,16 @@ def run_slot(
             "reason": pending,
         }
     rt.publications.mark(*key, "done", "done", source_id=source_id, url=url)
+    # 방금 올린 글을 V2R 글 목록 색인에도 바로 남긴다 → 다시 동기화하지 않아도 최신 (규칙 §3)
+    article_sync.record_published(
+        rt,
+        cafe=slot.cafe,
+        cafe_id=getattr(cafe, "cafe_id", None),
+        source_id=source_id,
+        login_id=slot.account,
+        title=m.title,
+        body_hash=m.content_hash,
+    )
     rt.account_state.touch_used(slot.account)
     for path in slot.images:
         try:

@@ -182,6 +182,49 @@ class TelegramChannel:
             return False
         return isinstance(payload, dict) and bool(payload.get("ok"))
 
+    def send_document(self, chat_id: str, path: Any, caption: str = "") -> bool:
+        """sendDocument(multipart)로 파일 한 개를 보낸다. 실패하면 False.
+
+        사진과 달리 텔레그램이 원본 그대로 첨부해 준다(.md 목록 등).
+        """
+        if not self.enabled:
+            return False
+        chat_id = str(chat_id)
+        if chat_id not in self.allowed_chat_ids:
+            log.warning("허용되지 않은 텔레그램 chat_id 발신 차단: %s", chat_id)
+            return False
+        doc = Path(path)
+        if not doc.is_file():
+            log.warning("보낼 파일이 없습니다: %s", doc.name)
+            return False
+        url = f"{API_BASE}/bot{self.token}/sendDocument"
+        data = {"chat_id": chat_id, "caption": (caption or "")[:1024]}
+        try:
+            with doc.open("rb") as fh:
+                files = {"document": (doc.name, fh, "application/octet-stream")}
+                if self._client is not None:
+                    resp = self._client.post(url, data=data, files=files, timeout=TIMEOUT)
+                else:
+                    with httpx.Client(timeout=TIMEOUT) as client:
+                        resp = client.post(url, data=data, files=files, timeout=TIMEOUT)
+            resp.raise_for_status()
+            payload = resp.json()
+        except httpx.HTTPStatusError as exc:
+            log.warning("텔레그램 sendDocument HTTP %s", exc.response.status_code)
+            return False
+        except Exception as exc:
+            log.warning("텔레그램 sendDocument 실패: %s", self._mask(str(exc)))
+            return False
+        return isinstance(payload, dict) and bool(payload.get("ok"))
+
+    def broadcast_document(self, path: Any, caption: str = "") -> int:
+        """허용된 모든 chat_id에 파일을 보낸다. 성공 건수 반환."""
+        return sum(
+            1
+            for chat_id in sorted(self.allowed_chat_ids)
+            if self.send_document(chat_id, path, caption)
+        )
+
     def broadcast_photo(self, path: Any, caption: str = "") -> int:
         """허용된 모든 chat_id에 사진을 보낸다. 성공 건수 반환."""
         return sum(

@@ -107,7 +107,23 @@ CREATE TABLE IF NOT EXISTS events (
     FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE SET NULL
 );
 
+CREATE TABLE IF NOT EXISTS article_index (
+    cafe_id    TEXT NOT NULL,
+    cafe       TEXT NOT NULL DEFAULT '',
+    source_id  TEXT NOT NULL,
+    article_id TEXT,
+    login_id   TEXT,
+    title      TEXT NOT NULL DEFAULT '',
+    title_norm TEXT NOT NULL DEFAULT '',
+    body_hash  TEXT,
+    created_at TEXT NOT NULL,
+    synced_at  TEXT NOT NULL,
+    PRIMARY KEY (cafe_id, source_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status, id);
+CREATE INDEX IF NOT EXISTS idx_article_index_title ON article_index(title_norm);
+CREATE INDEX IF NOT EXISTS idx_article_index_hash ON article_index(body_hash);
 CREATE INDEX IF NOT EXISTS idx_pub_status ON publications(status);
 CREATE INDEX IF NOT EXISTS idx_pub_source_id ON publications(source_id);
 CREATE INDEX IF NOT EXISTS idx_events_job ON events(job_id, id);

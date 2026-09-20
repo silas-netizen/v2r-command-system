@@ -73,7 +73,8 @@ def test_each_task_pattern(text, task):
 
 def test_all_tasks_covered_by_tests():
     # 26 + 사진 승인 흐름 2건(approve_photos·reject_photos) + 이모지 정리 1건
-    assert len(ALLOWED_TASKS) == 29
+    # + 예약·감시 4건(schedule_list·schedule_run·monitor_status·pending_report)
+    assert len(ALLOWED_TASKS) == 33
 
 
 def test_wash_photos_count():

@@ -10,6 +10,11 @@ from v2r.command.spec import KST, TaskSpec
 
 # --- 작업 패턴 (표 순서 고정) ---
 TASK_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
+    # 예약/감시 명령은 `현황`·`목록`·`점검` 같은 낱말에 가로채이지 않게 맨 앞에 둔다
+    ("schedule_run", re.compile(r"예약\s*(?:지금\s*)?(?:실행|강제\s*실행|돌려)")),
+    ("schedule_list", re.compile(r"예약\s*(목록|리스트|현황|확인|상태|표)")),
+    ("monitor_status", re.compile(r"감시\s*(상태|현황|목록|확인)")),
+    ("pending_report", re.compile(r"미처리\s*(알림|목록|보고|리스트)")),
     ("inspect_failures", re.compile(r"(실패|미완성|불확실).*(점검|재시도|모아|확인)")),
     ("reconcile", re.compile(r"(끊긴|미완료).*(이어|재개|점검)")),
     ("sync_all_sources", re.compile(r"전체\s*(원본|시트).*(동기화|갱신)")),
@@ -34,6 +39,9 @@ TASK_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("collect_photos", re.compile(r"사진.*(수집|가져와)")),
     ("wash_photos", re.compile(r"사진.*(세탁|변형)\s*(\d+)?")),
     ("learn_guides", re.compile(r"(메이크|make|지침).*(학습|읽어|가져와)", re.I)),
+    # V2R 글 목록 색인 (중복 방지) — `글 목록 동기화` / `자사 카페 글 목록 동기화`
+    ("sync_article_index", re.compile(r"글\s*목록.*(동기화|색인|갱신)")),
+    ("duplicate_check", re.compile(r"중복\s*(검사|점검|확인)")),
     ("cleanup_orphans", re.compile(r"(고아|찌꺼기).*(정리|삭제)")),
     # 이미 올라간 글의 이모지 뒷정리 (`오늘 이모지 정리`, `이모지 정리 전체`).
     # `발행`이 든 문장도 가로채이지 않게 publish_* 패턴보다 앞에 둔다.
@@ -116,6 +124,8 @@ RE_PHOTO_POSITIONAL = re.compile(
 )
 #: `2장` / `3개`처럼 개수로 읽어야 할 토큰 (자리값 브랜드·키워드에서 제외)
 RE_COUNT_TOKEN = re.compile(r"^\d+\s*(?:장|개|건)?$")
+#: `예약 지금 실행 <이름>` 에서 예약 이름
+RE_SCHEDULE_NAME = re.compile(r"예약\s*(?:지금\s*)?(?:실행|강제\s*실행|돌려(?:줘|라)?)\s*(.*)$")
 #: 키워드를 안 적었을 때 쓰는 기본 폴더 이름 (`warehouse.store.KEYWORD_FOLDER`와 같다)
 KEYWORD_FOLDER = "키워드"
 RE_ACCOUNTS = re.compile(
@@ -179,10 +189,16 @@ _NO_SLOT_TASKS = frozenset(
         "reconcile",
         "inspect_failures",
         "catalog",
+        "sync_article_index",
+        "duplicate_check",
         "cleanup_orphans",
         "cleanup_emoji",
         "repair_comments",
         "gpt_keepalive",
+        "schedule_list",
+        "schedule_run",
+        "monitor_status",
+        "pending_report",
     }
 )
 
@@ -253,6 +269,12 @@ def parse_korean_command(text: str, now: datetime | None = None) -> TaskSpec | N
         return None
 
     spec: dict = {"task": task, "notes": raw}
+
+    # 예약 이름 (`예약 지금 실행 아침 일상 글`)
+    if task == "schedule_run":
+        m = RE_SCHEDULE_NAME.search(raw)
+        if m:
+            spec["schedule_name"] = m.group(1).strip()
 
     # 시간창: 시각 표기 2개 → 시작/종료
     clocks = RE_CLOCK.findall(raw)
@@ -440,11 +462,17 @@ TASK_LABELS: dict[str, str] = {
     "request_photos": "사진 요청",
     "wash_photos": "사진 세탁",
     "learn_guides": "지침 학습",
+    "sync_article_index": "V2R 글 목록 동기화",
+    "duplicate_check": "중복 검사",
     "cleanup_orphans": "고아 글 정리",
     "cleanup_emoji": "이모지 정리",
     "repair_comments": "댓글 복구",
     "open_login": "로그인 창 열기",
     "stop": "작업 중지",
+    "schedule_list": "예약 목록",
+    "schedule_run": "예약 지금 실행",
+    "monitor_status": "감시 상태",
+    "pending_report": "미처리 목록 보내기",
     "status": "상태 조회",
     "dashboard": "현황판 갱신",
     "catalog": "카탈로그 조회",
@@ -466,6 +494,8 @@ def describe_spec(spec: TaskSpec) -> str:
         parts.append(f"카페 {spec.cafe}")
     if spec.brand:
         parts.append(f"브랜드 {spec.brand}")
+    if getattr(spec, "schedule_name", ""):
+        parts.append(f"예약 {spec.schedule_name}")
     if getattr(spec, "keyword", ""):
         parts.append(f"키워드 {spec.keyword}")
     if spec.board:

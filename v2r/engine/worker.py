@@ -776,6 +776,52 @@ def _collect_new_photos(rt: Runtime, spec: TaskSpec) -> dict:
     return stats
 
 
+#: 미처리(대기) 목록 파일 — 사람이 손으로 관리하고, 예약이 하루 5번 파일로 보낸다
+PENDING_REPORT_PATH = ("docs", "reports", "pending.md")
+
+
+def pending_report_path(rt: Runtime):
+    """미처리 목록 파일 경로."""
+    return rt.settings.repo_root.joinpath(*PENDING_REPORT_PATH)
+
+
+def _pending_report(rt: Runtime) -> dict:
+    """미처리 목록 파일을 텔레그램에 **파일로** 보낸다."""
+    from v2r.channels import notify_document_all
+
+    path = pending_report_path(rt)
+    stamp = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
+    if not path.is_file():
+        message = f"미처리 목록 파일이 없습니다: {path.name}"
+        notify_all(rt.channels, message)
+        return {"ok": False, "message": message}
+    caption = f"미처리 목록 {stamp}"
+    sent = notify_document_all(rt.channels, path, caption)
+
+    # 현황판은 claude.ai 쪽 사본을 실행기가 갱신할 수 없으므로 파일로 함께 보낸다
+    board_sent = 0
+    board_path = None
+    try:
+        from v2r.engine.dashboard import build_dashboard
+
+        board_path = build_dashboard(rt)
+        board_sent = notify_document_all(
+            rt.channels, board_path, f"운영 현황판 {stamp}"
+        )
+    except Exception as exc:  # 현황판 실패로 미처리 목록 전송까지 죽이지 않는다
+        log.warning("현황판 전송 실패: %s", exc)
+        notify_all(rt.channels, f"현황판을 보내지 못했습니다: {exc}")
+
+    return {
+        "ok": True,
+        "message": f"{caption} 전송 완료 ({sent}곳), 현황판 {board_sent}곳",
+        "sent": sent,
+        "dashboard_sent": board_sent,
+        "path": str(path),
+        "dashboard_path": str(board_path) if board_path else "",
+    }
+
+
 def _catalog_report(rt: Runtime, spec: TaskSpec) -> dict:
     cafes = rt.catalog.cafes()
     lines = [f"카페 {len(cafes)}개: " + ", ".join(c.name for c in cafes)]
@@ -817,14 +863,46 @@ def order_round_robin(slots: list[Any]) -> list[Any]:
     return out
 
 
-def _sleep_with_beat(seconds: float, beat: Any, sleep: Any = time.sleep) -> None:
-    """리스를 연장하며 나눠 쉰다 (긴 대기 중 작업을 뺏기지 않게)."""
+#: 긴 대기 중 "아직 살아 있다"고 이벤트를 남기는 간격(초). 감시견의 정체 판정(15분)보다 짧다.
+PROGRESS_EVENT_S = 600.0
+
+
+def _progress_event(
+    rt: Runtime | None, job_id: int | None, message: str, waited: float
+) -> None:
+    """긴 대기 중 진행 이벤트 1줄. 실패해도 발행을 막지 않는다."""
+    if rt is None or job_id is None:
+        return
+    try:
+        rt.events.log(job_id, "info", f"{message} ({int(waited // 60)}분째)")
+    except Exception as exc:  # pragma: no cover - 로그 실패는 삼킨다
+        log.warning("진행 이벤트 기록 실패: %s", exc)
+
+
+def _sleep_with_beat(
+    seconds: float,
+    beat: Any,
+    sleep: Any = time.sleep,
+    *,
+    rt: Runtime | None = None,
+    job_id: int | None = None,
+) -> None:
+    """리스를 연장하며 나눠 쉰다 (긴 대기 중 작업을 뺏기지 않게).
+
+    10분마다 진행 이벤트를 남겨 감시견이 "정체"로 오해하지 않게 한다.
+    """
     remaining = max(0.0, float(seconds))
+    waited = 0.0
+    next_event = PROGRESS_EVENT_S
     while remaining > 0:
         chunk = min(SLEEP_CHUNK_S, remaining)
         sleep(chunk)
         remaining -= chunk
+        waited += chunk
         beat()
+        if waited >= next_event:
+            next_event += PROGRESS_EVENT_S
+            _progress_event(rt, job_id, "대기 중", waited)
 
 
 #: 레이트 제한 대기 상한(6시간)과 리스 연장 간격(30초).
@@ -847,20 +925,31 @@ def rate_wait_seconds(exc: Any) -> float:
 
 
 def _wait_for_rate_limit(
-    rt: Runtime, seconds: float, beat: Any, sleep: Any = time.sleep
+    rt: Runtime,
+    seconds: float,
+    beat: Any,
+    sleep: Any = time.sleep,
+    *,
+    job_id: int | None = None,
 ) -> bool:
     """제한이 풀릴 때까지 30초씩 쉬며 리스를 연장한다.
 
     중지 요청이 오면 즉시 False. 끝까지 기다렸으면 True(같은 슬롯 재시도).
     """
     remaining = min(max(float(seconds), 0.0), RATE_WAIT_CAP_S)
+    waited = 0.0
+    next_event = PROGRESS_EVENT_S
     while remaining > 0:
         if stop_requested(rt):
             return False
         chunk = min(RATE_BEAT_S, remaining)
         sleep(chunk)
         remaining -= chunk
+        waited += chunk
         beat()
+        if waited >= next_event:
+            next_event += PROGRESS_EVENT_S
+            _progress_event(rt, job_id, "요청 제한 대기 중", waited)
     return not stop_requested(rt)
 
 
@@ -1090,12 +1179,14 @@ def _run_publish(
                             f"자사 카페 허용 시간대(08:00~02:00) 밖이라 {open_at:%H:%M}까지 대기합니다",
                         )
                         window_notified = True
-                    _sleep_with_beat((open_at - now_kst).total_seconds(), beat)
+                    _sleep_with_beat(
+                        (open_at - now_kst).total_seconds(), beat, rt=rt, job_id=job_id
+                    )
             if paced and not spec.dry_run:
                 # 앞 글에서 정한 다음 발행 허용 시각까지 쉰다 (글 사이 2~3분 랜덤)
                 wait = next_allowed - time.monotonic()
                 if wait > 0:
-                    _sleep_with_beat(wait, beat)
+                    _sleep_with_beat(wait, beat, rt=rt, job_id=job_id)
             rate_waits = 0
             while True:
                 try:
@@ -1139,7 +1230,7 @@ def _run_publish(
                         rt.events.log(
                             job_id, "warn", f"레이트 제한 대기 {int(wait)}초 ({kind}) — {m.title}"
                         )
-                        if _wait_for_rate_limit(rt, wait, beat):
+                        if _wait_for_rate_limit(rt, wait, beat, job_id=job_id):
                             continue  # 같은 슬롯 재시도 (원고는 소모되지 않는다)
                         stopped = True
                         failures.append(f"{m.title}: 중지 요청으로 대기를 멈췄습니다")
@@ -1311,6 +1402,21 @@ def dispatch(rt: Runtime, job: Any, owner: str | None = None) -> dict:
         return {"ok": True, "cancelled": cancelled}
     if task == "catalog":
         return _catalog_report(rt, spec)
+    if task == "schedule_list":
+        from v2r.engine import schedule as schedule_mod
+
+        return {"ok": True, "report": schedule_mod.schedule_report(rt)}
+    if task == "schedule_run":
+        from v2r.engine import schedule as schedule_mod
+
+        out = schedule_mod.run_now(rt, spec.schedule_name)
+        return {"ok": bool(out.get("ok")), "message": out.get("message", "")}
+    if task == "pending_report":
+        return _pending_report(rt)
+    if task == "monitor_status":
+        from v2r.engine import monitor as monitor_mod
+
+        return {"ok": True, "report": monitor_mod.monitor_report(rt)}
 
     raise ValueError(f"처리기가 없는 작업: {task}")
 
@@ -1499,6 +1605,7 @@ def serve(rt: Runtime, poll_seconds: int = 5, announce: bool = True) -> None:  #
             if time.monotonic() >= next_maintain:
                 next_maintain = time.monotonic() + MAINTAIN_TICK_S
                 maintain_session(rt)
+            watch_tick(rt)  # 예약 발사 + 모든 작업 감시 + 심장박동
             serve_poll(rt, owner)
         except KeyboardInterrupt:
             print("serve 중지", flush=True)
@@ -1506,6 +1613,29 @@ def serve(rt: Runtime, poll_seconds: int = 5, announce: bool = True) -> None:  #
         except Exception as exc:
             log.exception("serve 폴링 실패(계속 진행): %s", exc)
         time.sleep(poll_seconds)
+
+
+def watch_tick(rt: Runtime) -> dict:
+    """serve 루프 1회분의 예약·감시. 어떤 예외로도 루프를 죽이지 않는다."""
+    from v2r.engine import monitor as monitor_mod
+    from v2r.engine import schedule as schedule_mod
+
+    out: dict = {}
+    try:
+        out["schedule"] = schedule_mod.tick(rt)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("예약 틱 실패(계속 진행): %s", exc)
+        out["schedule"] = {"error": str(exc)}
+    try:
+        out["monitor"] = monitor_mod.tick(rt)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("감시 틱 실패(계속 진행): %s", exc)
+        out["monitor"] = {"error": str(exc)}
+    try:
+        schedule_mod.write_heartbeat(rt)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("심장박동 기록 실패: %s", exc)
+    return out
 
 
 __all__ = [
@@ -1517,4 +1647,5 @@ __all__ = [
     "maintain_session",
     "run_once",
     "serve",
+    "watch_tick",
 ]

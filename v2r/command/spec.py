@@ -18,6 +18,8 @@ ALLOWED_TASKS: frozenset[str] = frozenset(
         "reconcile",
         "sync_all_sources",
         "sync_sources",
+        "sync_article_index",
+        "duplicate_check",
         "generate_brand",
         "generate_affiliate_daily",
         "generate_daily",
@@ -36,6 +38,10 @@ ALLOWED_TASKS: frozenset[str] = frozenset(
         "repair_comments",
         "open_login",
         "stop",
+        "schedule_list",
+        "schedule_run",
+        "monitor_status",
+        "pending_report",
         "dashboard",
         "status",
         "catalog",
@@ -86,6 +92,8 @@ class TaskSpec(BaseModel):
     per_cafe_mode: str = ""
     #: `댓글 랜덤` / `댓글 0~3개` — 글마다 0~3개 랜덤 댓글 (self-cafe-daily-rules §5)
     random_comments: bool = False
+    #: `예약 지금 실행 <이름>`의 예약 이름
+    schedule_name: str = ""
     notes: str = ""
     manuscripts: list[dict] = Field(default_factory=list)
 

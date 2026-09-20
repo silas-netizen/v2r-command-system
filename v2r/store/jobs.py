@@ -184,6 +184,37 @@ class JobStore:
         self._release_lease(owner)
         return cur.rowcount
 
+    def open_jobs(self) -> list[dict]:
+        """아직 끝나지 않은(queued/running) 작업 전부. 오래된 것부터."""
+        rows = self.conn.execute(
+            "SELECT * FROM jobs WHERE status IN ('queued', 'running') ORDER BY id"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def lease_info(self) -> dict | None:
+        """실행기 리스 현황(owner, until). 없으면 None."""
+        row = self.conn.execute(
+            "SELECT owner, until FROM executor_lease WHERE id = 1"
+        ).fetchone()
+        return dict(row) if row else None
+
+    def release_stale_lease(self) -> bool:
+        """만료된 실행기 리스를 푼다. 풀었으면 True."""
+        row = self.conn.execute(
+            "SELECT owner, until FROM executor_lease WHERE id = 1"
+        ).fetchone()
+        if row is None or not row["owner"]:
+            return False
+        until = _parse(row["until"])
+        if until is not None and until > datetime.now(KST):
+            return False
+        self.conn.execute(
+            "UPDATE executor_lease SET owner = NULL, until = NULL, updated_at = ?"
+            " WHERE id = 1",
+            (now_iso(),),
+        )
+        return True
+
     def get(self, job_id: int) -> dict | None:
         """작업 1건."""
         row = self.conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()

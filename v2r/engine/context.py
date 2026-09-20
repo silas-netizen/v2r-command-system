@@ -11,6 +11,7 @@ from typing import Any
 
 from v2r.config import Settings, get_settings, load_yaml
 from v2r.store.accounts_state import AccountStateStore
+from v2r.store.article_index import ArticleIndexStore
 from v2r.store.db import connect, init_schema
 from v2r.store.events import EventLog
 from v2r.store.jobs import JobStore
@@ -26,6 +27,7 @@ class Runtime:
     conn: sqlite3.Connection
     jobs: JobStore
     publications: PublicationStore
+    article_index: ArticleIndexStore
     account_state: AccountStateStore
     sources_cache: SourceCache
     events: EventLog
@@ -55,6 +57,7 @@ class Runtime:
             conn=connection,
             jobs=JobStore(connection),
             publications=PublicationStore(connection),
+            article_index=ArticleIndexStore(connection),
             account_state=AccountStateStore(connection),
             sources_cache=SourceCache(connection),
             events=EventLog(connection),

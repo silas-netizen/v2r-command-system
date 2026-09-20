@@ -14,6 +14,8 @@ log = logging.getLogger(__name__)
 MODELS: dict[str, str] = {
     "ambiguous_command": "claude-haiku-4-5",
     "daily_comment": "claude-haiku-4-5",
+    #: 감시견 Tier 1 — 규칙표에 없는 오류 문구 1건 분류 (하루 상한 있음)
+    "error_diagnosis": "claude-haiku-4-5",
     "promo_comment": "claude-sonnet-5",
     "daily_adapt": "claude-sonnet-5",
     # 브랜드(제휴) 바이럴 원고. 지침의 모델 분리(본문/댓글)를 그대로 따른다.

@@ -1,4 +1,4 @@
-"""CLI: python -m v2r "<한국어 명령>" | status | session | dashboard | serve | run | reconcile."""
+"""CLI: python -m v2r "<한국어 명령>" | status | session | health | dashboard | serve | run | reconcile."""
 
 from __future__ import annotations
 
@@ -124,8 +124,8 @@ def main(argv: list[str] | None = None) -> int:
     args = list(argv if argv is not None else sys.argv[1:])
     if not args:
         print(
-            '사용법: python -m v2r "<한국어 명령>" | status | session | dashboard'
-            " | serve | run | reconcile"
+            '사용법: python -m v2r "<한국어 명령>" | status | session | health'
+            " | dashboard | serve | run | reconcile"
         )
         return 2
 
@@ -143,6 +143,11 @@ def main(argv: list[str] | None = None) -> int:
             from v2r.engine.dashboard import build_dashboard
 
             print(build_dashboard(rt))
+            return 0
+        if head == "health":
+            from v2r.engine.schedule import health_report
+
+            print(health_report(rt))
             return 0
         if head == "session":
             print(_session_report(rt))

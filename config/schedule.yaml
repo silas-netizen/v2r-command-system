@@ -1,0 +1,57 @@
+# 실행기 내장 예약표 (1순위). 윈도우 작업 스케줄러는 백업입니다.
+# - time: "HH:MM" (한국 시각)
+# - days: daily | weekdays | [mon, tue, wed, thu, fri, sat, sun]
+# - command: 텔레그램에 보내는 것과 똑같은 한국어 문장
+# - catch_up_minutes: 실행기가 꺼져 있었을 때 늦게라도 실행할 시간(분).
+#   비워 두면 그날 23:59까지 언제든 따라잡습니다.
+catch_up_minutes: null   # 전체 기본값
+
+entries:
+  - name: 아침 일상 글
+    time: "09:00"
+    days: daily
+    enabled: true
+    command: 자사 카페 일상 글 카페별 100건 실제 발행 댓글 랜덤
+
+  - name: 끊긴 작업 점검
+    time: "08:30"
+    days: daily
+    enabled: true
+    command: 끊긴 작업 점검
+
+  - name: GPT 세션 점검
+    time: "09:00"
+    days: daily
+    enabled: true
+    command: GPT 세션 점검
+
+  # 미처리 목록(docs/reports/pending.md)을 하루 5번 파일로 보냅니다.
+  - name: pending-1
+    time: "08:40"
+    days: daily
+    enabled: true
+    command: 미처리 알림
+
+  - name: pending-2
+    time: "11:00"
+    days: daily
+    enabled: true
+    command: 미처리 알림
+
+  - name: pending-3
+    time: "14:00"
+    days: daily
+    enabled: true
+    command: 미처리 알림
+
+  - name: pending-4
+    time: "17:00"
+    days: daily
+    enabled: true
+    command: 미처리 알림
+
+  - name: pending-5
+    time: "21:00"
+    days: daily
+    enabled: true
+    command: 미처리 알림
