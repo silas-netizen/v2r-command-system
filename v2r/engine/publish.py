@@ -13,7 +13,7 @@ from typing import Any
 
 from v2r.accounts.assign import AssignError, assign, rotate
 from v2r.accounts.loader import Account, load_from_rows
-from v2r.accounts.rules import eligible, find_affiliate, is_staff_level, work_type_for
+from v2r.accounts.rules import eligible, find_affiliate, work_type_for
 from v2r.api import articles as api_articles
 from v2r.api.errors import V2RApiError, classify
 from v2r.command.spec import TaskSpec
@@ -1010,9 +1010,9 @@ def _cafe_members(rt: Runtime, cafe_name: str) -> tuple[Any, list[str]]:
     if key not in cache:
         cafe = match_name(cafe_name, rt.catalog.cafes(), key=lambda c: c.name)
         accounts = list(rt.catalog.cafe_accounts(cafe.cafe_id))
-        if is_self_cafe(rt, cafe_name):
-            # 자사 카페 계정은 카페 등급이 '스탭'인 것만 쓴다 (V2R 회원 조회의 등급 이름으로 확인)
-            accounts = [ca for ca in accounts if is_staff_level(ca.level_name)]
+        # 자사 카페 계정의 '스탭' 여부는 V2R 회원 조회 등급이 아니라 **계정 시트**가 기준이다
+        # (사용자 결정 2026-09-21: 시트 '자사 카페' = 스탭. V2R 등급 표시는 동기화가 늦을 수 있음).
+        # 실제로 등급 미달(33007)이 나면 그때 그 카페에서만 교체한다(`not_staff_accounts`).
         members = [ca.login_id for ca in accounts]
         cache[key] = (cafe, members)
     return cache[key]
@@ -1128,12 +1128,26 @@ def pick_self_daily_accounts(
     return rng.sample(ids, want)
 
 
+def not_staff_accounts(rt: Runtime, cafe_name: str) -> set[str]:
+    """이 실행에서 '등급 미달(33007)'이 실제로 난 (카페, 계정). 그 카페에서만 뺀다."""
+    table: dict[str, set[str]] = rt.scratch.setdefault("not_staff_accounts", {})
+    return table.setdefault(_norm(cafe_name), set())
+
+
+def mark_not_staff(rt: Runtime, cafe_name: str, login_id: str) -> None:
+    not_staff_accounts(rt, cafe_name).add(str(login_id).casefold())
+
+
 def _daily_accounts_path(rt: Runtime) -> Path:
     return Path(rt.settings.data_dir) / "self_daily_accounts.json"
 
 
 def daily_self_accounts(
-    rt: Runtime, pool_all: list[Any], rng: random.Random | None = None, today: str | None = None
+    rt: Runtime,
+    pool_all: list[Any],
+    rng: random.Random | None = None,
+    today: str | None = None,
+    force: bool = False,
 ) -> list[str]:
     """**하루 동안 자사 카페 전체에 쓸 계정 10개** (규칙 §4, 2026-09-21 확정).
 
@@ -1141,9 +1155,9 @@ def daily_self_accounts(
     작업이 여러 번 돌거나 실행기가 재시작돼도 같은 날이면 같은 10개
     (`data/self_daily_accounts.json`에 날짜와 함께 기록).
 
-    후보는 시트 작업 구분 '자사 카페'(제외 아님) 계정 중 자사 카페에서 스탭 등급인 계정.
-    스탭인 카페 수가 많은 계정부터 우선하고(모든 카페 스탭 → 4곳 → 3곳 …),
-    같은 층 안에서는 무작위. 그래서 스탭 카페가 적은 카페도 되도록 10개 안에서 글쓴이를 찾는다.
+    후보는 시트 작업 구분 '자사 카페'(제외 아님) 계정 — 시트에 그렇게 돼 있으면 스탭으로 본다
+    (V2R 등급 표시로 거르지 않음, 사용자 결정 2026-09-21). 자사 카페에 가입돼 있는 곳이 많은
+    계정부터 우선(모든 카페 → 4곳 → 3곳 …), 같은 층 안에서는 무작위.
     """
     today = today or datetime.now(KST).strftime("%Y-%m-%d")
     path = _daily_accounts_path(rt)
@@ -1151,7 +1165,7 @@ def daily_self_accounts(
         saved = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
     except Exception:  # noqa: BLE001 - 깨진 파일은 새로 만든다
         saved = {}
-    if saved.get("date") == today and saved.get("accounts"):
+    if not force and saved.get("date") == today and saved.get("accounts"):
         return [str(a) for a in saved["accounts"]]
 
     self_ids = [
@@ -1293,6 +1307,7 @@ def plan(rt: Runtime, spec: TaskSpec, manuscripts: list[Manuscript]) -> list[Slo
                     daily = daily_self_accounts(rt, pool_all, self_daily_rng(rt))
                     rt.scratch["self_daily_accounts"] = daily
                 pool_ids = {(a if isinstance(a, str) else a.login_id).casefold() for a in pool}
+                pool_ids -= not_staff_accounts(rt, cafe_name)
                 chosen = [a for a in daily if a.casefold() in pool_ids]
                 if not chosen and daily:
                     # 오늘 10개 중 이 카페·게시판에 쓸 수 있는 계정이 없으면 여기만 따로 뽑는다
@@ -1454,14 +1469,26 @@ def build_daily_comments(
         return []
     author = str(slot.account or "").casefold()
     # 일상 글 댓글은 시트의 '자사 댓글' 계정(브랜드 원고 댓글용)을 쓰지 않는다(사용자 규칙 2026-09-19).
-    # 그 카페의 스탭 등급 회원 중 글쓴이를 뺀 계정에서 랜덤으로 고른다.
+    # 그 카페 회원 중 **시트 '자사 카페'** 계정(= 스탭)에서 글쓴이·등급 미달 계정을 뺀 뒤 랜덤.
+    try:
+        sheet_self = {
+            a.login_id.casefold()
+            for a in load_accounts(rt, prefer_cache=True)
+            if str(getattr(a, "work_type", "")).strip() == "자사 카페" and not getattr(a, "excluded", False)
+        }
+    except Exception as exc:  # noqa: BLE001
+        warn(f"계정 시트를 읽지 못해 댓글 0개로 발행합니다: {exc}")
+        return []
+    blocked = not_staff_accounts(rt, slot.cafe or "")
     pool = [
         ca
         for ca in members_list
-        if str(ca.login_id).casefold() != author and is_staff_level(ca.level_name)
+        if str(ca.login_id).casefold() != author
+        and str(ca.login_id).casefold() in sheet_self
+        and str(ca.login_id).casefold() not in blocked
     ]
     if not pool:
-        warn("글쓴이 말고 스탭 등급 댓글 계정이 이 카페에 없어 댓글 0개로 발행합니다")
+        warn("글쓴이 말고 자사 카페 댓글 계정이 이 카페에 없어 댓글 0개로 발행합니다")
         return []
 
     count = min(count, len(pool))
@@ -2033,6 +2060,14 @@ def run_slot(
             rt.account_state.restrict(slot.account, until, RESTRICT_CODE, "계정 제한(27000)")
             rt.events.log(job_id, "warn", f"계정 제한: {slot.account}")
             raise RetryWithOtherAccount(f"계정 제한: {slot.account}") from exc
+        if kind == "grade" and not created_any:
+            # 시트에는 스탭인데 실제 등급이 미달 → 이 카페에서만 이 계정을 빼고 다른 계정으로
+            # (앞선 일상 글이 이미 올라간 뒤면 되돌린 상태 그대로 실패로 둔다)
+            mark_not_staff(rt, slot.cafe or "", slot.account)
+            rt.events.log(
+                job_id, "warn", f"등급 미달로 계정 교체: {slot.account} ({slot.cafe}) — 시트 등급 확인 필요"
+            )
+            raise RetryWithOtherAccount(f"등급 미달: {slot.account}") from exc
         rt.events.log(job_id, "error", f"발행 실패({kind}): {m.title}{_rollback_note()}")
         raise PublishError(f"발행 실패({kind}): {exc}{_rollback_note()}") from exc
     except PublishError as exc:

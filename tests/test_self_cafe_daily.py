@@ -582,6 +582,9 @@ class _CommentCatalog:
 def test_build_daily_comments_roots_only(tmp_path, monkeypatch):
     rt = make_runtime(tmp_path)
     rt._catalog = _CommentCatalog()
+    monkeypatch.setattr(
+        publish_mod, "load_accounts", lambda rt, prefer_cache=False: [_Acc(f"member{i}") for i in range(5)]
+    )
     rt._llm = _FakeLLM('["저도 어제 딱 그랬어요ㅋㅋ", "오늘 날씨 진짜 좋더라구요", "저녁은 뭐 드셨어요"]')
     slot = publish_mod.Slot(
         manuscript=_m("고요한 아침", 0),
@@ -758,20 +761,29 @@ def test_is_staff_level_words():
     assert not is_staff_level(None)
 
 
-def test_self_cafe_members_only_staff(monkeypatch):
+def test_self_cafe_members_not_filtered_by_v2r_level(monkeypatch):
+    """자사 카페 계정의 스탭 여부는 계정 시트가 기준 — V2R 등급 표시로 거르지 않는다 (2026-09-21)."""
     from types import SimpleNamespace as NS
 
     from v2r.engine import publish
 
     cafe = NS(name="고요한 아침", cafe_id=1)
-    members = [NS(login_id="a", level_name="카페 스탭"), NS(login_id="b", level_name="새싹멤버")]
+    members = [NS(login_id="a", level_name="카페 스탭"), NS(login_id="b", level_name="우수멤버")]
     rt = NS(
         scratch={},
         cafes_cfg={"self_owned": [{"name": "고요한 아침"}], "affiliate": []},
         catalog=NS(cafes=lambda: [cafe], cafe_accounts=lambda cid: members),
     )
     _, logins = publish._cafe_members(rt, "고요한 아침")
-    assert logins == ["a"]
+    assert logins == ["a", "b"]
+
+
+def test_grade_error_swaps_account_only_in_that_cafe(tmp_path):
+    """실제 등급 미달(33007)이 나면 그 카페에서만 그 계정을 빼고 다른 계정으로 간다."""
+    rt = make_runtime(tmp_path)
+    publish_mod.mark_not_staff(rt, "러브 인썸", "user00")
+    assert "user00" in publish_mod.not_staff_accounts(rt, "러브 인썸")
+    assert "user00" not in publish_mod.not_staff_accounts(rt, "고요한 아침")
 
 
 def test_affiliate_cafe_members_not_filtered_by_staff():
@@ -807,11 +819,14 @@ def test_self_window_boundaries():
     assert next_self_window(same) == same
 
 
-def test_daily_comments_shift_out_of_window(tmp_path):
+def test_daily_comments_shift_out_of_window(tmp_path, monkeypatch):
     from v2r.engine.publish import KST, in_self_window
 
     rt = make_runtime(tmp_path)
     rt._catalog = _CommentCatalog()
+    monkeypatch.setattr(
+        publish_mod, "load_accounts", lambda rt, prefer_cache=False: [_Acc(f"member{i}") for i in range(5)]
+    )
     rt._llm = _FakeLLM('["저도 어제 딱 그랬어요ㅋㅋ", "오늘 날씨 진짜 좋더라구요", "저녁은 뭐 드셨어요"]')
     slot = publish_mod.Slot(
         manuscript=_m("고요한 아침", 0), account="member0", cafe="고요한 아침", board="반말일기"

@@ -1231,11 +1231,19 @@ def _other_account(rt: Runtime, spec: TaskSpec, slot: Any) -> str | None:
     from v2r.accounts.rules import eligible, work_type_for
 
     restricted = set(publish_mod.restricted_accounts(rt)) | {slot.account}
+    blocked = {r.casefold() for r in restricted} | publish_mod.not_staff_accounts(rt, slot.cafe or "")
     work_type = work_type_for(spec.task, slot.cafe, rt.cafes_cfg)
     usable = eligible(pool, work_type, publish_mod.all_comment_accounts(rt), restricted)
+    # 자사 일상 글이면 **오늘 10개 묶음** 안에서 먼저 찾는다 (규칙 §4)
+    daily = rt.scratch.get("self_daily_accounts")
+    if isinstance(daily, list) and daily:
+        usable_ids = {getattr(a, "login_id", str(a)).casefold() for a in usable}
+        for login in daily:
+            if login.casefold() in usable_ids and login.casefold() not in blocked:
+                return login
     for account in usable:
         login = getattr(account, "login_id", str(account))
-        if login and login != slot.account:
+        if login and login != slot.account and login.casefold() not in blocked:
             return login
     return None
 
