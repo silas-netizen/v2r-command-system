@@ -944,6 +944,23 @@ def _progress_event(
         log.warning("진행 이벤트 기록 실패: %s", exc)
 
 
+def touch_heartbeat(rt: Runtime | None) -> None:
+    """`data/serve_heartbeat.json` 을 지금 시각으로 찍는다 (최선 노력).
+
+    긴 작업 하나가 몇 분씩 돌면 serve 루프는 그동안 틱을 돌지 못한다. 그래서
+    리스를 연장하는 자리(=아직 살아 있다는 뜻)마다 심장박동 파일도 같이 찍는다.
+    파일 한 줄 쓰기라 값이 싸다 (장애 2026-09-20 #2).
+    """
+    if rt is None:
+        return
+    try:
+        from v2r.engine import schedule as schedule_mod
+
+        schedule_mod.write_heartbeat(rt)
+    except Exception as exc:  # noqa: BLE001 - 심장박동 실패가 발행을 막지 않는다
+        log.warning("심장박동 기록 실패: %s", exc)
+
+
 def _sleep_with_beat(
     seconds: float,
     beat: Any,
@@ -965,6 +982,7 @@ def _sleep_with_beat(
         remaining -= chunk
         waited += chunk
         beat()
+        touch_heartbeat(rt)
         if waited >= next_event:
             next_event += PROGRESS_EVENT_S
             _progress_event(rt, job_id, "대기 중", waited)
@@ -1012,6 +1030,7 @@ def _wait_for_rate_limit(
         remaining -= chunk
         waited += chunk
         beat()
+        touch_heartbeat(rt)
         if waited >= next_event:
             next_event += PROGRESS_EVENT_S
             _progress_event(rt, job_id, "요청 제한 대기 중", waited)
@@ -1211,7 +1230,8 @@ def _run_publish(
     playwright = context = page = None
 
     def beat() -> None:
-        """긴 루프 중 리스 연장. 잃었으면 중단한다 (M-5)."""
+        """긴 루프 중 리스 연장 + 실행기 심장박동. 리스를 잃었으면 중단한다 (M-5)."""
+        touch_heartbeat(rt)  # 긴 작업 동안 serve 틱이 못 도는 사이의 공백을 메운다
         if owner and job_id is not None:
             if not rt.jobs.heartbeat(job_id, owner):
                 raise publish_mod.PublishError("리스 상실: 다른 실행기가 작업을 가져갔습니다")
@@ -1759,6 +1779,7 @@ __all__ = [
     "maintain_session",
     "run_once",
     "serve",
+    "touch_heartbeat",
     "wait_for_other_publish",
     "watch_tick",
 ]

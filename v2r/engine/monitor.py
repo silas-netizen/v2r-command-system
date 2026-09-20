@@ -209,13 +209,54 @@ def _job_state(state: dict, job_id: int) -> dict:
     return state.setdefault("jobs", {}).setdefault(str(job_id), {})
 
 
+def _as_int(value: Any) -> int:
+    """숫자로 셀 수 있으면 정수, 아니면 0.
+
+    발행 결과의 집계 칸은 경로마다 모양이 다르다(정수일 때도 있고
+    ``{"ok": 3, "fail": 1}`` 같은 칸일 때도 있다). 어느 쪽이 와도 감시가
+    터지지 않게 여기서 한 번 걸러 센다 (장애 2026-09-20 #1).
+    """
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(float(value.strip() or 0))
+        except (TypeError, ValueError):
+            return 0
+    return 0
+
+
+def _as_list(value: Any) -> list:
+    """리스트가 아니면 리스트로 감싸 준다(빈 값은 빈 리스트)."""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, (tuple, set)):
+        return list(value)
+    return [value]
+
+
+def _count_rows(value: Any) -> int:
+    """`failures` 처럼 "줄 묶음"일 수도, 숫자일 수도 있는 값의 줄 수."""
+    if value is None:
+        return 0
+    if isinstance(value, (list, tuple, set, dict, str)):
+        return len(value)
+    return _as_int(value)
+
+
 def _retryable_rows(job: dict) -> int:
     """publish_* 실패 결과에서 다시 해볼 만한 줄 수."""
     try:
         result = json.loads(job.get("result_json") or "{}")
     except Exception:  # noqa: BLE001
         return 0
-    return len(result.get("failures") or [])
+    if not isinstance(result, dict):
+        return 0
+    return _count_rows(result.get("failures"))
 
 
 def _success_rows(job: dict) -> int:
@@ -226,20 +267,29 @@ def _success_rows(job: dict) -> int:
         return 0
     if not isinstance(result, dict):
         return 0
-    rows = [
-        r
-        for r in (result.get("results") or [])
-        if isinstance(r, dict) and str(r.get("status") or "") not in FAILED_ROW_STATUSES
-    ]
+    raw_results = result.get("results")
+    if isinstance(raw_results, dict):  # {카페: [줄, ...]} 모양도 받아 준다
+        raw_results = [r for group in raw_results.values() for r in _as_list(group)]
+    rows = 0
+    for r in _as_list(raw_results):
+        if isinstance(r, dict):
+            if str(r.get("status") or "") not in FAILED_ROW_STATUSES:
+                rows += 1
+        elif r is not None:
+            rows += 1  # 줄 모양을 모르면 "있다"고만 센다(보수적으로 부분 성공 처리)
     if rows:
-        return len(rows)
+        return rows
+    per_cafe = result.get("per_cafe")
+    if not isinstance(per_cafe, dict):
+        return 0
     total = 0
-    for counts in (result.get("per_cafe") or {}).values():
+    for counts in per_cafe.values():
         if isinstance(counts, dict):
-            try:
-                total += int(counts.get("ok") or 0)
-            except (TypeError, ValueError):
-                continue
+            # worker.per_cafe_counts({"ok","fail"}) / publish.prepare_per_cafe
+            # ({"requested","already","planned"}) 두 모양을 모두 받는다
+            total += _as_int(counts.get("ok"))
+        else:
+            total += _as_int(counts)  # 카페마다 숫자 하나만 온 옛 모양
     return total
 
 
@@ -329,6 +379,19 @@ def error_signature(error: str) -> str:
     return hashlib.sha1(text.encode("utf-8")).hexdigest()[:12]
 
 
+def _usage_total(router: Any) -> int:
+    """모델 사용량 합계(토큰).
+
+    `router.usage` 에는 `by_model` 처럼 **칸(dict)** 도 섞여 있다. 그냥
+    ``int(v)`` 하면 ``int() argument ... not 'dict'`` 로 감시 틱이 통째로
+    터진다 (장애 2026-09-20 #1). 숫자만 골라 센다.
+    """
+    usage = getattr(router, "usage", None)
+    if not isinstance(usage, dict):
+        return 0
+    return sum(_as_int(v) for k, v in usage.items() if k != "calls")
+
+
 def diagnose(rt: Any, state: dict, error: str, now: datetime, cfg: dict | None = None) -> dict:
     """오류 1건을 해석한다.
 
@@ -368,7 +431,7 @@ def diagnose(rt: Any, state: dict, error: str, now: datetime, cfg: dict | None =
             "resume": "",
         }
 
-    before = sum(int(v) for v in (getattr(router, "usage", {}) or {}).values())
+    before = _usage_total(router)
     try:
         data = router.complete_json(
             "error_diagnosis",
@@ -385,9 +448,9 @@ def diagnose(rt: Any, state: dict, error: str, now: datetime, cfg: dict | None =
             "explain": "처음 보는 오류입니다. 사람이 봐야 합니다.",
             "resume": "",
         }
-    after = sum(int(v) for v in (getattr(router, "usage", {}) or {}).values())
-    box["llm_calls"] = int(box.get("llm_calls", 0)) + 1
-    box["llm_tokens"] = int(box.get("llm_tokens", 0)) + max(0, after - before)
+    after = _usage_total(router)
+    box["llm_calls"] = _as_int(box.get("llm_calls")) + 1
+    box["llm_tokens"] = _as_int(box.get("llm_tokens")) + max(0, after - before)
 
     if isinstance(data, list):
         data = data[0] if data and isinstance(data[0], dict) else {}

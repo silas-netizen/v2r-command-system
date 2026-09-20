@@ -74,6 +74,81 @@ def check_against_history(
 # --------------------------------------------------------------------
 #: 제목이 "사실상 같다"고 볼 유사도 (difflib 비율)
 TITLE_NEAR_THRESHOLD = 0.92
+#: 비교 후보로 남기는 길이 차이(±30%). 길이가 이보다 더 차이 나면
+#: difflib 비율이 `TITLE_NEAR_THRESHOLD`에 닿을 수 없다.
+TITLE_LEN_TOLERANCE = 0.30
+#: 후보 앞자리 비교 글자 수(정규화 제목 기준)
+TITLE_PREFIX_N = 2
+#: rt.scratch 에 카페별 제목 목록을 담아 두는 칸 이름
+TITLES_CACHE_KEY = "_index_titles"
+
+
+def _titles_cache(rt: Any) -> dict:
+    """이번 실행 동안 쓸 카페별 제목 목록 칸."""
+    scratch = getattr(rt, "scratch", None)
+    if not isinstance(scratch, dict):
+        return {}
+    box = scratch.get(TITLES_CACHE_KEY)
+    if not isinstance(box, dict):
+        box = {}
+        scratch[TITLES_CACHE_KEY] = box
+    return box
+
+
+def cafe_titles(rt: Any, index: Any, cafe: str) -> list[tuple[str, str]]:
+    """그 카페의 `(제목, title_norm)` 목록 — 이번 실행 동안 한 번만 읽는다.
+
+    원고 1건마다 카페 전체 제목(1,300줄 남짓)을 다시 읽어 오면 슬롯마다
+    쓸데없이 느려진다 (장애 2026-09-20 #3). 색인 건수가 달라지면
+    (= 새 글이 들어왔으면) 캐시를 버리고 다시 읽는다.
+    """
+    box = _titles_cache(rt)
+    try:
+        stamp = int(index.count())
+    except Exception:  # noqa: BLE001
+        stamp = -1
+    hit = box.get(cafe)
+    if isinstance(hit, tuple) and hit[0] == stamp:
+        return hit[1]
+    rows = list(index.titles_for_cafe(cafe))
+    box[cafe] = (stamp, rows)
+    return rows
+
+
+def forget_cafe_titles(rt: Any, cafe: str = "") -> None:
+    """제목 캐시를 버린다(방금 글을 올렸을 때). 카페를 안 주면 전부."""
+    box = _titles_cache(rt)
+    if cafe:
+        box.pop(cafe, None)
+    else:
+        box.clear()
+
+
+def near_candidates(norm: str, rows: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """`SequenceMatcher`를 돌려 볼 값어치가 있는 제목만 추린다.
+
+    두 가지 싼 조건으로 거른다.
+
+    1. **길이** — ±30% 밖이면 difflib 비율이 0.92에 닿을 수 없다.
+    2. **앞 두 글자** — 사실상 같은 제목은 앞이 같다.
+
+    (둘 다 통과한 것만 실제 비율을 잰다.)
+    """
+    if not norm:
+        return []
+    lo = len(norm) * (1.0 - TITLE_LEN_TOLERANCE)
+    hi = len(norm) * (1.0 + TITLE_LEN_TOLERANCE)
+    head = norm[:TITLE_PREFIX_N]
+    out: list[tuple[str, str]] = []
+    for old_title, old_norm in rows:
+        if not old_norm:
+            continue
+        if not (lo <= len(old_norm) <= hi):
+            continue
+        if old_norm[:TITLE_PREFIX_N] != head:
+            continue
+        out.append((old_title, old_norm))
+    return out
 
 
 def _index_cafe_names(rt: Any, cafe: str) -> list[str]:
@@ -138,9 +213,9 @@ def is_duplicate_against_index(
 
     if norm:
         for name in cafe_names:
-            for old_title, old_norm in index.titles_for_cafe(name):
-                if not old_norm:
-                    continue
+            rows = cafe_titles(rt, index, name)
+            # 1,300건에 difflib를 다 돌리지 않는다: 길이·앞글자로 먼저 추린다
+            for old_title, old_norm in near_candidates(norm, rows):
                 ratio = difflib.SequenceMatcher(None, norm, old_norm).ratio()
                 if ratio >= TITLE_NEAR_THRESHOLD:
                     return True, f"제목 유사({name}, {ratio:.2f}): {old_title}"

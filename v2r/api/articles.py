@@ -505,6 +505,10 @@ def delete_article(client: V2RClient, source_id: str) -> dict:
     return client.post(PATH_DELETE, json={"source_id": source_id})
 
 
+#: 등록 확인 폴링 중 "아직 기다리는 중" 이벤트를 남기는 간격(초)
+WAIT_WRITTEN_EVENT_S = 30.0
+
+
 def wait_written(
     client: V2RClient,
     source_id: str,
@@ -512,13 +516,32 @@ def wait_written(
     poll: tuple[float, float] = (2.0, 5.0),
     timeout_after_sched: float = 1800.0,
     max_wait_s: float = 120.0,
+    *,
+    on_wait: Any = None,
 ) -> dict:
     """등록 완료까지 폴링. 예약 15초 전까지는 호출하지 않는다.
 
     예약 시각이 `max_wait_s`(기본 120초)보다 멀면 스레드를 오래 붙잡지 않고
     `PendingError`를 던진다. 호출자(reconcile)가 나중에 다시 확인해야 한다.
     naive `scheduled_at`은 KST로 간주한다.
+
+    **전체 대기 상한도 `max_wait_s`다** (장애 2026-09-20 #3). 예전에는
+    폴링만 `timeout_after_sched`(30분)까지 돌아, 서버가 상태를 안 돌려주면
+    슬롯 하나가 10분 넘게 조용히 멈춰 있었다. 이제 예약 대기 + 폴링을 합쳐
+    `max_wait_s`를 넘으면 `등록 확인 시간 초과`로 빠져나온다. `on_wait(초)`를
+    주면 `WAIT_WRITTEN_EVENT_S`마다 불러 진행을 남길 수 있다.
     """
+    began = time.monotonic()
+    budget = max(0.0, min(float(max_wait_s), float(timeout_after_sched)))
+
+    def _notify(waited: float) -> None:
+        if on_wait is None:
+            return
+        try:
+            on_wait(waited)
+        except Exception:  # pragma: no cover - 알림 실패가 확인을 막지 않는다
+            pass
+
     if scheduled_at is not None:
         target = scheduled_at
         if target.tzinfo is None:
@@ -530,11 +553,16 @@ def wait_written(
             )
         if wait > 0:
             time.sleep(wait)
-    deadline = time.monotonic() + timeout_after_sched
+    deadline = began + budget
 
     first, later = poll
     interval = first
+    next_event = WAIT_WRITTEN_EVENT_S
     while True:
+        waited = time.monotonic() - began
+        if waited >= next_event:
+            next_event += WAIT_WRITTEN_EVENT_S
+            _notify(waited)
         try:
             detail = get_article(client, source_id)
         except V2RApiError as exc:
@@ -562,7 +590,9 @@ def wait_written(
                 reason=str(field(history, "fail_reason", default="")),
             )
         if time.monotonic() > deadline:
-            raise V2RApiError(f"등록 확인 시간 초과: {source_id}")
+            raise V2RApiError(
+                f"등록 확인 시간 초과({budget:.0f}초): {source_id}"
+            )
         time.sleep(interval)
         interval = later
 
@@ -791,4 +821,5 @@ __all__ = [
     "to_iso_z",
     "verify_article",
     "wait_written",
+    "WAIT_WRITTEN_EVENT_S",
 ]

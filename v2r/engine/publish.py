@@ -1559,6 +1559,7 @@ def _create_and_verify(
     target_view_count: int = 0,
     parent_id: Any = None,
     on_created: Any = None,
+    job_id: int | None = None,
 ) -> tuple[str, str | None]:
     """글 1건 등록 후 GET 재확인.
 
@@ -1602,9 +1603,21 @@ def _create_and_verify(
     if problems:
         raise PublishError("등록 검증 실패: " + "; ".join(problems))
     if start_at is None:
+
+        def _waiting(waited: float) -> None:
+            """30초마다 "아직 기다리는 중" 한 줄 (조용한 정체를 막는다, #3)."""
+            try:
+                rt.events.log(job_id, "info", f"등록 확인 대기 {int(waited)}초: {title}")
+            except Exception:  # pragma: no cover - 이벤트 실패가 발행을 막지 않는다
+                log.info("등록 확인 대기 %d초: %s", int(waited), title)
+
         try:
             api_articles.wait_written(
-                rt.client, source_id, scheduled_at=start_at, max_wait_s=WAIT_WRITTEN_MAX_S
+                rt.client,
+                source_id,
+                scheduled_at=start_at,
+                max_wait_s=WAIT_WRITTEN_MAX_S,
+                on_wait=_waiting,
             )
         except api_articles.PendingError as exc:
             return str(source_id), f"예약 확인 대기: {exc}"
@@ -1652,6 +1665,14 @@ def assert_no_emoji(title: str, body: str, comments: list[dict] | None = None) -
         raise PublishError("이모지가 남아 있어 발행을 멈췄습니다: " + ", ".join(spots))
 
 
+def _warn_event(rt: Runtime, job_id: int | None, message: str) -> None:
+    """경고 이벤트 1줄(기록 실패도 삼킨다)."""
+    try:
+        rt.events.log(job_id, "warn", message)
+    except Exception:  # pragma: no cover - 방어용
+        log.warning("%s", message)
+
+
 def run_slot(
     rt: Runtime,
     spec: TaskSpec,
@@ -1693,7 +1714,11 @@ def run_slot(
 
     # 마지막 관문 — V2R 글 목록 색인에 같은 글이 있으면 등록하지 않는다(사용자 절대 규칙).
     # 선택 단계에서 걸렀더라도, 그 사이에 다른 슬롯이 같은 글을 올렸을 수 있다.
-    _dup, _why = duplicate.is_duplicate_against_index(rt, m, slot.cafe)
+    try:
+        _dup, _why = duplicate.is_duplicate_against_index(rt, m, slot.cafe)
+    except Exception as exc:  # noqa: BLE001 - 색인 조회 실패가 발행을 세우지 않는다
+        log.warning("중복 관문 조회 실패(그냥 진행): %s", exc)
+        _dup, _why = False, ""
     if _dup:
         rt.events.log(job_id, "warn", f"중복으로 발행 취소: {m.title} ({_why})")
         raise PublishError(f"V2R 기존 글과 중복: {_why}")
@@ -1807,6 +1832,7 @@ def run_slot(
                 start_at=slot.scheduled_at,
                 comments=[],
                 on_created=_on_created("daily_created", target=False),
+                job_id=job_id,
             )
             del daily_pending  # 일상 글 확정 보류는 수정글 등록을 막지 않는다
             daily_source_id = daily_id
@@ -1840,6 +1866,7 @@ def run_slot(
                 parent_source_id=daily_id,
                 target_view_count=random.randint(80, 100),
                 on_created=_on_created("revision_created"),
+                job_id=job_id,
             )
             planned["daily_source_id"] = daily_id
         else:
@@ -1874,6 +1901,7 @@ def run_slot(
                 start_at=slot.scheduled_at,
                 comments=payload,
                 on_created=_on_created("created"),
+                job_id=job_id,
             )
 
     except V2RApiError as exc:
@@ -1931,24 +1959,38 @@ def run_slot(
             "reason": pending,
         }
     rt.publications.mark(*key, "done", "done", source_id=source_id, url=url)
-    # 방금 올린 글을 V2R 글 목록 색인에도 바로 남긴다 → 다시 동기화하지 않아도 최신 (규칙 §3)
-    article_sync.record_published(
-        rt,
-        cafe=slot.cafe,
-        cafe_id=getattr(cafe, "cafe_id", None),
-        source_id=source_id,
-        login_id=slot.account,
-        title=m.title,
-        body_hash=m.content_hash,
-    )
-    rt.account_state.touch_used(slot.account)
+    # --- 여기서부터는 뒷정리다. 글은 이미 올라갔으므로 무엇이 터져도 발행을 실패로
+    #     만들거나 다음 슬롯을 막아서는 안 된다 (장애 2026-09-20 #3). ---
+    try:
+        # 방금 올린 글을 V2R 글 목록 색인에도 바로 남긴다 → 다시 동기화하지 않아도
+        # 최신이고, 중복 관문이 같은 글을 또 올리지 않는다 (규칙 §3)
+        article_sync.record_published(
+            rt,
+            cafe=slot.cafe,
+            cafe_id=getattr(cafe, "cafe_id", None),
+            source_id=source_id,
+            login_id=slot.account,
+            title=m.title,
+            body_hash=m.content_hash,
+        )
+        duplicate.forget_cafe_titles(rt, slot.cafe)  # 캐시에 방금 글을 반영한다
+    except Exception as exc:  # noqa: BLE001
+        log.warning("발행 뒤 색인 기록 실패(발행은 성공): %s", exc)
+        _warn_event(rt, job_id, f"색인 기록 실패(발행은 성공): {exc}")
+    try:
+        rt.account_state.touch_used(slot.account)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("계정 사용 기록 실패(발행은 성공): %s", exc)
     for path in slot.images:
         try:
             sha = rt.scratch.get("variant_sha", {}).get(str(path), Path(path).parent.name)
             record_variant_use(rt, sha, Path(path), source_id)
         except Exception:
             pass
-    rt.events.log(job_id, "info", f"발행 완료: {m.title} {url}")
+    try:
+        rt.events.log(job_id, "info", f"발행 완료: {m.title} {url}")
+    except Exception:  # noqa: BLE001 pragma: no cover
+        log.info("발행 완료: %s %s", m.title, url)
     return {**planned, "status": "done", "source_id": source_id, "url": url}
 
 

@@ -85,6 +85,16 @@ def _accounts(rt: Runtime, cafe_id: Any) -> list[str]:
     return out
 
 
+def _touch_heartbeat(rt: Runtime) -> None:
+    """실행기 심장박동 파일을 지금 시각으로 찍는다(최선 노력)."""
+    try:
+        from v2r.engine import schedule as schedule_mod
+
+        schedule_mod.write_heartbeat(rt)
+    except Exception as exc:  # pragma: no cover - 방어용
+        log.warning("심장박동 기록 실패: %s", exc)
+
+
 def sync_cafe_index(
     rt: Runtime,
     cafe_name: str,
@@ -121,6 +131,7 @@ def sync_cafe_index(
         return out
 
     def beat() -> None:
+        _touch_heartbeat(rt)  # 색인 동기화도 몇 분씩 돈다 (장애 2026-09-20 #2)
         if heartbeat is not None:
             try:
                 heartbeat()
@@ -173,6 +184,7 @@ def _fill_bodies(
             filled += 1
         except Exception as exc:
             errors.append(f"본문 {source_id}: {exc}")
+        _touch_heartbeat(rt)
         if heartbeat is not None:
             try:
                 heartbeat()
