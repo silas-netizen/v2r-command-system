@@ -297,3 +297,7 @@ schtasks /create /tn "V2R-Health" /tr "\"D:\v2r 자동화\v2r-command-system\scr
 
 실행기 자체가 죽으면 → 심장박동이 멈춤 → `V2R-Health`(5분) 가 `V2R-Serve` 재시작
 → 켜지자마자 그날 놓친 예약을 따라잡는다.
+
+## 실행기 재시작 절차 (2026-09-21)
+- 반드시 `powershell -ExecutionPolicy Bypass -File scriptsestart-serve.ps1` 사용. 옛 재시작 루프(cmd 창)와 파이썬 serve를 모두 끝낸 뒤 V2R-Serve 예약 작업으로 다시 띄운다.
+- 사고(2026-09-21): 09-19의 루프 창이 남아 로그 파일 잠금 오류를 계속 찍었음(발행 영향 없음). 루프 창은 항상 1개여야 한다.
