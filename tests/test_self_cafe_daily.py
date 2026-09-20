@@ -346,9 +346,17 @@ def test_self_cafe_names_excludes_excluded(tmp_path):
 # 3. 계획: 전부 즉시 + 계정 고정/연속 금지
 # --------------------------------------------------------------------
 class _Acc:
-    def __init__(self, login_id: str) -> None:
+    def __init__(self, login_id: str, work_type: str = "자사 카페") -> None:
         self.login_id = login_id
-        self.work_type = ""
+        self.work_type = work_type
+        self.excluded = False
+
+
+def _patch_members(monkeypatch, members_by_cafe: dict[str, list[str]]) -> None:
+    """V2R 회원 조회 대신 카페별 스탭 계정 목록을 준다."""
+    monkeypatch.setattr(
+        publish_mod, "_cafe_members", lambda rt, cafe: (None, list(members_by_cafe.get(cafe, [])))
+    )
 
 
 def test_plan_is_always_immediate_and_rotates_accounts(tmp_path, monkeypatch):
@@ -391,6 +399,7 @@ def test_plan_picks_ten_random_accounts_per_cafe(tmp_path, monkeypatch):
     monkeypatch.setattr(publish_mod, "load_accounts", lambda rt, prefer_cache=False: pool)
     monkeypatch.setattr(publish_mod, "eligible", lambda *a, **k: list(pool))
     monkeypatch.setattr(publish_mod, "_pool_for_cafe", lambda rt, spec, c, b, p: (list(p), False))
+    _patch_members(monkeypatch, {"고요한 아침": [a.login_id for a in pool]})
 
     spec = TaskSpec(task="publish_daily", count=20, per_cafe=True, dry_run=False)
     slots = publish_mod.plan(rt, spec, [_m("고요한 아침", i) for i in range(20)])
@@ -411,6 +420,7 @@ def test_plan_keeps_same_ten_accounts_across_boards(tmp_path, monkeypatch):
     monkeypatch.setattr(publish_mod, "load_accounts", lambda rt, prefer_cache=False: pool)
     monkeypatch.setattr(publish_mod, "eligible", lambda *a, **k: list(pool))
     monkeypatch.setattr(publish_mod, "_pool_for_cafe", lambda rt, spec, c, b, p: (list(p), False))
+    _patch_members(monkeypatch, {"고요한 아침": [a.login_id for a in pool]})
     boards = [f"게시판{i % 20}" for i in range(60)]
     monkeypatch.setattr(publish_mod, "resolve_board", lambda rt, m, spec, c: boards.pop(0))
 
@@ -418,6 +428,59 @@ def test_plan_keeps_same_ten_accounts_across_boards(tmp_path, monkeypatch):
     slots = publish_mod.plan(rt, spec, [_m("고요한 아침", i) for i in range(60)])
     used = {s.account for s in slots}
     assert len(used) == 10
+
+
+def test_daily_self_accounts_prefers_staff_in_more_cafes_and_sticks_for_the_day(tmp_path, monkeypatch):
+    """하루 10개는 자사 카페 전체 공용: 스탭 카페 수 많은 계정 우선, 같은 날은 같은 묶음 (규칙 §4)."""
+    rt = make_runtime(tmp_path)
+    rt.cafes_cfg = {"self_owned": [{"name": c, "cafe_id": i, "board": "b"} for i, c in enumerate(["A", "B", "C"])]}
+    pool = [_Acc(f"user{i:02d}") for i in range(30)] + [_Acc("aff01", "제휴 작업")]
+    members = {
+        "A": [f"user{i:02d}" for i in range(30)] + ["aff01"],
+        "B": [f"user{i:02d}" for i in range(30)],
+        "C": ["user00", "user01"],  # 이 카페는 스탭이 2개뿐
+    }
+    _patch_members(monkeypatch, members)
+    first = publish_mod.daily_self_accounts(rt, pool, random.Random(1), today="2026-09-21")
+    assert len(first) == 10
+    assert "user00" in first and "user01" in first  # 3곳 모두 스탭인 계정은 반드시 포함
+    assert "aff01" not in first  # 제휴 계정 제외
+    # 같은 날 다시 물으면(작업 재시작 등) 같은 묶음
+    again = publish_mod.daily_self_accounts(rt, pool, random.Random(99), today="2026-09-21")
+    assert again == first
+    # 날이 바뀌면 새로 뽑는다
+    tomorrow = publish_mod.daily_self_accounts(rt, pool, random.Random(5), today="2026-09-22")
+    assert len(tomorrow) == 10 and "user00" in tomorrow
+
+
+def test_plan_uses_one_daily_set_across_cafes(tmp_path, monkeypatch):
+    """카페가 달라도 하루 10개 안에서만 글쓴이를 고른다."""
+    rt = make_runtime(tmp_path)
+    rt.cafes_cfg = {"self_owned": [{"name": c, "cafe_id": i, "board": "b"} for i, c in enumerate(["A", "B"])]}
+    pool = [_Acc(f"user{i:02d}") for i in range(30)]
+    ids = [a.login_id for a in pool]
+    monkeypatch.setattr(publish_mod, "load_accounts", lambda rt, prefer_cache=False: pool)
+    monkeypatch.setattr(publish_mod, "eligible", lambda *a, **k: list(pool))
+    monkeypatch.setattr(publish_mod, "_pool_for_cafe", lambda rt, spec, c, b, p: (list(p), False))
+    _patch_members(monkeypatch, {"A": ids, "B": ids})
+    monkeypatch.setattr(publish_mod, "resolve_board", lambda rt, m, spec, c: f"게시판{hash(m.title) % 7}")
+
+    spec = TaskSpec(task="publish_daily", count=80, per_cafe=True, dry_run=False)
+    manuscripts = [_m("A", i) for i in range(40)] + [_m("B", i) for i in range(40)]
+    slots = publish_mod.plan(rt, spec, manuscripts)
+    used = {s.account for s in slots}
+    assert len(used) == 10
+    for cafe in ("A", "B"):
+        seq = [s.account for s in slots if s.cafe == cafe]
+        assert all(a != b for a, b in zip(seq, seq[1:]))  # 카페 안 연속 금지
+
+
+def test_avoid_consecutive_also_per_board():
+    cafes = ["A", "A", "A"]
+    boards = ["b1", "b2", "b1"]
+    assigned = {0: "u1", 1: "u2", 2: "u1"}
+    publish_mod._avoid_consecutive(cafes, assigned, {"a": ["u1", "u2", "u3"]}, boards)
+    assert assigned[2] != "u1"  # 같은 게시판(b1) 직전 글과 같은 계정 금지
 
 
 def test_avoid_consecutive_swaps_repeat():

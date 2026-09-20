@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import random
 import re
@@ -1127,26 +1128,107 @@ def pick_self_daily_accounts(
     return rng.sample(ids, want)
 
 
+def _daily_accounts_path(rt: Runtime) -> Path:
+    return Path(rt.settings.data_dir) / "self_daily_accounts.json"
+
+
+def daily_self_accounts(
+    rt: Runtime, pool_all: list[Any], rng: random.Random | None = None, today: str | None = None
+) -> list[str]:
+    """**하루 동안 자사 카페 전체에 쓸 계정 10개** (규칙 §4, 2026-09-21 확정).
+
+    카페·게시판마다 따로 뽑지 않고 그날 하루 10개를 정해 모든 자사 카페가 돌려 쓴다.
+    작업이 여러 번 돌거나 실행기가 재시작돼도 같은 날이면 같은 10개
+    (`data/self_daily_accounts.json`에 날짜와 함께 기록).
+
+    후보는 시트 작업 구분 '자사 카페'(제외 아님) 계정 중 자사 카페에서 스탭 등급인 계정.
+    스탭인 카페 수가 많은 계정부터 우선하고(모든 카페 스탭 → 4곳 → 3곳 …),
+    같은 층 안에서는 무작위. 그래서 스탭 카페가 적은 카페도 되도록 10개 안에서 글쓴이를 찾는다.
+    """
+    today = today or datetime.now(KST).strftime("%Y-%m-%d")
+    path = _daily_accounts_path(rt)
+    try:
+        saved = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    except Exception:  # noqa: BLE001 - 깨진 파일은 새로 만든다
+        saved = {}
+    if saved.get("date") == today and saved.get("accounts"):
+        return [str(a) for a in saved["accounts"]]
+
+    self_ids = [
+        a.login_id
+        for a in pool_all
+        if str(getattr(a, "work_type", "")).strip() == "자사 카페" and not getattr(a, "excluded", False)
+    ]
+    coverage: dict[str, int] = {}
+    for cafe_name in self_cafe_names(rt):
+        try:
+            _cafe, members = _cafe_members(rt, cafe_name)
+        except Exception as exc:  # noqa: BLE001 - 한 카페 조회 실패는 건너뛴다
+            log.warning("자사 카페 계정 조회 실패(%s): %s", cafe_name, exc)
+            continue
+        member_set = {m.casefold() for m in members}
+        for login_id in self_ids:
+            if login_id.casefold() in member_set:
+                coverage[login_id] = coverage.get(login_id, 0) + 1
+    if not coverage:
+        # 자사 카페 회원 조회가 전부 실패했거나 스탭 계정이 없다 → 빈 목록(호출자가 게시판별로 뽑음)
+        log.warning("오늘 자사 일상 글 계정 묶음을 만들지 못함(스탭 계정 없음) — 게시판별로 뽑습니다")
+        return []
+
+    rng = rng or random.Random()
+    chosen: list[str] = []
+    for tier in sorted(set(coverage.values()), reverse=True):
+        ids = [i for i, n in coverage.items() if n == tier]
+        rng.shuffle(ids)
+        for login_id in ids:
+            if len(chosen) >= SELF_DAILY_ACCOUNTS_MAX:
+                break
+            chosen.append(login_id)
+        if len(chosen) >= SELF_DAILY_ACCOUNTS_MAX:
+            break
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"date": today, "accounts": chosen}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("오늘 계정 묶음 저장 실패: %s", exc)
+    log.info("오늘 자사 일상 글 계정 %d개: %s", len(chosen), ", ".join(chosen))
+    return chosen
+
+
 def _avoid_consecutive(
-    cafes: list[str], assigned: dict[int, str], chosen_by_cafe: dict[str, list[str]]
+    cafes: list[str],
+    assigned: dict[int, str],
+    chosen_by_cafe: dict[str, list[str]],
+    boards: list[str] | None = None,
 ) -> None:
-    """같은 카페에서 같은 계정이 연속으로 쓰이지 않게 자리를 민다 (규칙 §4).
+    """같은 카페, 그리고 같은 게시판에서 같은 계정이 연속으로 쓰이지 않게 자리를 민다 (규칙 §4).
 
     계정 풀이 1개뿐이면 바꿀 수 없으므로 그대로 둔다.
     """
     previous: dict[str, str] = {}
+    previous_board: dict[tuple[str, str], str] = {}
     for i, cafe in enumerate(cafes):
         key = _norm(cafe)
+        board_key = (key, _norm(boards[i]) if boards and i < len(boards) else "")
         account = assigned.get(i)
         if not account:
             continue
-        if previous.get(key, "").casefold() == account.casefold():
+        clash = previous.get(key, "").casefold() == account.casefold() or (
+            previous_board.get(board_key, "").casefold() == account.casefold()
+        )
+        if clash:
             pool = chosen_by_cafe.get(key) or []
-            alternatives = [a for a in pool if a.casefold() != account.casefold()]
+            blocked = {previous.get(key, "").casefold(), previous_board.get(board_key, "").casefold()}
+            alternatives = [a for a in pool if a.casefold() not in blocked]
             if alternatives:
-                account = alternatives[0]
+                # 방금 쓴 계정에서 가장 먼 것을 고른다 (같은 두 계정만 왕복하지 않게)
+                account = alternatives[(i + len(alternatives) // 2) % len(alternatives)]
                 assigned[i] = account
         previous[key] = account
+        previous_board[board_key] = account
 
 
 def plan(rt: Runtime, spec: TaskSpec, manuscripts: list[Manuscript]) -> list[Slot]:
@@ -1205,14 +1287,21 @@ def plan(rt: Runtime, spec: TaskSpec, manuscripts: list[Manuscript]) -> list[Slo
                 # 규칙 §4: 카페마다 **무작위 10개**를 골라 고정하고 돌려 쓴다.
                 # 게시판이 달라도 같은 카페면 같은 10개를 쓴다 (게시판마다 새로 뽑으면
                 # 카페 전체로는 20개가 넘어가므로, 실행 1회분은 카페 단위로 기억한다).
-                fixed: dict[str, list[str]] = rt.scratch.setdefault("self_daily_fixed", {})
-                key = _norm(cafe_name)
-                if key not in fixed:
-                    fixed[key] = pick_self_daily_accounts(pool, self_daily_rng(rt))
+                # 2026-09-21 확정: 하루 동안 **자사 카페 전체**가 같은 10개를 돌려 쓴다.
+                daily = rt.scratch.get("self_daily_accounts")
+                if not isinstance(daily, list):
+                    daily = daily_self_accounts(rt, pool_all, self_daily_rng(rt))
+                    rt.scratch["self_daily_accounts"] = daily
                 pool_ids = {(a if isinstance(a, str) else a.login_id).casefold() for a in pool}
-                chosen = [a for a in fixed[key] if a.casefold() in pool_ids]
-                if not chosen:
-                    # 고정 10개가 이 게시판에 못 쓰면 이 게시판만 따로 뽑는다
+                chosen = [a for a in daily if a.casefold() in pool_ids]
+                if not chosen and daily:
+                    # 오늘 10개 중 이 카페·게시판에 쓸 수 있는 계정이 없으면 여기만 따로 뽑는다
+                    chosen = pick_self_daily_accounts(pool, self_daily_rng(rt))
+                    log.warning(
+                        "%s/%s: 오늘 계정 10개 중 쓸 수 있는 계정이 없어 따로 뽑음(%d개)",
+                        cafe_name, board, len(chosen),
+                    )
+                elif not chosen:
                     chosen = pick_self_daily_accounts(pool, self_daily_rng(rt))
             else:
                 if not pool:
@@ -1234,7 +1323,7 @@ def plan(rt: Runtime, spec: TaskSpec, manuscripts: list[Manuscript]) -> list[Slo
                 a for a in chosen if a not in chosen_by_cafe.get(_norm(cafe_name), [])
             )
         # 같은 카페에서 같은 계정을 연속으로 쓰지 않는다 (규칙 §4)
-        _avoid_consecutive(cafes, assigned, chosen_by_cafe)
+        _avoid_consecutive(cafes, assigned, chosen_by_cafe, boards)
 
     # --- 시각 계획 ---
     immediate_flags = [spec.immediate or is_test_cafe(rt, c) for c in cafes]
