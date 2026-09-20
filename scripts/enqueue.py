@@ -5,7 +5,14 @@ import sys
 from v2r.engine import worker
 from v2r.engine.context import Runtime
 
-text = " ".join(sys.argv[1:]).strip()
+args = sys.argv[1:]
+if len(args) >= 2 and args[0] == "--file":
+    # cmd 예약 실행에서 한글 인자가 깨지므로 파일(UTF-8)에서 읽는다
+    from pathlib import Path
+
+    text = Path(args[1]).read_text(encoding="utf-8").strip()
+else:
+    text = " ".join(args).strip()
 if not text:
     raise SystemExit("명령을 적어 주세요")
 rt = Runtime.open()

@@ -5,4 +5,5 @@ cd /d "%~dp0.."
 set PYTHONIOENCODING=utf-8
 set PYTHONUTF8=1
 call ".venv\Scripts\activate.bat"
-python scripts\enqueue.py 자사 카페 일상 글 카페별 100건 실제 발행 댓글 랜덤 >> "logs\enqueue-0900.log" 2>&1
+rem 한글 인자는 cmd에서 깨진다 → 명령 문구는 파일에서 읽는다
+python scripts\enqueue.py --file scripts\daily-0900.txt >> "logs\enqueue-0900.log" 2>&1
