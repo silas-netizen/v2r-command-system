@@ -102,8 +102,10 @@ RE_PER_CAFE_ADD = re.compile(r"추가로|추가\s*발행|더\s*(?:올려|발행)
 RE_RANDOM_COMMENTS = re.compile(r"댓글\s*(?:랜덤|무작위|\d+\s*~\s*\d+\s*개)")
 #: 개수 인식 전에 지우는 댓글 개수 표현 (`댓글 0~3개`가 글 수로 잡히지 않게)
 RE_COMMENT_COUNT = re.compile(r"댓글\s*\d+\s*(?:~\s*\d+\s*)?개")
-#: 자사 카페 일상 글의 기본 글 사이 대기(분) — self-cafe-daily-rules §4
-SELF_DAILY_INTERVAL = (2, 3)
+#: 자사 카페 일상 글의 **카페별** 글 사이 대기(분) — self-cafe-daily-rules §4.
+#: 2026-09-21 결정: 간격은 카페마다 따로 센다. 같은 카페의 다음 글만 2~5분 기다리고,
+#: 다른 카페 글은 곧바로 올린다.
+SELF_DAILY_INTERVAL = (2, 5)
 RE_SHEETS = re.compile(r"(\d+)\s*장")
 RE_ACCOUNT_COUNT = re.compile(r"(?:아이디|계정)\s*(\d+)\s*개")
 RE_INTERVAL_RANGE = re.compile(r"(\d+)\s*~\s*(\d+)\s*분")
@@ -432,7 +434,7 @@ def parse_korean_command(text: str, now: datetime | None = None) -> TaskSpec | N
         spec["random_comments"] = RE_RANDOM_COMMENTS.search(raw) is not None
         if spec["per_cafe"] or task == "publish_daily":
             # 규칙 §4: 자사 카페 일상 글은 (카페별이든 카페 하나든) 예약하지 않고 항상 즉시 발행하며,
-            # 글과 글 사이를 기본 2~3분 쉰다(`N~M분 간격`을 적으면 그 값).
+            # **같은 카페**의 다음 글까지 기본 2~5분 쉰다(`N~M분 간격`을 적으면 그 값).
             spec["immediate"] = True
             if not explicit_interval:
                 spec["interval_min"], spec["interval_max"] = SELF_DAILY_INTERVAL

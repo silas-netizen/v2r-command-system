@@ -9,6 +9,7 @@ import os
 import random
 import re
 import socket
+import threading
 import time
 import uuid
 from datetime import datetime, timedelta
@@ -1121,6 +1122,93 @@ def write_daily_report(
     return str(path)
 
 
+class CafePacer:
+    """카페별로 따로 쉬는 발행 순서 정하기 (규칙 §4, 사용자 결정 2026-09-21).
+
+    간격은 **전체 하나**가 아니라 **카페마다 하나**다. 어떤 카페에 글을 올리면
+    그 카페의 다음 글만 2~5분 기다리고, 다른 카페 글은 곧바로 올린다.
+    그래서 카페 5곳 × N건이 5×N×3.5분이 아니라 **약 N×3.5분** 만에 끝난다.
+
+    * 같은 카페 안의 시트 순서는 **절대 바꾸지 않는다**(사용자 절대 규칙 §2).
+    * 한 번에 한 건만 올린다(동시 호출 없음). 올릴 수 있는 카페가 여럿이면
+      가장 오래 기다린 카페부터, 전부 쉬는 중이면 가장 빨리 풀리는 카페를 기다린다.
+    """
+
+    def __init__(
+        self,
+        slots: list,
+        interval_min: float,
+        interval_max: float,
+        *,
+        rng: Any = None,
+        clock: Any = None,
+    ) -> None:
+        self.clock = clock or time.monotonic
+        self.rng = rng or random
+        self.lo = float(interval_min)
+        self.hi = float(max(interval_max, interval_min))
+        self.queues: dict[str, list[tuple[int, Any]]] = {}
+        self.first_pos: dict[str, int] = {}
+        for pos, slot in enumerate(slots, start=1):
+            cafe = str(getattr(slot, "cafe", "") or "")
+            self.queues.setdefault(cafe, []).append((pos, slot))
+            self.first_pos.setdefault(cafe, pos)
+        self.next_allowed: dict[str, float] = {c: 0.0 for c in self.queues}
+        self.cursor: dict[str, int] = {c: 0 for c in self.queues}
+
+    def _live(self) -> list[str]:
+        return [c for c, q in self.queues.items() if self.cursor[c] < len(q)]
+
+    def pending(self) -> int:
+        """아직 안 올린 글 수."""
+        return sum(len(q) - self.cursor[c] for c, q in self.queues.items())
+
+    def take(self) -> tuple[int, Any] | None:
+        """다음에 올릴 (원래 순번, 슬롯). 남은 게 없으면 None.
+
+        가장 빨리 풀리는 카페를 고른다(동점이면 시트에 먼저 나온 카페).
+        """
+        live = self._live()
+        if not live:
+            return None
+        cafe = min(live, key=lambda c: (self.next_allowed[c], self.first_pos[c]))
+        pos, slot = self.queues[cafe][self.cursor[cafe]]
+        self.cursor[cafe] += 1
+        return pos, slot
+
+    def wait_seconds(self, cafe: Any) -> float:
+        """그 카페에 지금 올려도 되나. 아직이면 기다릴 초."""
+        return max(0.0, self.next_allowed.get(str(cafe or ""), 0.0) - self.clock())
+
+    def mark(self, cafe: Any) -> float:
+        """그 카페에 글을 올렸다 — 다음 허용 시각을 정한다. 쉴 초를 돌려준다."""
+        key = str(cafe or "")
+        gap = 60.0 * self.rng.uniform(self.lo, self.hi)
+        self.next_allowed[key] = self.clock() + gap
+        return gap
+
+
+def duration_estimate(
+    slots: list, interval_min: float, interval_max: float
+) -> tuple[float, str]:
+    """카페별 간격으로 돌 때의 예상 소요(분, 한국어 한 줄).
+
+    카페별로 따로 쉬므로 전체 시간은 **글이 가장 많은 카페**가 정한다.
+    """
+    counts: dict[str, int] = {}
+    for slot in slots:
+        cafe = str(getattr(slot, "cafe", "") or "")
+        counts[cafe] = counts.get(cafe, 0) + 1
+    longest = max(counts.values()) if counts else 0
+    average = (float(interval_min) + float(max(interval_max, interval_min))) / 2.0
+    minutes = max(0.0, (longest - 1)) * average
+    if minutes >= 60:
+        line = f"예상 소요 약 {minutes / 60:.1f}시간"
+    else:
+        line = f"예상 소요 약 {int(round(minutes))}분"
+    return minutes, line
+
+
 def per_cafe_counts(
     results: list[dict], failed: list[tuple[Any, str]]
 ) -> dict[str, dict[str, int]]:
@@ -1220,9 +1308,14 @@ def _run_publish(
     results: list[dict] = []
     failures: list[str] = []
     failed_slots: list[tuple[Any, str]] = []
-    #: 다음 글을 올려도 되는 시각(monotonic). 연속한 두 글은 어차피 카페가 다르므로
-    #: 카페별이 아니라 **전체 하나의 간격**으로 쉰다 (규칙 §4).
-    next_allowed = 0.0
+    #: 카페마다 따로 세는 "다음 글 허용 시각" (규칙 §4, 결정 2026-09-21).
+    #: 모의 실행은 기다리지 않으므로 계획 순서를 그대로 보여 준다.
+    pacer = (
+        CafePacer(slots, spec.interval_min, spec.interval_max)
+        if paced and not spec.dry_run
+        else None
+    )
+    plain = list(enumerate(slots, start=1)) if pacer is None else []
     window_notified = False
     rate_notified = False  # 레이트 제한 안내는 작업당 한 번만
     touched: list[tuple] = []
@@ -1244,7 +1337,16 @@ def _run_publish(
 
     stopped = False
     try:
-        for index, slot in enumerate(slots, start=1):
+        while True:
+            if pacer is not None:
+                picked = pacer.take()
+                if picked is None:
+                    break
+                index, slot = picked
+            else:
+                if not plain:
+                    break
+                index, slot = plain.pop(0)
             if stopped or stop_requested(rt):  # 슬롯 사이에서 중지 확인 (M-9)
                 stopped = True
                 failures.append(f"{slot.manuscript.title}: 중지 요청으로 건너뜀")
@@ -1271,9 +1373,9 @@ def _run_publish(
                     _sleep_with_beat(
                         (open_at - now_kst).total_seconds(), beat, rt=rt, job_id=job_id
                     )
-            if paced and not spec.dry_run:
-                # 앞 글에서 정한 다음 발행 허용 시각까지 쉰다 (글 사이 2~3분 랜덤)
-                wait = next_allowed - time.monotonic()
+            if pacer is not None:
+                # 이 카페의 다음 글 허용 시각까지만 쉰다. 다른 카페는 이미 먼저 갔다.
+                wait = pacer.wait_seconds(slot.cafe)
                 if wait > 0:
                     _sleep_with_beat(wait, beat, rt=rt, job_id=job_id)
             rate_waits = 0
@@ -1329,10 +1431,8 @@ def _run_publish(
                 break
             if stopped:
                 continue
-            if paced and not spec.dry_run:
-                next_allowed = time.monotonic() + 60.0 * random.uniform(
-                    float(spec.interval_min), float(max(spec.interval_max, spec.interval_min))
-                )
+            if pacer is not None:
+                pacer.mark(slot.cafe)  # 이 카페만 2~5분 쉰다
             if not spec.dry_run and (not paced or index % 10 == 0 or index == len(slots)):
                 notify_all(
                     rt.channels,
@@ -1380,6 +1480,12 @@ def _run_publish(
         out["per_cafe"] = counts
         # 모의 실행에서 사용자가 순서를 확인할 수 있게 계획 순서를 그대로 싣는다
         out["sequence"] = list(rt.scratch.get("per_cafe_sequence") or [])
+        # 카페별 간격으로 도는 예상 소요(규칙 §4) — 모의 실행 보고에 한 줄로 싣는다
+        minutes, estimate = duration_estimate(slots, spec.interval_min, spec.interval_max)
+        out["estimate_minutes"] = round(minutes, 1)
+        out["estimate"] = estimate
+        if spec.dry_run:
+            out["message"] = f"{out.get('message') or '모의 실행'} — {estimate}"
         try:
             out["report_file"] = write_daily_report(rt, spec, results, failed_slots)
         except Exception as exc:  # 보고서 실패는 발행 결과를 바꾸지 않는다
@@ -1523,13 +1629,20 @@ def dispatch(rt: Runtime, job: Any, owner: str | None = None) -> dict:
 # --------------------------------------------------------------------
 # 큐 실행
 # --------------------------------------------------------------------
-def run_once(rt: Runtime, owner: str | None = None) -> dict | None:
-    """큐에서 1건을 실행한다. 없으면 None."""
+def run_once(
+    rt: Runtime, owner: str | None = None, scope: str | None = None
+) -> dict | None:
+    """큐에서 1건을 실행한다. 없으면 None.
+
+    `scope="main"` 이면 사이드카 몫(가벼운 작업)은 건너뛰고,
+    `scope="light"` 면 그 몫만 집는다. 기본값은 줄을 가리지 않는다.
+    """
     owner = owner or default_owner()
-    reaped = rt.jobs.reap_stale_running()  # 죽은 실행기의 고아 작업 정리 (M-5)
-    if reaped:
-        log.warning("리스가 끊긴 작업 %d건을 불확실로 정리했습니다", reaped)
-    job = rt.jobs.acquire(owner)
+    if scope != "light":
+        reaped = rt.jobs.reap_stale_running()  # 죽은 실행기의 고아 작업 정리 (M-5)
+        if reaped:
+            log.warning("리스가 끊긴 작업 %d건을 불확실로 정리했습니다", reaped)
+    job = rt.jobs.acquire(owner, scope=scope)
     if job is None:
         return None
 
@@ -1542,7 +1655,14 @@ def run_once(rt: Runtime, owner: str | None = None) -> dict | None:
         rt.jobs.finish(job_id, "failed", None, str(exc))
         rt.events.log(job_id, "error", f"작업 실패: {exc}")
         notify_all(rt.channels, f"작업 {job_id} 실패: {exc}")
-        return {"job_id": job_id, "status": "failed", "error": str(exc), "description": description}
+        out = {
+            "job_id": job_id,
+            "status": "failed",
+            "error": str(exc),
+            "description": description,
+        }
+        reply_to_origin(out)
+        return out
 
     failures = list(result.get("failures") or result.get("errors") or [])
     uncertain = list(result.get("uncertain") or [])
@@ -1568,14 +1688,20 @@ def run_once(rt: Runtime, owner: str | None = None) -> dict | None:
     if spec.task in PUBLISH_TASKS or spec.task == "reconcile":
         refresh_dashboard(rt)  # 발행·점검이 끝날 때마다 현황판을 새로 그린다
     notify_all(rt.channels, format_report(job_id, status, description))
-    return {"job_id": job_id, "status": status, "result": result, "description": description}
+    out = {"job_id": job_id, "status": status, "result": result, "description": description}
+    if error:
+        out["error"] = error
+    reply_to_origin(out)
+    return out
 
 
-def drain(rt: Runtime, owner: str | None = None, limit: int = 100) -> list[dict]:
+def drain(
+    rt: Runtime, owner: str | None = None, limit: int = 100, scope: str | None = None
+) -> list[dict]:
     """큐가 빌 때까지 실행."""
     done: list[dict] = []
     for _ in range(limit):
-        out = run_once(rt, owner)
+        out = run_once(rt, owner, scope=scope)
         if out is None:
             break
         done.append(out)
@@ -1592,16 +1718,55 @@ def _reply(channel: Any, chat_id: str, text: str) -> None:
         log.warning("답장 실패(%s): %s", getattr(channel, "name", "?"), exc)
 
 
-def serve_poll(rt: Runtime, owner: str | None = None) -> dict:
-    """serve 루프 1회분: 채널 수신 → 접수 → 큐 실행 → 보낸 방에 답장.
+#: job_id → (채널, 보낸 방). 명령을 **받은 쪽**(사이드카일 수 있다)과 작업을
+#: **끝낸 쪽**(본 실행기일 수 있다)이 다른 스레드이므로 프로세스 한 곳에 모아 둔다.
+ORIGINS: dict[int, tuple[Any, str]] = {}
+_ORIGINS_LOCK = threading.Lock()
+#: 기억해 둘 최대 건수(무한정 커지지 않게)
+ORIGINS_MAX = 200
 
-    루프를 절대 죽이지 않기 위해 채널별·명령별로 예외를 가둔다.
+
+def remember_origin(job_id: Any, channel: Any, chat_id: str) -> None:
+    """이 작업의 결과를 어느 방에 답할지 기억한다."""
+    if job_id is None:
+        return
+    with _ORIGINS_LOCK:
+        ORIGINS[int(job_id)] = (channel, str(chat_id))
+        while len(ORIGINS) > ORIGINS_MAX:
+            ORIGINS.pop(next(iter(ORIGINS)), None)
+
+
+def pop_origin(job_id: Any) -> tuple[Any, str] | None:
+    """기억해 둔 방을 꺼낸다(한 번만)."""
+    if job_id is None:
+        return None
+    with _ORIGINS_LOCK:
+        return ORIGINS.pop(int(job_id), None)
+
+
+def reply_to_origin(out: dict) -> bool:
+    """작업 결과를 명령이 들어온 그 방에 답한다. 기억이 없으면 아무것도 안 한다."""
+    origin = pop_origin(out.get("job_id"))
+    if origin is None:
+        return False
+    channel, chat_id = origin
+    result = out.get("result") or {}
+    text = format_report(
+        out.get("job_id"), out.get("status", ""), out.get("description", ""),
+        error=out.get("error"),
+    )
+    extra = result.get("report") or result.get("message") or ""
+    _reply(channel, chat_id, f"{text}\n{extra}".strip())
+    return True
+
+
+def poll_channels(rt: Runtime) -> int:
+    """채널 수신 → 명령 접수 → 접수 답장. 받은 명령 수를 돌려준다.
+
+    본 실행기가 긴 작업 안에 들어가 있으면 이 함수가 **사이드카 스레드**에서
+    돌아야 `현황`·`중지` 가 즉시 응답한다(장애 2026-09-20 C).
     """
-    owner = owner or default_owner()
-    #: job_id → (채널, 보낸 방) — 결과를 브로드캐스트만 하지 않고 그 방에도 답한다
-    origins: dict[int, tuple[Any, str]] = {}
     received = 0
-
     for channel in rt.channels:
         try:
             incoming = channel.poll()
@@ -1630,9 +1795,25 @@ def serve_poll(rt: Runtime, owner: str | None = None) -> dict:
             # 중지 뒤에 들어온 새 명령은 중지 상태를 푼다(그래야 큐가 다시 돈다)
             clear_stop(rt)
             job_id = out.get("job_id")
-            if job_id is not None:
-                origins[int(job_id)] = (channel, cmd.chat_id)
+            remember_origin(job_id, channel, cmd.chat_id)
             _reply(channel, cmd.chat_id, format_report(job_id, "running", out["description"]))
+    return received
+
+
+def serve_poll(
+    rt: Runtime,
+    owner: str | None = None,
+    *,
+    scope: str | None = None,
+    poll: bool = True,
+) -> dict:
+    """serve 루프 1회분: 채널 수신 → 접수 → 큐 실행 → 보낸 방에 답장.
+
+    사이드카가 채널을 읽고 있으면 `poll=False` 로 불러 두 번 읽지 않게 한다.
+    `scope="main"` 이면 가벼운 작업(사이드카 몫)은 집지 않는다.
+    """
+    owner = owner or default_owner()
+    received = poll_channels(rt) if poll else 0
 
     # 죽은 실행기가 남긴 작업 정리 (M-5). run_once 안에서도 하지만
     # 큐가 비어 있는 동안에도 주기적으로 돌아야 한다.
@@ -1649,24 +1830,12 @@ def serve_poll(rt: Runtime, owner: str | None = None) -> dict:
         return {"received": received, "reaped": reaped, "done": [], "stopped": True}
 
     try:
-        outs = drain(rt, owner)
+        outs = drain(rt, owner, scope=scope)
     except Exception as exc:
         log.exception("큐 실행 실패: %s", exc)
         return {"received": received, "reaped": reaped, "done": [], "error": str(exc)}
 
-    for out in outs:
-        origin = origins.get(int(out.get("job_id") or 0))
-        if origin is None:
-            continue  # 이 방이 시킨 작업이 아니다 (결과는 notify_all이 이미 보냈다)
-        channel, chat_id = origin
-        result = out.get("result") or {}
-        text = format_report(
-            out.get("job_id"), out.get("status", ""), out.get("description", ""),
-            error=out.get("error"),
-        )
-        extra = result.get("report") or result.get("message") or ""
-        _reply(channel, chat_id, f"{text}\n{extra}".strip())
-
+    # 결과 답장은 run_once 가 끝나는 자리에서 바로 보낸다(reply_to_origin).
     return {"received": received, "reaped": reaped, "done": outs, "stopped": False}
 
 
@@ -1727,14 +1896,19 @@ def serve(rt: Runtime, poll_seconds: int = 5, announce: bool = True) -> None:  #
     if announce:
         notify_all(rt.channels, SERVE_HELLO)
     next_maintain = 0.0
+    from v2r.engine import sidecar as sidecar_mod
+
+    side = sidecar_mod.SidecarThread(rt.settings)
+    side.start()  # 예약·감시·채널 수신·가벼운 작업은 본 루프와 따로 돈다
     try:
         while True:
             try:
                 if time.monotonic() >= next_maintain:
                     next_maintain = time.monotonic() + MAINTAIN_TICK_S
                     maintain_session(rt)
-                watch_tick(rt)  # 예약 발사 + 모든 작업 감시 + 심장박동
-                serve_poll(rt, owner)
+                side = ensure_sidecar(rt, side)  # 죽었으면 되살린다
+                watch_tick(rt, schedule=False, monitor=False)  # 심장박동만(예약·감시는 사이드카)
+                serve_poll(rt, owner, scope="main", poll=False)
             except KeyboardInterrupt:
                 print("serve 중지", flush=True)
                 return
@@ -1742,25 +1916,56 @@ def serve(rt: Runtime, poll_seconds: int = 5, announce: bool = True) -> None:  #
                 log.exception("serve 폴링 실패(계속 진행): %s", exc)
             time.sleep(poll_seconds)
     finally:
+        try:
+            side.stop()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("사이드카 정지 실패: %s", exc)
         held.release()
 
 
-def watch_tick(rt: Runtime) -> dict:
-    """serve 루프 1회분의 예약·감시. 어떤 예외로도 루프를 죽이지 않는다."""
+def ensure_sidecar(rt: Runtime, side: Any) -> Any:
+    """사이드카 스레드가 죽었으면 기록을 남기고 새로 띄운다."""
+    from v2r.engine import sidecar as sidecar_mod
+
+    if side is not None and side.is_alive():
+        sidecar_mod.alert_if_stale(rt)
+        return side
+    log.error("사이드카 스레드가 죽었습니다 — 다시 시작합니다")
+    try:
+        rt.events.log(None, "error", "사이드카 스레드 중단 — 재시작")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("사이드카 재시작 이벤트 기록 실패: %s", exc)
+    try:
+        notify_all(rt.channels, "사이드카(예약·감시) 스레드가 멈춰서 다시 시작했습니다")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("사이드카 재시작 알림 실패: %s", exc)
+    fresh = sidecar_mod.SidecarThread(rt.settings)
+    fresh.start()
+    return fresh
+
+
+def watch_tick(rt: Runtime, *, schedule: bool = True, monitor: bool = True) -> dict:
+    """serve 루프 1회분의 예약·감시. 어떤 예외로도 루프를 죽이지 않는다.
+
+    사이드카 스레드가 예약·감시를 맡으면 본 루프는 심장박동만 찍는다
+    (`schedule=False, monitor=False`).
+    """
     from v2r.engine import monitor as monitor_mod
     from v2r.engine import schedule as schedule_mod
 
     out: dict = {}
-    try:
-        out["schedule"] = schedule_mod.tick(rt)
-    except Exception as exc:  # noqa: BLE001
-        log.exception("예약 틱 실패(계속 진행): %s", exc)
-        out["schedule"] = {"error": str(exc)}
-    try:
-        out["monitor"] = monitor_mod.tick(rt)
-    except Exception as exc:  # noqa: BLE001
-        log.exception("감시 틱 실패(계속 진행): %s", exc)
-        out["monitor"] = {"error": str(exc)}
+    if schedule:
+        try:
+            out["schedule"] = schedule_mod.tick(rt)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("예약 틱 실패(계속 진행): %s", exc)
+            out["schedule"] = {"error": str(exc)}
+    if monitor:
+        try:
+            out["monitor"] = monitor_mod.tick(rt)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("감시 틱 실패(계속 진행): %s", exc)
+            out["monitor"] = {"error": str(exc)}
     try:
         schedule_mod.write_heartbeat(rt)
     except Exception as exc:  # noqa: BLE001
@@ -1772,13 +1977,18 @@ __all__ = [
     "ALLOWED_TASKS",
     "default_owner",
     "dispatch",
+    "ensure_sidecar",
     "ensure_single_serve",
     "drain",
     "handle_text",
     "idem_key",
     "maintain_session",
+    "poll_channels",
+    "remember_origin",
+    "reply_to_origin",
     "run_once",
     "serve",
+    "serve_poll",
     "touch_heartbeat",
     "wait_for_other_publish",
     "watch_tick",

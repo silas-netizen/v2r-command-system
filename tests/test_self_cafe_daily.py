@@ -43,8 +43,8 @@ def test_parse_self_daily_command():
     assert spec.random_comments is True
     assert spec.dry_run is False
     assert spec.immediate is True
-    # 간격을 적지 않으면 기본 2~3분 (규칙 §4)
-    assert (spec.interval_min, spec.interval_max) == (2, 3)
+    # 간격을 적지 않으면 기본 2~5분 (규칙 §4 — 카페별 간격)
+    assert (spec.interval_min, spec.interval_max) == (2, 5)
     assert spec.cafe == ""
 
 
@@ -66,7 +66,7 @@ def test_parse_plain_daily_keeps_defaults():
     spec = parse_korean_command("고요한 아침 일상 글 2개 올려줘")
     assert spec.per_cafe is False
     assert spec.random_comments is False
-    assert (spec.interval_min, spec.interval_max) == (2, 3)  # 일상 글은 항상 즉시·2~3분
+    assert (spec.interval_min, spec.interval_max) == (2, 5)  # 일상 글은 항상 즉시·카페별 2~5분
 
 
 # --------------------------------------------------------------------
@@ -801,3 +801,134 @@ def test_declump_breaks_runs_of_three_and_keeps_order_otherwise():
     # 몰림 없는 시트는 그대로
     seq2 = [{"cafe": c} for c in ["A", "B", "A", "B"]]
     assert publish_mod.declump_by_cafe([0, 1, 2, 3], seq2)[0] == [0, 1, 2, 3]
+
+
+# --------------------------------------------------------------------
+# 9. 카페별 간격 (사용자 결정 2026-09-21, 규칙 §4)
+# --------------------------------------------------------------------
+#: 이름이 서로 또렷하게 다른 자사 카페 5곳
+FIVE_CAFES = ["고요한 아침", "글로시 마이", "웨딩 노트", "바다 마을", "숲속 정원"]
+
+
+class _Clock:
+    """가짜 시계 — 진짜로 자지 않고 눈금만 앞으로 돌린다."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float, beat, **kwargs) -> None:
+        self.now += max(0.0, float(seconds))
+        beat()
+
+
+def _slots(plan: list[tuple[str, int]]) -> list:
+    out = []
+    for cafe, count in plan:
+        for i in range(count):
+            out.append(
+                publish_mod.Slot(
+                    manuscript=_m(cafe, i), account="u", cafe=cafe, board="b"
+                )
+            )
+    return out
+
+
+def test_pacer_는_카페마다_따로_쉬고_카페_안_순서를_지킨다():
+    """카페 5곳 × 4건이 5×4×3.5분이 아니라 약 (4-1)×3.5분 만에 끝난다."""
+    clock = _Clock()
+    cafes = list(FIVE_CAFES)
+    slots = _slots([(c, 4) for c in cafes])
+    pacer = worker.CafePacer(slots, 2, 5, rng=random.Random(7), clock=clock)
+
+    fired: list[tuple[float, str, str]] = []
+    while pacer.pending():
+        pos, slot = pacer.take()
+        wait = pacer.wait_seconds(slot.cafe)
+        clock.now += wait  # 올릴 수 있을 때까지 기다린다
+        fired.append((clock.now, slot.cafe, slot.manuscript.title))
+        pacer.mark(slot.cafe)
+
+    assert len(fired) == 20
+    elapsed = fired[-1][0] - fired[0][0]
+    # 전체 하나의 간격이었다면 최소 19×2분=38분. 카페별이면 최대 (4-1)×5분=15분.
+    assert 3 * 2 * 60 <= elapsed <= 3 * 5 * 60
+    for cafe in cafes:
+        mine = [(t, title) for t, c, title in fired if c == cafe]
+        assert [title for _, title in mine] == [f"{cafe} 글 {i}" for i in range(4)]
+        gaps = [b[0] - a[0] for a, b in zip(mine, mine[1:])]
+        assert all(2 * 60 <= g <= 5 * 60 for g in gaps)  # 같은 카페는 2~5분 간격
+
+
+def test_run_publish_은_카페별_간격으로_돈다(tmp_path, monkeypatch):
+    """`_run_publish` 실제 경로: 5개 카페 × 4건이 카페별 간격으로 빨리 끝난다."""
+    rt = make_runtime(tmp_path)
+    rt.settings.repo_root = tmp_path
+    cafes = list(FIVE_CAFES)
+    rt.cafes_cfg = {
+        "self_owned": [
+            {"name": c, "cafe_id": i + 1, "board": "b"} for i, c in enumerate(cafes)
+        ]
+    }
+    items = _interleaved("각색_0921", cafes * 4)
+    _fake_sources(monkeypatch, [("각색_0921", items)])
+    pool = [_Acc(f"user{i:02d}") for i in range(12)]
+    monkeypatch.setattr(publish_mod, "load_accounts", lambda rt, prefer_cache=False: pool)
+    monkeypatch.setattr(publish_mod, "eligible", lambda *a, **k: list(pool))
+    monkeypatch.setattr(publish_mod, "_pool_for_cafe", lambda rt, spec, c, b, p: (list(p), False))
+    monkeypatch.setattr(publish_mod, "in_self_window", lambda now: True)
+    monkeypatch.setattr(worker, "notify_all", lambda ch, msg: None)
+
+    clock = _Clock()
+    monkeypatch.setattr(worker.time, "monotonic", clock)
+    monkeypatch.setattr(worker, "_sleep_with_beat", clock.sleep)
+
+    fired: list[tuple[float, str]] = []
+
+    def fake_slot(rt_, spec_, slot, **kwargs):
+        fired.append((clock.now, slot.cafe))
+        return {"status": "done", "cafe": slot.cafe, "title": slot.manuscript.title}
+
+    monkeypatch.setattr(publish_mod, "run_slot", fake_slot)
+
+    spec = TaskSpec(
+        task="publish_daily", count=4, per_cafe=True, dry_run=False,
+        interval_min=2, interval_max=5, start_date="2026-09-21",
+    )
+    out = worker._run_publish(rt, None, spec)
+
+    assert out["slots"] == 20 and out["ok"] is True
+    elapsed = fired[-1][0] - fired[0][0]
+    assert elapsed <= 3 * 5 * 60  # 카페별 간격: 최대 15분
+    assert elapsed >= 3 * 2 * 60  # 그래도 같은 카페는 쉬었다
+    for cafe in cafes:
+        mine = [t for t, c in fired if c == cafe]
+        assert len(mine) == 4
+        assert all(2 * 60 <= b - a <= 5 * 60 for a, b in zip(mine, mine[1:]))
+
+
+def test_모의_실행_보고에_예상_소요가_나온다(tmp_path, monkeypatch):
+    rt = make_runtime(tmp_path)
+    rt.settings.repo_root = tmp_path
+    rt.cafes_cfg = TWO_CAFES
+    items = _interleaved("각색_0921", ["고요한 아침", "글로시 마이"] * 3)
+    _fake_sources(monkeypatch, [("각색_0921", items)])
+    pool = [_Acc(f"user{i:02d}") for i in range(12)]
+    monkeypatch.setattr(publish_mod, "load_accounts", lambda rt, prefer_cache=False: pool)
+    monkeypatch.setattr(publish_mod, "eligible", lambda *a, **k: list(pool))
+    monkeypatch.setattr(publish_mod, "_pool_for_cafe", lambda rt, spec, c, b, p: (list(p), False))
+
+    spec = TaskSpec(
+        task="publish_daily", count=3, per_cafe=True, dry_run=True,
+        interval_min=2, interval_max=5, start_date="2026-09-21",
+    )
+    out = worker._run_publish(rt, None, spec)
+    # 카페마다 3건 → (3-1) × 평균 3.5분 = 7분
+    assert out["estimate"] == "예상 소요 약 7분"
+    assert out["estimate_minutes"] == 7.0
+    assert "예상 소요 약 7분" in out["message"]
+    # 60분을 넘으면 시간 단위로 말한다
+    slots = _slots([("A", 31), ("B", 2)])
+    assert worker.duration_estimate(slots, 2, 5)[1] == "예상 소요 약 1.8시간"

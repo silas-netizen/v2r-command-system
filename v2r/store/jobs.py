@@ -47,13 +47,27 @@ def _owner_is_dead(owner: str | None) -> bool:
     return not pid_alive(int(pid_text))
 
 
+def _scope_for(task: str) -> str:
+    """그 작업을 어느 줄(main/light)에서 잡아야 하는가.
+
+    가벼운 조회 작업은 긴 발행 작업 뒤에 줄 서면 안 된다(장애 2026-09-20 C).
+    사이드카 스레드가 `light` 줄만 집어간다.
+    """
+    try:
+        from v2r.engine.sidecar import LIGHT_TASKS
+
+        return "light" if str(task) in LIGHT_TASKS else "main"
+    except Exception:  # noqa: BLE001 - 순환 참조·초기화 실패로 큐가 막히면 안 된다
+        return "main"
+
+
 class JobStore:
     """jobs + executor_lease 조작."""
 
     def __init__(self, conn: sqlite3.Connection) -> None:
         self.conn = conn
 
-    def enqueue(self, spec: TaskSpec, idem_key: str) -> int:
+    def enqueue(self, spec: TaskSpec, idem_key: str, lease_scope: str | None = None) -> int:
         """작업 등록. 같은 키가 있으면 기존 id 반환."""
         row = self.conn.execute(
             "SELECT id FROM jobs WHERE idem_key = ?", (idem_key,)
@@ -61,10 +75,11 @@ class JobStore:
         if row:
             return int(row["id"])
         ts = now_iso()
+        scope = lease_scope or _scope_for(spec.task)
         cur = self.conn.execute(
-            "INSERT INTO jobs (idem_key, task, spec_json, status, created_at, updated_at)"
-            " VALUES (?, ?, ?, 'queued', ?, ?)",
-            (idem_key, spec.task, spec.to_json(), ts, ts),
+            "INSERT INTO jobs (idem_key, task, spec_json, status, lease_scope,"
+            " created_at, updated_at) VALUES (?, ?, ?, 'queued', ?, ?, ?)",
+            (idem_key, spec.task, spec.to_json(), scope, ts, ts),
         )
         return int(cur.lastrowid)
 
@@ -137,13 +152,54 @@ class JobStore:
             (now_iso(), owner),
         )
 
-    def acquire(self, owner: str, lease_seconds: int = 900) -> sqlite3.Row | None:
-        """리스를 잡고 가장 오래된 queued 1건을 running으로."""
+    def acquire_light(self, owner: str, lease_seconds: int = 300) -> sqlite3.Row | None:
+        """`light` 줄의 가장 오래된 queued 1건을 running으로.
+
+        실행기 리스(executor_lease)를 **쓰지 않는다**. 그래야 긴 발행 작업이
+        리스를 쥐고 있는 동안에도 사이드카가 가벼운 작업을 바로 돌릴 수 있다.
+        """
+        until = (datetime.now(KST) + timedelta(seconds=lease_seconds)).isoformat(
+            timespec="seconds"
+        )
+        ts = now_iso()
+        row = self.conn.execute(
+            "SELECT id FROM jobs WHERE status = 'queued' AND lease_scope = 'light'"
+            " ORDER BY id LIMIT 1"
+        ).fetchone()
+        if row is None:
+            return None
+        job_id = int(row["id"])
+        cur = self.conn.execute(
+            "UPDATE jobs SET status = 'running', lease_owner = ?, lease_until = ?,"
+            " updated_at = ? WHERE id = ? AND status = 'queued'",
+            (owner, until, ts, job_id),
+        )
+        if cur.rowcount <= 0:
+            return None  # 그 사이 누가 집어갔다
+        return self.conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+
+    def acquire(
+        self, owner: str, lease_seconds: int = 900, scope: str | None = None
+    ) -> sqlite3.Row | None:
+        """리스를 잡고 가장 오래된 queued 1건을 running으로.
+
+        `scope="main"` 이면 사이드카 몫(`light`)은 건너뛴다. 기본값(None)은
+        예전처럼 줄을 가리지 않는다(사이드카 없이 도는 한 번짜리 실행용).
+        """
+        if scope == "light":
+            return self.acquire_light(owner, lease_seconds)
         if not self._take_lease(owner, lease_seconds):
             return None
-        row = self.conn.execute(
-            "SELECT * FROM jobs WHERE status = 'queued' ORDER BY id LIMIT 1"
-        ).fetchone()
+        if scope is None:
+            row = self.conn.execute(
+                "SELECT * FROM jobs WHERE status = 'queued' ORDER BY id LIMIT 1"
+            ).fetchone()
+        else:
+            row = self.conn.execute(
+                "SELECT * FROM jobs WHERE status = 'queued' AND lease_scope = ?"
+                " ORDER BY id LIMIT 1",
+                (scope,),
+            ).fetchone()
         if row is None:
             self._release_lease(owner)
             return None

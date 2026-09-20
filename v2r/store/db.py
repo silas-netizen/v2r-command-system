@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     task        TEXT NOT NULL,
     spec_json   TEXT NOT NULL,
     status      TEXT NOT NULL DEFAULT 'queued',
+    lease_scope TEXT NOT NULL DEFAULT 'main',
     lease_owner TEXT,
     lease_until TEXT,
     result_json TEXT,
@@ -122,6 +123,7 @@ CREATE TABLE IF NOT EXISTS article_index (
 );
 
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status, id);
+CREATE INDEX IF NOT EXISTS idx_jobs_scope ON jobs(status, lease_scope, id);
 CREATE INDEX IF NOT EXISTS idx_article_index_title ON article_index(title_norm);
 CREATE INDEX IF NOT EXISTS idx_article_index_hash ON article_index(body_hash);
 CREATE INDEX IF NOT EXISTS idx_pub_status ON publications(status);
@@ -130,8 +132,40 @@ CREATE INDEX IF NOT EXISTS idx_events_job ON events(job_id, id);
 """
 
 
+#: 예전 DB에 뒤늦게 붙인 칸들 — (테이블, 칸 이름, 칸 정의)
+MIGRATIONS = (
+    ("jobs", "lease_scope", "TEXT NOT NULL DEFAULT 'main'"),
+)
+
+
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
+    ).fetchone()
+    return row is not None
+
+
+def migrate(conn: sqlite3.Connection) -> list[str]:
+    """예전에 만들어진 DB에 빠진 칸을 채운다 (멱등). 추가한 칸 이름 목록 반환.
+
+    스키마 생성(`executescript`)보다 **먼저** 돌아야 한다. 새로 붙인 칸을 쓰는
+    인덱스가 SCHEMA 안에 있어서, 칸이 없는 옛 DB에서는 그 인덱스가 터진다.
+    """
+    added: list[str] = []
+    for table, column, decl in MIGRATIONS:
+        if not _table_exists(conn, table):
+            continue
+        names = {str(r["name"]) for r in conn.execute(f"PRAGMA table_info({table})")}
+        if column in names:
+            continue
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+        added.append(f"{table}.{column}")
+    return added
+
+
 def init_schema(conn: sqlite3.Connection) -> None:
     """모든 테이블 생성 (멱등)."""
+    migrate(conn)
     conn.executescript(SCHEMA)
     ts = now_iso()
     conn.execute(
