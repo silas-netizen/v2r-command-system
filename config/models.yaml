@@ -16,3 +16,15 @@ backend_order: [plan, batch, api]
 
 # 요금제 한도에 걸리면 이만큼 요금제 길을 쉽니다(시간). 코드 기본값과 같습니다.
 plan_lock_hours: 5
+
+# GPT(Codex) 교차 검증 — 원고를 만든 뒤 다른 모델에게 한 번 더 읽힙니다.
+# ChatGPT 요금제로 부르므로 추가 비용 0원이고, 읽기 전용이라 파일을 건드리지 않습니다.
+# 판정은 **우리가 정한 체크리스트 번호 안에서만** 받고, 점수는 (통과 수 / 전체)로
+# 우리가 계산합니다. `min_score` 미만이면 "GPT 지적"으로 **한 번만** 부분 재시도합니다.
+# codex 를 못 찾거나 시간이 넘으면 "미검증"으로 넘어가고 생성은 막지 않습니다.
+crosscheck:
+  enabled: true
+  min_score: 60
+  model: gpt-5.6-sol
+  effort: medium
+  timeout_sec: 300
