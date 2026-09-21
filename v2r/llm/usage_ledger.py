@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,7 @@ log = logging.getLogger(__name__)
 
 __all__ = [
     "LEDGER_BASENAME",
+    "LEDGER_DIR_ENV",
     "append_call",
     "cache_hit_ratio",
     "ledger_path",
@@ -28,6 +30,13 @@ __all__ = [
 
 #: 장부 파일 이름 뼈대 (`llm_usage-YYYY-MM.jsonl` 로 쪼개 쓴다)
 LEDGER_BASENAME = "llm_usage"
+
+#: 장부를 **다른 폴더로 돌리는** 환경변수 (2026-09-22).
+#:
+#: 시험(pytest)에서 라우터를 `data_dir` 없이 만들면 진짜 `data/` 장부에 가짜
+#: 호출이 그대로 적혀 버렸다. 그래서 이 변수 하나로 장부 폴더를 통째 갈아끼울
+#: 수 있게 했다. `tests/conftest.py`가 임시 폴더를 넣어 준다.
+LEDGER_DIR_ENV = "V2R_USAGE_LEDGER_DIR"
 
 #: 장부에 적는 토큰 칸
 TOKEN_FIELDS: tuple[str, ...] = (
@@ -39,9 +48,14 @@ TOKEN_FIELDS: tuple[str, ...] = (
 
 
 def ledger_path(data_dir: str | Path, when: datetime | None = None) -> Path:
-    """그 달의 장부 파일 경로 (`data/llm_usage-2026-09.jsonl`)."""
+    """그 달의 장부 파일 경로 (`data/llm_usage-2026-09.jsonl`).
+
+    환경변수 `V2R_USAGE_LEDGER_DIR`가 있으면 **그 폴더가 이긴다** (시험용).
+    """
     stamp = (when or datetime.now()).strftime("%Y-%m")
-    return Path(data_dir) / f"{LEDGER_BASENAME}-{stamp}.jsonl"
+    override = (os.environ.get(LEDGER_DIR_ENV, "") or "").strip()
+    base = Path(override) if override else Path(data_dir)
+    return base / f"{LEDGER_BASENAME}-{stamp}.jsonl"
 
 
 def cache_hit_ratio(counts: dict[str, Any] | None) -> float:

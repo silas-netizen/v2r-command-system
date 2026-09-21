@@ -32,6 +32,14 @@ LEGACY_BACKEND_ORDER = ("api",)
 #: 요금제 한도에 걸리면 이만큼 요금제 길을 쉰다 (설계서 §폴백)
 PLAN_LOCK_HOURS = 5
 
+#: 한도 문구를 한 번 봤을 때 **다시 해 보기까지** 기다리는 초 (2026-09-22).
+#:
+#: 2026-09-22 03:00:28에 "Claude usage limit reached" 한 줄로 5시간 잠금이
+#: 걸렸는데, 15분 뒤 요금제 호출은 전부 정상이었다(v3 원고 6건 0원). 진짜
+#: 한도였다면 15분 만에 풀릴 수 없다. 그래서 **1회 실패로는 잠그지 않는다** —
+#: 30초 쉬고 한 번 더 해 보고, 그때도 한도면 그제야 잠근다.
+PLAN_LIMIT_RETRY_SECONDS = 30
+
 #: 한도 잠금을 적어 두는 파일 이름 (`data/` 아래)
 PLAN_LOCK_NAME = "plan_lock.json"
 
@@ -217,6 +225,8 @@ class LLMRouter:
         #: 이 프로세스에서 요금제 길을 포기했는가 (미로그인은 다시 해도 같다)
         self._plan_disabled = False
         self._plan_warned = False
+        #: 한도 재시도까지 실패했을 때의 마지막 오류 (폴백 사유로 쓴다)
+        self._last_limit_error: Exception | None = None
         #: 마지막 호출 기록 (길·모델·프롬프트 지문). 원고 JSON에 그대로 실린다.
         self.last_call: dict[str, Any] = {}
         self.enabled = bool(self._client) or bool(self.api_key) or self.plan_in_order()
@@ -281,8 +291,16 @@ class LLMRouter:
             return None
         return until if until > datetime.now(until.tzinfo) else None
 
-    def lock_plan(self, reason: str = "", hours: int = PLAN_LOCK_HOURS) -> Path:
-        """요금제 길을 `hours` 시간 잠근다 (한도에 걸렸을 때)."""
+    def lock_plan(
+        self,
+        reason: str = "",
+        hours: int = PLAN_LOCK_HOURS,
+        first_error: str = "",
+    ) -> Path:
+        """요금제 길을 `hours` 시간 잠근다 (한도에 걸렸을 때).
+
+        `first_error` 는 30초 전 1차 시도의 오류 원문이다 (알림에 같이 싣는다).
+        """
         until = datetime.now().astimezone() + timedelta(hours=hours)
         path = self.plan_lock_path()
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -291,19 +309,35 @@ class LLMRouter:
                 {
                     "until": until.isoformat(),
                     "reason": reason,
+                    "first_error": first_error,
                     "locked_at": datetime.now().astimezone().isoformat(),
                     "hours": hours,
+                    "pid": os.getpid(),
                 },
                 ensure_ascii=False,
                 indent=2,
             ),
             encoding="utf-8",
         )
-        log.warning("요금제 한도 — %s시간 동안 요금제 길을 쉽니다 (%s)", hours, reason)
-        self._write_lock_alert(until, reason, hours)
+        # 잠금 파일이 **어디에** 생겼는지 로그로 남긴다. 2026-09-22에 알림만
+        # 남고 잠금 파일이 안 보이는 일이 있어, 경로를 확인할 수 있게 했다.
+        log.warning(
+            "요금제 한도 — %s시간 동안 요금제 길을 쉽니다 (%s) [잠금 파일: %s]",
+            hours,
+            reason,
+            path,
+        )
+        self._write_lock_alert(until, reason, hours, first_error=first_error, lock_path=path)
         return path
 
-    def _write_lock_alert(self, until: datetime, reason: str, hours: int) -> None:
+    def _write_lock_alert(
+        self,
+        until: datetime,
+        reason: str,
+        hours: int,
+        first_error: str = "",
+        lock_path: Path | None = None,
+    ) -> None:
         """요금제 잠금 전환을 `docs/reports/alerts/` 에 파일로 남긴다 (2026-09-22).
 
         잠기면 그다음 호출부터 **유료 API**로 넘어간다. 조용히 넘어가면 돈이 새므로
@@ -320,10 +354,17 @@ class LLMRouter:
             f"# 요금제 길 잠금 알림 ({stamp:%Y-%m-%d %H:%M} KST)\n\n"
             f"- 잠긴 시각: {stamp.isoformat(timespec='seconds')}\n"
             f"- 풀리는 시각: {until.isoformat(timespec='seconds')} ({hours}시간)\n"
-            f"- 이유: {reason or '(알 수 없음)'}\n\n"
+            f"- 이유: {reason or '(알 수 없음)'}\n"
+            f"- 잠금 파일: {lock_path or self.plan_lock_path()}\n"
+            f"- 적은 프로세스: pid {os.getpid()}\n\n"
             "요금제(구독) 한도에 걸려 잠갔습니다. 이 동안의 모델 호출은"
             " **유료 API**로 넘어갑니다. 급하지 않은 묶음 생성은 잠금이 풀린 뒤로"
-            " 미루는 것이 좋습니다.\n"
+            " 미루는 것이 좋습니다.\n\n"
+            "## claude 오류 원문\n\n"
+            "1차 시도(30초 전):\n\n"
+            f"```\n{first_error or '(1차 원문 없음 — 재시도 없이 잠금)'}\n```\n\n"
+            "2차 시도(잠금을 부른 오류):\n\n"
+            f"```\n{reason or '(원문 없음)'}\n```\n"
         )
         try:
             folder.mkdir(parents=True, exist_ok=True)
@@ -374,8 +415,18 @@ class LLMRouter:
                         model, system, user, max_tokens=max_tokens, usage_out=self.usage
                     )
                 except PlanLimit as exc:
-                    self.lock_plan(str(exc))
-                    last_error = exc
+                    # 한 번 실패로는 잠그지 않는다 — 30초 뒤 딱 한 번 더 해 본다
+                    retried = self._retry_after_limit(
+                        model, system, user, max_tokens, exc
+                    )
+                    if retried is not None:
+                        self._record(backend, purpose, model, fingerprint)
+                        info = getattr(self.plan_backend(), "last_info", None) or {}
+                        self._note_ledger(
+                            backend, purpose, model, fingerprint, (info or {}).get("usage")
+                        )
+                        return retried
+                    last_error = self._last_limit_error or exc
                     continue
                 except PlanNotLoggedIn as exc:
                     self._plan_disabled = True
@@ -441,6 +492,45 @@ class LLMRouter:
             "모델을 부를 수 있는 길이 없습니다"
             + (f" (마지막 오류: {last_error})" if last_error else "")
         )
+
+    def _retry_after_limit(
+        self,
+        model: str,
+        system: str,
+        user: str,
+        max_tokens: int,
+        first: Exception,
+    ) -> str | None:
+        """한도 문구를 봤을 때 30초 뒤 **한 번만** 다시 불러 본다.
+
+        - 두 번째가 성공하면 본문을 돌려준다 (잠그지 않는다 — 오탐이었다).
+        - 두 번째도 한도면 그제야 `lock_plan` 으로 5시간 잠근다.
+        - 두 번째가 다른 오류면 잠그지 않고 그 호출만 다음 길로 넘긴다.
+
+        `data/plan_lock.json` 은 `data/` 안에 있으므로 실행기·사이드카·일꾼
+        스크립트가 **같은 파일**을 본다. 잠금은 이 한 자리에서만 쓴다.
+        """
+        import time
+
+        self._last_limit_error = None
+        log.warning(
+            "요금제 한도 문구 1회 — %s초 뒤 한 번 더 해 봅니다 (아직 안 잠금): %s",
+            PLAN_LIMIT_RETRY_SECONDS,
+            first,
+        )
+        time.sleep(PLAN_LIMIT_RETRY_SECONDS)
+        try:
+            return self.plan_backend().complete(
+                model, system, user, max_tokens=max_tokens, usage_out=self.usage
+            )
+        except PlanLimit as second:
+            self.lock_plan(str(second), first_error=str(first))
+            self._last_limit_error = second
+            return None
+        except PlanError as second:
+            log.warning("요금제 길 재시도도 실패 — 잠그지 않고 다음 길로: %s", second)
+            self._last_limit_error = second
+            return None
 
     def _note_ledger(
         self,

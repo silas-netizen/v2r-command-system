@@ -45,17 +45,21 @@ WINDOWS_INSTALL_GLOB = (
 )
 
 #: 요금제 한도/속도 제한으로 읽는 문구
+#:
+#: 2026-09-22: 예전에는 `"limit"`, `"rate"`, `"try again"` 같은 **너무 넓은**
+#: 조각이 들어 있어서, 한도와 상관없는 일시 오류("Error: ... please try again")
+#: 한 줄에도 요금제 길을 5시간 잠가 버렸다. 한도를 가리키는 문구만 남긴다.
 LIMIT_MARKERS = (
     "usage limit",
     "rate limit",
     "rate_limit",
     "limit reached",
-    "limit",
-    "rate",
-    "try again",
+    "quota",
     "too many requests",
     "overloaded",
-    "한도",
+    "사용 한도",
+    "한도에 걸",
+    "한도 도달",
 )
 
 #: 로그인이 안 된 상태로 읽는 문구
@@ -284,7 +288,9 @@ class PlanBackend:
                     argv, (user or "").encode("utf-8"), cwd, self._env()
                 )
             except subprocess.TimeoutExpired as exc:
-                raise PlanLimit(f"요금제 길 응답이 {self.timeout}초를 넘겼습니다") from exc
+                # 응답이 늦은 것은 **한도가 아니다**. 5시간 잠그면 안 되고,
+                # 이 호출만 다음 길로 넘긴다 (2026-09-22).
+                raise PlanError(f"요금제 길 응답이 {self.timeout}초를 넘겼습니다") from exc
             except OSError as exc:
                 raise PlanError(f"claude 실행에 실패했습니다: {exc}") from exc
             text = out.decode("utf-8", "replace") if isinstance(out, bytes) else str(out)

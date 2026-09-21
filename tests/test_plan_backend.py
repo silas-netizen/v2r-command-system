@@ -243,7 +243,80 @@ def test_not_logged_in_falls_back_to_api_and_never_retries(tmp_path, caplog):
     assert sum("로그인되어 있지 않아" in r.message for r in caplog.records) == 1
 
 
-def test_limit_locks_plan_for_five_hours(tmp_path):
+@pytest.fixture
+def _no_wait(monkeypatch):
+    """한도 재시도 30초를 기다리지 않게 한다."""
+    import time
+
+    slept: list[float] = []
+    monkeypatch.setattr(time, "sleep", lambda s: slept.append(s))
+    return slept
+
+
+def test_limit_locks_plan_only_after_a_second_try(tmp_path, _no_wait):
+    """한도 문구를 **두 번** 봐야 잠근다 (2026-09-22 오탐 대책)."""
+    from v2r.llm.router import PLAN_LIMIT_RETRY_SECONDS
+
+    router = _router(tmp_path, LIMIT_JSON)
+    assert router.complete("brand_body", "지침", "요청") == "API 응답"
+    # 30초 기다렸고, CLI를 두 번 불렀다
+    assert _no_wait == [PLAN_LIMIT_RETRY_SECONDS]
+    lock = json.loads((tmp_path / "plan_lock.json").read_text(encoding="utf-8"))
+    assert "usage limit reached" in lock["first_error"]
+    alert = next((tmp_path.parent / "docs" / "reports" / "alerts").glob("plan-lock-*.md"))
+    text = alert.read_text(encoding="utf-8")
+    # 알림에 claude 오류 원문이 그대로 들어간다
+    assert "claude 오류 원문" in text
+    assert "Claude usage limit reached. Please try again later." in text
+    assert "plan_lock.json" in text
+
+
+def test_one_off_limit_message_does_not_lock(tmp_path, _no_wait):
+    """1차는 한도, 2차는 성공 → 잠그지 않고 요금제 길을 그대로 쓴다."""
+    answers = [LIMIT_JSON, OK_JSON]
+
+    def run(argv, stdin, cwd, env):
+        return 0, json.dumps(answers.pop(0)).encode("utf-8"), b""
+
+    backend = PlanBackend(work_dir=tmp_path, runner=run)
+    backend.exe = "claude.exe"
+    router = LLMRouter(
+        api_key="k",
+        client=_FakeClient("API 응답"),
+        backend_order=("plan", "api"),
+        plan=backend,
+        data_dir=tmp_path,
+    )
+    out = router.complete("brand_body", "지침", "요청")
+    assert json.loads(out) == {"title": "제목", "body": "본문"}
+    assert router.last_call["backend"] == "plan"
+    assert not (tmp_path / "plan_lock.json").exists()
+
+
+def test_transient_error_text_is_not_read_as_a_limit():
+    """'please try again' 같은 흔한 일시 오류로는 잠그지 않는다."""
+    for text in ("Error: something went wrong, please try again", "stream rate too slow"):
+        payload = dict(LIMIT_JSON, result=text)
+        with pytest.raises(PlanError) as got:
+            parse_result(json.dumps(payload))
+        assert not isinstance(got.value, PlanLimit)
+
+
+def test_timeout_is_not_a_limit(tmp_path):
+    """응답이 늦은 것은 한도가 아니다 — 5시간 잠그면 안 된다."""
+    import subprocess
+
+    def run(argv, stdin, cwd, env):
+        raise subprocess.TimeoutExpired(cmd="claude", timeout=1)
+
+    backend = PlanBackend(work_dir=tmp_path, runner=run)
+    backend.exe = "claude.exe"
+    with pytest.raises(PlanError) as got:
+        backend.complete("claude-sonnet-5", "지침", "요청")
+    assert not isinstance(got.value, PlanLimit)
+
+
+def test_limit_locks_plan_for_five_hours(tmp_path, _no_wait):
     router = _router(tmp_path, LIMIT_JSON)
     assert router.complete("brand_body", "지침", "요청") == "API 응답"
     lock = json.loads((tmp_path / "plan_lock.json").read_text(encoding="utf-8"))

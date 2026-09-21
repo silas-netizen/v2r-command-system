@@ -1009,10 +1009,22 @@ def _plan_keepalive(rt: Runtime, spec: TaskSpec) -> dict:
     out = check_session(rt.settings.data_dir)
     # 한도에 걸린 상태면 라우터도 그 사실을 알고 있어야 한다 (5시간 잠금)
     if out.get("limited") and rt.llm is not None and hasattr(rt.llm, "lock_plan"):
-        try:
-            rt.llm.lock_plan(out.get("note") or "요금제 한도")
-        except Exception:  # pragma: no cover - 잠금 실패가 점검을 망치면 안 된다
-            pass
+        # 1회 실패로는 잠그지 않는다 — 30초 뒤 한 번 더 확인한다 (2026-09-22).
+        import time
+
+        from v2r.llm.router import PLAN_LIMIT_RETRY_SECONDS
+
+        first = out.get("note") or "요금제 한도"
+        time.sleep(PLAN_LIMIT_RETRY_SECONDS)
+        again = check_session(rt.settings.data_dir)
+        if again.get("limited"):
+            try:
+                rt.llm.lock_plan(again.get("note") or first, first_error=str(first))
+            except Exception:  # pragma: no cover - 잠금 실패가 점검을 망치면 안 된다
+                pass
+        else:
+            out = again
+            out["limit_was_transient"] = True
     if out.get("notice"):
         notify_all(rt.channels, out["notice"])
         out["notified"] = True

@@ -288,6 +288,20 @@ def test_schedule_has_sunday_maintenance() -> None:
     assert entry[0]["days"] == ["sun"] and entry[0]["enabled"] is True
 
 
+def test_ledger_never_lands_in_the_real_data_dir(tmp_path: Path) -> None:
+    """`data_dir` 없이 만든 라우터도 진짜 장부를 건드리지 못한다 (2026-09-22).
+
+    시험 121줄이 `data/llm_usage-2026-09.jsonl` 에 섞여 들어간 일이 있었다.
+    `tests/conftest.py` 가 `V2R_USAGE_LEDGER_DIR` 을 임시 폴더로 돌려 막는다.
+    """
+    from v2r.llm import usage_ledger
+
+    real = Path(__file__).resolve().parents[1] / "data"
+    path = usage_ledger.append_call(real, "api", "brand_body", "claude-sonnet-5", {})
+    assert path is not None
+    assert real not in path.parents, f"진짜 data 폴더에 적혔습니다: {path}"
+
+
 def test_plan_lock_writes_an_alert_file(tmp_path: Path) -> None:
     from v2r.llm.router import LLMRouter
 
