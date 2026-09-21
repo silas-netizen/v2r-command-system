@@ -144,8 +144,9 @@ def test_comments_prompt_has_12_labels_and_limits():
     system, user = bw.build_comments_prompt("우아덤", KEYWORD, "제목", BODY)
     for label in bw.COMMENT_LABELS:
         assert label in system
-    assert "30자를 넘지 않는다" in system
-    assert "70자를 넘지 않는다" in system
+    assert "40자를 넘지 않는다" in system
+    assert "90자를 넘지 않는다" in system
+    assert "60자를 넘지 않는다" in system  # 대대댓글2는 조금 길게 (설계서 E)
     assert "대대댓글2 에서 처음 나온다" in system
     # user에는 이번 본문과 키워드만 (나머지는 캐시되는 고정부)
     assert KEYWORD in user and "제목" in user
@@ -195,24 +196,24 @@ def test_validate_rejects_low_keyword_count():
 
 
 def test_validate_flags_long_comment_as_warning():
-    """상한(30자)을 넘어도 1.5배(45자) 안이면 경고로만 잡는다."""
-    m = _manuscript(comments=_nodes({"댓글3": "가" * 40}))
+    """상한(40자)을 넘어도 100% 안이면 경고로만 잡는다."""
+    m = _manuscript(comments=_nodes({"댓글3": "가" * 50}))
     checks = bw.validate(m)
     row = next(c for c in checks if c["항목"] == "댓글 글자 수")
     assert row["통과"] is False and row["필수"] is False
-    assert "댓글3 40자 → 30자로 줄일 것" in row["실제"]  # 목표 글자 수를 짚어 준다
+    assert "댓글3 50자 → 40자로 줄일 것" in row["실제"]  # 목표 글자 수를 짚어 준다
     assert bw.failures(checks) == []  # 경고는 실패가 아니다
 
 
 def test_validate_hard_fails_beyond_2x_length():
     """상한의 100%(2배)를 넘기면 경고가 아니라 실패다 (사용자 결정 2026-09-19)."""
-    m = _manuscript(comments=_nodes({"댓글3": "가" * 61}))
+    m = _manuscript(comments=_nodes({"댓글3": "가" * 81}))
     problems = bw.failures(bw.validate(m))
-    assert any("심각 초과" in p and "30자로 줄일 것" in p for p in problems)
+    assert any("심각 초과" in p and "40자로 줄일 것" in p for p in problems)
 
 
 def test_soft_limits_off_makes_every_excess_hard():
-    m = _manuscript(comments=_nodes({"댓글3": "가" * 40}))
+    m = _manuscript(comments=_nodes({"댓글3": "가" * 50}))
     problems = bw.failures(bw.validate(m, soft_limits=False))
     assert any(p.startswith("댓글 글자 수:") for p in problems)
 
@@ -220,11 +221,11 @@ def test_soft_limits_off_makes_every_excess_hard():
 def test_comment_limits_are_configurable_per_brand():
     viral = bw.rule_for("우아덤")
     patsooni = bw.rule_for("팥순이", "질문형")
-    assert (viral.root_max, viral.comment2_max) == (30, 70)
-    assert (patsooni.root_max, patsooni.comment2_max) == (50, 50)
+    assert (viral.root_max, viral.comment2_max, viral.reply2_max) == (40, 90, 60)
+    assert (patsooni.root_max, patsooni.comment2_max, patsooni.reply2_max) == (50, 90, 90)
     assert viral.comment_max == viral.root_max  # 옛 이름도 그대로 읽힌다
-    loose = bw.BrandRule(brand="우아덤", root_max=45, comment2_max=90)
-    m = _manuscript(comments=_nodes({"댓글3": "가" * 40}))
+    loose = bw.BrandRule(brand="우아덤", root_max=55, comment2_max=90)
+    m = _manuscript(comments=_nodes({"댓글3": "가" * 50}))
     assert bw.validate(m, loose)[0] is not None
     row = next(c for c in bw.validate(m, loose) if c["항목"] == "댓글 글자 수")
     assert row["통과"] is True
@@ -366,13 +367,13 @@ def test_retry_note_tells_exact_length_target():
             self.n += 1
             self.calls.append((purpose, system, user))
             if self.n == 1:
-                return dict(COMMENTS, 댓글3="가" * 60)
+                return dict(COMMENTS, 댓글3="가" * 90)
             return dict(COMMENTS)
 
     llm = LongComments()
     bw.generate_manuscript(llm, "우아덤", KEYWORD)
     note = llm.calls[1][2]
-    assert "댓글3 60자 → 30자로 줄일 것" in note
+    assert "댓글3 90자 → 40자로 줄일 것" in note
 
 
 # --- 생성 -------------------------------------------------------
@@ -612,13 +613,13 @@ def test_merge_comments_replaces_only_given_labels():
 
 def test_partial_retry_prompt_asks_only_for_failing_nodes():
     system, user = bw.build_partial_retry_prompt(
-        "우아덤", KEYWORD, ["댓글2", "대댓글4"], ["댓글 글자 수 — 기준 30자, 실제 90자"]
+        "우아덤", KEYWORD, ["댓글2", "대댓글4"], ["댓글 글자 수 — 기준 40자, 실제 120자"]
     )
     assert "댓글2 대댓글4" in user
-    assert "90자" in user
+    assert "120자" in user
     assert "댓글1" not in user  # 멀쩡한 자리는 되보내지 않는다
     assert BODY not in user
-    assert "30자를 넘지 않는다" in system  # 고정 규칙은 캐시되는 system 쪽
+    assert "40자를 넘지 않는다" in system  # 고정 규칙은 캐시되는 system 쪽
 
 
 def test_partial_retry_merges_instead_of_resending_everything():
@@ -701,7 +702,7 @@ def test_combined_mode_falls_back_to_partial_retry():
 def test_combined_prompt_holds_both_rule_sets():
     system, user = bw.build_combined_prompt("우아덤", KEYWORD)
     assert "## 본문 규칙" in system and "## 댓글 규칙" in system
-    assert "250자" in system and "30자를 넘지 않는다" in system
+    assert "250자" in system and "40자를 넘지 않는다" in system
     assert KEYWORD in user and KEYWORD not in system
 
 

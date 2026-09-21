@@ -430,6 +430,13 @@ def _generate_brand(rt: Runtime, spec: TaskSpec) -> dict:
         return {"ok": False, "error": f"{brand}: 새로 쓸 `밀려남` 키워드가 없습니다"}
 
     guide = _brand_guide_text(rt, brand, spec.manuscript_type)
+    # 기존 완성 원고 예시(few-shot)와 최근 오프닝 — 없으면 그냥 건너뛴다
+    examples = bw.load_examples(
+        brand, spec.manuscript_type, str(xlsx) if xlsx.exists() else None
+    )
+    recent_openings = bw.load_recent_openings(
+        Path(rt.settings.warehouse_dir) / "manuscripts" / "generated"
+    )
     made: list[Any] = []
     failed: list[dict] = []
     unresolved: list[dict] = []
@@ -446,6 +453,8 @@ def _generate_brand(rt: Runtime, spec: TaskSpec) -> dict:
                 guide_text=guide,
                 stats=stats,
                 mode=(spec.generate_mode or "").strip(),
+                examples=examples,
+                recent_openings=recent_openings,
             )
         except Exception as exc:
             failed.append({"keyword": item["keyword"], "error": str(exc)})

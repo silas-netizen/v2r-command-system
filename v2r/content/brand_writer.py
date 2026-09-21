@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -21,13 +22,18 @@ from typing import Any
 from v2r.content.manuscript import CommentNode, Manuscript, content_hash, tags_from_keyword
 from v2r.llm.prompts import (
     BRAND_BODY_SYSTEM,
+    BRAND_CLICHE_RULE,
     BRAND_COMBINED_SYSTEM,
     BRAND_COMMENTS_SYSTEM,
     BRAND_FIRST_MENTION_RULE,
+    BRAND_LINE_BREAK_RULE,
     BRAND_PARTIAL_RETRY_SYSTEM,
+    BRAND_REVIEW_COMMENTS_SYSTEM,
     HUMAN_TONE_RULES,
     NO_INTERNAL_TERMS_RULE,
 )
+
+log = logging.getLogger(__name__)
 
 #: 댓글 12개 라벨 (읽는 순서 = live-comment-order.md §1)
 COMMENT_LABELS: tuple[str, ...] = (
@@ -101,6 +107,27 @@ RETREAT_PHRASES: tuple[str, ...] = (
     "참고만",
     "헷갈리지마시고",
     "따로검색",
+)
+
+#: 대대댓글2(질문형에서 제품을 처음 꺼내는 자리)에 나오면 **바로 실패**인 말
+#: (설계서 C. 기존 논리·흐름이 무너지는 표현들)
+REPLY2_BANNED_PHRASES: tuple[str, ...] = (
+    "제품보다",
+    "제품얘기랑은별개로",
+    "관리법개념",
+    "프레임",
+    "헷갈리지마시고",
+    "방법이중요",
+)
+
+#: 본문 한 줄 글자 수 상한 (지침의 "1줄 20자 안팎")
+LINE_MAX = 28
+#: 상한을 넘는 줄이 이 비율을 넘으면 **실패** (설계서 F-a)
+LINE_OVER_RATIO = 0.20
+
+#: 댓글5에서 수치로 인정하는 표현 (아라비아 숫자 또는 한글 수사)
+_NUMBER_RE = re.compile(
+    r"[0-9]|(?:한|두|세|네|다섯|여섯|일곱|여덟|아홉|열|스무)\s*(?:달|주|개월|번|일|kg|킬로|년)"
 )
 
 #: 후기형에서 작성자가 자기 제품을 두고 물으면 안 되는 말 (평가 2026-09-19 공통문제 11)
@@ -182,10 +209,12 @@ class BrandRule:
     authority: str = ""
     body_max: int = 250
     keyword_count: int = 3
-    #: 댓글2를 뺀 나머지 댓글의 글자 수 상한 (브랜드별로 조정 가능)
-    root_max: int = 30
-    #: 댓글2 글자 수 상한 (브랜드별로 조정 가능)
-    comment2_max: int = 70
+    #: 댓글2·대대댓글2를 뺀 나머지 댓글의 글자 수 상한 (설계서 E)
+    root_max: int = 40
+    #: 댓글2 글자 수 상한 (설계서 E)
+    comment2_max: int = 90
+    #: 대대댓글2 글자 수 상한 (제품을 꺼내는 자리라 조금 길게 준다, 설계서 E)
+    reply2_max: int = 60
     #: True면 상한 초과는 경고, 상한의 1.5배를 넘겨야 실패로 본다
     soft_limits: bool = True
     #: `{키워드}`를 몇 번째 문단 뒤에 둘지
@@ -194,6 +223,11 @@ class BrandRule:
     extra_placeholder: str = ""
     #: 제품명이 처음 등장해도 되는 라벨
     first_mention_label: str = "대대댓글2"
+    #: 지침이 **위치까지 정해 둔** 필수 멘트. `(라벨, (인정되는 표현들,))`
+    #: 같은 라벨에 여러 줄을 둘 수 있고, 한 줄 안의 표현 중 하나만 있으면 통과다.
+    required_phrases: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    #: 본문 한 줄 글자 수 상한 (모바일 줄 나눔)
+    line_max: int = LINE_MAX
     body_structure: tuple[str, ...] = ()
     body_notes: tuple[str, ...] = ()
     comment_notes: tuple[str, ...] = ()
@@ -342,8 +376,14 @@ _register(
         body_max=200,
         keyword_count=3,
         root_max=50,
-        comment2_max=50,
+        comment2_max=90,
+        reply2_max=90,
         placeholder_after_paragraph=2,
+        # 질문형 지침: 대대댓글2에 "농촌진흥청 / 체지방 25% 감소 검증"을 반드시 넣는다
+        required_phrases=(
+            ("대대댓글2", ("농촌진흥청", "국가기관")),
+            ("대대댓글2", ("25%", "25퍼", "25프로")),
+        ),
         body_structure=(
             "1단계 다이어트 중 고민 상황 (50자)",
             "2단계 키워드를 접하게 된 계기 (50자)",
@@ -381,10 +421,18 @@ _register(
         body_max=300,
         keyword_count=4,
         root_max=50,
-        comment2_max=50,
+        comment2_max=90,
+        reply2_max=90,
         placeholder_after_paragraph=1,
         extra_placeholder="{B/A}",
         first_mention_label="대댓글2",
+        # 후기형 지침이 자리까지 정해 둔 멘트
+        # 대대댓글2 = 체지방 25% 검증 근거 / 대대대댓글2 = 국가기관 인증 / 댓글4 = 바로 구매
+        required_phrases=(
+            ("대대댓글2", ("25%", "25퍼", "25프로")),
+            ("대대대댓글2", ("국가기관", "농촌진흥청")),
+            ("댓글4", ("구매했", "주문했", "강추")),
+        ),
         body_structure=(
             "키워드 단독 사용 후기로 시작",
             "느낀 점과 아쉬운 점",
@@ -455,20 +503,199 @@ def paragraphs(body: str) -> list[str]:
     return [p.strip() for p in re.split(r"\n\s*\n", body or "") if p.strip()]
 
 
+def body_lines(body: str) -> list[str]:
+    """본문의 빈 줄이 아닌 줄 목록 (자리표시자 줄은 뺀다)."""
+    out = []
+    for line in (body or "").splitlines():
+        text = line.strip()
+        if not text or re.fullmatch(r"\{[^{}]*\}", text):
+            continue
+        out.append(text)
+    return out
+
+
+def long_lines(body: str, line_max: int = LINE_MAX) -> list[str]:
+    """상한을 넘긴 줄 목록 (공백 포함으로 센다)."""
+    return [line for line in body_lines(body) if len(line) > line_max]
+
+
+def placeholder_paragraph_index(body: str) -> int:
+    """`{키워드}` 앞에 놓인 문단이 몇 개인지. 없으면 -1."""
+    blocks = [p.strip() for p in re.split(r"\n\s*\n", body or "")]
+    count = 0
+    for block in blocks:
+        if not block:
+            continue
+        if re.fullmatch(r"\{키워드\}", block):
+            return count
+        count += 1
+    return -1
+
+
+def opening_word(body: str) -> str:
+    """본문 첫 줄의 첫 어절 (오프닝 반복 검사에 쓴다)."""
+    for line in (body or "").splitlines():
+        text = line.strip()
+        if text and not re.fullmatch(r"\{[^{}]*\}", text):
+            return text.split()[0] if text.split() else ""
+    return ""
+
+
+def load_recent_openings(generated_dir: str | Path, limit: int = 20) -> list[str]:
+    """최근 생성 원고(`warehouse/manuscripts/generated/**/*.json`)의 오프닝 첫 어절.
+
+    파일이 없으면 빈 목록이라 검사가 통째로 건너뛰어진다 (설계서 F-c).
+    """
+    root = Path(generated_dir)
+    if not root.exists():
+        return []
+    files = sorted(root.rglob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    out: list[str] = []
+    for path in files[: max(0, int(limit))]:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        word = opening_word(str(data.get("body") or ""))
+        if word:
+            out.append(word)
+    return out
+
+
+def methods_already_tried(body: str) -> list[str]:
+    """본문에서 "작성자가 이미 해 본 방법" 줄을 뽑는 간단한 휴리스틱 (설계서 G).
+
+    댓글4가 본문과 어긋난 지적을 하지 않도록 프롬프트에 그대로 넘긴다.
+    """
+    marks = ("해봤", "해 봤", "써봤", "써 봤", "발라봤", "먹어봤", "먹어 봤", "다녀봤", "끊어봤")
+    out: list[str] = []
+    for line in body_lines(strip_placeholders(body)):
+        if any(m in line for m in marks):
+            out.append(line)
+    return out[:3]
+
+
+# ------------------------------------------------------------------ 예시(few-shot)
+#: 브랜드 시트에서 완성 원고를 읽어 오는 탭 이름
+EXAMPLE_SHEET = "게시글 쓰기 원본"
+#: few-shot으로 붙일 최대 예시 수 (많을수록 캐시 블록이 커진다)
+EXAMPLE_COUNT = 2
+#: 완성 행으로 인정하는 본문 최소 글자 수
+EXAMPLE_MIN_BODY = 150
+
+
+def _example_row_text(row: dict) -> tuple[str, str]:
+    """행 하나에서 `(원고유형, 본문 셀)`을 꺼낸다 (열 이름 또는 A~E 자리)."""
+    from v2r.sources.sheets import _by_letter
+
+    return _by_letter(row, "E", ("원고유형",)), _by_letter(row, "B", ("본문",))
+
+
+def _is_complete_example(text: str) -> bool:
+    """`sheet_text()` 형식의 완성 원고인가 (본문 150자 이상 + 댓글 12개)."""
+    from v2r.content.manuscript import parse_article
+
+    if not text or "제목" not in text:
+        return False
+    try:
+        parsed = parse_article(text)
+    except Exception:  # pragma: no cover - 파서가 못 읽는 셀은 그냥 버린다
+        return False
+    if body_length(parsed.body) < EXAMPLE_MIN_BODY:
+        return False
+    table = {re.sub(r"\s+", "", c.label): (c.text or "").strip() for c in parsed.comments}
+    return all(table.get(label) for label in COMMENT_LABELS)
+
+
+def load_examples(
+    brand: str,
+    manuscript_type: str = "",
+    rows_or_path: Any = None,
+) -> list[str]:
+    """기존 완성 원고 예시 `EXAMPLE_COUNT`개 (설계서 B).
+
+    `rows_or_path`는 행 목록(dict 리스트) 또는 `data/brand_sheet_<브랜드>.xlsx` 경로다.
+    같은 원고유형의 **완성 행**(본문 150자 이상 + 댓글 12개)을 시트 **앞에서부터**
+    고르므로 같은 시트면 늘 같은 예시가 나온다 (캐시가 깨지지 않는다).
+    시트가 없으면 예시 없이 진행한다 (경고 로그만 남긴다).
+    """
+    want = (manuscript_type or "").strip() or "질문형"
+    rows: list[dict]
+    if rows_or_path is None:
+        return []
+    if isinstance(rows_or_path, (str, Path)):
+        path = Path(rows_or_path)
+        if not path.exists():
+            log.warning("브랜드 시트가 없어 예시 없이 씁니다: %s (%s)", path, brand)
+            return []
+        try:
+            from v2r.sources.keyword_list import rows_from_xlsx
+
+            from v2r.sources.sheets import _restore_header_row
+
+            # 머리글 없이 데이터부터 시작하는 탭이면 첫 줄을 되살린다
+            rows = _restore_header_row(rows_from_xlsx(path, EXAMPLE_SHEET))[0]
+        except Exception as exc:
+            log.warning("브랜드 시트를 읽지 못해 예시 없이 씁니다: %s (%s)", exc, brand)
+            return []
+    else:
+        rows = list(rows_or_path or [])
+
+    out: list[str] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        mtype, text = _example_row_text(row)
+        if ((mtype or "").strip() or "질문형") != want:
+            continue
+        text = (text or "").strip()
+        if not _is_complete_example(text):
+            continue
+        out.append(text)
+        if len(out) >= EXAMPLE_COUNT:
+            break
+    if not out:
+        log.warning("%s/%s: 쓸 만한 완성 원고 예시를 찾지 못했습니다", brand, want)
+    return out
+
+
+def examples_block(examples: list[str] | None) -> list[str]:
+    """few-shot 예시를 system 캐시 블록에 넣을 줄 목록으로 만든다."""
+    items = [e for e in (examples or []) if (e or "").strip()]
+    if not items:
+        return []
+    lines = [
+        "",
+        "<기존 완성 원고 예시 — 형태와 흐름을 그대로 따를 것>",
+        "예시의 문장과 소재는 절대 베끼지 않는다."
+        " 문단 수 / 줄 길이 / 댓글 역할 / 브랜드가 등장하는 시점 / 말투만 따라 한다",
+    ]
+    for i, text in enumerate(items, start=1):
+        lines += [f"[예시 {i}]", "```text", text.strip(), "```"]
+    return lines
+
+
 # ------------------------------------------------------------------ 프롬프트
-def _guide_excerpt(guide_text: str, max_chars: int = 3500) -> str:
-    """지침 원문에서 앞부분만 참고 자료로 붙인다."""
+def _guide_block(guide_text: str) -> str:
+    """지침 **전문**을 참고 자료로 붙인다 (잘라내기 폐지, 설계서 A).
+
+    캐시되는 system 블록에만 들어가므로 길어도 비용이 거의 늘지 않는다.
+    """
     text = (guide_text or "").strip()
     if not text:
         return ""
-    return "\n<지침 원문 참고>\n" + text[:max_chars] + "\n"
+    return "\n<지침 원문 (전문 — 이 글의 최종 기준이다)>\n" + text + "\n"
 
 
-def _body_rules_block(rule: BrandRule, guide_text: str = "") -> list[str]:
+def _body_rules_block(
+    rule: BrandRule, guide_text: str = "", examples: list[str] | None = None
+) -> list[str]:
     """본문 규칙 중 **키워드와 상관없이 늘 같은** 부분 (프롬프트 캐시 대상)."""
     lines: list[str] = [
         f"브랜드: {rule.brand} (원고유형 {rule.manuscript_type})",
         f"타겟: {rule.target}",
+        "",
+        BRAND_LINE_BREAK_RULE,
         "",
         "<반드시 지켜야 할 규칙>",
         f"- 본문 글자 수는 공백 제외 {rule.body_max}자를 넘지 않는다",
@@ -507,7 +734,11 @@ def _body_rules_block(rule: BrandRule, guide_text: str = "") -> list[str]:
     lines.append("")
     lines.append("<작성 지침>")
     lines.extend(f"- {s}" for s in rule.body_notes)
-    lines.append(_guide_excerpt(guide_text))
+    lines.append(f"- 본문 한 줄은 {rule.line_max}자를 넘지 않는다 (모바일 한 줄 20자 안팎)")
+    lines.append("")
+    lines.append(BRAND_CLICHE_RULE)
+    lines.extend(examples_block(examples))
+    lines.append(_guide_block(guide_text))
     return lines
 
 
@@ -538,6 +769,7 @@ def build_body_prompt(
     cafe: str = "",
     guide_text: str = "",
     manuscript_type: str = "",
+    examples: list[str] | None = None,
 ) -> tuple[str, str]:
     """본문 생성용 `(고정 system, 키워드별 user)` 프롬프트.
 
@@ -550,14 +782,16 @@ def build_body_prompt(
         [
             BRAND_BODY_SYSTEM.format(tone=HUMAN_TONE_RULES, internal=NO_INTERNAL_TERMS_RULE),
             "",
-            *_body_rules_block(rule, guide_text),
+            *_body_rules_block(rule, guide_text, examples),
             '출력: {"title": "제목", "body": "본문"}',
         ]
     )
     return system, "\n".join(_body_dynamic_block(rule, keyword, cafe))
 
 
-def _comments_rules_block(rule: BrandRule, guide_text: str = "") -> list[str]:
+def _comments_rules_block(
+    rule: BrandRule, guide_text: str = "", examples: list[str] | None = None
+) -> list[str]:
     """댓글 규칙 중 **키워드·본문과 상관없이 늘 같은** 부분 (프롬프트 캐시 대상)."""
     product = rule.product_in_comment or rule.product
 
@@ -568,8 +802,9 @@ def _comments_rules_block(rule: BrandRule, guide_text: str = "") -> list[str]:
         f"쓸 수 있는 권위재: {rule.authority}",
         "",
         "<댓글 글자 수>",
-        f"- 댓글2를 뺀 모든 댓글은 {rule.comment_max}자를 넘지 않는다",
+        f"- 댓글2와 대대댓글2를 뺀 모든 댓글은 {rule.comment_max}자를 넘지 않는다",
         f"- 댓글2도 {rule.comment2_max}자를 넘지 않는다",
+        f"- 대대댓글2도 {rule.reply2_max}자를 넘지 않는다",
         "- 줄 나눔 없이 한 줄로 쓴다",
         "",
         "<12개 구조와 역할>",
@@ -605,9 +840,52 @@ def _comments_rules_block(rule: BrandRule, guide_text: str = "") -> list[str]:
             "- 작성자 자리에서는 자기가 이미 쓴 제품을 두고"
             " 그거 어디서 사요 / 어떤 성분이에요 / 효과 있나요 처럼 절대 되묻지 않는다"
         )
+    else:
+        # 질문형 대대댓글2 고정 틀 (설계서 C)
+        lines.append("")
+        lines.append("<대대댓글2 고정 틀 (질문형에서 가장 중요한 자리)>")
+        lines.append(
+            f"- 틀: {product} 를 먼저 꺼내고 + 왜 다른 방법으로는 안 되는지 한 마디 +"
+            " 검색해보면 나와요 류의 마무리"
+        )
+        lines.append(f"- 길이는 {min(rule.reply2_max, 60)}자 안쪽으로 쓴다")
+        lines.append(
+            "- 다음 말은 쓰는 순간 버린다: "
+            + " / ".join(REPLY2_BANNED_PHRASES)
+        )
+        lines.append(
+            f"- 좋은 보기) 저는 {product} 쓰고 있어요 그냥 참는 걸로는 계속 제자리더라구요"
+            " 검증된 거라 검색해보면 후기 많아요"
+        )
+    if rule.required_phrases:
+        lines.append("")
+        lines.append("<반드시 들어가야 하는 멘트 (자리까지 지침이 정해 둔 것)>")
+        for label, options in rule.required_phrases:
+            lines.append(f"- {label}: " + " 또는 ".join(options) + " 를 반드시 넣는다")
+    lines.append("")
+    lines.append("<댓글4·댓글5 추가 규칙>")
+    lines.append("- 댓글4는 본문에서 작성자가 이미 해 본 방법을 짚어 준다 (본문에 없는 방법을 지어내지 않는다)")
+    lines.append("- 댓글5는 기간과 감량·변화 수치를 반드시 숫자로 적는다 (3주 -5kg 처럼)")
+    lines.append("")
+    lines.append(BRAND_CLICHE_RULE)
     lines.extend(f"- {s}" for s in rule.comment_notes)
-    lines.append(_guide_excerpt(guide_text, 2500))
+    lines.extend(examples_block(examples))
+    lines.append(_guide_block(guide_text))
     return lines
+
+
+def _comments_system_prompt(rule: BrandRule) -> str:
+    """원고유형별 댓글 system 프롬프트 (후기형은 질문형과 완전히 분리, 설계서 D)."""
+    template = (
+        BRAND_REVIEW_COMMENTS_SYSTEM
+        if rule.manuscript_type == "후기형"
+        else BRAND_COMMENTS_SYSTEM
+    )
+    return template.format(
+        tone=HUMAN_TONE_RULES,
+        internal=NO_INTERNAL_TERMS_RULE,
+        first_mention=BRAND_FIRST_MENTION_RULE,
+    )
 
 
 def build_comments_prompt(
@@ -617,6 +895,7 @@ def build_comments_prompt(
     body: str,
     manuscript_type: str = "",
     guide_text: str = "",
+    examples: list[str] | None = None,
 ) -> tuple[str, str]:
     """댓글 12개 생성용 `(고정 system, 본문별 user)` 프롬프트.
 
@@ -626,15 +905,12 @@ def build_comments_prompt(
     rule = rule_for(brand, manuscript_type)
     system = "\n".join(
         [
-            BRAND_COMMENTS_SYSTEM.format(
-                tone=HUMAN_TONE_RULES,
-                internal=NO_INTERNAL_TERMS_RULE,
-                first_mention=BRAND_FIRST_MENTION_RULE,
-            ),
+            _comments_system_prompt(rule),
             "",
-            *_comments_rules_block(rule, guide_text),
+            *_comments_rules_block(rule, guide_text, examples),
         ]
     )
+    tried = methods_already_tried(body)
     user = "\n".join(
         [
             f"작성 키워드: {keyword}",
@@ -643,6 +919,12 @@ def build_comments_prompt(
             f"제목: {title}",
             strip_placeholders(body).strip(),
         ]
+        + (
+            ["", "<작성자가 본문에서 이미 해 봤다고 한 방법 — 댓글4는 이 중에서 짚는다>"]
+            + [f"- {t}" for t in tried]
+            if tried
+            else []
+        )
     )
     return system, user
 
@@ -653,6 +935,7 @@ def build_combined_prompt(
     cafe: str = "",
     guide_text: str = "",
     manuscript_type: str = "",
+    examples: list[str] | None = None,
 ) -> tuple[str, str]:
     """본문 + 댓글 12개를 **한 번에** 받는 `(고정 system, 키워드별 user)` 프롬프트."""
     rule = rule_for(brand, manuscript_type)
@@ -665,7 +948,7 @@ def build_combined_prompt(
             ),
             "",
             "## 본문 규칙",
-            *_body_rules_block(rule, guide_text),
+            *_body_rules_block(rule, guide_text, examples),
             "",
             "## 댓글 규칙",
             *_comments_rules_block(rule, guide_text),
@@ -681,6 +964,7 @@ def build_partial_retry_prompt(
     problems: list[str],
     manuscript_type: str = "",
     guide_text: str = "",
+    examples: list[str] | None = None,
 ) -> tuple[str, str]:
     """검증에 걸린 **그 자리만** 다시 받는 `(system, user)` 프롬프트.
 
@@ -696,7 +980,7 @@ def build_partial_retry_prompt(
                 first_mention=BRAND_FIRST_MENTION_RULE,
             ),
             "",
-            *_comments_rules_block(rule, guide_text),
+            *_comments_rules_block(rule, guide_text, examples),
         ]
     )
     want = [label for label in COMMENT_LABELS if label in set(labels)] or list(COMMENT_LABELS)
@@ -770,10 +1054,30 @@ def _check(
     }
 
 
+def first_product_mention_label(manuscript: Manuscript, rule: BrandRule) -> str:
+    """제품명이 **실제로** 처음 나온 댓글 라벨. 아무 데도 없으면 빈 문자열.
+
+    (예전에는 라벨 문자열만 보고 판단해 오판이 있었다 — 설계서 D)
+    """
+    names = [
+        _squash(p) for p in (rule.product_in_comment, rule.product) if (p or "").strip()
+    ]
+    order = {label: i for i, label in enumerate(COMMENT_LABELS)}
+    found = [
+        c.label
+        for c in sorted(
+            manuscript.comments, key=lambda c: order.get(re.sub(r"\s+", "", c.label), 99)
+        )
+        if any(n in _squash(c.text) for n in names)
+    ]
+    return re.sub(r"\s+", "", found[0]) if found else ""
+
+
 def validate(
     manuscript: Manuscript,
     rule: BrandRule | None = None,
     soft_limits: bool | None = None,
+    recent_openings: list[str] | None = None,
 ) -> list[dict]:
     """원고를 검증해 항목별 결과를 돌려준다 (예외를 던지지 않는다).
 
@@ -819,8 +1123,47 @@ def validate(
         )
     )
 
+    # --- 줄 나눔: 상한을 넘는 줄이 20%를 넘으면 실패 (설계서 F-a)
+    lines_all = body_lines(body)
+    over_lines = long_lines(body, rule.line_max)
+    ratio = (len(over_lines) / len(lines_all)) if lines_all else 0.0
+    checks.append(
+        _check(
+            "본문 줄 나눔",
+            f"한 줄 {rule.line_max}자 이하 (넘는 줄이 전체의"
+            f" {int(LINE_OVER_RATIO * 100)}% 이하)",
+            f"{len(over_lines)}/{len(lines_all)}줄 초과 ({int(ratio * 100)}%)"
+            + (f" 보기: {over_lines[0][:20]}…" if over_lines else ""),
+            ratio <= LINE_OVER_RATIO,
+        )
+    )
+
     has_ph = bool(re.search(r"^\s*\{키워드\}\s*$", body, re.MULTILINE))
     checks.append(_check("{키워드} 자리표시자", "단독 줄로 1개", "있음" if has_ph else "없음", has_ph))
+    if has_ph:
+        idx = placeholder_paragraph_index(body)
+        checks.append(
+            _check(
+                "{키워드} 문단 위치",
+                f"{rule.placeholder_after_paragraph}번째 문단 뒤",
+                f"{idx}번째 문단 뒤",
+                idx == rule.placeholder_after_paragraph,
+            )
+        )
+
+    # --- 오프닝 반복 (경고만, 설계서 F-c / H)
+    if recent_openings:
+        word = opening_word(body)
+        repeated = bool(word) and word in list(recent_openings)
+        checks.append(
+            _check(
+                "오프닝 반복",
+                "최근 원고 20편과 첫 어절이 겹치지 않음",
+                f"`{word}` 가 최근 원고와 겹침" if repeated else "겹치지 않음",
+                not repeated,
+                hard=False,
+            )
+        )
     if rule.extra_placeholder:
         extra = rule.extra_placeholder in body
         checks.append(
@@ -847,7 +1190,12 @@ def validate(
 
     # --- 댓글 글자 수: soft_limits면 1.5배까지 경고, 그 위는 실패
     def _limit_of(label: str) -> int:
-        return rule.comment2_max if re.sub(r"\s+", "", label) == "댓글2" else rule.root_max
+        name = re.sub(r"\s+", "", label)
+        if name == "댓글2":
+            return rule.comment2_max
+        if name == "대대댓글2":
+            return rule.reply2_max
+        return rule.root_max
 
     over: list[str] = []
     way_over: list[str] = []
@@ -863,7 +1211,8 @@ def validate(
     checks.append(
         _check(
             "댓글 글자 수",
-            f"댓글2 {rule.comment2_max}자 그 외 {rule.root_max}자 이하",
+            f"댓글2 {rule.comment2_max}자 대대댓글2 {rule.reply2_max}자"
+            f" 그 외 {rule.root_max}자 이하",
             ", ".join(over) if over else "모두 통과",
             not over,
             hard=not soft,
@@ -973,21 +1322,66 @@ def validate(
         )
     )
 
+    # --- 제품명이 **실제로** 처음 나온 자리 (라벨 문자열이 아니라 본문을 본다, 설계서 D)
     product = rule.product_in_comment or rule.product
-    before = COMMENT_LABELS[: COMMENT_LABELS.index(rule.first_mention_label)]
-    early = [
-        c.label
-        for c in manuscript.comments
-        if re.sub(r"\s+", "", c.label) in before
-        and any(_squash(p) in _squash(c.text) for p in (product, rule.product) if p)
-    ]
+    actual = first_product_mention_label(manuscript, rule)
     checks.append(
         _check(
             "제품명 최초 언급 위치",
             f"{rule.first_mention_label} 에서 처음",
-            ", ".join(early) + " 에서 먼저 나옴" if early else "규칙대로",
-            not early,
-            hard=False,
+            f"{actual} 에서 먼저 나옴" if actual else "어느 댓글에도 제품명이 없음",
+            actual == rule.first_mention_label,
+            scope="댓글",
+        )
+    )
+
+    # --- 대대댓글2 금칙어 (설계서 C)
+    reply2 = next(
+        (c for c in manuscript.comments if re.sub(r"\s+", "", c.label) == "대대댓글2"),
+        None,
+    )
+    banned2 = (
+        [w for w in REPLY2_BANNED_PHRASES if w in _squash(reply2.text)] if reply2 else []
+    )
+    checks.append(
+        _check(
+            "대대댓글2 금칙어",
+            " / ".join(REPLY2_BANNED_PHRASES) + " 금지",
+            "대대댓글2(" + ", ".join(banned2) + ")" if banned2 else "없음",
+            not banned2,
+            scope="댓글",
+        )
+    )
+
+    # --- 지침이 자리까지 정해 둔 필수 멘트 (설계서 D)
+    if rule.required_phrases:
+        table = {re.sub(r"\s+", "", c.label): _squash(c.text) for c in manuscript.comments}
+        missing = [
+            f"{label}({options[0]})"
+            for label, options in rule.required_phrases
+            if not any(_squash(o) in table.get(label, "") for o in options)
+        ]
+        checks.append(
+            _check(
+                "필수 멘트",
+                ", ".join(f"{label}={'/'.join(o)}" for label, o in rule.required_phrases),
+                ", ".join(missing) + " 빠짐" if missing else "모두 있음",
+                not missing,
+                scope="댓글",
+            )
+        )
+
+    # --- 댓글5는 수치·기간을 반드시 적는다 (설계서 G)
+    c5 = next(
+        (c for c in manuscript.comments if re.sub(r"\s+", "", c.label) == "댓글5"), None
+    )
+    has_number = bool(c5 and _NUMBER_RE.search(c5.text or ""))
+    checks.append(
+        _check(
+            "댓글5 수치",
+            "기간·감량 같은 수치를 1개 이상",
+            "있음" if has_number else "댓글5 에 수치가 없음",
+            has_number,
             scope="댓글",
         )
     )
@@ -1088,6 +1482,8 @@ def generate_manuscript(
     stats: dict | None = None,
     max_attempts: int = MAX_ATTEMPTS,
     mode: str = "",
+    examples: list[str] | None = None,
+    recent_openings: list[str] | None = None,
 ) -> Manuscript:
     """키워드 한 개로 제목·본문·댓글 12개를 만든다.
 
@@ -1119,11 +1515,11 @@ def generate_manuscript(
 
     if mode == "combined":
         return _generate_combined(
-            llm, rule, brand, keyword, cafe, guide_text, stats, cap, before
+            llm, rule, brand, keyword, cafe, guide_text, stats, cap, before, examples
         )
 
     body_sys, body_user = build_body_prompt(
-        brand, keyword, cafe, guide_text, rule.manuscript_type
+        brand, keyword, cafe, guide_text, rule.manuscript_type, examples
     )
     draft: Manuscript | None = None
     body_bad: list[str] = []
@@ -1162,12 +1558,82 @@ def generate_manuscript(
     if draft is None:
         raise BrandWriteError(f"본문 생성 실패({brand}/{keyword}): 쓸 만한 본문을 받지 못했습니다")
 
-    comment_attempts = _fill_comments(llm, draft, rule, brand, keyword, guide_text, cap)
+    # 오프닝 첫 어절이 최근 원고와 겹치면 딱 한 번만 다시 써 본다 (설계서 F-c)
+    body_attempts += _retry_repeated_opening(
+        llm, draft, rule, brand, keyword, body_sys, body_user, recent_openings
+    )
+
+    comment_attempts = _fill_comments(
+        llm, draft, rule, brand, keyword, guide_text, cap, examples=examples
+    )
     if all(not c.text for c in draft.comments):
         raise BrandWriteError(f"댓글 생성 실패({brand}/{keyword}): 댓글을 하나도 받지 못했습니다")
 
-    _finish(draft, rule, stats, body_attempts, comment_attempts, cap, llm, before, "single")
+    _finish(
+        draft,
+        rule,
+        stats,
+        body_attempts,
+        comment_attempts,
+        cap,
+        llm,
+        before,
+        "single",
+        recent_openings,
+    )
     return draft
+
+
+def _retry_repeated_opening(
+    llm: Any,
+    draft: Manuscript,
+    rule: BrandRule,
+    brand: str,
+    keyword: str,
+    body_sys: str,
+    body_user: str,
+    recent_openings: list[str] | None,
+) -> int:
+    """오프닝 첫 어절이 최근 원고와 겹치면 **한 번만** 본문을 다시 받는다.
+
+    다시 받은 본문이 검증을 통과하고 오프닝도 안 겹칠 때만 바꿔 끼운다.
+    돌려주는 값은 늘어난 시도 횟수(0 또는 1)다.
+    """
+    words = [w for w in (recent_openings or []) if w]
+    word = opening_word(draft.body)
+    if not words or not word or word not in words:
+        return 0
+    note = _retry_note(
+        [
+            f"오프닝 반복 — 기준 최근 원고와 다른 첫 어절 인데 실제 `{word}` 로 또 시작함"
+            " (다른 소재·다른 문장 구조로 완전히 새로 시작할 것)"
+        ]
+    )
+    try:
+        data = llm.complete_json("brand_body", body_sys, body_user + note, max_tokens=2500)
+    except Exception:  # 다시 쓰기는 덤이라 실패해도 원고를 버리지 않는다
+        return 1
+    if not isinstance(data, dict):
+        return 1
+    body = _clean_body(_as_text(data.get("body") or data.get("본문")))
+    title = _as_text(data.get("title") or data.get("제목")) or draft.title
+    if not body or opening_word(body) in words:
+        return 1
+    candidate = Manuscript(
+        title=title,
+        body=body,
+        cafe=draft.cafe,
+        keyword=keyword,
+        tags=tags_from_keyword(keyword),
+        manuscript_type=rule.manuscript_type,
+        source=f"generated:{rule.brand}",
+        comments=_comment_nodes({}),
+        content_hash=content_hash(title, body),
+    )
+    if not violations(validate(candidate, rule), scope="본문"):
+        draft.title, draft.body = title, body
+        draft.content_hash = content_hash(title, body)
+    return 1
 
 
 def _usage_snapshot(llm: Any) -> dict:
@@ -1216,10 +1682,11 @@ def _finish(
     llm: Any,
     before: dict,
     mode: str,
+    recent_openings: list[str] | None = None,
 ) -> None:
     """해시를 다시 찍고 `stats`(시도 횟수·남은 위반·토큰·어림 비용)를 채운다."""
     draft.content_hash = content_hash(draft.title, draft.body)
-    unresolved = violations(validate(draft, rule))
+    unresolved = violations(validate(draft, rule, recent_openings=recent_openings))
     if stats is None:
         return
     from v2r.llm.router import estimate_cost
@@ -1250,6 +1717,7 @@ def _fill_comments(
     guide_text: str,
     cap: int,
     seed: bool = False,
+    examples: list[str] | None = None,
 ) -> int:
     """본문이 정해진 뒤 댓글 12개를 채운다. 두 번째 시도부터는 **걸린 자리만** 다시 받는다.
 
@@ -1257,7 +1725,13 @@ def _fill_comments(
     부분 재시도를 쓴다 (`combined` 모드에서 댓글만 어긋났을 때).
     """
     cmt_sys, cmt_user = build_comments_prompt(
-        brand, keyword, draft.title, draft.body, rule.manuscript_type, guide_text
+        brand,
+        keyword,
+        draft.title,
+        draft.body,
+        rule.manuscript_type,
+        guide_text,
+        examples,
     )
     best_comments: list[CommentNode] = []
     comment_bad: list[str] = []
@@ -1277,7 +1751,13 @@ def _fill_comments(
         else:
             labels = failing_comment_labels(validate(draft, rule))
             sys_p, user_p = build_partial_retry_prompt(
-                brand, keyword, labels, comment_bad, rule.manuscript_type, guide_text
+                brand,
+                keyword,
+                labels,
+                comment_bad,
+                rule.manuscript_type,
+                guide_text,
+                examples,
             )
             try:
                 payload = llm.complete_json("brand_comments", sys_p, user_p, max_tokens=1500)
@@ -1303,13 +1783,14 @@ def _generate_combined(
     stats: dict | None,
     cap: int,
     before: dict,
+    examples: list[str] | None = None,
 ) -> Manuscript:
     """본문 + 댓글 12개를 한 번에 받는 방식 (`mode="combined"`).
 
     본문이 어긋나면 통째로 다시, 댓글만 어긋나면 **걸린 자리만** 다시 받는다.
     """
     sys_p, user_p = build_combined_prompt(
-        brand, keyword, cafe, guide_text, rule.manuscript_type
+        brand, keyword, cafe, guide_text, rule.manuscript_type, examples
     )
     draft: Manuscript | None = None
     bad_all: list[str] = []
@@ -1354,7 +1835,7 @@ def _generate_combined(
         not c.text for c in draft.comments
     ):
         comment_attempts = _fill_comments(
-            llm, draft, rule, brand, keyword, guide_text, cap, seed=True
+            llm, draft, rule, brand, keyword, guide_text, cap, seed=True, examples=examples
         )
     if all(not c.text for c in draft.comments):
         raise BrandWriteError(f"댓글 생성 실패({brand}/{keyword}): 댓글을 하나도 받지 못했습니다")
@@ -1471,11 +1952,23 @@ __all__ = [
     "BrandWriteError",
     "COMMENT_LABELS",
     "INTERNAL_TERMS",
+    "LINE_MAX",
+    "LINE_OVER_RATIO",
     "PERSONA_SEEDS",
+    "REPLY2_BANNED_PHRASES",
     "RETREAT_PHRASES",
     "SOFT_LIMIT_FACTOR",
     "author_labels",
     "body_length",
+    "body_lines",
+    "examples_block",
+    "first_product_mention_label",
+    "load_examples",
+    "load_recent_openings",
+    "long_lines",
+    "methods_already_tried",
+    "opening_word",
+    "placeholder_paragraph_index",
     "build_body_prompt",
     "build_comments_prompt",
     "failures",
