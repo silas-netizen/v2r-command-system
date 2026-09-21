@@ -225,9 +225,12 @@ BRAND_ONLY_EVIDENCE: dict[str, tuple[str, ...]] = {
     "팥순이": ("농촌진흥청", "체지방25%", "체지방 25%", "25%", "25퍼", "25프로")
 }
 
-#: 웃음·감탄 표기 (ㅋㅋ ㅎㅎ ㅠㅠ). 근거 문장 옆에 붙으면 신뢰가 깎인다
-#: (사용자 지시 2026-09-22).
+#: 웃음·감탄 표기 (ㅋㅋ ㅎㅎ ㅠㅠ). 문장에 붙은 꼬리로 본다
 LAUGH_RE = re.compile(r"[ㅋㅎㅠㅜ]+")
+
+#: 그 중 **근거 문장 옆에 붙으면 신뢰가 깎이는** 것 (사용자 지시 2026-09-22).
+#: ㅠㅠ 는 웃는 것이 아니라 안타까움이라 근거 문장에서도 허용한다.
+EVIDENCE_LAUGH_RE = re.compile(r"[ㅋㅎ]+")
 
 #: 근거를 말하는 자리라 웃음 표기를 막는 댓글
 EVIDENCE_COMMENT_LABELS: tuple[str, ...] = ("댓글2", "대대댓글2")
@@ -822,11 +825,11 @@ def evidence_laughter_problems(text: str) -> list[str]:
     for sentence in reply2_sentences(text):
         if not is_evidence_sentence(sentence):
             continue
-        marks = LAUGH_RE.findall(sentence)
+        marks = EVIDENCE_LAUGH_RE.findall(sentence)
         if marks:
             out.append(
                 f"근거 문장 웃음 표기 — `{sentence.strip()}` 에 {''.join(marks)} 가 붙었다"
-                " (ㅋㅋ ㅎㅎ ㅠㅠ 는 대안의 한계나 마무리 문장에서만 쓴다)"
+                " (ㅋㅋ ㅎㅎ 는 대안의 한계나 마무리 문장에서만 쓴다. ㅠㅠ 는 괜찮다)"
             )
     return out
 
@@ -836,7 +839,7 @@ def strip_evidence_laughter(text: str) -> str:
     out: list[str] = []
     for sentence in reply2_sentences(text):
         if is_evidence_sentence(sentence):
-            sentence = re.sub(r"\s*" + LAUGH_RE.pattern, "", sentence)
+            sentence = re.sub(r"\s*" + EVIDENCE_LAUGH_RE.pattern, "", sentence)
         out.append(sentence.strip())
     return " ".join(s for s in out if s)
 
@@ -979,7 +982,7 @@ def reply2_prompt_block(rule: "BrandRule", golden: list[str] | None = None) -> l
         "3) 다른 방법으로는 왜 안 되는지 한 문장 (그냥 참는 걸로는 / 잠깐뿐이라 / 소용없더라구요)",
         "4) 검색해보시면 후기 많아요 류로 마무리한다",
         "- 완전한 문장 3~4개로 쓴다. 문장은 반드시 서술 어미(~요 ~에요 ~더라구요)로 끝낸다",
-        "- 근거를 말하는 문장(의사·기관·검증·성분·원리)에는 ㅋㅋ ㅎㅎ ㅠㅠ 를 붙이지 않는다"
+        "- 근거를 말하는 문장(의사·기관·검증·성분·원리)에는 ㅋㅋ ㅎㅎ 를 붙이지 않는다 (ㅠㅠ 는 괜찮다)"
         " (웃으면서 말하면 그 근거의 신뢰가 깎인다)."
         " 웃음 표기는 다른 방법의 한계를 말하는 문장이나 마지막 검색 유도 문장에서만 쓴다",
         "- 근거를 낱말로 나열하지 않는다"
@@ -1424,14 +1427,15 @@ def _comments_rules_block(
     lines.append("<근거 문장에는 웃지 않는다 (사용자 지시 2026-09-22)>")
     lines.append(
         "- 댓글2와 대대댓글2에서 **근거를 말하는 문장**(의사 기관 논문 검증 성분 원리)에는"
-        " ㅋㅋ ㅎㅎ ㅠㅠ 를 붙이지 않는다 — 웃으면서 말하면 신뢰가 떨어진다"
+        " ㅋㅋ ㅎㅎ 를 붙이지 않는다 — 웃으면서 말하면 신뢰가 떨어진다"
     )
     lines.append(
         "- 나쁜 보기) 의사분들이 추천하는 보호막 강화 성분이 들어있어요 ㅋㅋㅋㅋ"
     )
     lines.append(
-        "- 웃음 표기는 다른 방법의 한계를 말하는 문장이나 마지막 검색 유도 문장에서만 쓴다"
+        "- ㅋㅋ ㅎㅎ 는 다른 방법의 한계를 말하는 문장이나 마지막 검색 유도 문장에서만 쓴다"
     )
+    lines.append("- ㅠㅠ 는 웃는 게 아니라 안타까움이라 근거 문장에 붙어도 괜찮다")
     lines.append("")
     lines.append("<댓글4·댓글5 추가 규칙>")
     lines.append("- 댓글4는 본문에서 작성자가 이미 해 본 방법을 짚어 준다 (본문에 없는 방법을 지어내지 않는다)")
@@ -1968,8 +1972,8 @@ def validate(
     checks.append(
         _check(
             "근거 문장 웃음 표기",
-            ", ".join(EVIDENCE_COMMENT_LABELS) + " 의 근거 문장에 ㅋㅋ ㅎㅎ ㅠㅠ 금지"
-            " (한계·마무리 문장에서만 쓴다)",
+            ", ".join(EVIDENCE_COMMENT_LABELS) + " 의 근거 문장에 ㅋㅋ ㅎㅎ 금지"
+            " (한계·마무리 문장에서만 쓴다. ㅠㅠ 는 괜찮다)",
             " / ".join(laughs) if laughs else "없음",
             not laughs,
             scope="댓글",

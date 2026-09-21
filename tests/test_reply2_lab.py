@@ -297,6 +297,20 @@ def test_laughter_next_to_evidence_is_a_failure():
     assert any("근거 문장 웃음 표기" in p for p in problems)
 
 
+def test_crying_marks_are_allowed_even_on_evidence():
+    """ㅠㅠ 는 웃는 게 아니라 안타까움이라 근거 문장에 붙어도 된다 (2026-09-22)."""
+    rule = bw.rule_for("뉴더미스")
+    ok = (
+        "자연방패 항문세정제 라고 있어요 치질 카페에서 추천 많이 받은 세정제인데 "
+        "보호막 강화 성분이 핵심이에요 ㅠㅠ 연고나 좌욕만으로는 한계가 있더라구요 "
+        "검색해보시면 후기 많아요"
+    )
+    assert bw.reply2_problems(ok, rule) == []
+    assert bw.strip_evidence_laughter(ok) == ok  # ㅠㅠ 는 지우지 않는다
+    laughing = ok.replace("핵심이에요 ㅠㅠ", "핵심이에요 ㅎㅎ")
+    assert any("근거 문장 웃음 표기" in p for p in bw.reply2_problems(laughing, rule))
+
+
 def test_laughter_on_the_limit_or_closing_sentence_is_fine():
     rule = bw.rule_for("뉴더미스")
     ok = (
@@ -334,7 +348,8 @@ def test_validate_flags_laughter_in_evidence_comments():
 def test_comments_prompt_states_the_no_laughing_rule():
     system, _ = bw.build_comments_prompt("뉴더미스", "치질수술", "제목", "본문")
     assert "근거 문장에는 웃지 않는다" in system
-    assert "ㅋㅋ ㅎㅎ ㅠㅠ 를 붙이지 않는다" in system
+    assert "ㅋㅋ ㅎㅎ 를 붙이지 않는다" in system
+    assert "ㅠㅠ 는 웃는 게 아니라 안타까움이라 근거 문장에 붙어도 괜찮다" in system
 
 
 # --- 골든 최종 목록 -----------------------------------------------
