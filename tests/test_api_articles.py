@@ -568,3 +568,13 @@ def test_update_article_sends_flat_body():
     assert body["source_id"] == "SID" and body["menu_id"] == 2 and body["cafe_id"] == 1
     assert body["title"] == "새 제목" and body["tag_list"] == ["a"]
     assert "destination" not in body
+
+
+
+def test_search_exposure_check_always_off():
+    """카페탭 검색 노출 검사는 항상 미사용 (사용자 절대 규칙 2026-09-21)."""
+    from v2r.api import articles as a
+
+    dest = a.build_destination(cafe=1, menu=2, head=None, login_id="u", start_at=None)
+    assert dest["use_search_exposure"] is False
+    assert a.USE_SEARCH_EXPOSURE is False
