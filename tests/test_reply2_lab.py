@@ -225,7 +225,7 @@ def test_jangeuddeum_needs_absorption_and_blend_logic():
            "그냥 참고 버티는걸로는 안되더라구요 검색해보시면 후기 많아요")
     assert any("브랜드 논리" in p for p in bw.reply2_problems(bad, rule))
     good = ("장으뜸 장어즙이라고 있어요 배합이랑 원물 함량을 따져 만들어서 몸에 흡수가 "
-            "잘된대요ㅎㅎ 아무거나 먹으면 소용없더라구요 검색해보시면 후기 많아요")
+            "잘된대요 아무거나 먹으면 소용없더라구요 검색해보시면 후기 많아요")
     assert bw.reply2_problems(good, rule) == []
 
 
@@ -235,7 +235,7 @@ def test_newdermis_needs_barrier_logic():
            "좌욕만으로는 한계가 있더라구요 검색해보시면 후기 많아요")
     assert any("브랜드 논리" in p for p in bw.reply2_problems(bad, rule))
     good = ("자연방패 항문세정제라고 있어요 항문 보호막을 강화해주는 성분이 들어가서 "
-            "접근이 달라요ㅋㅋ 그냥 씻기만 하는건 소용없더라구요 검색해보시면 후기 많아요")
+            "접근이 달라요 그냥 씻기만 하는건 소용없더라구요 검색해보시면 후기 많아요")
     assert bw.reply2_problems(good, rule) == []
 
 
@@ -281,3 +281,74 @@ def test_report_can_carry_the_golden_table():
     assert text.startswith("# 2차 후보 (2026-09-21)")
     assert "## 채택된 골든 문장" in text
     assert "### 우아덤(질문형)" in text
+
+
+# --- 근거 문장 옆 웃음 표기 금지 (사용자 지시 2026-09-22) -------------
+BAD_LAUGH = (
+    "자연방패 항문세정제라는게 있는데요 치질카페에서 항문외과 의사분들이 추천하는 "
+    "보호막 강화 성분이 들어있어요 ㅋㅋㅋㅋ 이 성분 없이 씻기만 하면 소용없어서 "
+    "계속 가렵더라구요 검색해보시면 후기 많아요"
+)
+
+
+def test_laughter_next_to_evidence_is_a_failure():
+    rule = bw.rule_for("뉴더미스")
+    problems = bw.reply2_problems(BAD_LAUGH, rule)
+    assert any("근거 문장 웃음 표기" in p for p in problems)
+
+
+def test_laughter_on_the_limit_or_closing_sentence_is_fine():
+    rule = bw.rule_for("뉴더미스")
+    ok = (
+        "자연방패 항문세정제라는게 있어요 항문 보호막을 지켜주는 성분이 들어 있어서 "
+        "그냥 씻기만 하는 거랑은 원리가 아예 달라요 연고만 바르면 그때뿐이더라구요ㅋㅋ "
+        "후기 검색해보시면 많아요"
+    )
+    assert bw.reply2_problems(ok, rule) == []
+
+
+def test_standalone_laughter_belongs_to_the_sentence_before_it():
+    """`성분이에요 ㅎㅎ` 처럼 띄어 쓴 웃음도 앞 문장에 붙은 것으로 본다."""
+    assert len(bw.reply2_sentences("성분이에요 ㅎㅎ 소용없더라구요")) == 2
+    assert bw.is_evidence_sentence("보호막 강화 성분이 들어있어요 ㅋㅋㅋㅋ") is True
+    assert bw.evidence_laughter_problems("보호막 강화 성분이에요 ㅎㅎ 소용없더라구요")
+
+
+def test_stripping_only_removes_laughter_from_evidence_sentences():
+    cleaned = bw.strip_evidence_laughter(BAD_LAUGH)
+    assert "ㅋㅋ" not in cleaned
+    assert "보호막 강화 성분이 들어있어요" in cleaned  # 문장 자체는 그대로다
+    keep = "성분이 좋아요 그냥 씻으면 소용없더라구요ㅋㅋ 검색해보시면 후기 많아요"
+    assert bw.strip_evidence_laughter(keep) == keep
+
+
+def test_validate_flags_laughter_in_evidence_comments():
+    from tests.test_brand_writer import _manuscript, _nodes
+
+    bad = _manuscript(comments=_nodes({"대대댓글2": BAD_LAUGH.replace(
+        "자연방패 항문세정제라는게", "그린커피 아하바하라는게")}))
+    row = next(c for c in bw.validate(bad) if c["항목"] == "근거 문장 웃음 표기")
+    assert row["통과"] is False and row["필수"] is True
+
+
+def test_comments_prompt_states_the_no_laughing_rule():
+    system, _ = bw.build_comments_prompt("뉴더미스", "치질수술", "제목", "본문")
+    assert "근거 문장에는 웃지 않는다" in system
+    assert "ㅋㅋ ㅎㅎ ㅠㅠ 를 붙이지 않는다" in system
+
+
+# --- 골든 최종 목록 -----------------------------------------------
+def test_golden_config_holds_every_pick_and_no_laughing_evidence():
+    counts = {
+        ("우아덤", "질문형"): 3,
+        ("장으뜸", "질문형"): 2,
+        ("코숨핏", "질문형"): 3,
+        ("뉴더미스", "질문형"): 5,
+        ("팥순이", "질문형"): 4,
+        ("팥순이", "후기형"): 4,
+    }
+    for (brand, mtype), n in counts.items():
+        items = bw.load_golden_reply2(brand, mtype)
+        assert len(items) == n, f"{brand}/{mtype}"
+        for text in items:
+            assert bw.reply2_problems(text, bw.rule_for(brand, mtype)) == [], text
