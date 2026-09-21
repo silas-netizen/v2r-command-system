@@ -30,7 +30,9 @@ log = logging.getLogger(__name__)
 LOGIN_URL = "https://nid.naver.com/nidlogin.login?mode=form&url=https%3A%2F%2Fwww.naver.com"
 HOME_URL = "https://www.naver.com/"
 #: 세션 연장 겸 로그인 확인용으로 방문할 페이지(로그인 필요한 곳이면 더 확실하다)
-TOUCH_URL = "https://cafe.naver.com/ca-fe/home"
+TOUCH_URL = "https://nid.naver.com/user2/help/myInfo?lang=ko_KR"  # 로그인 없이는 로그인 페이지로 튕기는 곳
+#: 로그인 상태에서만 화면에 보이는 글자(실측 2026-09-21)
+LOGIN_MARKERS = ("로그아웃", "내정보", "회원정보")
 #: 로그인됐을 때 반드시 있는 쿠키 이름 (값은 절대 다루지 않는다)
 LOGIN_COOKIES = ("NID_AUT", "NID_SES")
 COOKIE_DOMAIN_SUFFIX = "naver.com"
@@ -160,7 +162,13 @@ def _cookies(context) -> list[dict[str, Any]]:
 
 def _looks_logged_out(page) -> bool:
     url = (page.url or "").lower()
-    return "nidlogin" in url or "nid.naver.com/login" in url
+    if "nidlogin" in url or "nid.naver.com/login" in url:
+        return True
+    try:
+        body = page.inner_text("body")[:4000]
+    except Exception:
+        return False  # 본문을 못 읽으면 URL 판정만 쓴다
+    return not any(m in body for m in LOGIN_MARKERS)
 
 
 # --- 로그인(1회) ---------------------------------------------------------------
