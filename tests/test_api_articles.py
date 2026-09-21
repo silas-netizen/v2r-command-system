@@ -572,9 +572,9 @@ def test_update_article_sends_flat_body():
 
 
 def test_search_exposure_check_always_off():
-    """카페탭 검색 노출 검사는 항상 미사용 (사용자 절대 규칙 2026-09-21)."""
+    """카페탭 검색 노출 검사는 항상 **사용** (사용자 절대 규칙 2026-09-21; 안 보내면 서버가 미사용으로 저장함)."""
     from v2r.api import articles as a
 
     dest = a.build_destination(cafe=1, menu=2, head=None, login_id="u", start_at=None)
-    assert dest["use_search_exposure"] is False
-    assert a.USE_SEARCH_EXPOSURE is False
+    assert dest["use_search_exposure"] is True
+    assert a.USE_SEARCH_EXPOSURE is True

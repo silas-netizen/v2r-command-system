@@ -53,9 +53,9 @@ DEFAULT_WRITE_OPTIONS: dict[str, Any] = {
     "naverOpen": True,
 }
 
-#: "카페탭 검색 노출 검사" — V2R 글쓰기 화면 기본값은 사용(true)이지만 **우리는 항상 미사용**
+#: "카페탭 검색 노출 검사" — V2R 글쓰기 화면 기본값 사용(true)을 **항상 사용으로 유지** (미사용으로 바꾸지 않음; 바디에 안 실으면 서버가 false로 저장하므로 반드시 true를 보낸다)
 #: (사용자 절대 규칙 2026-09-21). 등록·수정 바디의 `use_search_exposure`에 그대로 실린다.
-USE_SEARCH_EXPOSURE = False
+USE_SEARCH_EXPOSURE = True
 
 DONE_STATUSES = {"DONE", "SUCCESS"}
 IMAGE_CTYPES = {"image", "imageGroup", "imageStrip"}
@@ -99,7 +99,7 @@ def build_destination(
         "start_at": to_iso_z(start_at),
         "target_view_count": target_view_count,
         "use_comment_ai": True,
-        "use_search_exposure": USE_SEARCH_EXPOSURE,  # 카페탭 검색 노출 검사: 항상 미사용
+        "use_search_exposure": USE_SEARCH_EXPOSURE,  # 카페탭 검색 노출 검사: 항상 사용
         "parent_id": parent_id,
     }
 
@@ -498,7 +498,7 @@ def update_article(
         "start_at": dest.get("start_at"),
         "target_view_count": dest.get("target_view_count") or 0,
         "target_comment_count": dest.get("target_comment_count") or 0,
-        "use_search_exposure": USE_SEARCH_EXPOSURE,  # 수정할 때도 미사용으로 맞춘다
+        "use_search_exposure": USE_SEARCH_EXPOSURE,  # 수정할 때도 사용으로 맞춘다
         "comments": [],
         "likes": [],
         "parent_source_id": src.get("parent_source_id"),

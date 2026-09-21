@@ -103,7 +103,7 @@ GET /naver_cafes/heads?cafe_id=…&naver_login_id=…&menu_id=…  → 말머리
     "start_at": "2026-08-31T01:30:00Z",
     "target_view_count": 0,
     "use_comment_ai": true,
-    "use_search_exposure": false,   // 카페탭 검색 노출 검사 — 항상 미사용(사용자 절대 규칙 2026-09-21). 화면 기본값은 true
+    "use_search_exposure": true,    // 카페탭 검색 노출 검사 — 항상 사용(사용자 절대 규칙 2026-09-21). 바디에 없으면 서버가 false로 저장하므로 반드시 보낸다
     "parent_id": null
   },
   "likes": [],
