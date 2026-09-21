@@ -31,6 +31,7 @@ ALLOWED_TASKS: frozenset[str] = frozenset(
         "reject_photos",
         "gpt_keepalive",
         "naver_keepalive",
+        "web_keepalive",
         "request_photos",
         "wash_photos",
         "learn_guides",

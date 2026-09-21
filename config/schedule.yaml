@@ -53,6 +53,12 @@ entries:
     enabled: true
     command: 네이버 세션 점검
 
+  - name: 웹 세션 점검(Claude·Make)
+    time: "09:20"
+    days: daily
+    enabled: true
+    command: 웹 세션 점검
+
   # 미처리 목록(docs/reports/pending.md)을 하루 5번 파일로 보냅니다.
   - name: pending-1
     time: "08:40"

@@ -490,34 +490,45 @@ def _generate_brand(rt: Runtime, spec: TaskSpec) -> dict:
                     "keyword": item["keyword"],
                     "attempts": stats.get("attempts", 0),
                     "rules": stats["unresolved"],
+                    # 경고가 아니라 **필수 실패**가 남았는가 (남으면 미완성)
+                    "hard": stats.get("unresolved_hard") or [],
                 }
             )
         made.append((m, stats))
 
     tokens = dict(getattr(rt.llm, "usage", {}) or {})
-    report = (
-        Path(rt.settings.repo_root)
-        / "docs"
-        / "reports"
-        / f"brand-draft-{brand}-{spec.start_date}.md"
-    )
+    # 원고유형이 다르면 파일도 달라야 한다 — 예전에는 팥순이 질문형·후기형이
+    # 같은 이름이라 뒤에 만든 쪽이 앞엣것을 덮어썼다 (사용자 지시 2026-09-21)
+    mtype = (spec.manuscript_type or "").strip()
+    stem = f"brand-draft-{brand}-{mtype}" if mtype else f"brand-draft-{brand}"
+    report = Path(rt.settings.repo_root) / "docs" / "reports" / f"{stem}-{spec.start_date}.md"
     if made:
         bw.write_review_md(
             [m for m, _ in made],
             report,
             title=f"브랜드 원고 초안 — {brand} ({spec.start_date})",
         )
+    # 검증을 끝내 통과하지 못한 원고가 있으면 **성공이라고 하지 않는다**
+    # (사용자 절대 규칙: 통과분만 받는다, 2026-09-21)
+    incomplete = [u["keyword"] for u in unresolved if u.get("hard")]
     return {
-        "ok": bool(made),
+        "ok": bool(made) and not failed and not incomplete,
         "brand": brand,
         "generated": len(made),
+        "incomplete": incomplete,
         "failed": failed,
         "unresolved": unresolved,
         "attempts": {m.keyword: s.get("attempts", 0) for m, s in made},
         "keywords": [m.keyword for m, _ in made],
         "report": str(report) if made else "",
         "message": (
-            f"{brand} 원고 {len(made)}건을 만들었습니다. 검토용 문서: {report}"
+            (
+                f"{brand} 원고 {len(made)}건 중 {len(incomplete)}건이 **미완성**입니다"
+                f" ({', '.join(incomplete)} — 검증을 끝내 통과하지 못했습니다)."
+                f" 검토용 문서: {report}"
+                if incomplete
+                else f"{brand} 원고 {len(made)}건을 만들었습니다. 검토용 문서: {report}"
+            )
             if made
             else f"{brand} 원고를 만들지 못했습니다"
         ),
@@ -847,6 +858,22 @@ def _naver_keepalive(rt: Runtime, spec: TaskSpec) -> dict:
         notify_all(rt.channels, "네이버 세션: 현재 프로필이 풀려 백업으로 복구해 유지 중입니다.")
     for warning in out.get("warnings") or []:
         notify_all(rt.channels, f"네이버 세션 경고: {warning}")
+    return out
+
+
+def _web_keepalive(rt: Runtime, spec: TaskSpec) -> dict:
+    """Claude 플랫폼·Make 로그인 세션 점검·연장 (사용자 지시 2026-09-21). 풀린 곳만 알린다."""
+    from v2r.warehouse.web_session import RELOGIN_NOTICE, SITES, check_all
+
+    del spec
+    out = check_all()
+    for key, res in out["sites"].items():
+        site = SITES[key]
+        if not res.get("logged_in") and "프로필 없음" not in str(res.get("note")):
+            notify_all(rt.channels, RELOGIN_NOTICE.format(name=site.name, key=key))
+            res["notified"] = True
+        elif res.get("restored_from_backup"):
+            notify_all(rt.channels, f"{site.name} 세션: 풀려서 백업으로 복구해 유지 중입니다.")
     return out
 
 
@@ -1630,6 +1657,8 @@ def dispatch(rt: Runtime, job: Any, owner: str | None = None) -> dict:
         return _gpt_keepalive(rt, spec)
     if task == "naver_keepalive":
         return _naver_keepalive(rt, spec)
+    if task == "web_keepalive":
+        return _web_keepalive(rt, spec)
     if task == "request_photos":
         return _request_photos(rt, spec)
     if task == "wash_photos":
