@@ -802,6 +802,18 @@ def _gpt_keepalive(rt: Runtime, spec: TaskSpec) -> dict:
     return out
 
 
+def _naver_keepalive(rt: Runtime, spec: TaskSpec) -> dict:
+    """네이버 로그인 세션을 점검·연장하고, 풀렸으면 알린다 (사용자 규칙 2026-09-21)."""
+    from v2r.warehouse.naver_session import RELOGIN_NOTICE, check_naver_session
+
+    del spec
+    out = check_naver_session()
+    if not out.get("logged_in"):
+        notify_all(rt.channels, RELOGIN_NOTICE)
+        out["notified"] = True
+    return out
+
+
 #: `NoPhotoError` 메시지에서 브랜드·폴더를 뽑는다 (`store.ensure_keyword_pool` 문구)
 _NO_PHOTO_RE = re.compile(r"브랜드\s+(\S+?)의\s+'([^']*)'\s*폴더")
 
@@ -1580,6 +1592,8 @@ def dispatch(rt: Runtime, job: Any, owner: str | None = None) -> dict:
         return _reject_photos(rt, spec)
     if task == "gpt_keepalive":
         return _gpt_keepalive(rt, spec)
+    if task == "naver_keepalive":
+        return _naver_keepalive(rt, spec)
     if task == "request_photos":
         return _request_photos(rt, spec)
     if task == "wash_photos":

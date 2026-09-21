@@ -50,6 +50,7 @@ LIGHT_TASKS = frozenset(
         "status",
         "dashboard",
         "gpt_keepalive",
+        "naver_keepalive",
     }
 )
 

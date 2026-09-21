@@ -75,7 +75,8 @@ def test_all_tasks_covered_by_tests():
     # 26 + 사진 승인 흐름 2건(approve_photos·reject_photos) + 이모지 정리 1건
     # + 예약·감시 4건(schedule_list·schedule_run·monitor_status·pending_report)
     # + V2R 글 목록 색인 2건(sync_article_index·duplicate_check)
-    assert len(ALLOWED_TASKS) == 35
+    # + 네이버 세션 점검 1건(naver_keepalive, 2026-09-21)
+    assert len(ALLOWED_TASKS) == 36
 
 
 def test_wash_photos_count():

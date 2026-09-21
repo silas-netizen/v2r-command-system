@@ -28,6 +28,7 @@ TASK_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("collect_daily", re.compile(r"일상\s*글.*(수집|가져와)")),
     ("collect_new_photos", re.compile(r"새\s*(사진|이미지)\s*(수거|회수|가져오기|가져와)")),
     ("gpt_keepalive", re.compile(r"(gpt|지피티).*(유지|점검)", re.I)),
+    ("naver_keepalive", re.compile(r"네이버.*(세션|로그인).*(유지|점검)")),
     # 사진 승인 흐름 (사용자 규칙 2026-09-19): 생성은 반드시 승인을 받고,
     # 만든 사진도 승인/반려를 받는다. 일반 `사진 생성` 패턴보다 먼저 본다.
     ("generate_photos", re.compile(r"사진\s*생성\s*승인")),
@@ -197,6 +198,7 @@ _NO_SLOT_TASKS = frozenset(
         "cleanup_emoji",
         "repair_comments",
         "gpt_keepalive",
+        "naver_keepalive",
         "schedule_list",
         "schedule_run",
         "monitor_status",
@@ -461,6 +463,7 @@ TASK_LABELS: dict[str, str] = {
     "approve_photos": "사진 승인",
     "reject_photos": "사진 반려",
     "gpt_keepalive": "GPT 세션 점검",
+    "naver_keepalive": "네이버 세션 점검",
     "request_photos": "사진 요청",
     "wash_photos": "사진 세탁",
     "learn_guides": "지침 학습",

@@ -301,3 +301,9 @@ schtasks /create /tn "V2R-Health" /tr "\"D:\v2r 자동화\v2r-command-system\scr
 ## 실행기 재시작 절차 (2026-09-21)
 - 반드시 `powershell -ExecutionPolicy Bypass -File scriptsestart-serve.ps1` 사용. 옛 재시작 루프(cmd 창)와 파이썬 serve를 모두 끝낸 뒤 V2R-Serve 예약 작업으로 다시 띄운다.
 - 사고(2026-09-21): 09-19의 루프 창이 남아 로그 파일 잠금 오류를 계속 찍었음(발행 영향 없음). 루프 창은 항상 1개여야 한다.
+
+## 네이버 로그인 유지 (2026-09-21)
+- 1회 로그인: PC에서 `scripts
+aver-login.cmd` → 창에서 직접 로그인(**로그인 상태 유지 체크**). 프로필 `data/browser-profile-naver`, 쿠키 `data/naver_cookies.json`(+ web-crawler `output/cafe.naver.com/cookies.json`).
+- 매일 09:10 `네이버 세션 점검`(사이드카, 발행 중에도 실행): 헤드리스로 카페 홈 방문 → 세션 연장·쿠키 갱신. 풀리면 텔레그램 "naver-login.cmd 실행" 알림.
+- 텔레그램 명령 `네이버 세션 점검`으로 언제든 수동 점검. 비밀번호는 입력·저장 대행 안 함.
