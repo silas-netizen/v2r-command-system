@@ -196,9 +196,14 @@ def last_progress(rt: Any, job: dict) -> datetime | None:
     """그 작업이 마지막으로 움직인 시각(갱신 시각 또는 마지막 이벤트)."""
     marks = [_ts(job.get("updated_at")), _ts(job.get("created_at"))]
     try:
-        rows = rt.events.recent(int(job["id"]), limit=1)
-        if rows:
-            marks.append(_ts(rows[0].get("created_at")))
+        # 감시기가 남긴 이벤트("감시: …")는 진행이 아니다 — 그것까지 진행으로 치면
+        # 정체 경고를 남긴 순간 다시 "방금 움직인 작업"이 되어 영영 정리되지 않는다.
+        rows = rt.events.recent(int(job["id"]), limit=5)
+        for row in rows:
+            if str(row.get("message") or "").startswith("감시:"):
+                continue
+            marks.append(_ts(row.get("created_at")))
+            break
     except Exception:  # noqa: BLE001
         pass
     marks = [m for m in marks if m is not None]

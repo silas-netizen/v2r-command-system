@@ -358,8 +358,31 @@ def _generate_affiliate_daily(rt: Runtime, spec: TaskSpec) -> dict:
 BRAND_GUIDE_DIR = "★NEW 카페 바이럴★"
 
 
+#: 정리본 폴더 — 시스템/사용자 프롬프트를 나누고 중복을 정리한 지침 (2026-09-21). 있으면 원문보다 우선.
+BRAND_GUIDE_CLEAN_DIR = "정리본"
+
+
+def _clean_guide_text(rt: Runtime, brand: str, manuscript_type: str = "") -> str:
+    """정리본 지침(`warehouse/guides/정리본/<브랜드>.md`, 팥순이는 `팥순이 질문형/후기형.md`)."""
+    root = Path(rt.warehouse.guides_dir) / BRAND_GUIDE_CLEAN_DIR
+    if not root.exists():
+        return ""
+    kind = "후기형" if (manuscript_type or "").strip() == "후기형" else "질문형"
+    for name in (f"{brand} {kind}.md", f"{brand}.md"):
+        path = root / name
+        if path.exists():
+            try:
+                return path.read_text(encoding="utf-8")
+            except OSError:
+                return ""
+    return ""
+
+
 def _brand_guide_text(rt: Runtime, brand: str, manuscript_type: str = "") -> str:
-    """브랜드 지침 원문. 못 찾으면 빈 문자열."""
+    """브랜드 지침. 정리본이 있으면 정리본, 없으면 원문. 못 찾으면 빈 문자열."""
+    clean = _clean_guide_text(rt, brand, manuscript_type)
+    if clean:
+        return clean
     root = Path(rt.warehouse.guides_dir) / BRAND_GUIDE_DIR
     if not root.exists():
         return ""
