@@ -11,7 +11,6 @@ Make 시나리오 지침(`warehouse/guides/★NEW 카페 바이럴★/`)을 브�
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import re
@@ -78,11 +77,11 @@ MAX_ATTEMPTS = 10
 #: 명령에서 `한번에` 라고 적으면 combined 로 바뀐다.
 DEFAULT_MODE = "single"
 
-#: 본문 글자 수 허용 오차 (지침 상한의 몇 배까지 통과로 볼지)
-LENGTH_TOLERANCE = 1.15
-
-#: 댓글 길이 `soft_limits` 모드에서 이 배수까지는 경고, 넘으면 실패
-SOFT_LIMIT_FACTOR = 2.0  # 사용자 결정(2026-09-19): 상한의 100% 초과만 실패, 그 이하는 경고
+#: 글자 수 허용 배수 — 본문·댓글 **모두** 상한의 200%까지는 통과다.
+#: 사용자 지시(2026-09-21): "글자 수 제한은 상한의 200%까지 허용하고 글 완성도를
+#: 먼저 높이자." 그 이하는 경고조차 내지 않는다 (경고가 재시도를 부르지 않게).
+LENGTH_TOLERANCE = 2.0
+SOFT_LIMIT_FACTOR = 2.0
 
 #: 결과물에 새어 나오면 안 되는 작업용 내부 용어 (평가 2026-09-19 공통문제 7)
 #: "규칙"은 뺐다 — "근무 불규칙한" 같은 평범한 말에 걸려 멀쩡한 원고를 떨어뜨렸다
@@ -122,6 +121,116 @@ REPLY2_BANNED_PHRASES: tuple[str, ...] = (
     "방법이중요",
 )
 
+#: 대대댓글2 길이 (사용자 지시 2026-09-21: 60자 미만만 탈락, 상한은 200%까지 허용)
+REPLY2_MIN_LEN = 60
+REPLY2_MAX_LEN = 110
+
+#: 대대댓글2 근거 문장에 들어가야 하는 낱말 (권위 / 검증 / 원리)
+REPLY2_EVIDENCE_WORDS: tuple[str, ...] = (
+    "농촌진흥청",
+    "국가기관",
+    "정부기관",
+    "기관",
+    "검증",
+    "인증",
+    "논문",
+    "임상",
+    "실험",
+    "연구",
+    "의사",
+    "원장",
+    "산부인과",
+    "항문외과",
+    "이비인후과",
+    "피부과",
+    "병원",
+    "클리닉",
+    "성분",
+    "원리",
+    "방식",
+    "작용",
+    "흡수",
+    "강화",
+    "정돈",
+    "막아",
+    "막아주",
+    "보호막",
+    "근육",
+    "배합",
+    "멜라닌",
+    "각질",
+    "기도",
+    "비강",
+    "새싹",
+    "추출",
+    "지방",
+    "체지방",
+    "배출",
+    "붙잡",
+    "잡아주",
+)
+
+#: 대대댓글2 "대안의 한계" 문장에 들어가야 하는 낱말
+REPLY2_LIMIT_WORDS: tuple[str, ...] = (
+    "그냥",
+    "만으로는",
+    "만있",
+    "한계",
+    "잠깐",
+    "도루묵",
+    "제자리",
+    "소용없",
+    "겉돌",
+    "안돼",
+    "안되",
+    "재발",
+    "그때뿐",
+    "금방다시",
+    "다시올라",
+    "또막",
+    "참는",
+    "참기",
+    "아무거나",
+    "단순",
+    "있어야",
+    "없으면",
+    "없는건",
+    "없는게",
+    "의미없",
+    "결국",
+    "억지로",
+    "그대로",
+    "떼면",
+    "둘다",
+    "아니라",
+    "달라",
+    "다르",
+    "굶",
+    "덜",
+    "똑같",
+)
+
+#: 대대댓글2 검색 유도에 인정하는 낱말
+REPLY2_SEARCH_WORDS: tuple[str, ...] = ("검색", "찾아보")
+
+#: 특정 브랜드만 쓸 수 있는 근거 (다른 브랜드가 가져다 쓰면 거짓말이 된다).
+#: 모델이 팥순이 근거(농촌진흥청 체지방 25%)를 장으뜸 댓글에 가져다 쓴 일이 있었다.
+BRAND_ONLY_EVIDENCE: dict[str, tuple[str, ...]] = {
+    "팥순이": ("농촌진흥청", "체지방25%", "체지방 25%", "25%", "25퍼", "25프로")
+}
+
+#: 문장 끝(서술 어미)으로 인정하는 마지막 글자
+SENTENCE_ENDINGS: tuple[str, ...] = ("요", "죠", "용", "욬")
+
+#: 조사·어미가 붙은 어절로 보는 마지막 글자 (이게 아니면 "맨 명사"로 본다)
+_PARTICLE_TAIL = set(
+    "은는이가을를에서의도만로과와랑고며면데라나니야해져진된인한할겨봐줘써들"
+    "건걸것게거뿐때중째쯤씩큼퍼졌쳐혀줄"
+)
+
+#: 명사만 이만큼 줄줄이 붙으면 문장이 아니라 **낱말 나열**로 본다
+BARE_NOUN_RUN_MAX = 3
+
 #: 본문 한 줄 글자 수 상한 (지침의 "1줄 20자 안팎")
 LINE_MAX = 28
 #: 상한을 넘는 줄이 이 비율을 넘으면 **실패** (설계서 F-a)
@@ -158,36 +267,48 @@ def author_labels(manuscript_type: str) -> tuple[str, ...]:
     return tuple(label for label in COMMENT_LABELS if roles.get(label) == "본문 작성자")
 
 
-#: 페르소나 씨앗 풀 — 나이대 / 상황 / 말투 특징 / 글 쓰는 시각 (평가 2026-09-19 공통문제 6)
-PERSONA_SEEDS: tuple[dict[str, str], ...] = (
-    {"나이대": "20대 후반", "상황": "자취 3년차 직장인 혼자 사는 원룸", "말투": "ㅋㅋ를 자주 붙이고 문장이 짧다", "시각": "퇴근하고 밤 11시쯤"},
-    {"나이대": "30대 초반", "상황": "결혼 1년차 맞벌이 신혼", "말투": "ㅠㅠ가 많고 조심스럽게 묻는다", "시각": "점심시간 짬내서"},
-    {"나이대": "30대 중반", "상황": "다섯 살 아이 키우는 워킹맘", "말투": "말이 빨라서 문장이 자주 끊긴다", "시각": "아이 재우고 새벽 1시"},
-    {"나이대": "40대 초반", "상황": "중학생 아이 둘 키우는 전업주부", "말투": "ㅎㅎ를 붙이고 존댓말이 반듯하다", "시각": "아침에 아이 보내고"},
-    {"나이대": "20대 중반", "상황": "취준 끝나고 막 입사한 신입", "말투": "요즘 말 섞고 감탄이 잦다", "시각": "주말 낮에 누워서"},
-    {"나이대": "30대 후반", "상황": "야근 잦은 사무직 직장맘", "말투": "담담하게 사실만 적는다", "시각": "출근 지하철에서"},
-    {"나이대": "40대 중반", "상황": "자영업 하며 가게 지키는 사람", "말투": "말끝을 흐리고 사투리가 살짝 섞인다", "시각": "가게 한산한 오후"},
-    {"나이대": "20대 후반", "상황": "교대 근무라 잠 시간이 들쑥날쑥한 간호직", "말투": "줄임말을 자주 쓴다", "시각": "야간 근무 끝나고 아침"},
-    {"나이대": "30대 초반", "상황": "임신 준비 2년차", "말투": "조심스럽고 되묻는 말이 많다", "시각": "자기 전 침대에서"},
-    {"나이대": "40대 후반", "상황": "다 큰 자녀 독립시키고 부부만 사는 집", "말투": "천천히 길게 쓰고 옛날 얘기를 곁들인다", "시각": "저녁 설거지 끝내고"},
-    {"나이대": "20대 초반", "상황": "기숙사 사는 대학생", "말투": "ㅋㅋㅋㅋ를 길게 쓰고 가볍다", "시각": "수업 사이 비는 시간"},
-    {"나이대": "30대 중반", "상황": "재택 근무로 하루 종일 앉아 있는 프리랜서", "말투": "자조 섞인 농담을 한 번 넣는다", "시각": "일 끝난 밤 10시"},
-    {"나이대": "40대 초반", "상황": "출퇴근 왕복 세 시간 지방 근무", "말투": "짧게 끊어 쓰고 느낌표가 잦다", "시각": "주말 아침 일찍"},
-    {"나이대": "50대 초반", "상황": "손주 봐 주는 일이 잦은 사람", "말투": "존댓말이 정중하고 이모티콘이 적다", "시각": "낮 시간 한가할 때"},
-    {"나이대": "20대 후반", "상황": "결혼 준비하며 드레스 앞두고 있는 예비신부", "말투": "들뜬 말투에 물음이 많다", "시각": "퇴근길 버스에서"},
-    {"나이대": "30대 후반", "상황": "운동 시작했다 그만두기를 반복하는 사람", "말투": "솔직하게 실패담부터 꺼낸다", "시각": "일요일 밤"},
+#: 본문에서 **상황 연출**로 보는 말 (사용자 지시 2026-09-21).
+#: "글 쓰는 장소·시간·상태"를 적는 순간 실제 회원 글이 아니게 된다.
+#: 공백을 지운 본문에서 찾으므로 띄어쓰기가 달라도 걸린다.
+SCENE_BANNED_PHRASES: tuple[str, ...] = (
+    "글남겨",
+    "글남기",
+    "글써요",
+    "글써봐",
+    "글씁니다",
+    "글써봅니다",
+    "글쓰는중",
+    "글쓰다가",
+    "글올려요",
+    "글올려봐요",
+    "올려봐요",
+    "남겨봐요",
+    "남겨봅니다",
+    "한산해",
+    "한산한",
+    "잠깐앉아",
+    "앉아서써",
+    "쓰는중이에요",
+    "쓰는중입니다",
+    "끄적",
+    "적어봐요",
+    "적어보는",
+    "적어봅니다",
+    "적어놓고가",
+    "써보는중",
 )
 
-
-def persona_for(brand: str, keyword: str, manuscript_type: str = "") -> dict[str, str]:
-    """브랜드·키워드로 고정된 페르소나 씨앗 하나를 고른다.
-
-    같은 키워드는 늘 같은 인물이 나오고(테스트 재현 가능), 같은 브랜드의
-    다른 키워드는 다른 인물이 나오도록 키워드까지 섞어 해시한다.
-    """
-    seed = f"{brand}/{manuscript_type or ''}/{keyword}".encode()
-    index = int(hashlib.blake2s(seed, digest_size=8).hexdigest(), 16) % len(PERSONA_SEEDS)
-    return PERSONA_SEEDS[index]
+#: 본문 프롬프트에 박아 두는 **절대 규칙** (페르소나·상황 연출 폐지, 2026-09-21)
+NO_SCENE_RULE = (
+    "<절대 규칙 — 글 쓰는 상황을 연출하지 않는다>\n"
+    "- 기존 완성 원고처럼 **문제 상황(증상·고민)부터 바로** 시작한다\n"
+    "- 글을 쓰는 장소·시간·상태를 묘사하지 않는다\n"
+    "- 다음 같은 말은 쓰는 순간 그 글은 버린다:"
+    " ~하다가 글 남겨요 / 가게가 한산해서 / 잠깐 앉아서 / 쓰는 중이에요 /"
+    " 끄적여봐요 / 적어봐요 / 적어보는 중 / 올려봐요\n"
+    "- 나이 직업 가족 구성 같은 인물 설정을 굳이 꺼내지 않는다"
+    " (고민 자체를 말하다 자연스럽게 드러나는 것만 남긴다)"
+)
 
 
 class BrandWriteError(RuntimeError):
@@ -216,7 +337,7 @@ class BrandRule:
     #: 댓글2 글자 수 상한 (설계서 E)
     comment2_max: int = 90
     #: 대대댓글2 글자 수 상한 (제품을 꺼내는 자리라 조금 길게 준다, 설계서 E)
-    reply2_max: int = 60
+    reply2_max: int = REPLY2_MAX_LEN
     #: True면 상한 초과는 경고, 상한의 1.5배를 넘겨야 실패로 본다
     soft_limits: bool = True
     #: `{키워드}`를 몇 번째 문단 뒤에 둘지
@@ -264,7 +385,8 @@ class BrandRule:
 
 
 _VIRAL_STRUCTURE = (
-    "오프닝: 구체적 페르소나와 결핍을 드러내 공감을 만든다 (과장된 극적 표현 금지)",
+    "오프닝: 지금 겪고 있는 문제(증상·고민)를 첫 줄부터 바로 꺼낸다"
+    " (글 쓰는 상황이나 인물 소개로 시작하지 않는다)",
     "솔루션: 문제가 생긴 과정 → 예전에 해봤지만 효과 없던 노력 → 아직 남은 고민",
     "클로징: 고민을 한 번 더 짚고 해결 방법을 알려달라는 조언 요청으로 끝낸다",
 )
@@ -394,7 +516,7 @@ _register(
         keyword_count=3,
         root_max=50,
         comment2_max=90,
-        reply2_max=90,
+        reply2_max=REPLY2_MAX_LEN,
         placeholder_after_paragraph=2,
         # 질문형 지침: 대대댓글2에 "농촌진흥청 / 체지방 25% 감소 검증"을 반드시 넣는다
         required_phrases=(
@@ -439,7 +561,7 @@ _register(
         keyword_count=4,
         root_max=50,
         comment2_max=90,
-        reply2_max=90,
+        reply2_max=REPLY2_MAX_LEN,
         placeholder_after_paragraph=1,
         extra_placeholder="{B/A}",
         first_mention_label="대댓글2",
@@ -518,6 +640,189 @@ def keyword_hits(body: str, keyword: str) -> int:
 def paragraphs(body: str) -> list[str]:
     """빈 줄로 나눈 문단 목록."""
     return [p.strip() for p in re.split(r"\n\s*\n", body or "") if p.strip()]
+
+
+# --------------------------------------------------- 대대댓글2 문장 뜯어보기
+def _bare_tail(word: str) -> str:
+    """어절에서 꼬리표(!?~)를 뗀 몸통."""
+    return (word or "").strip().strip("!?~.…,\"'()[]" + "ㅋㅎㅠㅜㅡㄷㄴㅇ")
+
+
+def is_sentence_end(word: str) -> bool:
+    """이 어절이 서술 어미로 끝나는가 (`~해요` `~거든요` `~더라구요`)."""
+    body = _bare_tail(word)
+    return bool(body) and body.endswith(SENTENCE_ENDINGS)
+
+
+def reply2_sentences(text: str) -> list[str]:
+    """댓글 한 줄을 **문장 단위**로 자른다.
+
+    카페 댓글은 마침표를 안 쓰기 때문에 서술 어미(`~요` `~죠`)로 끊는다.
+    마지막 조각이 어미로 끝나지 않으면 그 조각도 그대로 돌려준다
+    (`reply2_structure_problems` 가 "끝을 못 맺었다"고 잡는다).
+    """
+    words = (text or "").split()
+    out: list[str] = []
+    buf: list[str] = []
+    for word in words:
+        buf.append(word)
+        if is_sentence_end(word):
+            out.append(" ".join(buf))
+            buf = []
+    if buf:
+        out.append(" ".join(buf))
+    return out
+
+
+def max_bare_noun_run(text: str) -> int:
+    """조사도 어미도 없는 맨 명사가 몇 개나 줄줄이 붙어 있는지.
+
+    `참기만 하면 제자리 농촌진흥청 25% 검증 검색해봐요` 처럼 근거를 문장이
+    아니라 **낱말 나열**로 적은 조각을 잡아내려고 센다.
+    """
+    run = 0
+    best = 0
+    for word in (text or "").split():
+        body = _bare_tail(word)
+        if not body:
+            continue
+        bare = body[-1] not in _PARTICLE_TAIL and not is_sentence_end(body)
+        run = run + 1 if bare else 0
+        best = max(best, run)
+    return best
+
+
+def _has_any(text: str, words: tuple[str, ...]) -> bool:
+    squashed = _squash(text)
+    return any(_squash(w) in squashed for w in words)
+
+
+def reply2_sentence_problems(
+    text: str, product: str = "", min_sentences: int = 3, max_sentences: int = 4
+) -> list[str]:
+    """대대댓글2가 **문장으로 이어지는가**만 본다 (구조·낱말은 따로 본다).
+
+    `product`를 주면 제품 이름은 낱말 나열 세기에서 뺀다 (`자연방패 항문세정제`
+    처럼 이름 자체가 명사 두세 개인 브랜드가 억울하게 걸리지 않게).
+    """
+    problems: list[str] = []
+    sentences = reply2_sentences(text)
+    if not sentences:
+        return ["문장 없음 — 빈 줄이다"]
+    if not is_sentence_end(sentences[-1].split()[-1] if sentences[-1].split() else ""):
+        problems.append("끝맺음 — 마지막 문장이 서술 어미(~요/~에요/~더라구요)로 끝나지 않는다")
+    if not min_sentences <= len(sentences) <= max_sentences:
+        problems.append(
+            f"문장 수 — 완전한 문장 {min_sentences}~{max_sentences}개여야 하는데"
+            f" {len(sentences)}개다"
+        )
+    short = [s for s in sentences if len(s.split()) < 2]
+    if short:
+        problems.append(f"조각 문장 — 어절이 하나뿐인 문장이 있다 (`{short[0]}`)")
+    counted = text or ""
+    if product:
+        counted = counted.replace(product, " ")
+    run = max_bare_noun_run(counted)
+    if run > BARE_NOUN_RUN_MAX:
+        problems.append(
+            f"낱말 나열 — 조사 없는 명사가 {run}개 연달아 붙어 문장이 아니라 나열이다"
+        )
+    return problems
+
+
+def reply2_structure_problems(text: str, rule: "BrandRule") -> list[str]:
+    """질문형 대대댓글2의 4요소 + 문장 검사 (기존 원고 구조 그대로).
+
+    구조: [제품명(이)라고 있어요] → [근거를 **완전한 문장**으로] →
+    [대안의 한계 한 문장] → [검색해보시면 후기 많아요]
+    """
+    product = rule.product_in_comment or rule.product
+    problems: list[str] = []
+    if product and _squash(product) not in _squash(text):
+        problems.append(f"제품 표기 — `{product}` 가 들어가지 않았다")
+    if not _has_any(text, REPLY2_EVIDENCE_WORDS):
+        problems.append(
+            "근거 문장 — 권위기관·검증·원리 중 하나를 **완전한 문장**으로 적어야 한다"
+        )
+    if not _has_any(text, REPLY2_LIMIT_WORDS):
+        problems.append("대안의 한계 — 다른 방법으로는 왜 안 되는지 한 문장이 없다")
+    if not _has_any(text, REPLY2_SEARCH_WORDS):
+        problems.append("검색 유도 — 검색해보시면 후기 많아요 류의 마무리가 없다")
+    problems += reply2_sentence_problems(text, product)
+    for owner, words in BRAND_ONLY_EVIDENCE.items():
+        if rule.brand == owner:
+            continue
+        stolen = [w for w in words if _squash(w) in _squash(text)]
+        if stolen:
+            problems.append(
+                f"근거 도용 — {owner} 근거({', '.join(stolen)})를 가져다 썼다"
+            )
+            break
+    banned = [w for w in REPLY2_BANNED_PHRASES if w in _squash(text)]
+    if banned:
+        problems.append("금칙어 — " + ", ".join(banned))
+    return problems
+
+
+def review_reply2_problems(text: str, rule: "BrandRule") -> list[str]:
+    """후기형 대대댓글2 — 역할이 다르다 (여분 계정이 "저도 이거 먹는 중"이라 거든다).
+
+    제품명을 다시 꺼내지 않고 `이거` 로 받으며, 기간·감량 수치와 기관 검증을 말한다.
+    """
+    problems: list[str] = []
+    if not _has_any(text, ("저도", "저두", "나도")):
+        problems.append("맞장구 — 저도 이거 쓰는 중이라는 동조가 없다")
+    if not _has_any(text, ("이거", "이걸", "이것")):
+        problems.append("지칭 — 제품명 대신 `이거` 로 받아야 한다")
+    if not _NUMBER_RE.search(text or ""):
+        problems.append("수치 — 기간과 감량 수치를 숫자로 적어야 한다")
+    if not _has_any(text, ("25%", "25퍼", "25프로")):
+        problems.append("검증 수치 — 체지방 25% 감소 결과가 빠졌다")
+    if not _has_any(text, ("정부기관", "국가기관", "농촌진흥청", "기관")):
+        problems.append("권위 — 정부기관 실험이라는 근거가 빠졌다")
+    product = rule.product_in_comment or rule.product
+    if product and _squash(product) in _squash(text):
+        problems.append(f"제품 표기 — 후기형 대대댓글2는 `{product}` 를 다시 쓰지 않는다")
+    problems += reply2_sentence_problems(text, product, min_sentences=2)
+    return problems
+
+
+def reply2_problems(text: str, rule: "BrandRule") -> list[str]:
+    """원고유형에 맞는 대대댓글2 검사."""
+    if rule.manuscript_type == "후기형":
+        return review_reply2_problems(text, rule)
+    return reply2_structure_problems(text, rule)
+
+
+def reply2_prompt_block(rule: "BrandRule") -> list[str]:
+    """질문형 대대댓글2 작성 지시 (기존 완성 원고 구조를 그대로 적은 것).
+
+    예전에는 "60자 안쪽" 같은 길이부터 못 박아서 모델이 문장을 조각내
+    `참기만 하면 제자리 농촌진흥청 25% 검증 검색해봐요` 같은 낱말 나열이 나왔다.
+    이제는 **완전한 문장**과 논리 흐름을 먼저 요구하고 길이는 길이감만 말한다
+    (사용자 지시 2026-09-21).
+    """
+    product = rule.product_in_comment or rule.product
+    return [
+        "",
+        "<대대댓글2 — 질문형에서 가장 중요한 자리. 아래 네 마디를 이 차례로 쓴다>",
+        f"1) {product} (이)라고 있어요 — 제품을 먼저 꺼낸다",
+        "2) 왜 믿을 만한지 **완전한 문장 하나**로 적는다"
+        " (권위기관 / 검증받은 성분 / 어떤 원리로 작용하는지 중 하나를 문장으로 풀어 쓴다)",
+        "3) 다른 방법으로는 왜 안 되는지 한 문장 (그냥 참는 걸로는 / 잠깐뿐이라 / 소용없더라구요)",
+        "4) 검색해보시면 후기 많아요 류로 마무리한다",
+        "- 완전한 문장 3~4개로 쓴다. 문장은 반드시 서술 어미(~요 ~에요 ~더라구요)로 끝낸다",
+        "- 근거를 낱말로 나열하지 않는다"
+        " (나쁜 보기: `참기만 하면 제자리 농촌진흥청 25% 검증 검색해봐요`"
+        " — 조각난 구와 명사 나열이라 사람이 쓴 말이 아니다)",
+        f"- 길이는 기존 원고와 비슷한 느낌으로 쓴다 (대략 {REPLY2_MIN_LEN}~{REPLY2_MAX_LEN}자)."
+        " 길이를 맞추려고 조사나 서술어를 빼지 마라 — 문장이 온전한 것이 먼저다",
+        f"- 근거는 이 브랜드가 실제로 쓸 수 있는 것({rule.authority})만 쓴다."
+        " 다른 브랜드의 기관명·검증 수치를 가져다 쓰면 안 된다",
+        "- 다음 말은 쓰는 순간 버린다: " + " / ".join(REPLY2_BANNED_PHRASES),
+        f"- 좋은 보기) {product}라고 있어요 국가기관인 농촌진흥청에서 체지방 25% 감소"
+        " 검증받은 성분이에요 그냥 참는거로는 한계있어서 검색해보시면 후기 많아요",
+    ]
 
 
 def body_lines(body: str) -> list[str]:
@@ -789,6 +1094,8 @@ def _body_rules_block(
         "",
         BRAND_LINE_BREAK_RULE,
         "",
+        NO_SCENE_RULE,
+        "",
         "<반드시 지켜야 할 규칙>",
         f"- 본문 글자 수는 공백 제외 {rule.body_max}자를 넘지 않는다",
         "- 분량을 맞추려고 중간에 끊지 말고 반드시 끝을 맺는다",
@@ -836,19 +1143,14 @@ def _body_rules_block(
 
 def _body_dynamic_block(rule: BrandRule, keyword: str, cafe: str = "") -> list[str]:
     """본문 프롬프트 중 **키워드마다 달라지는** 부분 (캐시하지 않는다)."""
-    who = persona_for(rule.brand, keyword, rule.manuscript_type)
     lines = [
         f"작성 키워드: {keyword}",
         f"- 작성 키워드 `{keyword}` 를 한 글자도 빼먹지 말고 본문에 정확히 "
         f"{rule.keyword_count}번 넣는다",
         "",
-        "<글쓴이 — 이 인물로만 써라>",
-        f"- 나이대: {who['나이대']}",
-        f"- 상황: {who['상황']}",
-        f"- 말투 특징: {who['말투']}",
-        f"- 글 쓰는 시각: {who['시각']}",
-        "이 인물로만 써라. 다른 나이대나 다른 상황으로 바꾸지 말고"
-        " 이 사람의 하루가 글에 묻어나게 한 줄 이상 구체적인 정황을 적는다",
+        "<첫 줄 — 문제부터 바로>",
+        f"- `{keyword}` 로 고민하는 사람이 겪는 **증상이나 고민**을 첫 줄에 바로 적는다",
+        "- 글을 쓰는 장소·시간·상태를 적지 않는다 (한산해서 / 잠깐 앉아 / 글 남겨요 금지)",
     ]
     if cafe:
         lines.append(f"올릴 카페: {cafe}")
@@ -896,7 +1198,7 @@ def _comments_rules_block(
         "<댓글 글자 수>",
         f"- 댓글2와 대대댓글2를 뺀 모든 댓글은 {rule.comment_max}자를 넘지 않는다",
         f"- 댓글2도 {rule.comment2_max}자를 넘지 않는다",
-        f"- 대대댓글2도 {rule.reply2_max}자를 넘지 않는다",
+        f"- 대대댓글2는 {rule.reply2_max}자 안팎으로 쓴다 (길이보다 문장이 온전한 것이 먼저다)",
         "- 줄 나눔 없이 한 줄로 쓴다",
         "",
         "<12개 구조와 역할>",
@@ -933,22 +1235,8 @@ def _comments_rules_block(
             " 그거 어디서 사요 / 어떤 성분이에요 / 효과 있나요 처럼 절대 되묻지 않는다"
         )
     else:
-        # 질문형 대대댓글2 고정 틀 (설계서 C)
-        lines.append("")
-        lines.append("<대대댓글2 고정 틀 (질문형에서 가장 중요한 자리)>")
-        lines.append(
-            f"- 틀: {product} 를 먼저 꺼내고 + 왜 다른 방법으로는 안 되는지 한 마디 +"
-            " 검색해보면 나와요 류의 마무리"
-        )
-        lines.append(f"- 길이는 {min(rule.reply2_max, 60)}자 안쪽으로 쓴다")
-        lines.append(
-            "- 다음 말은 쓰는 순간 버린다: "
-            + " / ".join(REPLY2_BANNED_PHRASES)
-        )
-        lines.append(
-            f"- 좋은 보기) 저는 {product} 쓰고 있어요 그냥 참는 걸로는 계속 제자리더라구요"
-            " 검증된 거라 검색해보면 후기 많아요"
-        )
+        # 질문형 대대댓글2 구조 (기존 원고 구조 그대로, 2026-09-21 개편)
+        lines.extend(reply2_prompt_block(rule))
     if rule.required_phrases:
         lines.append("")
         lines.append("<반드시 들어가야 하는 멘트 (자리까지 지침이 정해 둔 것)>")
@@ -1204,7 +1492,9 @@ def validate(
     그 위부터 실패다 (평가 2026-09-19 제안 3). 지정하지 않으면 브랜드 규칙값을 쓴다.
     """
     rule = rule or rule_for(brand_of(manuscript), manuscript.manuscript_type)
-    soft = rule.soft_limits if soft_limits is None else bool(soft_limits)
+    # `soft_limits`는 이제 뜻이 없다 (길이는 늘 상한의 200%까지 통과).
+    # 부르는 쪽을 깨지 않으려고 자리만 남겨 둔다.
+    _ = soft_limits if soft_limits is not None else rule.soft_limits
     body = manuscript.body or ""
     keyword = manuscript.keyword or ""
     checks: list[dict] = []
@@ -1212,7 +1502,7 @@ def validate(
     length = body_length(body)
     limit = int(rule.body_max * LENGTH_TOLERANCE)
     checks.append(
-        _check("본문 글자 수(공백 제외)", f"{rule.body_max}자 이하", f"{length}자", length <= limit)
+        _check("본문 글자 수(공백 제외)", f"{limit}자 이하 (상한 {rule.body_max}자의 200%)", f"{length}자", length <= limit)
     )
 
     hits = keyword_hits(body, keyword)
@@ -1234,6 +1524,22 @@ def validate(
             "없음" if not rule.banned_in_body else ", ".join(rule.banned_in_body) + " 금지",
             ", ".join(found) if found else "없음",
             not found,
+        )
+    )
+
+    # --- 상황 연출 금지 (사용자 지시 2026-09-21): 글 쓰는 장소·시간·상태 묘사
+    scene = [
+        w
+        for w in SCENE_BANNED_PHRASES
+        if w in _squash(body) or w in _squash(manuscript.title)
+    ]
+    checks.append(
+        _check(
+            "상황 연출 금지",
+            "글 남겨요 / 한산해서 / 잠깐 앉아 / 쓰는 중 / 끄적 / 적어봐요 류 금지"
+            " (문제 상황부터 바로 시작)",
+            ", ".join(scene) if scene else "없음",
+            not scene,
         )
     )
 
@@ -1321,40 +1627,26 @@ def validate(
             return rule.reply2_max
         return rule.root_max
 
-    over: list[str] = []
+    # 상한의 200%를 넘을 때만 실패다. 그 이하는 경고도 내지 않는다
+    # (경고가 재시도를 불러 글 완성도를 깎던 문제, 사용자 지시 2026-09-21).
     way_over: list[str] = []
     for c in manuscript.comments:
-        cap = _limit_of(c.label)
+        cap = int(_limit_of(c.label) * SOFT_LIMIT_FACTOR)
         size = len(c.text)
-        if size <= cap:
-            continue
-        note = f"{c.label} {size}자 → {cap}자로 줄일 것"
-        over.append(note)
-        if size > cap * SOFT_LIMIT_FACTOR:
-            way_over.append(note)
+        if size > cap:
+            way_over.append(f"{c.label} {size}자 → {cap}자로 줄일 것")
+    factor = int(SOFT_LIMIT_FACTOR * 100)
     checks.append(
         _check(
             "댓글 글자 수",
-            f"댓글2 {rule.comment2_max}자 대대댓글2 {rule.reply2_max}자"
-            f" 그 외 {rule.root_max}자 이하",
-            ", ".join(over) if over else "모두 통과",
-            not over,
-            hard=not soft,
+            f"상한의 {factor}% 이하 (댓글2 {int(rule.comment2_max * SOFT_LIMIT_FACTOR)}자"
+            f" 대대댓글2 {int(rule.reply2_max * SOFT_LIMIT_FACTOR)}자"
+            f" 그 외 {int(rule.root_max * SOFT_LIMIT_FACTOR)}자)",
+            ", ".join(way_over) if way_over else "모두 통과",
+            not way_over,
             scope="댓글",
         )
     )
-    if soft:
-        factor = int(SOFT_LIMIT_FACTOR * 100)
-        checks.append(
-            _check(
-                "댓글 글자 수 심각 초과",
-                f"상한의 {factor}%(댓글2 {int(rule.comment2_max * SOFT_LIMIT_FACTOR)}자"
-                f" 그 외 {int(rule.root_max * SOFT_LIMIT_FACTOR)}자) 이하",
-                ", ".join(way_over) if way_over else "없음",
-                not way_over,
-                scope="댓글",
-            )
-        )
 
     # --- 댓글에 내부 용어가 새지 않았는가
     leaked_c = sorted(
@@ -1472,6 +1764,20 @@ def validate(
             " / ".join(REPLY2_BANNED_PHRASES) + " 금지",
             "대대댓글2(" + ", ".join(banned2) + ")" if banned2 else "없음",
             not banned2,
+            scope="댓글",
+        )
+    )
+
+    # --- 대대댓글2 구조·문장 (기존 원고 구조 그대로, 2026-09-21 개편)
+    struct2 = reply2_problems(reply2.text, rule) if reply2 else ["대대댓글2 없음"]
+    checks.append(
+        _check(
+            "대대댓글2 구조",
+            "제품 소개 → 근거 문장 → 대안의 한계 → 검색 유도, 완전한 문장 3~4개"
+            if rule.manuscript_type != "후기형"
+            else "저도 이거 먹는 중 + 기간·감량 수치 + 기관 검증 결과, 완전한 문장",
+            " / ".join(struct2) if struct2 else "통과",
+            not struct2,
             scope="댓글",
         )
     )
@@ -2226,7 +2532,13 @@ __all__ = [
     "INTERNAL_TERMS",
     "LINE_MAX",
     "LINE_OVER_RATIO",
-    "PERSONA_SEEDS",
+    "SCENE_BANNED_PHRASES",
+    "NO_SCENE_RULE",
+    "REPLY2_MIN_LEN",
+    "REPLY2_MAX_LEN",
+    "reply2_problems",
+    "reply2_sentences",
+    "reply2_prompt_block",
     "REPLY2_BANNED_PHRASES",
     "RETREAT_PHRASES",
     "SOFT_LIMIT_FACTOR",
@@ -2250,7 +2562,6 @@ __all__ = [
     "failures",
     "generate_manuscript",
     "keyword_hits",
-    "persona_for",
     "review_block",
     "rule_for",
     "save_json",

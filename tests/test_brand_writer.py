@@ -38,7 +38,7 @@ COMMENTS = {
     "대댓글1": "아 그렇군요 처음 알았어요ㅠㅠ",
     "댓글2": "비타민C 발라도 각질이 두꺼우면 흡수가 안된대요 각질 정돈되는걸로 바꿔보세요",
     "대댓글2": "헉 그런건 어떤 성분 봐야되요?",
-    "대대댓글2": "그린커피 아하바하 찾아보세요 흡수가 달라요",
+    "대대댓글2": "그린커피 아하바하라고 있어요 아하바하가 두꺼워진 각질을 정돈해줘서 그린커피가 멜라닌까지 닿는 원리에요 단순 미백크림은 겉돌아서 소용없더라구요 검색해보시면 후기 많아요",
     "대대대댓글2": "222 저도 그거 쓰고 확실히 나아졌어요",
     "댓글3": "저도 작년에 똑같이 고민했어요ㅠㅠ",
     "대댓글3": "저만 그런게 아니였네요ㅎㅎ",
@@ -47,6 +47,9 @@ COMMENTS = {
     "댓글5": "저는 두 달쯤 쓰니까 톤이 확 밝아졌어요",
     "대댓글5": "와 두 달이면 해볼만하네요!",
 }
+
+
+GOOD_REPLY2 = COMMENTS["대대댓글2"]
 
 
 def _nodes(table: dict[str, str] | None = None) -> list[CommentNode]:
@@ -146,7 +149,7 @@ def test_comments_prompt_has_12_labels_and_limits():
         assert label in system
     assert "40자를 넘지 않는다" in system
     assert "90자를 넘지 않는다" in system
-    assert "60자를 넘지 않는다" in system  # 대대댓글2는 조금 길게 (설계서 E)
+    assert "대대댓글2는 110자 안팎으로 쓴다" in system  # 길이보다 문장이 먼저다
     assert "대대댓글2 에서 처음 나온다" in system
     # user에는 이번 본문과 키워드만 (나머지는 캐시되는 고정부)
     assert KEYWORD in user and "제목" in user
@@ -195,34 +198,43 @@ def test_validate_rejects_low_keyword_count():
     assert any("키워드 포함 횟수" in p for p in bw.failures(bw.validate(bad)))
 
 
-def test_validate_flags_long_comment_as_warning():
-    """상한(40자)을 넘어도 100% 안이면 경고로만 잡는다."""
+def test_length_over_cap_is_not_even_a_warning():
+    """길이는 상한의 200%까지 통과다 (사용자 지시 2026-09-21).
+
+    상한을 조금 넘겼다고 경고를 내면 그 경고가 재시도를 불러 글 완성도를 깎았다.
+    """
     m = _manuscript(comments=_nodes({"댓글3": "가" * 50}))
     checks = bw.validate(m)
     row = next(c for c in checks if c["항목"] == "댓글 글자 수")
-    assert row["통과"] is False and row["필수"] is False
-    assert "댓글3 50자 → 40자로 줄일 것" in row["실제"]  # 목표 글자 수를 짚어 준다
-    assert bw.failures(checks) == []  # 경고는 실패가 아니다
+    assert row["통과"] is True
+    assert bw.failures(checks) == []
 
 
 def test_validate_hard_fails_beyond_2x_length():
-    """상한의 100%(2배)를 넘기면 경고가 아니라 실패다 (사용자 결정 2026-09-19)."""
+    """상한의 200%를 넘기면 그때는 실패다."""
     m = _manuscript(comments=_nodes({"댓글3": "가" * 81}))
     problems = bw.failures(bw.validate(m))
-    assert any("심각 초과" in p and "40자로 줄일 것" in p for p in problems)
+    assert any("댓글 글자 수" in p and "80자로 줄일 것" in p for p in problems)
 
 
-def test_soft_limits_off_makes_every_excess_hard():
+def test_body_length_also_allows_200_percent():
+    rule = bw.rule_for("우아덤")
+    assert int(rule.body_max * bw.LENGTH_TOLERANCE) == rule.body_max * 2
+    m = _manuscript(body=BODY + "\n\n" + "가" * 200)
+    row = next(c for c in bw.validate(m) if c["항목"] == "본문 글자 수(공백 제외)")
+    assert row["통과"] is True
+
+
+def test_soft_limits_flag_no_longer_changes_anything():
     m = _manuscript(comments=_nodes({"댓글3": "가" * 50}))
-    problems = bw.failures(bw.validate(m, soft_limits=False))
-    assert any(p.startswith("댓글 글자 수:") for p in problems)
+    assert bw.failures(bw.validate(m, soft_limits=False)) == []
 
 
 def test_comment_limits_are_configurable_per_brand():
     viral = bw.rule_for("우아덤")
     patsooni = bw.rule_for("팥순이", "질문형")
-    assert (viral.root_max, viral.comment2_max, viral.reply2_max) == (40, 90, 60)
-    assert (patsooni.root_max, patsooni.comment2_max, patsooni.reply2_max) == (50, 90, 90)
+    assert (viral.root_max, viral.comment2_max, viral.reply2_max) == (40, 90, 110)
+    assert (patsooni.root_max, patsooni.comment2_max, patsooni.reply2_max) == (50, 90, 110)
     assert viral.comment_max == viral.root_max  # 옛 이름도 그대로 읽힌다
     loose = bw.BrandRule(brand="우아덤", root_max=55, comment2_max=90)
     m = _manuscript(comments=_nodes({"댓글3": "가" * 50}))
@@ -238,7 +250,7 @@ def test_validate_rejects_internal_terms_in_body():
 
 
 def test_validate_rejects_internal_terms_in_comments():
-    bad = _manuscript(comments=_nodes({"대대댓글2": "그린커피 아하바하요 프레임이 달라요"}))
+    bad = _manuscript(comments=_nodes({"대대댓글2": GOOD_REPLY2 + " 프레임이 달라요"}))
     problems = bw.failures(bw.validate(bad))
     assert any("댓글 내부 용어" in p and "프레임" in p for p in problems)
 
@@ -278,26 +290,36 @@ def test_prompts_forbid_internal_terms():
         assert "내부 용어 누출 금지" in text
 
 
-# --- 페르소나 다양화 --------------------------------------------
-def test_body_prompt_injects_persona_seed():
-    _, user = bw.build_body_prompt("우아덤", KEYWORD)
-    who = bw.persona_for("우아덤", KEYWORD, "질문형")
-    assert "이 인물로만 써라" in user
-    for value in who.values():
-        assert value in user
+# --- 상황 연출 금지 (사용자 지시 2026-09-21) ---------------------
+def test_body_prompt_has_no_persona_and_bans_scene_setting():
+    system, user = bw.build_body_prompt("우아덤", KEYWORD)
+    # 인물 설정을 프롬프트에 심지 않는다 (내부 용어 금지 목록의 `페르소나`는 예외)
+    assert "페르소나는" not in system and "페르소나" not in user
+    assert "나이대" not in user and "글 쓰는 시각" not in user
+    assert "이 인물로만 써라" not in user
+    assert "글 쓰는 상황을 연출하지 않는다" in system
+    assert "문제 상황(증상·고민)" in system or "문제(증상·고민)" in system
+    assert "글 남겨요" in system and "한산해서" in system
+    assert "문제부터 바로" in user
 
 
-def test_persona_pool_is_big_and_stable():
-    assert len(bw.PERSONA_SEEDS) >= 12
-    assert bw.persona_for("우아덤", KEYWORD) == bw.persona_for("우아덤", KEYWORD)
-    for seed in bw.PERSONA_SEEDS:
-        assert {"나이대", "상황", "말투", "시각"} == set(seed)
+@pytest.mark.parametrize(
+    "line",
+    [
+        "가게가 한산해서 잠깐 앉아 글 남겨요",
+        "퇴근하고 누워서 끄적여봐요",
+        "궁금해서 적어봐요",
+    ],
+)
+def test_validate_rejects_scene_setting_in_body(line):
+    bad = _manuscript(body=line + "\n\n" + BODY)
+    problems = bw.failures(bw.validate(bad))
+    assert any("상황 연출 금지" in p for p in problems)
 
 
-def test_two_keywords_of_same_brand_get_different_personas():
-    a = bw.persona_for("우아덤", "비타민C", "질문형")
-    b = bw.persona_for("우아덤", "편평사마귀", "질문형")
-    assert a != b
+def test_clean_body_has_no_scene_problem():
+    row = next(c for c in bw.validate(_manuscript()) if c["항목"] == "상황 연출 금지")
+    assert row["통과"] is True
 
 
 # --- 후기형 댓글 역할 -------------------------------------------
@@ -319,7 +341,7 @@ def test_author_labels_differ_by_manuscript_type():
 def _review_manuscript(**table) -> Manuscript:
     base = {
         "대댓글2": "저는 팥순ㅇㅣ 먹고 있어요 두 달째에요",
-        "대대댓글2": "저도 이거 먹는중인데 확실히 다르더라구요",
+        "대대댓글2": "저도 이거 먹는중인데 5주만에 7kg 정도 빠졌어요 정부기관 실험에서 체지방 25% 줄었다는 결과 나온 성분이래요",
         "대대대댓글2": "맞아욬ㅋㅋ 같이 하시는 분들 많더라구요",
     }
     base.update(table)
@@ -344,7 +366,7 @@ def test_review_type_rejects_author_asking_about_effect():
 
 def test_review_type_allows_pool_account_to_ask():
     """여분 풀 계정(대대댓글2)이 묻는 것은 막지 않는다."""
-    ok = _review_manuscript(대대댓글2="저도 이거 먹는중이에요 효과 어때요?")
+    ok = _review_manuscript(대대댓글2="저도 이거 먹는중인데 6주만에 8kg 빠졌어요 정부기관 실험에서 체지방 25% 줄었다는 성분이래요 효과 어때요?")
     assert not any("작성자 되묻기" in p for p in bw.failures(bw.validate(ok)))
 
 
@@ -373,7 +395,7 @@ def test_retry_note_tells_exact_length_target():
     llm = LongComments()
     bw.generate_manuscript(llm, "우아덤", KEYWORD)
     note = llm.calls[1][2]
-    assert "댓글3 90자 → 40자로 줄일 것" in note
+    assert "댓글3 90자 → 80자로 줄일 것" in note
 
 
 # --- 생성 -------------------------------------------------------

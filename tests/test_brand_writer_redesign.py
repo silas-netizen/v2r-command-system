@@ -30,7 +30,7 @@ COMMENTS = {
     "대댓글1": "아 그렇군요 처음 알았어요ㅠㅠ",
     "댓글2": "비타민C 발라도 각질이 두꺼우면 흡수가 안된대요 각질 정돈되는걸로 바꿔보세요",
     "대댓글2": "헉 그런건 어떤 성분 봐야되요?",
-    "대대댓글2": "그린커피 아하바하 찾아보세요 흡수가 달라요",
+    "대대댓글2": "그린커피 아하바하라고 있어요 아하바하가 두꺼워진 각질을 정돈해줘서 그린커피가 멜라닌까지 닿는 원리에요 단순 미백크림은 겉돌아서 소용없더라구요 검색해보시면 후기 많아요",
     "대대대댓글2": "222 저도 그거 쓰고 확실히 나아졌어요",
     "댓글3": "저도 작년에 똑같이 고민했어요ㅠㅠ",
     "대댓글3": "저만 그런게 아니였네요ㅎㅎ",
@@ -134,8 +134,8 @@ def test_review_and_question_comment_prompts_are_separate():
     )
     assert "이 글은 **후기형**이다" in review
     assert "후기형 댓글 스레드 고정 흐름" in review
-    assert "대대댓글2 고정 틀" not in review  # 질문형 틀은 섞이지 않는다
-    assert "대대댓글2 고정 틀" in question
+    assert "대대댓글2 — 질문형에서 가장 중요한 자리" not in review  # 질문형 틀은 섞이지 않는다
+    assert "대대댓글2 — 질문형에서 가장 중요한 자리" in question
     assert "후기형 댓글 스레드 고정 흐름" not in question
 
 
@@ -143,7 +143,7 @@ def test_review_and_question_comment_prompts_are_separate():
 def test_reply2_banned_phrase_is_a_hard_failure():
     bad = _manuscript(
         comments=bw._comment_nodes(
-            dict(COMMENTS, 대대댓글2="그린커피 아하바하 쓰는데 제품보다 방법이 중요해요")
+            dict(COMMENTS, 대대댓글2=COMMENTS["대대댓글2"] + " 제품보다 방법이 중요해요")
         )
     )
     problems = bw.failures(bw.validate(bad))
@@ -153,7 +153,9 @@ def test_reply2_banned_phrase_is_a_hard_failure():
 
 def test_question_prompt_states_reply2_frame_and_bans():
     system, _ = bw.build_comments_prompt("우아덤", KEYWORD, "제목", BODY)
-    assert "검색해보면 나와요" in system
+    assert "검색해보시면 후기 많아요" in system
+    assert "완전한 문장 3~4개로 쓴다" in system
+    assert "근거를 낱말로 나열하지 않는다" in system
     for word in bw.REPLY2_BANNED_PHRASES:
         assert word in system
 
@@ -186,7 +188,7 @@ def _patsooni(mtype: str, **table) -> Manuscript:
         "대댓글1": "오 감사해요ㅎㅎ",
         "댓글2": "곤약젤리만 먹다 요요 왔는데 팥순추출물 같이 하고 5kg 뺐어요",
         "대댓글2": "팥순ㅇㅣ 먹고 있어요 3주째에요",
-        "대대댓글2": "저도 이거 먹는중인데 농촌진흥청에서 체지방 25% 검증된 거래요",
+        "대대댓글2": "팥순ㅇㅣ라고 있어요 국가기관인 농촌진흥청에서 체지방 25% 감소 검증받은 성분이에요 그냥 참는거로는 한계있더라구요 검색해보시면 후기 많아요",
         "대대대댓글2": "맞아욬ㅋㅋ 국가기관 인증이라 믿음가요",
         "댓글3": "곤약젤리 맛은 어때요?",
         "대댓글3": "생각보다 먹을만해요ㅎㅎ",
@@ -208,7 +210,7 @@ def test_patsooni_required_phrases_are_enforced_by_label():
     ok = _patsooni("질문형")
     assert _row("필수 멘트", bw.validate(ok))["통과"] is True
 
-    bad = _patsooni("질문형", 대대댓글2="저도 이거 먹는중인데 확실히 다르더라구요")
+    bad = _patsooni("질문형", 대대댓글2="팥순ㅇㅣ라고 있어요 다이어트 카페에서 많이들 추천하는 성분이에요 그냥 참는거로는 한계있더라구요 검색해보시면 후기 많아요")
     row = _row("필수 멘트", bw.validate(bad))
     assert row["통과"] is False and row["필수"] is True
     assert "대대댓글2" in row["실제"]
@@ -289,12 +291,13 @@ def test_repeated_opening_triggers_one_regeneration():
 
 # --- E/G/H. 길이·수치·근거 --------------------------------------
 def test_reply2_gets_its_own_length_limit():
+    """대대댓글2는 110자가 상한이고 그 200%(220자)까지 통과다."""
     rule = bw.rule_for("우아덤")
-    m = _manuscript(comments=bw._comment_nodes(dict(COMMENTS, 대대댓글2="가" * 55)))
-    assert _row("댓글 글자 수", bw.validate(m))["통과"] is True  # 60자까지 허용
-    over = _manuscript(comments=bw._comment_nodes(dict(COMMENTS, 대대댓글2="가" * 65)))
+    m = _manuscript(comments=bw._comment_nodes(dict(COMMENTS, 대대댓글2="가" * 150)))
+    assert _row("댓글 글자 수", bw.validate(m))["통과"] is True
+    over = _manuscript(comments=bw._comment_nodes(dict(COMMENTS, 대대댓글2="가" * 221)))
     assert _row("댓글 글자 수", bw.validate(over))["통과"] is False
-    assert rule.reply2_max == 60
+    assert rule.reply2_max == 110 == bw.REPLY2_MAX_LEN
 
 
 def test_comment5_needs_a_number():
@@ -323,7 +326,7 @@ def test_failing_labels_route_new_checks_into_partial_retry():
     """새 검증 항목도 걸린 댓글만 다시 쓰게 라벨로 이어진다."""
     bad = _manuscript(
         comments=bw._comment_nodes(
-            dict(COMMENTS, 댓글5="확실히 좋아졌어요", 대대댓글2="그린커피 아하바하요 제품보다 방법이 중요해요")
+            dict(COMMENTS, 댓글5="확실히 좋아졌어요", 대대댓글2=COMMENTS["대대댓글2"] + " 제품보다 방법이 중요해요")
         )
     )
     labels = bw.failing_comment_labels(bw.validate(bad))
