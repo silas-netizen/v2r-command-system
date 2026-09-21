@@ -390,7 +390,9 @@ def test_generate_manuscript_with_fake_llm():
 
 def test_generate_keeps_retrying_until_it_passes():
     """한 번 어긋났다고 포기하지 않고 구체적 위반을 짚어 다시 시킨다."""
-    bad_body = BODY.replace("{키워드}", "음")
+    # 자리표시자 누락은 이제 코드가 알아서 넣으므로, 모델만 고칠 수 있는
+    # 위반(내부 용어 누출)으로 재시도를 확인한다
+    bad_body = BODY.replace("별로 달라지는게 없더라구요", "프레임이 아예 다르더라구요")
 
     class Flaky(FakeLLM):
         def __init__(self, good_at: int):
@@ -414,18 +416,20 @@ def test_generate_keeps_retrying_until_it_passes():
     assert llm.n == 4 and "{키워드}" in m.body
     assert stats["body_attempts"] == 4 and stats["unresolved"] == []
     note = llm.calls[1][2]
-    assert "직전 시도에서 어긴 규칙" in note
-    assert "{키워드} 자리표시자" in note  # 무엇이 어긋났는지 구체적으로 알려 준다
+    assert "이것만 고쳐라" in note  # 통째로 다시 쓰지 않고 직전 본문을 고쳐 쓰게 한다
+    assert "직전에 쓴 본문" in note
+    assert "내부 용어" in note  # 무엇이 어긋났는지 구체적으로 알려 준다
 
 
 def test_generate_stops_at_attempt_cap_and_records_rules():
-    """상한(6회)까지 가면 실패로 보고하지 않고 남은 규칙만 적어 둔다."""
-    llm = FakeLLM(body=BODY.replace("{키워드}", "음"))
+    """상한까지 가면 실패로 보고하지 않고 남은 규칙만 적어 둔다."""
+    llm = FakeLLM(body=BODY.replace("별로 달라지는게 없더라구요", "프레임이 아예 다르더라구요"))
     stats: dict = {}
     m = bw.generate_manuscript(llm, "우아덤", KEYWORD, stats=stats)
-    assert stats["body_attempts"] == bw.MAX_ATTEMPTS == 6
+    assert stats["body_attempts"] == bw.MAX_ATTEMPTS == 10
     assert stats["hit_cap"] is True
-    assert any("{키워드} 자리표시자" in r for r in stats["unresolved"])
+    assert stats["ok"] is False  # 실패를 남긴 채 성공이라고 하지 않는다
+    assert any("내부 용어" in r for r in stats["unresolved_hard"])
     assert m.title and len(m.comments) == 12  # 원고는 버리지 않는다
 
 
@@ -571,6 +575,51 @@ def test_worker_generate_brand(tmp_path, monkeypatch):
     assert saved.exists()
     report = Path(out["report"])
     assert report.exists() and "비타민C" in report.read_text(encoding="utf-8")
+    rt.close()
+
+
+def test_worker_report_name_includes_manuscript_type(tmp_path, monkeypatch):
+    """팥순이 질문형·후기형이 서로의 검토 파일을 덮어쓰지 않는다 (2026-09-21)."""
+    from tests.test_engine import make_runtime
+
+    rt = make_runtime(tmp_path)
+    rt.settings.repo_root = tmp_path
+    rt._llm = FakeLLM()
+    rt._llm_ready = True
+    monkeypatch.setattr(
+        "v2r.sources.keyword_list.load_pushed_keywords",
+        lambda brand, cfg=None, xlsx_path=None, limit=0: [
+            {"keyword": KEYWORD, "cafe": "씨씨앙"},
+            {"keyword": "이노시톨", "cafe": "씨씨앙"},
+        ],
+    )
+    names = set()
+    for text in ("팥순이 질문형 원고 1개 만들어줘", "팥순이 후기형 원고 1개 만들어줘"):
+        out = worker._generate_brand(rt, parse_korean_command(text))
+        names.add(Path(out["report"]).name)
+    assert len(names) == 2  # 유형이 다르면 파일도 다르다
+    assert any("질문형" in n for n in names) and any("후기형" in n for n in names)
+    rt.close()
+
+
+def test_worker_reports_not_ok_when_a_manuscript_is_unfinished(tmp_path, monkeypatch):
+    """검증을 끝내 통과 못 하면 성공이라고 보고하지 않는다 (사용자 절대 규칙)."""
+    from tests.test_engine import make_runtime
+
+    rt = make_runtime(tmp_path)
+    rt.settings.repo_root = tmp_path
+    rt._llm = FakeLLM(body=BODY.replace("별로 달라지는게 없더라구요", "프레임이 아예 다르더라구요"))
+    rt._llm_ready = True
+    monkeypatch.setattr(
+        "v2r.sources.keyword_list.load_pushed_keywords",
+        lambda brand, cfg=None, xlsx_path=None, limit=0: [
+            {"keyword": KEYWORD, "cafe": "씨씨앙"}
+        ],
+    )
+    out = worker._generate_brand(rt, parse_korean_command("우아덤 원고 1개 만들어줘"))
+    assert out["ok"] is False and out["incomplete"] == [KEYWORD]
+    assert "미완성" in out["message"]
+    assert "미완성" in Path(out["report"]).read_text(encoding="utf-8")
     rt.close()
 
 

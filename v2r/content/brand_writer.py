@@ -70,8 +70,9 @@ ACCOUNT_ROLES_BY_TYPE: dict[str, dict[str, str]] = {
     "후기형": {"대대댓글2": "여분 댓글풀 계정(A6)", "대대대댓글2": "본문 작성자"},
 }
 
-#: 원고 한 건당 최대 시도 횟수 (본문·댓글 각각). 사용자 지시 2026-09-19
-MAX_ATTEMPTS = 6
+#: 원고 한 건당 최대 시도 횟수 (본문·댓글 각각). 사용자 지시 2026-09-19,
+#: 2026-09-21에 6 → 10으로 올렸다 (그래도 못 지키면 `ok: False`로 보고한다)
+MAX_ATTEMPTS = 10
 
 #: 기본 생성 방식. `single` = 본문 호출 + 댓글 호출(2번), `combined` = 한 번에(1번).
 #: 명령에서 `한번에` 라고 적으면 combined 로 바뀐다.
@@ -84,6 +85,8 @@ LENGTH_TOLERANCE = 1.15
 SOFT_LIMIT_FACTOR = 2.0  # 사용자 결정(2026-09-19): 상한의 100% 초과만 실패, 그 이하는 경고
 
 #: 결과물에 새어 나오면 안 되는 작업용 내부 용어 (평가 2026-09-19 공통문제 7)
+#: "규칙"은 뺐다 — "근무 불규칙한" 같은 평범한 말에 걸려 멀쩡한 원고를 떨어뜨렸다
+#: (사용자 지시 2026-09-21).
 INTERNAL_TERMS: tuple[str, ...] = (
     "프레임",
     "페르소나",
@@ -92,7 +95,6 @@ INTERNAL_TERMS: tuple[str, ...] = (
     "원고",
     "댓글1",
     "대댓글",
-    "규칙",
 )
 
 #: 브랜드를 꺼낸 뒤 스스로 힘을 빼는 말 (평가 2026-09-19 공통문제 2)
@@ -231,6 +233,21 @@ class BrandRule:
     body_structure: tuple[str, ...] = ()
     body_notes: tuple[str, ...] = ()
     comment_notes: tuple[str, ...] = ()
+
+    @property
+    def extra_placeholder_after_paragraph(self) -> int:
+        """추가 자리표시자를 몇 번째 문단 뒤에 둘지.
+
+        `body_structure`에 그 토큰이 적혀 있으면(예: 팥순이 후기형의
+        "병행 효과 (여기에 {B/A} 표시)") 그 항목 번호를 쓰고, 없으면 맨 뒤다.
+        """
+        token = self.extra_placeholder
+        if not token:
+            return 0
+        for i, item in enumerate(self.body_structure, start=1):
+            if token in item:
+                return i
+        return len(self.body_structure) or 99
 
     @property
     def comment_max(self) -> int:
@@ -530,6 +547,81 @@ def placeholder_paragraph_index(body: str) -> int:
             return count
         count += 1
     return -1
+
+
+def leaked_internal_terms(text: str) -> list[str]:
+    """글에 **낱말로** 새어 나온 내부 용어 목록 (사용자 지시 2026-09-21).
+
+    앞에 다른 한글 글자가 붙어 있으면 그 용어가 아니라 **다른 낱말의 일부**로 본다.
+    (`불규칙` 안의 `규칙`, `사본문서` 안의 `본문` 같은 오탐을 막는다.)
+    빈칸은 하나로 줄여서 보되 없애지는 않는다 — 없애면 낱말 경계가 사라진다.
+    """
+    spaced = re.sub(r"\s+", " ", strip_placeholders(text or ""))
+    return [
+        term
+        for term in INTERNAL_TERMS
+        if re.search(r"(?<![가-힣])" + re.escape(term), spaced)
+    ]
+
+
+def _drop_token(body: str, token: str) -> str:
+    """자리표시자 토큰을 본문에서 전부 지우고 빈 줄을 정리한다."""
+    out = (body or "").replace(token, "")
+    out = re.sub(r"(?m)^[ \t]+$", "", out)
+    return re.sub(r"\n{3,}", "\n\n", out).strip("\n")
+
+
+def insert_placeholder(body: str, token: str, after_paragraph: int) -> str:
+    """`token`을 **정해진 문단 뒤**에 단독 줄로 넣어 준다 (결정적 보정).
+
+    자리표시자 위치는 브랜드 규칙이 이미 정해 둔 값이라 모델에게 맡길 일이
+    아니다 (사용자 지시 2026-09-21). 이미 들어 있던 같은 토큰은 지우고
+    다시 제자리에 넣는다. 문단 수가 모자라면 맨 뒤에 붙인다.
+    """
+    return _place_tokens(body, [(token, after_paragraph)])
+
+
+def _place_tokens(body: str, wanted: list[tuple[str, int]]) -> str:
+    """여러 자리표시자를 **글 문단 기준** 위치에 한 번에 넣는다.
+
+    위치를 셀 때 자리표시자 줄은 문단으로 세지 않는다 (서로 밀지 않게).
+    """
+    clean = body or ""
+    for token, _ in wanted:
+        clean = _drop_token(clean, token)
+    blocks = paragraphs(clean)
+    if not blocks:
+        return body or ""
+    plan = [
+        (min(max(int(after), 1), len(blocks)), token)
+        for token, after in wanted
+        if token
+    ]
+    for idx, token in sorted(plan, key=lambda item: -item[0]):
+        blocks.insert(idx, token)
+    return "\n\n".join(blocks)
+
+
+def drop_bare_keyword_paragraphs(body: str, keyword: str) -> str:
+    """키워드만 덩그러니 적힌 문단을 지운다.
+
+    모델이 `{키워드}` 대신 키워드 값을 한 줄 짜리 문단으로 써 버리는 일이 잦다.
+    그 줄은 자리표시자 노릇을 하려던 것이라 글에 남으면 뜬금없이 읽힌다.
+    """
+    needle = _squash(keyword)
+    if not needle:
+        return body or ""
+    keep = [p for p in paragraphs(body) if _squash(p) != needle]
+    return "\n\n".join(keep)
+
+
+def apply_placeholders(body: str, rule: "BrandRule", keyword: str = "") -> str:
+    """브랜드 규칙이 요구하는 자리표시자를 본문에 결정적으로 넣는다."""
+    out = drop_bare_keyword_paragraphs(body, keyword) if keyword else (body or "")
+    wanted = [("{키워드}", rule.placeholder_after_paragraph)]
+    if rule.extra_placeholder:
+        wanted.append((rule.extra_placeholder, rule.extra_placeholder_after_paragraph))
+    return _place_tokens(out, wanted)
 
 
 def opening_word(body: str) -> str:
@@ -1000,6 +1092,33 @@ def build_partial_retry_prompt(
     return system, user
 
 
+def build_body_fix_user(keyword: str, body: str, problems: list[str]) -> str:
+    """본문을 **처음부터 다시 쓰지 않고 고쳐 쓰게** 하는 user 프롬프트.
+
+    통째로 다시 쓰게 하면 모델이 매번 새 글을 뽑아 같은 항목에서 또 걸린다
+    (2026-09-21 재시도 실패 원인). 직전 본문을 그대로 돌려주고 **걸린 곳만**
+    손보게 하면 같은 실패를 되풀이하지 않는다. `system` 프롬프트는
+    `build_body_prompt` 가 만든 것을 그대로 다시 쓴다 (캐시도 그대로 탄다).
+    """
+    return "\n".join(
+        [
+            f"작성 키워드: {keyword}",
+            "",
+            "<직전에 쓴 본문 — 이 글을 **살려서 고쳐 쓴다**>",
+            "```",
+            strip_placeholders(body or "").strip(),
+            "```",
+            "",
+            "<이 본문이 어긴 규칙 — 이것만 고쳐라>",
+            *(f"- {p}" for p in problems),
+            "",
+            "고칠 곳만 손보고 나머지 문장·말투·흐름은 그대로 둔다.",
+            "자리표시자(`{키워드}` `{B/A}`)는 넣지 마라 — 그건 프로그램이 알아서 넣는다.",
+            '고친 본문 전체를 `{"body": "..."}` 형식 JSON 하나로 돌려라',
+        ]
+    )
+
+
 def failing_comment_labels(checks: list[dict]) -> list[str]:
     """검증 결과에서 **문제가 있는 댓글 라벨**만 추려 낸다."""
     found: set[str] = set()
@@ -1097,8 +1216,14 @@ def validate(
     )
 
     hits = keyword_hits(body, keyword)
+    short = max(rule.keyword_count - hits, 0)
     checks.append(
-        _check("키워드 포함 횟수", f"{rule.keyword_count}회 이상", f"{hits}회", hits >= rule.keyword_count)
+        _check(
+            "키워드 포함 횟수",
+            f"`{keyword}` 를 글자 그대로 {rule.keyword_count}회 이상",
+            f"{hits}회" + (f" — `{keyword}` 가 들어간 문장 {short}개를 더 넣어야 한다" if short else ""),
+            hits >= rule.keyword_count,
+        )
     )
 
     squashed = _squash(body)
@@ -1112,8 +1237,7 @@ def validate(
         )
     )
 
-    bare = _squash(strip_placeholders(body))
-    leaked = [w for w in INTERNAL_TERMS if w in bare]
+    leaked = leaked_internal_terms(body)
     checks.append(
         _check(
             "내부 용어 미노출",
@@ -1237,8 +1361,7 @@ def validate(
         {
             f"{c.label}({w})"
             for c in manuscript.comments
-            for w in INTERNAL_TERMS
-            if w in _squash(c.text)
+            for w in leaked_internal_terms(c.text)
         }
     )
     checks.append(
@@ -1525,7 +1648,11 @@ def generate_manuscript(
     body_bad: list[str] = []
     body_attempts = 0
     for body_attempts in range(1, cap + 1):
-        user = body_user + (_retry_note(body_bad) if body_bad else "")
+        if draft is not None and body_bad:
+            # 두 번째 시도부터는 **직전 본문을 고쳐 쓰게** 한다 (통째로 다시 쓰지 않는다)
+            user = build_body_fix_user(keyword, draft.body, body_bad)
+        else:
+            user = body_user
         try:
             data = llm.complete_json("brand_body", body_sys, user, max_tokens=2500)
         except Exception as exc:  # 모델 오류는 재시도로 풀리지 않는다
@@ -1533,11 +1660,15 @@ def generate_manuscript(
         if not isinstance(data, dict):
             body_bad = ["출력 형식 — 기준 JSON 객체 하나 인데 실제 다른 형식"]
             continue
-        title = _as_text(data.get("title") or data.get("제목"))
+        title = _as_text(data.get("title") or data.get("제목")) or (
+            draft.title if draft else ""
+        )
         body = _clean_body(_as_text(data.get("body") or data.get("본문")))
         if not body:
             body_bad = ["본문 — 기준 내용이 있어야 함 인데 실제 비어 있음"]
             continue
+        # 자리표시자는 규칙이 자리를 정해 둔 값이라 **코드가** 넣는다 (모델에게 맡기지 않는다)
+        body = apply_placeholders(body, rule, keyword)
         candidate = Manuscript(
             title=title,
             body=body,
@@ -1616,6 +1747,8 @@ def _retry_repeated_opening(
     if not isinstance(data, dict):
         return 1
     body = _clean_body(_as_text(data.get("body") or data.get("본문")))
+    if body:
+        body = apply_placeholders(body, rule, keyword)
     title = _as_text(data.get("title") or data.get("제목")) or draft.title
     if not body or opening_word(body) in words:
         return 1
@@ -1686,7 +1819,10 @@ def _finish(
 ) -> None:
     """해시를 다시 찍고 `stats`(시도 횟수·남은 위반·토큰·어림 비용)를 채운다."""
     draft.content_hash = content_hash(draft.title, draft.body)
-    unresolved = violations(validate(draft, rule, recent_openings=recent_openings))
+    checks = validate(draft, rule, recent_openings=recent_openings)
+    unresolved = violations(checks)
+    # 경고를 뺀 **필수 실패**만 따로 — 이게 남으면 원고는 미완성이다
+    hard = violations(checks, include_warnings=False)
     if stats is None:
         return
     from v2r.llm.router import estimate_cost
@@ -1696,6 +1832,8 @@ def _finish(
     stats["comment_attempts"] = comment_attempts
     stats["attempts"] = body_attempts + comment_attempts
     stats["unresolved"] = unresolved
+    stats["unresolved_hard"] = hard
+    stats["ok"] = not hard
     stats["hit_cap"] = bool(unresolved) and (
         body_attempts >= cap or comment_attempts >= cap
     )
@@ -1809,6 +1947,7 @@ def _generate_combined(
         if not body:
             bad_all = ["본문 — 기준 내용이 있어야 함 인데 실제 비어 있음"]
             continue
+        body = apply_placeholders(body, rule, keyword)
         candidate = Manuscript(
             title=title,
             body=body,
@@ -1887,9 +2026,18 @@ def review_block(manuscript: Manuscript, heading_level: int = 2) -> str:
     roles = dict(ACCOUNT_ROLES_COMMON)
     roles.update(ACCOUNT_ROLES_BY_TYPE.get(rule.manuscript_type, {}))
     h = "#" * heading_level
+    checks_all = validate(manuscript, rule)
+    hard_fail = [c for c in checks_all if c["필수"] and not c["통과"]]
+    status = (
+        f"미완성 — 검증 실패 {len(hard_fail)}개 ({', '.join(c['항목'] for c in hard_fail)})"
+        if hard_fail
+        else "완료 — 검증 전부 통과"
+    )
     out: list[str] = [
-        f"{h} {manuscript.keyword} ({rule.brand} / {rule.manuscript_type})",
+        f"{h} {manuscript.keyword} ({rule.brand} / {rule.manuscript_type})"
+        + (" — 미완성" if hard_fail else ""),
         "",
+        f"- 상태: **{status}**",
         f"- 키워드: `{manuscript.keyword}`",
         f"- 카페: {manuscript.cafe or '(지정 없음)'}",
         f"- 원고유형: {rule.manuscript_type}",
@@ -1917,7 +2065,7 @@ def review_block(manuscript: Manuscript, heading_level: int = 2) -> str:
             f" {_md_escape(node.text)} |"
         )
     out += ["", f"{h}# 검증 결과", "", "| 항목 | 기준 | 실제 | 결과 |", "|---|---|---|---|"]
-    for check in validate(manuscript, rule):
+    for check in checks_all:
         mark = "통과" if check["통과"] else ("실패" if check["필수"] else "경고")
         out.append(
             f"| {_md_escape(check['항목'])} | {_md_escape(check['기준'])} |"
@@ -1939,7 +2087,17 @@ def write_review_md(
     head = title or (
         f"브랜드 원고 검토 — {brand_of(items[0]) if items else ''}"
     )
+    unfinished = [
+        m for m in items if any(c["필수"] and not c["통과"] for c in validate(m))
+    ]
     parts = [f"# {head}", "", f"원고 {len(items)}건. 발행하지 않았고 시트에도 쓰지 않았다.", ""]
+    if unfinished:
+        parts += [
+            f"> **미완성 {len(unfinished)}건**: "
+            + ", ".join(f"`{m.keyword}`" for m in unfinished)
+            + " — 검증을 끝내 통과하지 못했다. 그대로 쓰면 안 된다.",
+            "",
+        ]
     for m in items:
         parts.append(review_block(m, heading_level=2))
     target.write_text("\n".join(parts), encoding="utf-8")
@@ -1969,6 +2127,10 @@ __all__ = [
     "methods_already_tried",
     "opening_word",
     "placeholder_paragraph_index",
+    "leaked_internal_terms",
+    "insert_placeholder",
+    "apply_placeholders",
+    "build_body_fix_user",
     "build_body_prompt",
     "build_comments_prompt",
     "failures",

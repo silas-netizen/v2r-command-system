@@ -329,3 +329,87 @@ def test_failing_labels_route_new_checks_into_partial_retry():
     labels = bw.failing_comment_labels(bw.validate(bad))
     assert "댓글5" in labels and "대대댓글2" in labels
     assert "댓글1" not in labels
+
+
+# --- 2026-09-21 수정: 내부 용어 오탐 / 자리표시자 결정적 보정 / 미완성 표시 ----
+def test_internal_term_check_ignores_words_that_only_contain_the_term():
+    """`근무 불규칙한` 같은 평범한 말이 내부 용어로 잡히면 안 된다."""
+    body = BODY.replace("거울 볼 때마다 속상해요", "근무가 불규칙한 편이라 더 그래요")
+    assert bw.leaked_internal_terms(body) == []
+    assert _row("내부 용어 미노출", bw.validate(_manuscript(body=body)))["통과"] is True
+    # 댓글도 마찬가지
+    ok = _manuscript(comments=bw._comment_nodes(dict(COMMENTS, 댓글1="근무 불규칙한 사람은 더 힘들어요")))
+    assert _row("댓글 내부 용어 미노출", bw.validate(ok))["통과"] is True
+
+
+def test_rule_word_is_no_longer_an_internal_term():
+    assert "규칙" not in bw.INTERNAL_TERMS
+
+
+def test_internal_term_still_caught_as_a_real_word():
+    body = BODY.replace("거울 볼 때마다 속상해요", "프레임이 아예 다르더라구요")
+    assert bw.leaked_internal_terms(body) == ["프레임"]
+    assert _row("내부 용어 미노출", bw.validate(_manuscript(body=body)))["통과"] is False
+
+
+def test_placeholder_is_inserted_by_code_at_the_fixed_paragraph():
+    """`{키워드}`는 모델이 아니라 코드가 정해진 문단 뒤에 넣는다."""
+    rule = bw.rule_for("우아덤", "질문형")
+    naked = bw.strip_placeholders(BODY)
+    fixed = bw.apply_placeholders(naked, rule)
+    assert bw.placeholder_paragraph_index(fixed) == rule.placeholder_after_paragraph == 2
+    # 엉뚱한 자리에 있던 것도 제자리로 옮겨 준다
+    moved = "{키워드}\n\n" + naked
+    assert bw.placeholder_paragraph_index(bw.apply_placeholders(moved, rule)) == 2
+    # 이미 제자리면 개수가 늘지 않는다
+    assert bw.apply_placeholders(fixed, rule).count("{키워드}") == 1
+
+
+def test_extra_placeholder_goes_after_its_structure_paragraph():
+    """팥순이 후기형의 `{B/A}` 도 코드가 넣는다 (병행 효과 문단 뒤 = 4번째)."""
+    rule = bw.rule_for("팥순이", "후기형")
+    assert rule.extra_placeholder == "{B/A}"
+    assert rule.extra_placeholder_after_paragraph == 4
+    body = "\n\n".join(f"문단{i}" for i in range(1, 6))
+    out = bw.apply_placeholders(body, rule)
+    blocks = bw.paragraphs(out)
+    assert blocks[1] == "{키워드}"  # 첫 문단 뒤
+    assert blocks.index("{B/A}") == 5  # 자리표시자 1개가 앞에 끼어 있으므로 5번째 자리
+    assert blocks[4] == "문단4" and blocks[6] == "문단5"
+    assert out.count("{B/A}") == 1
+
+
+def test_bare_keyword_paragraph_is_removed_before_placing():
+    """모델이 `{키워드}` 대신 키워드 값을 한 줄로 써 두면 그 줄은 지운다."""
+    rule = bw.rule_for("우아덤", "질문형")
+    body = bw.strip_placeholders(BODY).strip() + f"\n\n{KEYWORD}\n"
+    out = bw.apply_placeholders(body, rule, KEYWORD)
+    assert KEYWORD not in bw.paragraphs(out)  # 덩그러니 남은 줄은 없다
+    assert bw.placeholder_paragraph_index(out) == 2
+    # 키워드를 안 주면 예전처럼 건드리지 않는다
+    assert KEYWORD in bw.paragraphs(bw.apply_placeholders(body, rule))
+
+
+def test_keyword_shortfall_message_says_how_many_to_add():
+    """키워드 횟수 부족은 `몇 개 더 넣어야 하는지`까지 말해 준다."""
+    body = BODY.replace("예전에 비타민C 크림도 발라봤는데", "예전에 크림도 발라봤는데")
+    row = _row("키워드 포함 횟수", bw.validate(_manuscript(body=body)))
+    assert row["통과"] is False
+    assert "1개를 더 넣어야 한다" in row["실제"] and KEYWORD in row["기준"]
+
+
+def test_body_fix_prompt_revises_instead_of_rewriting():
+    user = bw.build_body_fix_user(KEYWORD, BODY, ["키워드 포함 횟수 — 기준 4회 인데 실제 2회"])
+    assert "직전에 쓴 본문" in user and "이것만 고쳐라" in user
+    assert "키워드 포함 횟수" in user
+    assert "그건 프로그램이 알아서 넣는다" in user
+
+
+def test_review_md_marks_unfinished_manuscripts(tmp_path):
+    """검증을 통과 못 한 원고는 검토 파일에 `미완성`이라고 적는다."""
+    bad = _manuscript(body=BODY.replace("거울 볼 때마다 속상해요", "프레임이 아예 다르더라구요"))
+    path = bw.write_review_md([bad], tmp_path / "r.md")
+    text = path.read_text(encoding="utf-8")
+    assert "미완성 1건" in text and "미완성 — 검증 실패" in text
+    good = bw.write_review_md([_manuscript()], tmp_path / "ok.md").read_text(encoding="utf-8")
+    assert "미완성" not in good and "완료 — 검증 전부 통과" in good
