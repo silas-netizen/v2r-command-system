@@ -114,7 +114,7 @@ def export_cookies(cookies: list[dict[str, Any]], path: Path, extra_targets: lis
 
 
 # --- 브라우저 -----------------------------------------------------------------
-def _launch(path: Path, headless: bool):
+def _launch(path: Path, headless: bool, user_agent: str | None = None):
     from playwright.sync_api import sync_playwright
 
     path.mkdir(parents=True, exist_ok=True)
@@ -128,6 +128,8 @@ def _launch(path: Path, headless: bool):
                 viewport={"width": 1280, "height": 900},
                 locale="ko-KR",
             )
+            if user_agent:
+                kwargs["user_agent"] = user_agent
             if channel:
                 kwargs["channel"] = channel
             context = playwright.chromium.launch_persistent_context(str(path), **kwargs)
@@ -182,6 +184,7 @@ def login_interactive(profile_dir: str | Path | None = None, timeout: int = LOGI
             page.goto(TOUCH_URL, wait_until="domcontentloaded", timeout=60000)
             if not _looks_logged_out(page) and has_login_cookies(_cookies(context)):
                 export_cookies(_cookies(context), cookies_path(path), web_crawler_cookie_targets())
+                remember_user_agent(page, path)
                 print("이미 로그인돼 있습니다. 세션을 연장하고 쿠키를 갱신했습니다.", flush=True)
                 return True
         page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
@@ -200,6 +203,7 @@ def login_interactive(profile_dir: str | Path | None = None, timeout: int = LOGI
                 if _looks_logged_out(page):
                     continue
                 n = export_cookies(_cookies(context), cookies_path(path), web_crawler_cookie_targets())
+                remember_user_agent(page, path)
                 print(f"네이버 로그인 확인됨. 쿠키 {n}개 저장. 이제 창을 닫아도 됩니다.", flush=True)
                 return True
             if time.monotonic() >= next_notice:
@@ -210,17 +214,87 @@ def login_interactive(profile_dir: str | Path | None = None, timeout: int = LOGI
         _close(playwright, context, page)
 
 
-# --- 점검·연장(매일) ------------------------------------------------------------
-def check_naver_session(profile_dir: str | Path | None = None) -> dict:
-    """헤드리스로 프로필을 열어 로그인 유지 여부를 확인하고 세션을 연장한다."""
-    path = Path(profile_dir) if profile_dir is not None else default_profile_dir()
+# --- 프로필 백업/복구 (수단 2: 프로필이 깨져도 되살린다) -------------------------
+BACKUP_SUFFIX = ".bak"
+#: 백업에서 뺄 큰 캐시 폴더
+_BACKUP_IGNORE = ("Cache", "Code Cache", "GPUCache", "DawnGraphiteCache", "DawnWebGPUCache",
+                  "ShaderCache", "GrShaderCache", "Service Worker", "CacheStorage")
+#: 남은 유지 기간이 이보다 짧으면(연장이 안 먹는 것) 미리 알린다
+EARLY_WARN_DAYS = 3.0
+UA_FILENAME = "naver_ua.txt"
+
+
+def backup_dir(path: Path) -> Path:
+    return path.with_name(path.name + BACKUP_SUFFIX)
+
+
+def backup_profile(path: Path) -> bool:
+    """로그인 확인된 프로필을 통째로 백업(캐시 제외). 실패해도 점검은 계속."""
+    import shutil
+
+    dst = backup_dir(path)
+    tmp = dst.with_name(dst.name + ".tmp")
+    try:
+        if tmp.exists():
+            shutil.rmtree(tmp, ignore_errors=True)
+        shutil.copytree(path, tmp, ignore=shutil.ignore_patterns(*_BACKUP_IGNORE), dirs_exist_ok=True)
+        if dst.exists():
+            shutil.rmtree(dst, ignore_errors=True)
+        tmp.rename(dst)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        log.warning("프로필 백업 실패: %s", exc)
+        return False
+
+
+def restore_profile(path: Path) -> bool:
+    """백업으로 되돌린다(깨진 현재 프로필은 `.broken`으로 치워 둔다)."""
+    import shutil
+
+    src = backup_dir(path)
+    if not src.is_dir():
+        return False
+    try:
+        broken = path.with_name(path.name + ".broken")
+        if broken.exists():
+            shutil.rmtree(broken, ignore_errors=True)
+        if path.exists():
+            path.rename(broken)
+        shutil.copytree(src, path)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        log.warning("프로필 복구 실패: %s", exc)
+        return False
+
+
+def ua_path(path: Path) -> Path:
+    return path.parent / UA_FILENAME
+
+
+def remember_user_agent(page, path: Path) -> None:
+    """로그인 창(보이는 크롬)의 UA를 기록 → 헤드리스 점검도 같은 UA로 (수단 3: 기기 바뀐 척 안 함)."""
+    try:
+        ua = page.evaluate("navigator.userAgent")
+        if ua and "Headless" not in ua:
+            ua_path(path).write_text(str(ua), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def saved_user_agent(path: Path) -> str | None:
+    try:
+        text = ua_path(path).read_text(encoding="utf-8").strip()
+        return text or None
+    except Exception:
+        return None
+
+
+# --- 점검·연장 (하루 4회, 수단 1: 방문할 때마다 NID_SES가 30일로 다시 발급된다 — 실측 2026-09-21) ---
+def _check_once(path: Path) -> dict:
     out: dict[str, Any] = {"ok": True, "logged_in": False, "profile": str(path), "note": ""}
-    if not path.is_dir():
-        out["note"] = "프로필 폴더가 없습니다 (아직 한 번도 로그인하지 않음)."
-        return out
     playwright = context = page = None
     try:
-        playwright, context, page = _launch(path, headless=True)
+        playwright, context, page = _launch(path, headless=True, user_agent=saved_user_agent(path))
         before = _cookies(context)
         if not has_login_cookies(before):
             out["note"] = "로그인 쿠키(NID_AUT/NID_SES) 없음 → 풀림"
@@ -231,6 +305,7 @@ def check_naver_session(profile_dir: str | Path | None = None) -> dict:
         except Exception as exc:  # noqa: BLE001
             out["note"] = f"네이버 접속 실패({exc.__class__.__name__}) → 판정 보류(쿠키는 있음)"
             out["logged_in"] = True
+            out["unverified"] = True
             return out
         after = _cookies(context)
         if _looks_logged_out(page) or not has_login_cookies(after):
@@ -240,7 +315,7 @@ def check_naver_session(profile_dir: str | Path | None = None) -> dict:
         expiry = login_cookie_expiry(after)
         out.update(logged_in=True, note=f"세션 연장 방문 완료, 쿠키 {n}개 저장")
         if expiry:
-            out["expires_in_days"] = round((expiry - time.time()) / 86400, 1)
+            out["expires_in_days"] = round((expiry - time.time()) / 86400, 2)
         return out
     except Exception as exc:  # noqa: BLE001
         out["ok"] = False
@@ -250,13 +325,43 @@ def check_naver_session(profile_dir: str | Path | None = None) -> dict:
         _close(playwright, context, page)
 
 
+def check_naver_session(profile_dir: str | Path | None = None) -> dict:
+    """로그인 유지 점검·연장. 순서: 점검 → (풀림/실패면) 백업으로 복구 후 재점검 → (OK면) 백업 갱신.
+
+    반환 `warnings`: 연장이 안 먹어 남은 기간이 짧을 때 등, 사람이 봐야 할 것.
+    """
+    path = Path(profile_dir) if profile_dir is not None else default_profile_dir()
+    if not path.is_dir() and not backup_dir(path).is_dir():
+        return {"ok": True, "logged_in": False, "profile": str(path),
+                "note": "프로필 폴더가 없습니다 (아직 한 번도 로그인하지 않음).", "warnings": []}
+    out = _check_once(path) if path.is_dir() else {"ok": False, "logged_in": False, "note": "프로필 없음"}
+    out.setdefault("warnings", [])
+    if not out.get("logged_in") and backup_dir(path).is_dir():
+        # 수단 2: 백업으로 되돌려 한 번 더
+        if restore_profile(path):
+            again = _check_once(path)
+            again.setdefault("warnings", [])
+            again["restored_from_backup"] = True
+            again["note"] = f"현재 프로필 풀림({out.get('note')}) → 백업으로 복구 후: {again.get('note')}"
+            out = again
+    if out.get("logged_in") and not out.get("unverified"):
+        out["backup"] = backup_profile(path)
+        days = out.get("expires_in_days")
+        if isinstance(days, (int, float)) and days < EARLY_WARN_DAYS:
+            out["warnings"].append(
+                f"세션 연장이 안 먹고 있습니다(남은 {days}일). 미리 scripts\\naver-login.cmd 로 다시 로그인해 두세요."
+            )
+    return out
+
+
 def main(argv: list[str] | None = None) -> int:
     import sys
 
     args = list(argv if argv is not None else sys.argv[1:])
     if "--check" in args:
         out = check_naver_session()
-        print(f"네이버 로그인 상태: {'OK' if out['logged_in'] else '풀림'} {out['note']}")
+        print(f"네이버 로그인 상태: {'OK' if out['logged_in'] else '풀림'} {out['note']} "
+              f"남은 {out.get('expires_in_days', '?')}일 백업 {out.get('backup')} 경고 {out.get('warnings')}")
         return 0 if out["logged_in"] else 1
     print(f"네이버 로그인 창을 엽니다. 프로필: {default_profile_dir()}")
     ok = login_interactive()

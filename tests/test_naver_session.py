@@ -66,3 +66,51 @@ def test_naver_keepalive_quiet_when_logged_in(monkeypatch):
     monkeypatch.setattr(worker, "notify_all", lambda channels, text, **kw: sent.append(text))
     out = worker._naver_keepalive(_RT(), None)
     assert out["logged_in"] and not sent
+
+
+def test_backup_and_restore_profile(tmp_path):
+    prof = tmp_path / "browser-profile-naver"
+    (prof / "Default" / "Cache").mkdir(parents=True)
+    (prof / "Default" / "Cookies").write_text("c", encoding="utf-8")
+    (prof / "Default" / "Cache" / "big").write_text("x" * 100, encoding="utf-8")
+    assert ns.backup_profile(prof)
+    bak = ns.backup_dir(prof)
+    assert (bak / "Default" / "Cookies").exists()
+    assert not (bak / "Default" / "Cache").exists()  # 캐시는 뺀다
+    (prof / "Default" / "Cookies").write_text("broken", encoding="utf-8")
+    assert ns.restore_profile(prof)
+    assert (prof / "Default" / "Cookies").read_text(encoding="utf-8") == "c"
+    assert (tmp_path / "browser-profile-naver.broken").exists()
+
+
+def test_check_restores_from_backup_when_logged_out(tmp_path, monkeypatch):
+    prof = tmp_path / "browser-profile-naver"
+    prof.mkdir()
+    ns.backup_dir(prof).mkdir()
+    calls = []
+
+    def fake_once(path):
+        calls.append(1)
+        return {"ok": True, "logged_in": len(calls) > 1, "note": "n", "expires_in_days": 30.0}
+
+    monkeypatch.setattr(ns, "_check_once", fake_once)
+    monkeypatch.setattr(ns, "backup_profile", lambda p: True)
+    out = ns.check_naver_session(prof)
+    assert out["logged_in"] and out["restored_from_backup"] and len(calls) == 2
+
+
+def test_check_warns_when_extension_not_working(tmp_path, monkeypatch):
+    prof = tmp_path / "browser-profile-naver"
+    prof.mkdir()
+    monkeypatch.setattr(ns, "_check_once", lambda p: {"ok": True, "logged_in": True, "note": "n", "expires_in_days": 1.5})
+    monkeypatch.setattr(ns, "backup_profile", lambda p: True)
+    out = ns.check_naver_session(prof)
+    assert out["warnings"] and "naver-login.cmd" in out["warnings"][0]
+
+
+def test_worker_notifies_warning_and_restore(monkeypatch):
+    sent = []
+    monkeypatch.setattr(ns, "check_naver_session", lambda: {"ok": True, "logged_in": True, "restored_from_backup": True, "warnings": ["w1"]})
+    monkeypatch.setattr(worker, "notify_all", lambda channels, text, **kw: sent.append(text))
+    worker._naver_keepalive(_RT(), None)
+    assert any("백업" in t for t in sent) and any("w1" in t for t in sent)

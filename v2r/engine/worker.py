@@ -811,6 +811,10 @@ def _naver_keepalive(rt: Runtime, spec: TaskSpec) -> dict:
     if not out.get("logged_in"):
         notify_all(rt.channels, RELOGIN_NOTICE)
         out["notified"] = True
+    elif out.get("restored_from_backup"):
+        notify_all(rt.channels, "네이버 세션: 현재 프로필이 풀려 백업으로 복구해 유지 중입니다.")
+    for warning in out.get("warnings") or []:
+        notify_all(rt.channels, f"네이버 세션 경고: {warning}")
     return out
 
 
