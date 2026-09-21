@@ -130,7 +130,10 @@ def check_session(
     돌려주는 값: `ok`, `logged_in`, `limited`, `mode`(file/os-store),
     `auth_method`, `notice`(사람에게 보낼 문구. 없으면 빈 문자열), `note`, `exe`.
     """
-    del data_dir  # 저장하거나 복사할 것이 없다 (위 설명 참고)
+    # data_dir: 자격증명 백업·복원 폴더(`data/claude-cli-backup`). 사용자 허용(2026-09-21):
+    # "자동 복원까지 허용. 로그인 유지가 원칙, 풀리면 알아서 방법을 찾을 것."
+    from v2r.llm import cli_credentials
+
     backend = backend or PlanBackend()
     out: dict[str, Any] = {
         "ok": False,
@@ -156,11 +159,22 @@ def check_session(
     if status:
         out["auth_method"] = str(status.get("authMethod") or "")
         out["logged_in"] = bool(status.get("loggedIn"))
+        if not out["logged_in"] and data_dir:
+            # 풀렸다 → 백업으로 되돌리고 한 번 더 본다 (사람에게 알리는 건 그다음)
+            if cli_credentials.restore(data_dir):
+                again = auth_status(backend.exe)
+                if again and again.get("loggedIn"):
+                    out["logged_in"] = True
+                    out["auth_method"] = str(again.get("authMethod") or "")
+                    out["restored_from_backup"] = True
+                    out["note"] = "로그인이 풀려 백업 자격증명으로 복원함"
         if not out["logged_in"]:
-            out["note"] = "claude auth status: loggedIn=false"
+            out["note"] = out.get("note") or "claude auth status: loggedIn=false"
             out["notice"] = RELOGIN_NOTICE
             return out
         out["ok"] = True
+        if data_dir:
+            cli_credentials.backup(data_dir)
         if not deep:
             return out
 
