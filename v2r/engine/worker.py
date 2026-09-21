@@ -464,6 +464,96 @@ def _generate_brand(rt: Runtime, spec: TaskSpec) -> dict:
     failed: list[dict] = []
     unresolved: list[dict] = []
     out_dir = Path(rt.settings.warehouse_dir) / "manuscripts" / "generated" / brand
+    # 명령에 `요금제로` / `api로` 가 있으면 그 길만 쓴다 (원래 값은 끝나고 되돌린다)
+    forced = (getattr(spec, "llm_backend", "") or "").strip()
+    previous_force = getattr(rt.llm, "force_backend", "")
+    if forced and hasattr(rt.llm, "force_backend"):
+        rt.llm.force_backend = forced
+    try:
+        made, failed, unresolved = _generate_brand_loop(
+            rt, spec, brand, todo, guide, examples, recent_openings, out_dir
+        )
+    finally:
+        if forced and hasattr(rt.llm, "force_backend"):
+            rt.llm.force_backend = previous_force
+
+    tokens = dict(getattr(rt.llm, "usage", {}) or {})
+    by_backend = tokens.get("by_backend") if isinstance(tokens, dict) else None
+    # 길별 건수 — 요금제 길로 만든 원고는 추가 비용이 0원이다
+    backends: dict[str, int] = {}
+    for _, s in made:
+        name = s.get("backend") or ""
+        if name:
+            backends[name] = backends.get(name, 0) + 1
+    # 원고유형이 다르면 파일도 달라야 한다 — 예전에는 팥순이 질문형·후기형이
+    # 같은 이름이라 뒤에 만든 쪽이 앞엣것을 덮어썼다 (사용자 지시 2026-09-21)
+    mtype = (spec.manuscript_type or "").strip()
+    stem = f"brand-draft-{brand}-{mtype}" if mtype else f"brand-draft-{brand}"
+    report = Path(rt.settings.repo_root) / "docs" / "reports" / f"{stem}-{spec.start_date}.md"
+    if made:
+        bw.write_review_md(
+            [m for m, _ in made],
+            report,
+            title=f"브랜드 원고 초안 — {brand} ({spec.start_date})",
+            stats=[s for _, s in made],
+        )
+    # 검증을 끝내 통과하지 못한 원고가 있으면 **성공이라고 하지 않는다**
+    # (사용자 절대 규칙: 통과분만 받는다, 2026-09-21)
+    incomplete = [u["keyword"] for u in unresolved if u.get("hard")]
+    plan_made = backends.get("plan", 0)
+    return {
+        "ok": bool(made) and not failed and not incomplete,
+        "brand": brand,
+        "generated": len(made),
+        "incomplete": incomplete,
+        "failed": failed,
+        "unresolved": unresolved,
+        "attempts": {m.keyword: s.get("attempts", 0) for m, s in made},
+        "keywords": [m.keyword for m, _ in made],
+        "report": str(report) if made else "",
+        "message": (
+            (
+                f"{brand} 원고 {len(made)}건 중 {len(incomplete)}건이 **미완성**입니다"
+                f" ({', '.join(incomplete)} — 검증을 끝내 통과하지 못했습니다)."
+                f" 검토용 문서: {report}"
+                if incomplete
+                else f"{brand} 원고 {len(made)}건을 만들었습니다."
+                + (f" 그중 {plan_made}건은 요금제 길이라 비용 0원입니다." if plan_made else "")
+                + f" 검토용 문서: {report}"
+            )
+            if made
+            else f"{brand} 원고를 만들지 못했습니다"
+        ),
+        "tokens": tokens,
+        "by_backend": by_backend or {},
+        # 길별 건수 (`plan`은 구독 안이라 추가 비용 0원)
+        "backends": backends,
+        "backend_costs_usd": {
+            name: (0.0 if name != "api" else None) for name in backends
+        },
+        "llm_backend": forced,
+        # 2026-09 기준 추정 단가로 어림한 값이다 (실제 요금표 확인 필요)
+        "estimated_usd": estimate_cost(tokens),
+        "mode": (spec.generate_mode or bw.DEFAULT_MODE),
+    }
+
+
+def _generate_brand_loop(
+    rt: Runtime,
+    spec: TaskSpec,
+    brand: str,
+    todo: list[dict],
+    guide: str,
+    examples: Any,
+    recent_openings: Any,
+    out_dir: Path,
+) -> tuple[list, list[dict], list[dict]]:
+    """키워드 목록을 돌며 원고를 만든다 (결과 정리는 부르는 쪽에서)."""
+    from v2r.content import brand_writer as bw
+
+    made: list[Any] = []
+    failed: list[dict] = []
+    unresolved: list[dict] = []
     for item in todo:
         stats: dict = {}
         try:
@@ -495,48 +585,7 @@ def _generate_brand(rt: Runtime, spec: TaskSpec) -> dict:
                 }
             )
         made.append((m, stats))
-
-    tokens = dict(getattr(rt.llm, "usage", {}) or {})
-    # 원고유형이 다르면 파일도 달라야 한다 — 예전에는 팥순이 질문형·후기형이
-    # 같은 이름이라 뒤에 만든 쪽이 앞엣것을 덮어썼다 (사용자 지시 2026-09-21)
-    mtype = (spec.manuscript_type or "").strip()
-    stem = f"brand-draft-{brand}-{mtype}" if mtype else f"brand-draft-{brand}"
-    report = Path(rt.settings.repo_root) / "docs" / "reports" / f"{stem}-{spec.start_date}.md"
-    if made:
-        bw.write_review_md(
-            [m for m, _ in made],
-            report,
-            title=f"브랜드 원고 초안 — {brand} ({spec.start_date})",
-        )
-    # 검증을 끝내 통과하지 못한 원고가 있으면 **성공이라고 하지 않는다**
-    # (사용자 절대 규칙: 통과분만 받는다, 2026-09-21)
-    incomplete = [u["keyword"] for u in unresolved if u.get("hard")]
-    return {
-        "ok": bool(made) and not failed and not incomplete,
-        "brand": brand,
-        "generated": len(made),
-        "incomplete": incomplete,
-        "failed": failed,
-        "unresolved": unresolved,
-        "attempts": {m.keyword: s.get("attempts", 0) for m, s in made},
-        "keywords": [m.keyword for m, _ in made],
-        "report": str(report) if made else "",
-        "message": (
-            (
-                f"{brand} 원고 {len(made)}건 중 {len(incomplete)}건이 **미완성**입니다"
-                f" ({', '.join(incomplete)} — 검증을 끝내 통과하지 못했습니다)."
-                f" 검토용 문서: {report}"
-                if incomplete
-                else f"{brand} 원고 {len(made)}건을 만들었습니다. 검토용 문서: {report}"
-            )
-            if made
-            else f"{brand} 원고를 만들지 못했습니다"
-        ),
-        "tokens": tokens,
-        # 2026-09 기준 추정 단가로 어림한 값이다 (실제 요금표 확인 필요)
-        "estimated_usd": estimate_cost(tokens),
-        "mode": (spec.generate_mode or bw.DEFAULT_MODE),
-    }
+    return made, failed, unresolved
 
 
 def _generate_daily(rt: Runtime, spec: TaskSpec) -> dict:
@@ -874,6 +923,33 @@ def _web_keepalive(rt: Runtime, spec: TaskSpec) -> dict:
             res["notified"] = True
         elif res.get("restored_from_backup"):
             notify_all(rt.channels, f"{site.name} 세션: 풀려서 백업으로 복구해 유지 중입니다.")
+    return out
+
+
+def _plan_keepalive(rt: Runtime, spec: TaskSpec) -> dict:
+    """요금제(Claude Code) 로그인이 살아 있는지 짧은 호출로 확인한다.
+
+    사용자 철칙 "로그인은 1회 후 절대 유지" — 이 점검이 매일 세션을 건드려
+    준다. 풀렸으면 `scripts\\claude-cli-login.cmd` 를 돌리라고 알린다.
+    """
+    from v2r.llm.plan_session import check_session
+
+    del spec
+    out = check_session(rt.settings.data_dir)
+    # 한도에 걸린 상태면 라우터도 그 사실을 알고 있어야 한다 (5시간 잠금)
+    if out.get("limited") and rt.llm is not None and hasattr(rt.llm, "lock_plan"):
+        try:
+            rt.llm.lock_plan(out.get("note") or "요금제 한도")
+        except Exception:  # pragma: no cover - 잠금 실패가 점검을 망치면 안 된다
+            pass
+    if out.get("notice"):
+        notify_all(rt.channels, out["notice"])
+        out["notified"] = True
+    out["message"] = (
+        "요금제 길 로그인 정상입니다."
+        if out.get("ok")
+        else (out.get("notice") or out.get("note") or "요금제 길 점검 실패")
+    )
     return out
 
 
@@ -1659,6 +1735,8 @@ def dispatch(rt: Runtime, job: Any, owner: str | None = None) -> dict:
         return _naver_keepalive(rt, spec)
     if task == "web_keepalive":
         return _web_keepalive(rt, spec)
+    if task == "plan_keepalive":
+        return _plan_keepalive(rt, spec)
     if task == "request_photos":
         return _request_photos(rt, spec)
     if task == "wash_photos":

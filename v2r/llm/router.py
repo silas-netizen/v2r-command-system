@@ -2,13 +2,39 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import os
+from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 from .anthropic import LLMDisabled, create_message, make_client
+from .plan_backend import PlanBackend, PlanError, PlanLimit, PlanNotLoggedIn
 
 log = logging.getLogger(__name__)
+
+#: 길(백엔드) 이름. 설계서 `quality-parity-strategy-2026-09-21.md` §길 표.
+#: - `plan`  요금제(구독) — Claude Code 비대화 실행. 추가 비용 0원.
+#: - `batch` 배치 API — 아직 안 만들었다. 자리만 잡아 두고 다음 길로 넘어간다.
+#: - `api`   일반 API — 기존 길.
+BACKENDS = ("plan", "batch", "api")
+
+#: 설정이 없을 때 쓰는 차례
+DEFAULT_BACKEND_ORDER = ("plan", "batch", "api")
+
+#: `LLMRouter()`를 직접 만들 때의 차례 (예전 동작 그대로)
+LEGACY_BACKEND_ORDER = ("api",)
+
+#: 요금제 한도에 걸리면 이만큼 요금제 길을 쉰다 (설계서 §폴백)
+PLAN_LOCK_HOURS = 5
+
+#: 한도 잠금을 적어 두는 파일 이름 (`data/` 아래)
+PLAN_LOCK_NAME = "plan_lock.json"
+
+#: 요금제 길의 임시 작업 폴더 (저장소 밖 취급 — CLAUDE.md·기억이 안 붙게)
+PLAN_WORK_DIRNAME = "plan-work"
 
 # 용도 -> 모델 ID
 MODELS: dict[str, str] = {
@@ -44,13 +70,28 @@ PRICES_USD_PER_MTOK: dict[str, dict[str, float]] = {
 DEFAULT_PRICE = PRICES_USD_PER_MTOK["claude-sonnet-5"]
 
 __all__ = [
+    "BACKENDS",
+    "DEFAULT_BACKEND_ORDER",
+    "PLAN_LOCK_HOURS",
     "MODELS",
     "LLMRouter",
     "LLMDisabled",
     "extract_json",
     "estimate_cost",
+    "prompt_sha256",
     "PRICES_USD_PER_MTOK",
 ]
+
+
+def prompt_sha256(system: str, user: str) -> str:
+    """system+user 프롬프트의 지문.
+
+    **길이 달라도 이 값이 같아야 한다**는 것이 품질 동일성의 증거다
+    (설계서 §1 "프롬프트는 한 곳에서만 만든다"). 두 토막을 그냥 이어 붙이면
+    경계가 흐려지므로 널 문자로 끊는다.
+    """
+    blob = f"{system or ''}\x00{user or ''}".encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()
 
 
 def _cost_one(usage: dict, model: str) -> float:
@@ -75,6 +116,41 @@ def estimate_cost(usage: dict | None, model: str = "") -> float:
     if isinstance(per_model, dict) and per_model:
         return round(sum(_cost_one(u, name) for name, u in per_model.items()), 6)
     return round(_cost_one(usage, model), 6)
+
+
+def normalize_backend_order(raw: Any) -> tuple[str, ...]:
+    """설정에서 읽은 길 차례를 다듬는다. 모르는 이름은 버린다."""
+    if isinstance(raw, str):
+        items = [p.strip() for p in raw.replace(",", " ").split()]
+    elif isinstance(raw, (list, tuple)):
+        items = [str(p).strip() for p in raw]
+    else:
+        items = []
+    out: list[str] = []
+    for name in items:
+        low = name.lower()
+        if low in BACKENDS and low not in out:
+            out.append(low)
+    return tuple(out) or DEFAULT_BACKEND_ORDER
+
+
+def load_backend_order(settings: Any | None = None) -> tuple[str, ...]:
+    """`config/models.yaml`의 `backend_order` (없으면 기본 차례)."""
+    try:
+        from ..config import load_yaml
+
+        data = load_yaml("models")
+    except Exception:  # pragma: no cover - 설정을 못 읽어도 기본값으로 돈다
+        data = {}
+    del settings
+    return normalize_backend_order((data or {}).get("backend_order"))
+
+
+def _count_backend(usage_out: dict, backend: str) -> None:
+    """길별 호출 수를 센다 (`api`는 토큰을 `by_model` 쪽에서 이미 센다)."""
+    per = usage_out.setdefault("by_backend", {})
+    slot = per.setdefault(backend, {"calls": 0})
+    slot["calls"] = int(slot.get("calls", 0) or 0) + 1
 
 
 def extract_json(text: str) -> dict | list:
@@ -118,21 +194,111 @@ def extract_json(text: str) -> dict | list:
 class LLMRouter:
     """용도 이름으로 모델을 골라 호출한다."""
 
-    def __init__(self, api_key: str = "", client: Any | None = None) -> None:
+    def __init__(
+        self,
+        api_key: str = "",
+        client: Any | None = None,
+        backend_order: Any = None,
+        plan: Any = None,
+        data_dir: str | Path = "",
+    ) -> None:
         self.api_key = (api_key or "").strip()
         self._client = client
-        self.enabled = bool(self._client) or bool(self.api_key)
+        #: 길 차례. 직접 만들 때는 예전처럼 API 길만 쓴다 (기존 동작 보존).
+        self.backend_order: tuple[str, ...] = normalize_backend_order(
+            backend_order if backend_order is not None else LEGACY_BACKEND_ORDER
+        )
+        self.data_dir = Path(data_dir) if data_dir else None
+        self._plan = plan
+        #: `V2R_LLM_BACKEND` / 명령의 `요금제로` 로 한 길만 쓰게 못박을 때
+        self.force_backend: str = (os.environ.get("V2R_LLM_BACKEND", "") or "").strip()
+        #: 이 프로세스에서 요금제 길을 포기했는가 (미로그인은 다시 해도 같다)
+        self._plan_disabled = False
+        self._plan_warned = False
+        #: 마지막 호출 기록 (길·모델·프롬프트 지문). 원고 JSON에 그대로 실린다.
+        self.last_call: dict[str, Any] = {}
+        self.enabled = bool(self._client) or bool(self.api_key) or self.plan_in_order()
         #: 이 라우터로 쓴 토큰 누계 (비용 보고용)
-        self.usage: dict[str, int] = {}
+        self.usage: dict[str, Any] = {}
 
+    # --- 설정 -----------------------------------------------------
     @classmethod
     def from_settings(cls, settings: Any | None = None) -> "LLMRouter":
-        """설정에서 키를 읽어 라우터를 만든다."""
+        """설정에서 키와 길 차례를 읽어 라우터를 만든다."""
         if settings is None:
             from ..config import get_settings
 
             settings = get_settings()
-        return cls(api_key=getattr(settings, "anthropic_api_key", "") or "")
+        return cls(
+            api_key=getattr(settings, "anthropic_api_key", "") or "",
+            backend_order=load_backend_order(settings),
+            data_dir=getattr(settings, "data_dir", "") or "",
+        )
+
+    def plan_in_order(self) -> bool:
+        """요금제 길이 차례에 들어 있는가."""
+        return "plan" in self._effective_order()
+
+    def _effective_order(self) -> tuple[str, ...]:
+        forced = (self.force_backend or "").strip()
+        if forced in BACKENDS:
+            return (forced,)
+        return self.backend_order
+
+    def _data_dir(self) -> Path:
+        if self.data_dir is not None:
+            return self.data_dir
+        from ..config import get_settings
+
+        return Path(get_settings().data_dir)
+
+    # --- 요금제 길 ------------------------------------------------
+    def plan_backend(self) -> PlanBackend:
+        """요금제 길 백엔드 (작업 폴더는 `data/plan-work/`)."""
+        if self._plan is None:
+            self._plan = PlanBackend(work_dir=self._data_dir() / PLAN_WORK_DIRNAME)
+        return self._plan
+
+    def plan_lock_path(self) -> Path:
+        """한도 잠금 파일 (`data/plan_lock.json`)."""
+        return self._data_dir() / PLAN_LOCK_NAME
+
+    def plan_locked_until(self) -> datetime | None:
+        """요금제 길이 언제까지 잠겨 있는가. 안 잠겼으면 None."""
+        path = self.plan_lock_path()
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        raw = (data or {}).get("until") if isinstance(data, dict) else None
+        if not raw:
+            return None
+        try:
+            until = datetime.fromisoformat(str(raw))
+        except ValueError:
+            return None
+        return until if until > datetime.now(until.tzinfo) else None
+
+    def lock_plan(self, reason: str = "", hours: int = PLAN_LOCK_HOURS) -> Path:
+        """요금제 길을 `hours` 시간 잠근다 (한도에 걸렸을 때)."""
+        until = datetime.now().astimezone() + timedelta(hours=hours)
+        path = self.plan_lock_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "until": until.isoformat(),
+                    "reason": reason,
+                    "locked_at": datetime.now().astimezone().isoformat(),
+                    "hours": hours,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        log.warning("요금제 한도 — %s시간 동안 요금제 길을 쉽니다 (%s)", hours, reason)
+        return path
 
     def estimated_cost(self) -> float:
         """이 라우터로 쓴 토큰의 어림 비용(USD)."""
@@ -148,21 +314,96 @@ class LLMRouter:
         return self._client
 
     def complete(self, purpose: str, system: str, user: str, max_tokens: int = 1200) -> str:
-        """모델 호출 후 텍스트 반환. 키가 없으면 LLMDisabled."""
-        if not self.enabled:
-            raise LLMDisabled("ANTHROPIC_API_KEY가 없어 모델 기능을 사용할 수 없습니다")
-        client = self._ensure_client()
+        """길을 차례로 밟아 가며 모델을 부르고 텍스트를 돌려준다.
+
+        **system/user 문자열은 어느 길로 가든 한 글자도 바뀌지 않는다.**
+        길마다 다른 것은 "어떻게 부르는가"뿐이다 (설계서 §품질 동일성).
+
+        폴백 규칙:
+        - `PlanLimit` → `data/plan_lock.json`에 5시간 잠금을 적고 다음 길로
+        - `PlanNotLoggedIn` → 경고를 **한 번만** 남기고, 이 프로세스에서는
+          요금제 길을 더 시도하지 않는다 (다시 해도 결과가 같다)
+        - `PlanError`(그 밖) → 그 호출만 다음 길로
+        - `batch` → 아직 없다. 조용히 다음 길로.
+        """
         model = self.model_for(purpose)
-        log.debug("LLM 호출 용도=%s 모델=%s", purpose, model)
-        return create_message(
-            client,
-            model,
-            system,
-            user,
-            max_tokens=max_tokens,
-            usage_out=self.usage,
-            thinking=THINKING_DISABLED if purpose in NO_THINKING_PURPOSES else None,
+        fingerprint = prompt_sha256(system, user)
+        order = self._effective_order()
+        last_error: Exception | None = None
+        for backend in order:
+            if backend == "plan":
+                if self._plan_disabled:
+                    continue
+                locked = self.plan_locked_until()
+                if locked is not None:
+                    log.debug("요금제 길 잠금 중 (%s까지) — 다음 길로", locked)
+                    continue
+                try:
+                    text = self.plan_backend().complete(
+                        model, system, user, max_tokens=max_tokens, usage_out=self.usage
+                    )
+                except PlanLimit as exc:
+                    self.lock_plan(str(exc))
+                    last_error = exc
+                    continue
+                except PlanNotLoggedIn as exc:
+                    self._plan_disabled = True
+                    if not self._plan_warned:
+                        self._plan_warned = True
+                        log.warning(
+                            "Claude Code에 로그인되어 있지 않아 요금제 길을 건너뜁니다"
+                            " (scripts\\claude-cli-login.cmd 를 한 번 실행하세요): %s",
+                            exc,
+                        )
+                    last_error = exc
+                    continue
+                except PlanError as exc:
+                    log.warning("요금제 길 호출 실패 — 다음 길로: %s", exc)
+                    last_error = exc
+                    continue
+                self._record(backend, purpose, model, fingerprint)
+                return text
+            if backend == "batch":
+                # 아직 만들지 않았다. 자리만 잡아 두고 다음 길로 넘어간다.
+                last_error = last_error or NotImplementedError("배치 API 길은 아직 없습니다")
+                continue
+            if backend == "api":
+                if not (self._client or self.api_key):
+                    last_error = last_error or LLMDisabled(
+                        "ANTHROPIC_API_KEY가 없어 모델 기능을 사용할 수 없습니다"
+                    )
+                    continue
+                client = self._ensure_client()
+                log.debug("LLM 호출 용도=%s 모델=%s 길=api", purpose, model)
+                text = create_message(
+                    client,
+                    model,
+                    system,
+                    user,
+                    max_tokens=max_tokens,
+                    usage_out=self.usage,
+                    thinking=THINKING_DISABLED if purpose in NO_THINKING_PURPOSES else None,
+                )
+                _count_backend(self.usage, "api")
+                self._record(backend, purpose, model, fingerprint)
+                return text
+        if isinstance(last_error, LLMDisabled):
+            raise last_error
+        raise LLMDisabled(
+            "모델을 부를 수 있는 길이 없습니다"
+            + (f" (마지막 오류: {last_error})" if last_error else "")
         )
+
+    def _record(self, backend: str, purpose: str, model: str, fingerprint: str) -> None:
+        """마지막 호출을 적어 둔다 (원고 JSON·검토 MD가 이걸 읽는다)."""
+        self.last_call = {
+            "backend": backend,
+            "purpose": purpose,
+            "model": model,
+            "prompt_sha256": fingerprint,
+            # 요금제 길은 구독 안이라 추가 비용이 0원이다
+            "cost_usd": 0.0 if backend != "api" else None,
+        }
 
     def complete_json(
         self, purpose: str, system: str, user: str, max_tokens: int = 1200

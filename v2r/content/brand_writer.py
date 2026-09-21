@@ -1684,6 +1684,8 @@ def generate_manuscript(
         # 위반이 적은 쪽을 들고 간다 (끝내 못 지켜도 버리지 않기 위해)
         if draft is None or len(bad) < len(body_bad):
             draft, body_bad = candidate, bad
+            # 이 원고를 만든 호출의 길·프롬프트 지문을 남긴다
+            _note_call(llm, stats, "body")
         if not bad:
             break
     if draft is None:
@@ -1695,7 +1697,7 @@ def generate_manuscript(
     )
 
     comment_attempts = _fill_comments(
-        llm, draft, rule, brand, keyword, guide_text, cap, examples=examples
+        llm, draft, rule, brand, keyword, guide_text, cap, examples=examples, stats=stats
     )
     if all(not c.text for c in draft.comments):
         raise BrandWriteError(f"댓글 생성 실패({brand}/{keyword}): 댓글을 하나도 받지 못했습니다")
@@ -1789,20 +1791,42 @@ def _usage_delta(llm: Any, before: dict) -> dict:
     for key, value in usage.items():
         if isinstance(value, int):
             out[key] = value - int(before.get(key, 0) or 0)
-    now_models = usage.get("by_model")
-    if isinstance(now_models, dict):
-        old_models = before.get("by_model")
-        old_models = old_models if isinstance(old_models, dict) else {}
+    # `by_model`(단가표를 태우는 자리)과 `by_backend`(길별 누계) 둘 다 뺀다
+    for bucket in ("by_model", "by_backend"):
+        now_groups = usage.get(bucket)
+        if not isinstance(now_groups, dict):
+            continue
+        old_groups = before.get(bucket)
+        old_groups = old_groups if isinstance(old_groups, dict) else {}
         per: dict = {}
-        for name, counts in now_models.items():
-            old = old_models.get(name) or {}
+        for name, counts in now_groups.items():
+            old = old_groups.get(name) or {}
+            if not isinstance(counts, dict):
+                continue
             per[name] = {
                 k: int(v) - int(old.get(k, 0) or 0)
                 for k, v in counts.items()
                 if isinstance(v, int)
             }
-        out["by_model"] = per
+        out[bucket] = per
     return out
+
+
+def _note_call(llm: Any, stats: dict | None, slot: str) -> None:
+    """방금 한 모델 호출의 **길**과 **프롬프트 지문**을 `stats`에 적어 둔다.
+
+    지문(`prompt_sha256`)은 system+user 문자열의 sha256이다. 요금제 길로 만든
+    원고와 API 길로 만든 원고의 지문이 같으면 **같은 지침으로 만들었다는 증거**가
+    된다 (설계서 §품질 동일성).
+    """
+    if stats is None:
+        return
+    call = getattr(llm, "last_call", None)
+    if not isinstance(call, dict) or not call:
+        return
+    stats[f"{slot}_backend"] = call.get("backend", "")
+    stats[f"{slot}_prompt_sha256"] = call.get("prompt_sha256", "")
+    stats[f"{slot}_model"] = call.get("model", "")
 
 
 def _finish(
@@ -1837,8 +1861,17 @@ def _finish(
     stats["hit_cap"] = bool(unresolved) and (
         body_attempts >= cap or comment_attempts >= cap
     )
+    # 어느 길로 만들었는가 + 프롬프트 지문 (본문·댓글 각각).
+    # 길이 달라도 지문이 같으면 같은 지침으로 만든 것이다.
+    body_backend = stats.get("body_backend", "")
+    stats["backend"] = body_backend or stats.get("comments_backend", "")
+    stats["prompt_sha256"] = {
+        "body": stats.get("body_prompt_sha256", ""),
+        "comments": stats.get("comments_prompt_sha256", ""),
+    }
     usage = _usage_delta(llm, before)
     stats["usage"] = usage
+    stats["by_backend"] = usage.get("by_backend") or {}
     stats["input_tokens"] = usage.get("input_tokens", 0)
     stats["output_tokens"] = usage.get("output_tokens", 0)
     stats["cache_read_input_tokens"] = usage.get("cache_read_input_tokens", 0)
@@ -1856,6 +1889,7 @@ def _fill_comments(
     cap: int,
     seed: bool = False,
     examples: list[str] | None = None,
+    stats: dict | None = None,
 ) -> int:
     """본문이 정해진 뒤 댓글 12개를 채운다. 두 번째 시도부터는 **걸린 자리만** 다시 받는다.
 
@@ -1885,6 +1919,7 @@ def _fill_comments(
                 )
             except Exception as exc:
                 raise BrandWriteError(f"댓글 생성 실패({brand}/{keyword}): {exc}") from exc
+            _note_call(llm, stats, "comments")
             draft.comments = _comment_nodes(payload)
         else:
             labels = failing_comment_labels(validate(draft, rule))
@@ -1964,6 +1999,9 @@ def _generate_combined(
         bad = violations(checks)
         if draft is None or len(bad) < len(bad_all):
             draft, bad_all = candidate, bad
+            # 한 번에 받는 방식이라 본문·댓글이 같은 호출에서 나온다
+            _note_call(llm, stats, "body")
+            _note_call(llm, stats, "comments")
         if not body_bad:
             break
     if draft is None:
@@ -1974,7 +2012,16 @@ def _generate_combined(
         not c.text for c in draft.comments
     ):
         comment_attempts = _fill_comments(
-            llm, draft, rule, brand, keyword, guide_text, cap, seed=True, examples=examples
+            llm,
+            draft,
+            rule,
+            brand,
+            keyword,
+            guide_text,
+            cap,
+            seed=True,
+            examples=examples,
+            stats=stats,
         )
     if all(not c.text for c in draft.comments):
         raise BrandWriteError(f"댓글 생성 실패({brand}/{keyword}): 댓글을 하나도 받지 못했습니다")
@@ -2002,6 +2049,20 @@ def to_dict(manuscript: Manuscript, stats: dict | None = None) -> dict:
     data["checks"] = validate(manuscript)
     if stats:
         data["stats"] = dict(stats)
+        # 어느 길(backend)로 만들었고 어떤 프롬프트를 넣었는지를 **맨 위에도** 둔다.
+        # 나중에 길별 품질을 비교할 때 이 두 값만 보면 된다 (설계서 §5).
+        data["backend"] = stats.get("backend", "")
+        data["prompt_sha256"] = dict(
+            stats.get("prompt_sha256")
+            or {
+                "body": stats.get("body_prompt_sha256", ""),
+                "comments": stats.get("comments_prompt_sha256", ""),
+            }
+        )
+        # 요금제 길은 구독 안이라 추가 비용이 0원이다
+        data["cost_usd"] = (
+            0.0 if data["backend"] == "plan" else stats.get("estimated_usd", 0.0)
+        )
     return data
 
 
@@ -2020,7 +2081,36 @@ def _md_escape(text: str) -> str:
     return (text or "").replace("|", "\\|").replace("\n", " ")
 
 
-def review_block(manuscript: Manuscript, heading_level: int = 2) -> str:
+#: 길 이름을 사람 말로
+BACKEND_LABELS = {
+    "plan": "요금제(구독) 길 — 추가 비용 0원",
+    "batch": "배치 API 길",
+    "api": "일반 API 길 — 비용 발생",
+}
+
+
+def backend_lines(stats: dict | None) -> list[str]:
+    """검토 MD에 넣는 "어느 길로 만들었나" 줄들."""
+    if not stats:
+        return []
+    backend = stats.get("backend") or ""
+    if not backend:
+        return []
+    fingerprints = stats.get("prompt_sha256") or {}
+    body = str(fingerprints.get("body", ""))
+    comments = str(fingerprints.get("comments", ""))
+    lines = [f"- 생성 경로(backend): **{backend}** — {BACKEND_LABELS.get(backend, backend)}"]
+    if body or comments:
+        # 지문이 같으면 다른 길로 만들어도 같은 지침을 넣었다는 뜻이다
+        lines.append(
+            f"- 프롬프트 지문(sha256): 본문 `{body[:16] or '-'}` / 댓글 `{comments[:16] or '-'}`"
+        )
+    return lines
+
+
+def review_block(
+    manuscript: Manuscript, heading_level: int = 2, stats: dict | None = None
+) -> str:
     """원고 1건의 사람이 읽는 블록 (제목·본문·댓글 표·검증 표)."""
     rule = rule_for(brand_of(manuscript), manuscript.manuscript_type)
     roles = dict(ACCOUNT_ROLES_COMMON)
@@ -2043,6 +2133,7 @@ def review_block(manuscript: Manuscript, heading_level: int = 2) -> str:
         f"- 원고유형: {rule.manuscript_type}",
         f"- 본문 글자 수(공백 제외): {body_length(manuscript.body)}자"
         f" / 키워드 {keyword_hits(manuscript.body, manuscript.keyword)}회",
+        *backend_lines(stats),
         "",
         f"{h}# 제목",
         "",
@@ -2079,9 +2170,17 @@ def write_review_md(
     manuscripts: Manuscript | list[Manuscript],
     path: str | Path,
     title: str = "",
+    stats: list[dict] | dict | None = None,
 ) -> Path:
-    """사람이 읽는 검토용 MD를 쓴다."""
+    """사람이 읽는 검토용 MD를 쓴다.
+
+    `stats`를 주면 원고마다 **어느 길(backend)로 만들었는지**와 프롬프트 지문을
+    함께 적는다 (원고와 같은 차례여야 한다).
+    """
     items = [manuscripts] if isinstance(manuscripts, Manuscript) else list(manuscripts)
+    stat_list: list[dict] = (
+        [stats] if isinstance(stats, dict) else list(stats or [])
+    )
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     head = title or (
@@ -2098,15 +2197,30 @@ def write_review_md(
             + " — 검증을 끝내 통과하지 못했다. 그대로 쓰면 안 된다.",
             "",
         ]
-    for m in items:
-        parts.append(review_block(m, heading_level=2))
+    backends = sorted({str(s.get("backend")) for s in stat_list if s.get("backend")})
+    if backends:
+        parts += [
+            "생성 경로(backend): "
+            + ", ".join(f"`{b}` — {BACKEND_LABELS.get(b, b)}" for b in backends),
+            "",
+        ]
+    for idx, m in enumerate(items):
+        parts.append(
+            review_block(
+                m,
+                heading_level=2,
+                stats=stat_list[idx] if idx < len(stat_list) else None,
+            )
+        )
     target.write_text("\n".join(parts), encoding="utf-8")
     return target
 
 
 __all__ = [
+    "BACKEND_LABELS",
     "BRAND_RULES",
     "BrandRule",
+    "backend_lines",
     "BrandWriteError",
     "COMMENT_LABELS",
     "INTERNAL_TERMS",

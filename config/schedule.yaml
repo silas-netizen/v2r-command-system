@@ -59,6 +59,14 @@ entries:
     enabled: true
     command: 웹 세션 점검
 
+  # 요금제(Claude Code) 로그인이 살아 있는지 아주 짧은 호출로 확인합니다.
+  # 풀려 있으면 scripts\claude-cli-login.cmd 를 돌리라고 알려 줍니다.
+  - name: 요금제 세션 점검
+    time: "09:25"
+    days: daily
+    enabled: true
+    command: 요금제 세션 점검
+
   # 미처리 목록(docs/reports/pending.md)을 하루 5번 파일로 보냅니다.
   - name: pending-1
     time: "08:40"

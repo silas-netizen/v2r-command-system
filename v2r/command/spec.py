@@ -32,6 +32,7 @@ ALLOWED_TASKS: frozenset[str] = frozenset(
         "gpt_keepalive",
         "naver_keepalive",
         "web_keepalive",
+        "plan_keepalive",
         "request_photos",
         "wash_photos",
         "learn_guides",
@@ -81,6 +82,9 @@ class TaskSpec(BaseModel):
     #: 브랜드 원고 생성 방식. 빈 값 = 기본(`brand_writer.DEFAULT_MODE`),
     #: `combined` = 본문과 댓글 12개를 모델 호출 한 번으로 받는다 (`한번에`)
     generate_mode: str = ""
+    #: 모델을 부를 길. 빈 값 = 설정(`config/models.yaml`)의 차례대로.
+    #: `plan` = 요금제(`요금제로`), `api` = 일반 API(`api로`), `batch` = 배치(미구현)
+    llm_backend: str = ""
     keyword: str = ""
     source: str = ""
     dry_run: bool = True
@@ -104,6 +108,14 @@ class TaskSpec(BaseModel):
     def _check_task(cls, v: str) -> str:
         if v not in ALLOWED_TASKS:
             raise ValueError(f"허용되지 않은 작업: {v}")
+        return v
+
+    @field_validator("llm_backend")
+    @classmethod
+    def _check_backend(cls, v: str) -> str:
+        v = (v or "").strip().lower()
+        if v and v not in {"plan", "batch", "api"}:
+            raise ValueError(f"허용되지 않은 길: {v}")
         return v
 
     @field_validator("count", "account_count", "interval_min", "interval_max")

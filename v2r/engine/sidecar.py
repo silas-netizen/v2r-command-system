@@ -52,6 +52,7 @@ LIGHT_TASKS = frozenset(
         "gpt_keepalive",
         "naver_keepalive",
         "web_keepalive",
+        "plan_keepalive",
     }
 )
 

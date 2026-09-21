@@ -1,0 +1,18 @@
+# 모델을 어느 "길"로 부를지 (설계서 docs/reports/quality-parity-strategy-2026-09-21.md)
+#
+# - plan  : 요금제(구독) 길. Claude Code 를 비대화로 한 번 실행한다. 추가 비용 0원.
+#           로그인이 안 되어 있으면 자동으로 다음 길로 넘어가고 경고를 한 번 남긴다.
+#           (한 번만 로그인해 두면 됩니다: scripts\claude-cli-login.cmd)
+# - batch : 배치 API 길. **아직 만들지 않았습니다.** 자리만 잡혀 있어 그냥 지나갑니다.
+# - api   : 일반 API 길. ANTHROPIC_API_KEY 로 부릅니다(돈이 나갑니다).
+#
+# 어느 길로 가든 모델에 넣는 지침(system)과 요청(user) 글자는 **완전히 같습니다.**
+# 원고 JSON과 검토 문서에 어느 길로 만들었는지(backend)와 프롬프트 지문
+# (prompt_sha256)이 남아 나중에 대조할 수 있습니다.
+#
+# 한 번만 다르게 쓰고 싶으면 명령에 "요금제로" / "api로" 를 붙이세요.
+# 환경변수 V2R_LLM_BACKEND=plan 으로 통째로 못박을 수도 있습니다.
+backend_order: [plan, batch, api]
+
+# 요금제 한도에 걸리면 이만큼 요금제 길을 쉽니다(시간). 코드 기본값과 같습니다.
+plan_lock_hours: 5

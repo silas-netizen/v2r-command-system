@@ -77,7 +77,8 @@ def test_all_tasks_covered_by_tests():
     # + V2R 글 목록 색인 2건(sync_article_index·duplicate_check)
     # + 네이버 세션 점검 1건(naver_keepalive, 2026-09-21)
     # + 웹 세션 점검 1건(web_keepalive: Claude·Make, 2026-09-21)
-    assert len(ALLOWED_TASKS) == 37
+    # + 요금제 세션 점검 1건(plan_keepalive: Claude Code CLI, 2026-09-21)
+    assert len(ALLOWED_TASKS) == 38
 
 
 def test_wash_photos_count():
