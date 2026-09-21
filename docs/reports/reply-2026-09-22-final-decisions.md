@@ -1,4 +1,4 @@
-# 최종 결정 7건 반영 (2026-09-22 08:41 KST, 실측)
+# 최종 결정 7건 반영 (2026-09-22 08:46 KST, 실측)
 
 **원고 최종 = v3 6건**([brand-final-v3-2026-09-22.md](file:///D:/v2r%20%EC%9E%90%EB%8F%99%ED%99%94/v2r-command-system/docs/reports/brand-final-v3-2026-09-22.md)). 재생성 없이 아래 규칙만 코드·골든·정리본에 넣습니다(일꾼 진행 중, 결과 [final-rules-2026-09-22.md](file:///D:/v2r%20%EC%9E%90%EB%8F%99%ED%99%94/v2r-command-system/docs/reports/final-rules-2026-09-22.md)).
 
