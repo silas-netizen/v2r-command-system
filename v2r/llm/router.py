@@ -12,6 +12,8 @@ from typing import Any
 
 from .anthropic import LLMDisabled, create_message, make_client
 from .plan_backend import PlanBackend, PlanError, PlanLimit, PlanNotLoggedIn
+from .usage_ledger import TOKEN_FIELDS as LEDGER_TOKEN_FIELDS
+from .usage_ledger import append_call
 
 log = logging.getLogger(__name__)
 
@@ -298,7 +300,36 @@ class LLMRouter:
             encoding="utf-8",
         )
         log.warning("요금제 한도 — %s시간 동안 요금제 길을 쉽니다 (%s)", hours, reason)
+        self._write_lock_alert(until, reason, hours)
         return path
+
+    def _write_lock_alert(self, until: datetime, reason: str, hours: int) -> None:
+        """요금제 잠금 전환을 `docs/reports/alerts/` 에 파일로 남긴다 (2026-09-22).
+
+        잠기면 그다음 호출부터 **유료 API**로 넘어간다. 조용히 넘어가면 돈이 새므로
+        사람이 바로 볼 수 있는 자리에 알림 파일을 만든다.
+        """
+        # 알림은 **잠금 파일이 있는 곳 기준**으로 적는다 (`data/` 의 윗 폴더).
+        # 그래야 시험에서 임시 폴더를 쓰면 알림도 임시 폴더에 떨어져 저장소를
+        # 더럽히지 않는다.
+        root = self._data_dir().parent
+        stamp = datetime.now().astimezone()
+        folder = root / "docs" / "reports" / "alerts"
+        path = folder / f"plan-lock-{stamp:%Y-%m-%d-%H%M}.md"
+        text = (
+            f"# 요금제 길 잠금 알림 ({stamp:%Y-%m-%d %H:%M} KST)\n\n"
+            f"- 잠긴 시각: {stamp.isoformat(timespec='seconds')}\n"
+            f"- 풀리는 시각: {until.isoformat(timespec='seconds')} ({hours}시간)\n"
+            f"- 이유: {reason or '(알 수 없음)'}\n\n"
+            "요금제(구독) 한도에 걸려 잠갔습니다. 이 동안의 모델 호출은"
+            " **유료 API**로 넘어갑니다. 급하지 않은 묶음 생성은 잠금이 풀린 뒤로"
+            " 미루는 것이 좋습니다.\n"
+        )
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")
+        except OSError as exc:
+            log.warning("요금제 잠금 알림 파일 기록 실패: %s", exc)
 
     def estimated_cost(self) -> float:
         """이 라우터로 쓴 토큰의 어림 비용(USD)."""
@@ -362,6 +393,10 @@ class LLMRouter:
                     last_error = exc
                     continue
                 self._record(backend, purpose, model, fingerprint)
+                info = getattr(self.plan_backend(), "last_info", None) or {}
+                self._note_ledger(
+                    backend, purpose, model, fingerprint, (info or {}).get("usage")
+                )
                 return text
             if backend == "batch":
                 # 아직 만들지 않았다. 자리만 잡아 두고 다음 길로 넘어간다.
@@ -375,6 +410,9 @@ class LLMRouter:
                     continue
                 client = self._ensure_client()
                 log.debug("LLM 호출 용도=%s 모델=%s 길=api", purpose, model)
+                before_api = {
+                    k: int(self.usage.get(k, 0) or 0) for k in LEDGER_TOKEN_FIELDS
+                }
                 text = create_message(
                     client,
                     model,
@@ -386,6 +424,16 @@ class LLMRouter:
                 )
                 _count_backend(self.usage, "api")
                 self._record(backend, purpose, model, fingerprint)
+                self._note_ledger(
+                    backend,
+                    purpose,
+                    model,
+                    fingerprint,
+                    {
+                        k: int(self.usage.get(k, 0) or 0) - before_api[k]
+                        for k in LEDGER_TOKEN_FIELDS
+                    },
+                )
                 return text
         if isinstance(last_error, LLMDisabled):
             raise last_error
@@ -393,6 +441,32 @@ class LLMRouter:
             "모델을 부를 수 있는 길이 없습니다"
             + (f" (마지막 오류: {last_error})" if last_error else "")
         )
+
+    def _note_ledger(
+        self,
+        backend: str,
+        purpose: str,
+        model: str,
+        fingerprint: str,
+        counts: Any,
+    ) -> None:
+        """사용량 장부(`data/llm_usage-YYYY-MM.jsonl`)에 이 호출을 한 줄 적는다.
+
+        장부는 덤이다 — 어떤 이유로든 실패해도 호출 결과를 버리지 않는다.
+        """
+        if not isinstance(counts, dict):
+            return
+        try:
+            append_call(
+                self._data_dir(),
+                backend,
+                purpose,
+                model,
+                counts,
+                prompt_sha256=fingerprint,
+            )
+        except Exception as exc:  # noqa: BLE001 - 장부 때문에 호출이 죽으면 안 된다
+            log.warning("사용량 장부 기록 실패: %s", exc)
 
     def _record(self, backend: str, purpose: str, model: str, fingerprint: str) -> None:
         """마지막 호출을 적어 둔다 (원고 JSON·검토 MD가 이걸 읽는다)."""

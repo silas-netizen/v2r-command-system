@@ -61,6 +61,7 @@ def test_legacy_example_sentence():
         ("댓글 다시 세팅해줘", "repair_comments"),
         ("현황판 갱신", "dashboard"),
         ("우아덤 원고 1개 만들어줘", "generate_brand"),
+        ("정기 정비", "maintenance"),
     ],
 )
 def test_each_task_pattern(text, task):
@@ -78,7 +79,8 @@ def test_all_tasks_covered_by_tests():
     # + 네이버 세션 점검 1건(naver_keepalive, 2026-09-21)
     # + 웹 세션 점검 1건(web_keepalive: Claude·Make, 2026-09-21)
     # + 요금제 세션 점검 1건(plan_keepalive: Claude Code CLI, 2026-09-21)
-    assert len(ALLOWED_TASKS) == 38
+    # + 정기 정비 1건(maintenance: 이벤트 정리·VACUUM·캐시, 2026-09-22)
+    assert len(ALLOWED_TASKS) == 39
 
 
 def test_wash_photos_count():

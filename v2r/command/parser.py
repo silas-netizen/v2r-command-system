@@ -51,6 +51,8 @@ TASK_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("sync_article_index", re.compile(r"글\s*목록.*(동기화|색인|갱신)")),
     ("duplicate_check", re.compile(r"중복\s*(검사|점검|확인)")),
     ("cleanup_orphans", re.compile(r"(고아|찌꺼기).*(정리|삭제)")),
+    # 정기 정비(이벤트 정리·VACUUM·임시 파일·브라우저 캐시) — 다른 "정리"보다 뒤에 둔다
+    ("maintenance", re.compile(r"(정기\s*정비|db\s*정비|디비\s*정비|정비\s*작업)", re.I)),
     # 이미 올라간 글의 이모지 뒷정리 (`오늘 이모지 정리`, `이모지 정리 전체`).
     # `발행`이 든 문장도 가로채이지 않게 publish_* 패턴보다 앞에 둔다.
     ("cleanup_emoji", re.compile(r"이모지.*(정리|제거|삭제)")),
@@ -207,6 +209,7 @@ _NO_SLOT_TASKS = frozenset(
         "sync_article_index",
         "duplicate_check",
         "cleanup_orphans",
+        "maintenance",
         "cleanup_emoji",
         "repair_comments",
         "gpt_keepalive",
@@ -494,6 +497,7 @@ TASK_LABELS: dict[str, str] = {
     "sync_article_index": "V2R 글 목록 동기화",
     "duplicate_check": "중복 검사",
     "cleanup_orphans": "고아 글 정리",
+    "maintenance": "정기 정비",
     "cleanup_emoji": "이모지 정리",
     "repair_comments": "댓글 복구",
     "open_login": "로그인 창 열기",

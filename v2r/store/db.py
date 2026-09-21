@@ -130,6 +130,9 @@ CREATE INDEX IF NOT EXISTS idx_article_index_hash ON article_index(body_hash);
 CREATE INDEX IF NOT EXISTS idx_pub_status ON publications(status);
 CREATE INDEX IF NOT EXISTS idx_pub_source_id ON publications(source_id);
 CREATE INDEX IF NOT EXISTS idx_events_job ON events(job_id, id);
+-- 발행 조회는 늘 "어느 카페 / 언제"로 찾는다 (누적 속도 조치 2026-09-22)
+CREATE INDEX IF NOT EXISTS idx_pub_cafe_created ON publications(cafe, created_at);
+CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at);
 """
 
 

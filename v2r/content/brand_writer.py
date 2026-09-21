@@ -19,15 +19,17 @@ from pathlib import Path
 from typing import Any
 
 from v2r.content.manuscript import CommentNode, Manuscript, content_hash, tags_from_keyword
+from v2r.content.guide_compress import compress_guide_text
 from v2r.llm.prompts import (
-    BRAND_BODY_SYSTEM,
+    BRAND_BODY_TASK,
     BRAND_CLICHE_RULE,
-    BRAND_COMBINED_SYSTEM,
-    BRAND_COMMENTS_SYSTEM,
+    BRAND_COMBINED_TASK,
+    BRAND_COMMENTS_TASK,
     BRAND_FIRST_MENTION_RULE,
     BRAND_LINE_BREAK_RULE,
-    BRAND_PARTIAL_RETRY_SYSTEM,
-    BRAND_REVIEW_COMMENTS_SYSTEM,
+    BRAND_PARTIAL_RETRY_TASK,
+    BRAND_REVIEW_THREAD_FLOW,
+    BRAND_SHARED_SYSTEM,
     HUMAN_TONE_RULES,
     NO_INTERNAL_TERMS_RULE,
 )
@@ -219,6 +221,149 @@ REVIEW_MIN_KG = 8
 #: 감량 수치를 찾는 표현 (`8kg` `8키로` `8 킬로`)
 _KG_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(?:kg|KG|Kg|키로|킬로|킬로그램)")
 
+#: 후기형 **댓글**의 감량 수치 범위 (정리본 `팥순이 후기형.md` 절대 규칙 4번:
+#: "숫자는 매번 다르게 (3~10kg, 3~8주 범위)"). 본문 마무리(10~12kg)와는 다른 값이다.
+REVIEW_COMMENT_MIN_KG = 3.0
+REVIEW_COMMENT_MAX_KG = 10.0
+
+#: 후기형 댓글5의 역할 = **요요 고민 토로** (정리본 `팥순이 후기형.md`:
+#: "요요 때문에 진짜 몇 번을 실패했는지 모르겠어요" / "'요요 때문에 실패' 기본 유지").
+REVIEW_C5_YOYO_WORDS: tuple[str, ...] = ("요요",)
+REVIEW_C5_FAIL_WORDS: tuple[str, ...] = (
+    "실패",
+    "몇번",
+    "여러번",
+    "번이나",
+    "다시쪄",
+    "또쪄",
+    "되돌아",
+    "도루묵",
+)
+
+#: 본문 문단 끝에 붙이는 한글 이모티콘 (정리본 `팥순이 후기형.md`:
+#: "문단 끝에 한글 이모티콘 추가 (ㅋㅋ, ㅎㅎ, ㅠㅠ, !! 등)")
+PARAGRAPH_TAIL_MARKS: tuple[str, ...] = ("ㅠ", "ㅜ", "ㅋ", "ㅎ", "!!", "!")
+
+#: 요요를 말하면 기간과 kg 을 함께 적는다 (정리본 11번: "[기간 명시 + 명확한 kg]",
+#: "요요가 와서 쪘다고 하는 부분에 모두 적용할 것")
+_PERIOD_RE = re.compile(
+    r"(\d+\s*(?:주|달|개월|년|일))|((?:한|두|세|네|다섯|여섯|일곱|여덟|아홉|열)\s*(?:주|달|개월|년))"
+)
+
+#: 댓글3(바이럴 4종)이 반드시 담아야 하는 **해결 경험 / 도움이 된 노력**
+#: (정리본 `코숨핏.md` 등: "해결된 경험을 공유한다 ... 어떤 노력이 필요했는지 알려준다")
+COMMENT3_SOLUTION_WORDS: tuple[str, ...] = (
+    "해결",
+    "괜찮아졌",
+    "나아졌",
+    "좋아졌",
+    "줄었",
+    "덜해졌",
+    "효과",
+    "도움",
+    "덕분",
+    "해보니",
+    "하고나서",
+    "하니까",
+    "바꾸니",
+    "챙기니",
+    "지키니",
+    "버릇",
+    "습관",
+    "루틴",
+)
+
+#: 근거 출처로 쓰이는 **기관** 낱말 (두 개를 겹쳐 붙이면 출처가 불분명해진다)
+AUTHORITY_PLACE_WORDS: tuple[str, ...] = (
+    "수면클리닉",
+    "이비인후과",
+    "산부인과",
+    "항문외과",
+    "피부과",
+    "내과",
+    "한의원",
+    "대학병원",
+    "종합병원",
+    "보건소",
+    "농촌진흥청",
+    "식약처",
+    "국가기관",
+    "정부기관",
+)
+#: 근거 출처로 쓰이는 **문헌·사람** 낱말
+AUTHORITY_OTHER_WORDS: tuple[str, ...] = (
+    "논문",
+    "연구",
+    "학회",
+    "저널",
+    "특허",
+    "임상",
+    "실험",
+    "의사",
+    "전문의",
+    "원장",
+    "교수",
+    "박사",
+)
+
+#: 고민을 말하는 문장 (여기에 ㅋㅋ ㅎㅎ 가 붙으면 정서가 어긋난다, 2026-09-22)
+WORRY_WORDS: tuple[str, ...] = (
+    "걱정",
+    "불안",
+    "무섭",
+    "허무",
+    "속상",
+    "막막",
+    "답답",
+    "우울",
+    "지쳐",
+    "지치",
+    "힘들",
+    "고민",
+    "안빠져",
+    "안빠지",
+    "그대로예요",
+    "그대로에요",
+    "재발",
+    "실패",
+    "멘붕",
+    "눈물",
+    "포기",
+)
+#: 고민 문장에 붙으면 안 되는 웃음 표기 (ㅠㅠ 는 권장)
+WORRY_LAUGH_RE = re.compile(r"[ㅋㅎ]+")
+
+#: 프롬프트에 박는 규칙 한 줄 — 근거 출처는 하나만
+ONE_SOURCE_RULE = (
+    "근거의 출처는 **하나만** 쓴다"
+    " (나쁜 보기: `수면클리닉 이비인후과 의사 논문에` — 기관·사람·문헌을 겹쳐 붙이면"
+    " 출처가 불분명해지고 꾸며 낸 티가 난다. 좋은 보기: `이비인후과에서 들었는데`)"
+)
+#: 프롬프트에 박는 규칙 한 줄 — 권위 근거는 원고 전체에서 한 번만
+ONE_AUTHORITY_PER_MANUSCRIPT_RULE = (
+    "의사·논문·기관·클리닉 같은 **권위 근거는 원고 전체에서 한 번만** 쓴다."
+    " 댓글2에서 이미 썼으면 대대댓글2에서는 성분·원리·직접 겪은 체감으로 설득한다"
+    " (같은 권위를 두 번 꺼내면 짜고 친 티가 난다)"
+)
+#: 프롬프트에 박는 규칙 한 줄 — 검색 유도 마무리를 습관처럼 붙이지 않는다
+SEARCH_VARIETY_RULE = (
+    "검색 유도 마무리는 **문장 형태를 매번 바꾼다**."
+    " `후기 많아요` 를 기본으로 붙이지 말고 `한번 검색해보세요` `찾아보시면 나와요`"
+    " 처럼 그때그때 다르게 끝낸다"
+)
+#: 프롬프트에 박는 규칙 한 줄 — 카페 구어체(-더라구요)
+DEORAGUYO_RULE = (
+    "겪은 일을 말할 때는 카페 구어체 `~더라구요` 를 살린다"
+    " (`허무했어요` 보다 `허무하더라구요`, `효과 없었어요` 보다 `효과가 없더라구요`)"
+)
+
+#: 프롬프트에 박는 규칙 한 줄 — 고민 문장에는 ㅠㅠ
+WORRY_LAUGH_RULE = (
+    "고민·걱정을 말하는 문장(걱정돼요 / 안 빠져요 / 재발했어요 / 허무해요)에는"
+    " ㅋㅋ ㅎㅎ 를 붙이지 않고 ㅠㅠ 를 쓴다"
+    " (웃으면서 걱정하는 말은 사람이 쓴 말로 읽히지 않는다)."
+    " ㅋㅋ ㅎㅎ 는 후기·마무리처럼 밝은 대목에서만 쓴다"
+)
 #: 특정 브랜드만 쓸 수 있는 근거 (다른 브랜드가 가져다 쓰면 거짓말이 된다).
 #: 모델이 팥순이 근거(농촌진흥청 체지방 25%)를 장으뜸 댓글에 가져다 쓴 일이 있었다.
 BRAND_ONLY_EVIDENCE: dict[str, tuple[str, ...]] = {
@@ -412,6 +557,9 @@ class BrandRule:
     required_phrases: tuple[tuple[str, tuple[str, ...]], ...] = ()
     #: 본문 한 줄 글자 수 상한 (모바일 줄 나눔)
     line_max: int = LINE_MAX
+    #: 댓글3이 "해결된 경험·도움이 된 노력"을 담아야 하는가 (바이럴 4종 지침).
+    #: 팥순이는 댓글3이 **키워드 효과 질문**이라 검사하지 않는다.
+    comment3_needs_solution: bool = True
     body_structure: tuple[str, ...] = ()
     body_notes: tuple[str, ...] = ()
     comment_notes: tuple[str, ...] = ()
@@ -456,6 +604,8 @@ _VIRAL_BODY_NOTES = (
     "제목에 공감을 부르는 우는 이모티콘(ㅠㅠ)을 섞는다",
     "모바일 기준으로 한 줄 20자 이내 한 문단 4줄 이내로 문단을 자주 나눈다",
     "제품명이나 브랜드명을 본문에서 절대 말하지 않는다 (댓글에서 나오게 남겨 둔다)",
+    WORRY_LAUGH_RULE,
+    DEORAGUYO_RULE,
 )
 _VIRAL_COMMENT_NOTES = (
     "댓글1은 제품과 무관하게 작성자의 질문에 답하는 중립적 정보다 (광고 아님을 증명)",
@@ -466,10 +616,17 @@ _VIRAL_COMMENT_NOTES = (
     "대대댓글2에서 제품명을 처음 꺼내고 쓰게 된 계기와 느낀 변화 한 가지를 적은 뒤"
     " 다른 방법은 왜 안 되는지 한 마디 덧붙이고 검색해보라고 유도한다",
     "대대대댓글2는 제3자가 222 저도 효과 봤어요 식으로 여론을 만든다",
-    "댓글3은 비슷한 고민 경험 공유 대댓글3은 맞장구다",
+    "댓글3은 비슷한 고민을 말한 뒤 **해결된 경험이나 도움이 된 노력**을 한 마디 덧붙인다"
+    " (고충만 늘어놓고 끝내지 않는다) 대댓글3은 맞장구다",
     "댓글4는 작성자가 시도한 잘못된 방법을 가볍게 짚어 준다 (두 문장 내외)",
     "댓글5는 제3자 여론 보강이다 수치와 기간을 구체적으로 쓰고 다른 제품을 언급하지 않는다",
     "대댓글5는 효과에 호기심을 보이는 반응이다",
+    # --- 2026-09-22 GPT 교차 검증 반영 (docs/reports/codex-crosscheck-2026-09-22.md)
+    ONE_SOURCE_RULE,
+    ONE_AUTHORITY_PER_MANUSCRIPT_RULE,
+    SEARCH_VARIETY_RULE,
+    WORRY_LAUGH_RULE,
+    DEORAGUYO_RULE,
 )
 
 
@@ -589,6 +746,7 @@ _register(
         authority="다이어트 카페 추천 후기",
         body_max=200,
         keyword_count=3,
+        comment3_needs_solution=False,
         root_max=50,
         comment2_max=90,
         reply2_max=REPLY2_MAX_LEN,
@@ -634,6 +792,7 @@ _register(
         authority="다이어트 카페 추천 후기",
         body_max=300,
         keyword_count=4,
+        comment3_needs_solution=False,
         root_max=50,
         comment2_max=90,
         reply2_max=REPLY2_MAX_LEN,
@@ -662,13 +821,22 @@ _register(
             "키워드에 대한 객관적 설명을 길게 늘어놓지 않는다",
             "모바일 기준으로 한 줄 20자 이내 한 문단 4줄 이내로 문단을 자주 나눈다",
             "마무리의 감량 수치는 -10.0kg~-12.0kg 사이에서 소수 첫째 자리까지 매번 다르게 쓴다",
+            "문단은 반드시 ㅠㅠ ㅋㅋ ㅎㅎ !! 중 하나로 끝낸다 (문단 끝 한글 이모티콘)",
+            "요요가 와서 다시 쪘다고 쓸 때는 기간과 명확한 kg 수치를 같이 적는다",
         ),
         comment_notes=_REVIEW_COMMENT_BASE
         + (
             "모든 댓글은 50자를 넘지 않는다",
+            f"댓글의 감량 수치는 {REVIEW_COMMENT_MIN_KG:g}~{REVIEW_COMMENT_MAX_KG:g}kg,"
+            " 기간은 3~8주 범위에서 매번 다르게 쓴다 (본문 마무리 수치와는 다른 범위다)",
+            "댓글5는 요요 때문에 여러 번 실패했다는 토로다"
+            " (정체기 경험만 쓰면 안 된다) 대댓글5는 꾸준한 루틴·체질 개선으로 받아 준다",
             "작성자는 이미 써 본 사람이라 대댓글2에서 작성자가 직접 팥순ㅇㅣ 를 꺼낸다",
             "작성자는 자기가 이미 쓴 제품을 두고 되묻지 않는다 (어디서 사요 어떤 성분이에요 금지)",
-            "대대댓글2는 여분 댓글 계정이 저도 이거 먹는 중이라고 거든다",
+            "대대댓글2는 여분 댓글 계정이 저도 이거 먹는 중이라고 거든다"
+            " 질문형과 똑같이 네 마디를 갖춘다:"
+            " 저도 이거 먹는 중 → 기간·감량 수치와 국가기관 체지방 25% 검증 근거 →"
+            " 식단만으로는 왜 안 되는지 한 문장 → 검색해보시면 후기 많아요 류 마무리",
             "대대대댓글2는 작성자가 맞장구치며 마무리한다",
             "네이버 를 언급하지 않는다",
         ),
@@ -922,12 +1090,188 @@ def review_reply2_problems(text: str, rule: "BrandRule") -> list[str]:
         problems.append("검증 수치 — 체지방 25% 감소 결과가 빠졌다")
     if not _has_any(text, ("정부기관", "국가기관", "농촌진흥청", "기관")):
         problems.append("권위 — 정부기관 실험이라는 근거가 빠졌다")
+    # 후기형도 질문형과 같은 4요소다 (2026-09-22 GPT 교차 검증 반영):
+    # 제품(이거) → 근거 → **대안의 한계** → **검색 유도**
+    if not _has_any(text, REPLY2_LIMIT_WORDS):
+        problems.append("대안의 한계 — 식단만으로는 왜 안 되는지 한 문장이 없다")
+    if not _has_any(text, REPLY2_SEARCH_WORDS):
+        problems.append("검색 유도 — 검색해보시면 후기 많아요 류의 마무리가 없다")
     product = rule.product_in_comment or rule.product
     if product and _squash(product) in _squash(text):
         problems.append(f"제품 표기 — 후기형 대대댓글2는 `{product}` 를 다시 쓰지 않는다")
-    problems += reply2_sentence_problems(text, product, min_sentences=2)
+    # 4요소(제품→근거→대안 한계→검색 유도)에 맞장구 한 마디가 더 붙어 최대 5문장이다
+    problems += reply2_sentence_problems(
+        text, product, min_sentences=2, max_sentences=5
+    )
     problems += evidence_laughter_problems(text)
     return problems
+
+
+def shared_authority_words(*texts: str) -> list[str]:
+    """여러 글에 **함께** 나오는 권위 근거 낱말."""
+    words = tuple(AUTHORITY_PLACE_WORDS) + tuple(AUTHORITY_OTHER_WORDS)
+    squashed = [_squash(t) for t in texts]
+    return [w for w in words if all(w in one for one in squashed)]
+
+
+def duplicate_authority_problems(comment2: str, reply2: str) -> list[str]:
+    """권위 근거는 원고 전체에서 한 번만 (사용자 원고 피드백 2026-09-22).
+
+    댓글2에서 `항문외과 의사` 를 썼으면 대대댓글2에서는 성분·원리·체감으로 간다.
+    """
+    shared = shared_authority_words(comment2, reply2)
+    if not shared:
+        return []
+    return [
+        "권위 근거 중복 — " + ", ".join(shared) + " 를 댓글2와 대대댓글2에서 함께 썼다"
+        " (대대댓글2는 성분·원리·직접 겪은 체감으로 바꿔 쓴다)"
+    ]
+
+
+def closing_sentence(text: str) -> str:
+    """대대댓글2의 **마지막 문장** (같은 마무리가 되풀이되는지 보려고 쓴다)."""
+    sentences = reply2_sentences(text)
+    return _squash(sentences[-1]) if sentences else ""
+
+
+def repeated_closings(texts: list[str]) -> list[str]:
+    """한 묶음(같은 브랜드 하루) 안에서 **똑같은 마무리 문장**이 되풀이되는가."""
+    seen: dict[str, int] = {}
+    for text in texts:
+        key = closing_sentence(text)
+        if key:
+            seen[key] = seen.get(key, 0) + 1
+    return [f"같은 마무리 문장이 {n}번 되풀이됨: `{k}`" for k, n in seen.items() if n > 1]
+
+
+def comment3_role_problems(text: str) -> list[str]:
+    """댓글3이 **해결 경험 / 도움이 된 노력**을 담았는가 (정리본 댓글3 세트 역할).
+
+    고충만 늘어놓고 끝나면 "이 사람도 나랑 같은 고민이었는데 해결됐구나" 라는
+    신뢰가 생기지 않는다 (코숨핏 지적).
+    """
+    if not (text or "").strip():
+        return ["댓글3 없음"]
+    if _has_any(text, COMMENT3_SOLUTION_WORDS):
+        return []
+    return [
+        "댓글3 역할 — 비슷한 고충만 있고 해결된 경험이나 도움이 된 노력이 없다"
+        " (무엇을 해보니 어떻게 나아졌는지 한 마디를 넣는다)"
+    ]
+
+
+def stacked_authority_problems(text: str) -> list[str]:
+    """근거 출처를 **겹쳐 붙였는가** (경고, 2026-09-22).
+
+    `수면클리닉 이비인후과 의사 논문에` 처럼 기관·사람·문헌을 나란히 붙이면
+    출처가 하나도 분명하지 않고 꾸며 낸 티가 난다. 출처는 하나만 쓴다.
+    """
+    words = tuple(AUTHORITY_PLACE_WORDS) + tuple(AUTHORITY_OTHER_WORDS)
+    pattern = re.compile("|".join(re.escape(w) for w in words))
+    out: list[str] = []
+    for sentence in reply2_sentences(text) or [text or ""]:
+        found = [(m.start(), m.end(), m.group()) for m in pattern.finditer(sentence)]
+        run: list[str] = []
+        prev_end = -99
+        runs: list[list[str]] = []
+        for start, end, word in found:
+            if start - prev_end <= 2:
+                run.append(word)
+            else:
+                run = [word]
+                runs.append(run)
+            prev_end = end
+        places = [w for _, _, w in found if w in AUTHORITY_PLACE_WORDS]
+        worst = max(runs, key=len) if runs else []
+        if len(worst) >= 3 or len(places) >= 2:
+            out.append(
+                "근거 출처 겹침 — `"
+                + " ".join(worst or places)
+                + "` 처럼 출처를 겹쳐 붙이지 말고 **하나만** 쓴다"
+            )
+    return out
+
+
+def worry_laughter_problems(text: str) -> list[str]:
+    """고민을 말하는 문장에 붙은 ㅋㅋ ㅎㅎ (경고, 2026-09-22).
+
+    `엽산이랑 철분은 챙겨 먹었는데도 그대로예요ㅋㅋ` 처럼 걱정을 말하면서
+    웃어 버리면 정서가 어긋난다. 그 자리는 ㅠㅠ 다.
+    """
+    out: list[str] = []
+    for sentence in reply2_sentences(text) or [text or ""]:
+        if not _has_any(sentence, WORRY_WORDS):
+            continue
+        marks = WORRY_LAUGH_RE.findall(sentence)
+        if marks:
+            out.append(
+                f"고민 문장 웃음 표기 — `{sentence.strip()}` 에 {''.join(marks)} 가 붙었다"
+                " (고민·걱정 문장에는 ㅠㅠ 를 쓴다)"
+            )
+    return out
+
+
+def yoyo_number_problems(text: str) -> list[str]:
+    """요요(다시 쪘다)를 말했으면 **기간과 kg** 을 같이 적었는가.
+
+    정리본 `팥순이 후기형.md` 11번: 몸무게 변화는 [기간 명시 + 명확한 kg] 으로 쓰고
+    "요요가 와서 쪘다고 하는 부분에 모두 적용할 것".
+    """
+    if "요요" not in _squash(text) and not _has_any(text, ("다시쪄", "다시쪘", "또쪘")):
+        return []
+    out: list[str] = []
+    if not _KG_RE.search(text or ""):
+        out.append("요요 수치 — 요요를 말했으면 몇 kg 다시 쪘는지 적어야 한다")
+    if not _PERIOD_RE.search(text or ""):
+        out.append("요요 기간 — 요요를 말했으면 몇 주(달) 만인지 적어야 한다")
+    return out
+
+
+def review_comment5_problems(text: str) -> list[str]:
+    """후기형 댓글5 — 요요로 여러 번 실패했다는 토로 + 댓글 수치 범위(3~10kg).
+
+    정리본 `팥순이 후기형.md`: 댓글5(요요 고민 토로) "요요 때문에 진짜 몇 번을
+    실패했는지 모르겠어요" / 절대 규칙 4번 "숫자는 매번 다르게 (3~10kg, 3~8주 범위)".
+    """
+    if not (text or "").strip():
+        return ["댓글5 없음"]
+    out: list[str] = []
+    if not _has_any(text, REVIEW_C5_YOYO_WORDS) or not _has_any(
+        text, REVIEW_C5_FAIL_WORDS
+    ):
+        out.append(
+            "댓글5 역할 — 요요로 여러 번 실패했다는 토로가 있어야 한다"
+            " (정체기 경험만으로는 안 된다)"
+        )
+    kilos = [float(m) for m in _KG_RE.findall(text or "")]
+    bad = [
+        k for k in kilos if not REVIEW_COMMENT_MIN_KG <= k <= REVIEW_COMMENT_MAX_KG
+    ]
+    if bad:
+        out.append(
+            f"댓글5 감량 수치 — {bad[0]:g}kg 는 댓글 수치 범위"
+            f"({REVIEW_COMMENT_MIN_KG:g}~{REVIEW_COMMENT_MAX_KG:g}kg) 밖이다"
+        )
+    return out
+
+
+def review_body_problems(body: str) -> list[str]:
+    """후기형 본문 — 문단 끝 한글 이모티콘과 요요 수치 (정리본 반영, 2026-09-22)."""
+    out: list[str] = []
+    naked = [
+        p.strip().splitlines()[-1].strip()
+        for p in paragraphs(body)
+        if p.strip()
+        and not re.fullmatch(r"\{[^{}]*\}", p.strip())
+        and not any(p.rstrip().endswith(mark) for mark in PARAGRAPH_TAIL_MARKS)
+    ]
+    if naked:
+        out.append(
+            f"문단 끝 이모티콘 — {len(naked)}개 문단이 ㅠㅠ ㅋㅋ ㅎㅎ !! 없이 끝난다"
+            f" (보기: `{naked[0][-16:]}`)"
+        )
+    out += yoyo_number_problems(body)
+    return out
 
 
 def reply2_problems(text: str, rule: "BrandRule") -> list[str]:
@@ -1236,9 +1580,13 @@ def load_examples(
     return out
 
 
+#: system에 넣는 시트 예시 개수 상한 (2026-09-22 토큰 절약 — 전부 넣지 않는다)
+MAX_PROMPT_EXAMPLES = 3
+
+
 def examples_block(examples: list[str] | None) -> list[str]:
-    """few-shot 예시를 system 캐시 블록에 넣을 줄 목록으로 만든다."""
-    items = [e for e in (examples or []) if (e or "").strip()]
+    """few-shot 예시를 system 캐시 블록에 넣을 줄 목록으로 만든다 (최대 3개)."""
+    items = [e for e in (examples or []) if (e or "").strip()][:MAX_PROMPT_EXAMPLES]
     if not items:
         return []
     lines = [
@@ -1254,14 +1602,17 @@ def examples_block(examples: list[str] | None) -> list[str]:
 
 # ------------------------------------------------------------------ 프롬프트
 def _guide_block(guide_text: str) -> str:
-    """지침 **전문**을 참고 자료로 붙인다 (잘라내기 폐지, 설계서 A).
+    """지침을 참고 자료로 붙인다.
 
-    캐시되는 system 블록에만 들어가므로 길어도 비용이 거의 늘지 않는다.
+    **프롬프트에 실을 때만** `compress_guide_text`로 줄인다 (2026-09-22). 코드
+    검증기가 이미 검사하는 규칙(줄 나눔·글자 수·`{키워드}` 자리·웃음 표기·출력
+    형식)과 Make 운영 메모·중복 문장은 빼고, 모델만 할 수 있는 판단(브랜드 정보·
+    설득 논리·구조)만 남긴다. 원본 md 파일은 건드리지 않는다.
     """
-    text = (guide_text or "").strip()
+    text = compress_guide_text(guide_text)
     if not text:
         return ""
-    return "\n<지침 원문 (전문 — 이 글의 최종 기준이다)>\n" + text + "\n"
+    return "\n<지침 (이 글의 최종 기준이다)>\n" + text + "\n"
 
 
 def _body_rules_block(
@@ -1337,6 +1688,43 @@ def _body_dynamic_block(rule: BrandRule, keyword: str, cafe: str = "") -> list[s
     return lines
 
 
+def build_shared_system(
+    brand: str,
+    manuscript_type: str = "",
+    guide_text: str = "",
+    examples: list[str] | None = None,
+) -> str:
+    """브랜드(+원고유형)당 **하나뿐인** system 프롬프트 (2026-09-22 토큰 절약).
+
+    본문·댓글·부분 재시도가 **글자 하나까지 같은** 문자열을 쓴다. 그래야 원고 한
+    건 안에서도 2·3번째 호출이 프롬프트 캐시(`cache_read_input_tokens`)를 타고,
+    같은 브랜드를 잇달아 만들면 다음 원고까지 캐시가 이어진다.
+
+    "이번에 무엇을 쓸 차례인가"(할 일)와 출력 형식은 여기에 넣지 않는다 — 그걸
+    넣는 순간 호출마다 system이 달라져 캐시가 깨지기 때문이다. 그쪽은 user로 간다.
+    지침·시트 예시도 **딱 한 번만** 넣는다 (예전에는 본문용·댓글용에 두 번 실렸다).
+    """
+    rule = rule_for(brand, manuscript_type)
+    return "\n".join(
+        [
+            BRAND_SHARED_SYSTEM.format(
+                tone=HUMAN_TONE_RULES,
+                internal=NO_INTERNAL_TERMS_RULE,
+                first_mention=BRAND_FIRST_MENTION_RULE,
+            ),
+            "",
+            "## 본문 규칙",
+            *_body_rules_block(rule),
+            "",
+            "## 댓글 규칙",
+            *_comments_rules_block(rule),
+            "",
+            *examples_block(examples),
+            _guide_block(guide_text),
+        ]
+    )
+
+
 def build_body_prompt(
     brand: str,
     keyword: str,
@@ -1345,22 +1733,17 @@ def build_body_prompt(
     manuscript_type: str = "",
     examples: list[str] | None = None,
 ) -> tuple[str, str]:
-    """본문 생성용 `(고정 system, 키워드별 user)` 프롬프트.
+    """본문 생성용 `(공용 system, 이번 할 일 user)` 프롬프트.
 
-    system에는 브랜드 규칙·구조·예시·지침처럼 **키워드가 바뀌어도 똑같은** 내용만
-    담는다. 그래야 프롬프트 캐시가 걸려 두 번째 키워드부터 입력 비용이 1/10로
-    떨어진다. 키워드·카페·페르소나 씨앗은 user로 간다.
+    system은 `build_shared_system`이 만든 **브랜드 공용** 문자열 그대로다.
+    "본문을 써라"와 출력 형식, 키워드·카페는 user로 간다.
     """
     rule = rule_for(brand, manuscript_type)
-    system = "\n".join(
-        [
-            BRAND_BODY_SYSTEM.format(tone=HUMAN_TONE_RULES, internal=NO_INTERNAL_TERMS_RULE),
-            "",
-            *_body_rules_block(rule, guide_text, examples),
-            '출력: {"title": "제목", "body": "본문"}',
-        ]
+    system = build_shared_system(brand, manuscript_type, guide_text, examples)
+    user = "\n".join(
+        [BRAND_BODY_TASK, "", *_body_dynamic_block(rule, keyword, cafe)]
     )
-    return system, "\n".join(_body_dynamic_block(rule, keyword, cafe))
+    return system, user
 
 
 def _comments_rules_block(
@@ -1398,6 +1781,8 @@ def _comments_rules_block(
     )
     if rule.manuscript_type == "후기형":
         writer = ", ".join(author_labels(rule.manuscript_type))
+        lines.append("")
+        lines.append(BRAND_REVIEW_THREAD_FLOW)
         lines.append("")
         lines.append("<후기형 — 노드별 작성 계정 역할 (질문형과 다르다)>")
         lines.append(f"- 본문 작성자가 쓰는 자리: {writer}")
@@ -1448,20 +1833,6 @@ def _comments_rules_block(
     return lines
 
 
-def _comments_system_prompt(rule: BrandRule) -> str:
-    """원고유형별 댓글 system 프롬프트 (후기형은 질문형과 완전히 분리, 설계서 D)."""
-    template = (
-        BRAND_REVIEW_COMMENTS_SYSTEM
-        if rule.manuscript_type == "후기형"
-        else BRAND_COMMENTS_SYSTEM
-    )
-    return template.format(
-        tone=HUMAN_TONE_RULES,
-        internal=NO_INTERNAL_TERMS_RULE,
-        first_mention=BRAND_FIRST_MENTION_RULE,
-    )
-
-
 def build_comments_prompt(
     brand: str,
     keyword: str,
@@ -1471,22 +1842,18 @@ def build_comments_prompt(
     guide_text: str = "",
     examples: list[str] | None = None,
 ) -> tuple[str, str]:
-    """댓글 12개 생성용 `(고정 system, 본문별 user)` 프롬프트.
+    """댓글 12개 생성용 `(공용 system, 이번 할 일 user)` 프롬프트.
 
-    브랜드 규칙·12개 구조·역할 설명은 늘 같으니 system에 넣어 캐시하고,
-    user에는 키워드와 이번 본문(제목·본문)만 담는다.
+    system은 본문 생성 때와 **똑같은** 브랜드 공용 문자열이라 이 호출은 캐시를
+    읽고 지나간다. "댓글을 써라"와 출력 형식, 이번 본문은 user로 간다.
     """
     rule = rule_for(brand, manuscript_type)
-    system = "\n".join(
-        [
-            _comments_system_prompt(rule),
-            "",
-            *_comments_rules_block(rule, guide_text, examples),
-        ]
-    )
+    system = build_shared_system(brand, manuscript_type, guide_text, examples)
     tried = methods_already_tried(body)
     user = "\n".join(
         [
+            BRAND_COMMENTS_TASK,
+            "",
             f"작성 키워드: {keyword}",
             "",
             "<본문>",
@@ -1511,24 +1878,13 @@ def build_combined_prompt(
     manuscript_type: str = "",
     examples: list[str] | None = None,
 ) -> tuple[str, str]:
-    """본문 + 댓글 12개를 **한 번에** 받는 `(고정 system, 키워드별 user)` 프롬프트."""
+    """본문 + 댓글 12개를 **한 번에** 받는 `(공용 system, 이번 할 일 user)` 프롬프트."""
     rule = rule_for(brand, manuscript_type)
-    system = "\n".join(
-        [
-            BRAND_COMBINED_SYSTEM.format(
-                tone=HUMAN_TONE_RULES,
-                internal=NO_INTERNAL_TERMS_RULE,
-                first_mention=BRAND_FIRST_MENTION_RULE,
-            ),
-            "",
-            "## 본문 규칙",
-            *_body_rules_block(rule, guide_text, examples),
-            "",
-            "## 댓글 규칙",
-            *_comments_rules_block(rule, guide_text),
-        ]
+    system = build_shared_system(brand, manuscript_type, guide_text, examples)
+    user = "\n".join(
+        [BRAND_COMBINED_TASK, "", *_body_dynamic_block(rule, keyword, cafe)]
     )
-    return system, "\n".join(_body_dynamic_block(rule, keyword, cafe))
+    return system, user
 
 
 def build_partial_retry_prompt(
@@ -1540,26 +1896,18 @@ def build_partial_retry_prompt(
     guide_text: str = "",
     examples: list[str] | None = None,
 ) -> tuple[str, str]:
-    """검증에 걸린 **그 자리만** 다시 받는 `(system, user)` 프롬프트.
+    """검증에 걸린 **그 자리만** 다시 받는 `(공용 system, 이번 할 일 user)` 프롬프트.
 
     직전 출력 12개를 통째로 되보내지 않는다. 고친 자리만 JSON으로 받아
-    `merge_comments`로 갈아 끼운다 (재시도 입력 토큰이 크게 줄어든다).
+    `merge_comments`로 갈아 끼운다. system은 본문·댓글 때와 **똑같은** 공용
+    문자열이라 재시도 호출은 거의 전부 캐시 읽기로 지나간다.
     """
-    rule = rule_for(brand, manuscript_type)
-    system = "\n".join(
-        [
-            BRAND_PARTIAL_RETRY_SYSTEM.format(
-                tone=HUMAN_TONE_RULES,
-                internal=NO_INTERNAL_TERMS_RULE,
-                first_mention=BRAND_FIRST_MENTION_RULE,
-            ),
-            "",
-            *_comments_rules_block(rule, guide_text, examples),
-        ]
-    )
+    system = build_shared_system(brand, manuscript_type, guide_text, examples)
     want = [label for label in COMMENT_LABELS if label in set(labels)] or list(COMMENT_LABELS)
     user = "\n".join(
         [
+            BRAND_PARTIAL_RETRY_TASK,
+            "",
             f"작성 키워드: {keyword}",
             "",
             "<다시 쓸 자리>",
@@ -2026,6 +2374,101 @@ def validate(
             scope="댓글",
         )
     )
+
+    # --- 후기형 본문: 문단 끝 한글 이모티콘 + 요요 수치 (정리본, 2026-09-22)
+    if rule.manuscript_type == "후기형":
+        body_bad = review_body_problems(body)
+        checks.append(
+            _check(
+                "후기형 본문 이모티콘·요요 수치",
+                "문단 끝마다 ㅠㅠ ㅋㅋ ㅎㅎ !! 중 하나, 요요를 말하면 기간+kg",
+                " / ".join(body_bad) if body_bad else "통과",
+                not body_bad,
+            )
+        )
+        # 댓글5 = 요요로 여러 번 실패했다는 토로, 수치는 3~10kg
+        c5_bad = review_comment5_problems(c5.text if c5 else "")
+        checks.append(
+            _check(
+                "후기형 댓글5 역할·수치",
+                f"요요로 여러 번 실패 + 감량 수치는"
+                f" {REVIEW_COMMENT_MIN_KG:g}~{REVIEW_COMMENT_MAX_KG:g}kg",
+                " / ".join(c5_bad) if c5_bad else "통과",
+                not c5_bad,
+                scope="댓글",
+            )
+        )
+
+    # --- 권위 근거는 원고 전체에서 한 번만 (사용자 원고 피드백 2026-09-22)
+    c2 = next(
+        (c for c in manuscript.comments if re.sub(r"\s+", "", c.label) == "댓글2"), None
+    )
+    dup_auth = (
+        duplicate_authority_problems(c2.text if c2 else "", reply2.text if reply2 else "")
+    )
+    checks.append(
+        _check(
+            "권위 근거 중복",
+            "의사·논문·기관·클리닉은 원고 전체에서 한 번만"
+            " (댓글2에서 썼으면 대대댓글2는 성분·원리·체감으로)",
+            " / ".join(dup_auth) if dup_auth else "없음",
+            not dup_auth,
+            scope="댓글",
+        )
+    )
+
+    # --- 댓글3은 해결 경험·도움이 된 노력을 담는다 (바이럴 4종 지침)
+    if rule.comment3_needs_solution:
+        c3 = next(
+            (c for c in manuscript.comments if re.sub(r"\s+", "", c.label) == "댓글3"),
+            None,
+        )
+        c3_bad = comment3_role_problems(c3.text if c3 else "")
+        checks.append(
+            _check(
+                "댓글3 역할",
+                "비슷한 고충 + **해결된 경험이나 도움이 된 노력**",
+                " / ".join(c3_bad) if c3_bad else "통과",
+                not c3_bad,
+                scope="댓글",
+            )
+        )
+
+    # --- 근거 출처 겹침 (경고): 수면클리닉 이비인후과 의사 논문 같은 나열
+    stacked = [
+        f"{c.label}: {p}"
+        for c in manuscript.comments
+        for p in stacked_authority_problems(c.text)
+    ]
+    checks.append(
+        _check(
+            "근거 출처 하나만",
+            "기관·사람·문헌을 겹쳐 붙이지 않는다 (출처는 1개)",
+            " / ".join(stacked) if stacked else "없음",
+            not stacked,
+            hard=False,
+            scope="댓글",
+        )
+    )
+
+    # --- 고민 문장의 ㅋㅋ ㅎㅎ (경고): 그 자리는 ㅠㅠ 다
+    worry_body = worry_laughter_problems(body)
+    worry_comments = [
+        f"{c.label}: {p}"
+        for c in manuscript.comments
+        for p in worry_laughter_problems(c.text)
+    ]
+    for scope, found in (("본문", worry_body), ("댓글", worry_comments)):
+        checks.append(
+            _check(
+                f"고민 문장 웃음 표기({scope})",
+                "걱정·고민을 말하는 문장에는 ㅠㅠ (ㅋㅋ ㅎㅎ 금지)",
+                " / ".join(found) if found else "없음",
+                not found,
+                hard=False,
+                scope=scope,
+            )
+        )
     return checks
 
 
@@ -2301,7 +2744,13 @@ def _usage_snapshot(llm: Any) -> dict:
 
 
 def _usage_delta(llm: Any, before: dict) -> dict:
-    """이 원고 한 건이 쓴 토큰만 빼낸다 (모델별 누계 `by_model`도 같이 뺀다)."""
+    """이 원고 한 건이 쓴 토큰만 빼낸다 (모델별 누계 `by_model`도 같이 뺀다).
+
+    주의: 라우터의 토큰 누계는 **프로세스 전체가 함께 쓰는 하나**다. 그래서
+    브랜드 2개를 동시에 돌리면(`brand_batch`) 이 뺄셈에 옆 원고의 몫이 섞인다.
+    묶음 전체의 정확한 수치는 사용량 장부(`data/llm_usage-YYYY-MM.jsonl`)를 봐야
+    한다 — 거기는 호출 한 건이 한 줄이라 섞이지 않는다.
+    """
     usage = getattr(llm, "usage", None)
     if not isinstance(usage, dict):
         return {}
@@ -2367,6 +2816,7 @@ def _finish(
     hard = violations(checks, include_warnings=False)
     if stats is None:
         return
+    from v2r.llm import usage_ledger as cache_ledger
     from v2r.llm.router import estimate_cost
 
     stats["mode"] = mode
@@ -2394,6 +2844,17 @@ def _finish(
     stats["output_tokens"] = usage.get("output_tokens", 0)
     stats["cache_read_input_tokens"] = usage.get("cache_read_input_tokens", 0)
     stats["cache_creation_input_tokens"] = usage.get("cache_creation_input_tokens", 0)
+    # 요금제 길은 최상위 누계에 넣지 않으니 길별 누계(`by_backend`)에서 찾아 합친다
+    counts = {
+        key: int(usage.get(key, 0) or 0) for key in cache_ledger.TOKEN_FIELDS
+    }
+    for per in (usage.get("by_backend") or {}).values():
+        if not isinstance(per, dict):
+            continue
+        for key in cache_ledger.TOKEN_FIELDS:
+            counts[key] += int(per.get(key, 0) or 0)
+    # 이번 원고가 읽은 입력 가운데 **캐시로 지나간 몫** (1에 가까울수록 좋다)
+    stats["cache_hit_ratio"] = round(cache_ledger.cache_hit_ratio(counts), 4)
     stats["estimated_usd"] = estimate_cost(usage)
 
 

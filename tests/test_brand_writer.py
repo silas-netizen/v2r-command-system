@@ -41,7 +41,7 @@ COMMENTS = {
     "대댓글2": "헉 그런건 어떤 성분 봐야되요?",
     "대대댓글2": "그린커피 아하바하라고 있어요 아하바하가 두꺼워진 각질을 정돈해줘서 그린커피가 멜라닌까지 닿는 원리에요 단순 미백크림은 겉돌아서 소용없더라구요 검색해보시면 후기 많아요",
     "대대대댓글2": "222 저도 그거 쓰고 확실히 나아졌어요",
-    "댓글3": "저도 작년에 똑같이 고민했어요ㅠㅠ",
+    "댓글3": "저도 작년에 똑같이 고민했는데 관리 바꾸니까 좀 나아졌어요ㅠㅠ",
     "대댓글3": "저만 그런게 아니였네요ㅎㅎ",
     "댓글4": "스크럽 자주 하면 더 올라와요",
     "대댓글4": "아 그거 계속 했는데 큰일이네요",
@@ -131,7 +131,10 @@ def test_body_prompt_carries_brand_rules():
     assert "{키워드}" in system
     assert "2번째 문단" in system
     assert KEYWORD in user and "씨씨앙" in user
-    assert KEYWORD not in system  # 키워드가 고정부에 섞이면 캐시가 깨진다
+    # 키워드·카페가 고정부에 섞이면 캐시가 깨진다 — 무엇을 넣어도 system은 같아야 한다
+    other, _ = bw.build_body_prompt("우아덤", "편평사마귀", "다른카페")
+    assert other == system
+    assert "씨씨앙" not in system
     assert build is not None
 
 
@@ -204,7 +207,7 @@ def test_length_over_cap_is_not_even_a_warning():
 
     상한을 조금 넘겼다고 경고를 내면 그 경고가 재시도를 불러 글 완성도를 깎았다.
     """
-    m = _manuscript(comments=_nodes({"댓글3": "가" * 50}))
+    m = _manuscript(comments=_nodes({"댓글3": "도움됐어요" + "가" * 45}))
     checks = bw.validate(m)
     row = next(c for c in checks if c["항목"] == "댓글 글자 수")
     assert row["통과"] is True
@@ -227,7 +230,7 @@ def test_body_length_also_allows_200_percent():
 
 
 def test_soft_limits_flag_no_longer_changes_anything():
-    m = _manuscript(comments=_nodes({"댓글3": "가" * 50}))
+    m = _manuscript(comments=_nodes({"댓글3": "도움됐어요" + "가" * 45}))
     assert bw.failures(bw.validate(m, soft_limits=False)) == []
 
 
@@ -238,7 +241,7 @@ def test_comment_limits_are_configurable_per_brand():
     assert (patsooni.root_max, patsooni.comment2_max, patsooni.reply2_max) == (50, 90, 110)
     assert viral.comment_max == viral.root_max  # 옛 이름도 그대로 읽힌다
     loose = bw.BrandRule(brand="우아덤", root_max=55, comment2_max=90)
-    m = _manuscript(comments=_nodes({"댓글3": "가" * 50}))
+    m = _manuscript(comments=_nodes({"댓글3": "도움됐어요" + "가" * 45}))
     assert bw.validate(m, loose)[0] is not None
     row = next(c for c in bw.validate(m, loose) if c["항목"] == "댓글 글자 수")
     assert row["통과"] is True

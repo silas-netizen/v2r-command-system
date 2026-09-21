@@ -509,6 +509,15 @@ def _generate_brand(rt: Runtime, spec: TaskSpec) -> dict:
         "failed": failed,
         "unresolved": unresolved,
         "attempts": {m.keyword: s.get("attempts", 0) for m, s in made},
+        # GPT 교차 검증 결과 (켜져 있지 않거나 실패하면 "미검증")
+        "gpt": {
+            m.keyword: {
+                "score": s.get("gpt_score"),
+                "verdict": s.get("gpt_verdict", "미검증"),
+                "notes": len(s.get("gpt_notes") or []),
+            }
+            for m, s in made
+        },
         "keywords": [m.keyword for m, _ in made],
         "report": str(report) if made else "",
         "message": (
@@ -550,10 +559,13 @@ def _generate_brand_loop(
 ) -> tuple[list, list[dict], list[dict]]:
     """키워드 목록을 돌며 원고를 만든다 (결과 정리는 부르는 쪽에서)."""
     from v2r.content import brand_writer as bw
+    from v2r.content import gpt_crosscheck
 
     made: list[Any] = []
     failed: list[dict] = []
     unresolved: list[dict] = []
+    # 한 묶음(같은 브랜드 한 번 실행) 안에서 대대댓글2 마무리가 되풀이되는지 본다
+    closings: list[str] = []
     for item in todo:
         stats: dict = {}
         try:
@@ -572,6 +584,30 @@ def _generate_brand_loop(
         except Exception as exc:
             failed.append({"keyword": item["keyword"], "error": str(exc)})
             continue
+        reply2 = next(
+            (c for c in m.comments if c.label.replace(" ", "") == "대대댓글2"), None
+        )
+        if reply2 is not None:
+            closings.append(reply2.text)
+            repeats = bw.repeated_closings(closings)
+            if repeats:
+                # 경고만 남긴다 (사용자 원고 피드백 2026-09-22: 마무리를 매번 바꾼다)
+                stats["closing_repeat"] = repeats
+        # GPT(Codex) 교차 검증 — 실패해도 원고 생성은 막지 않는다 (미검증으로 남긴다)
+        try:
+            gpt_crosscheck.crosscheck_manuscript(
+                rt.llm,
+                m,
+                bw.rule_for(brand, spec.manuscript_type),
+                guide_text=guide,
+                examples=examples,
+                stats=stats,
+            )
+        except Exception as exc:  # 교차 검증은 **덤**이다
+            stats.update(
+                {"gpt_checked": False, "gpt_score": None,
+                 "gpt_verdict": "미검증", "gpt_notes": [], "gpt_error": str(exc)}
+            )
         bw.save_json(m, out_dir / f"{item['keyword']}.json", stats)
         if stats.get("unresolved"):
             # 포기하지 않고 최대 횟수까지 다시 시켰는데도 남은 규칙 (사용자 지시 2026-09-19)
@@ -586,6 +622,41 @@ def _generate_brand_loop(
             )
         made.append((m, stats))
     return made, failed, unresolved
+
+
+def generate_brand_bundles(
+    rt: Runtime,
+    bundles: list[tuple[str, str]],
+    count: int = 1,
+    max_brands: int | None = None,
+    generate_mode: str = "",
+) -> list[dict]:
+    """여러 (브랜드, 원고유형) 묶음을 한 번에 만든다 (2026-09-22).
+
+    - 같은 브랜드(+유형)끼리 **붙여서** 만든다 → 두 번째 원고부터 지침을 다시 읽지
+      않는다 (프롬프트 캐시).
+    - 브랜드는 **최대 2개 동시**, 같은 브랜드 안에서는 순차 (`brand_batch`).
+
+    결과는 넣은 순서 그대로, `_generate_brand`가 돌려주는 dict 목록이다.
+    """
+    from v2r.content import brand_batch
+
+    limit = brand_batch.DEFAULT_MAX_BRANDS if max_brands is None else max_brands
+
+    def run_one(brand: str, mtype: str, index: int) -> dict:
+        one = TaskSpec(
+            task="generate_brand",
+            brand=brand,
+            manuscript_type=mtype,
+            count=count,
+            generate_mode=generate_mode,
+        )
+        del index
+        return _generate_brand(rt, one)
+
+    return brand_batch.run_bundles(
+        brand_batch.order_bundles(bundles), run_one, max_brands=limit
+    )
 
 
 def _generate_daily(rt: Runtime, spec: TaskSpec) -> dict:
@@ -1749,6 +1820,10 @@ def dispatch(rt: Runtime, job: Any, owner: str | None = None) -> dict:
         from v2r.engine.cleanup import cleanup_orphans
 
         return cleanup_orphans(rt, spec)
+    if task == "maintenance":
+        from v2r.engine.maintenance import run_maintenance
+
+        return run_maintenance(rt, spec)
     if task == "cleanup_emoji":
         from v2r.engine.emoji_cleanup import cleanup_emoji
 
@@ -2060,6 +2135,15 @@ def serve(rt: Runtime, poll_seconds: int = 5, announce: bool = True) -> None:  #
     if held is None:
         return
     owner = default_owner()
+    # 지난번 실행이 남긴 요금제 임시 파일을 먼저 치운다 (누적 속도 조치 2026-09-22)
+    try:
+        from v2r.engine.maintenance import clean_plan_work
+
+        left = clean_plan_work(rt.settings.data_dir).get("removed", 0)
+        if left:
+            log.info("시작 청소 — 요금제 임시 파일 %d개 삭제", left)
+    except Exception as exc:  # noqa: BLE001 - 청소 실패로 실행기를 못 띄우면 안 된다
+        log.warning("시작 청소 실패(계속 진행): %s", exc)
     print(f"serve 시작: 채널 {len(rt.channels)}개, {poll_seconds}초 간격", flush=True)
     log.info("serve 시작: 채널 %d개", len(rt.channels))
     if announce:

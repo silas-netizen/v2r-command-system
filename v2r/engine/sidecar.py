@@ -53,6 +53,7 @@ LIGHT_TASKS = frozenset(
         "naver_keepalive",
         "web_keepalive",
         "plan_keepalive",
+        "maintenance",
     }
 )
 
