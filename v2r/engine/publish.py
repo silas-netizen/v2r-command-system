@@ -1023,13 +1023,112 @@ def is_self_cafe(rt: Runtime, cafe_name: str) -> bool:
     return any(cafe_matches(cafe_name, n) for n in self_cafe_names(rt, include_excluded=True))
 
 
+def plan_event(rt: Runtime, level: str, message: str) -> None:
+    """계획 단계 이벤트. job_id를 모르면 `rt.scratch`에 담아 worker가 기록한다."""
+    job_id = rt.scratch.get("job_id")
+    if job_id:
+        try:
+            rt.events.log(job_id, level, message)
+            return
+        except Exception:  # pragma: no cover - 방어
+            pass
+    rt.scratch.setdefault("plan_events", []).append((level, message))
+
+
+def flush_plan_events(rt: Runtime, job_id: int | None) -> None:
+    """계획 단계에서 모아 둔 이벤트를 실제 job_id로 기록한다."""
+    pending = rt.scratch.pop("plan_events", None) or []
+    for level, message in pending:
+        try:
+            rt.events.log(job_id, level, message)
+        except Exception:  # pragma: no cover - 방어
+            log.info("계획 이벤트: %s %s", level, message)
+
+
+def _menu_cache_key(cafe_id: Any, day: str) -> str:
+    """게시판 권한 하루 캐시 키."""
+    return f"menus:{cafe_id}:{day}"
+
+
+def cafe_menus(rt: Runtime, cafe: Any, logins: list[str]) -> tuple[list[Any], dict[str, str]]:
+    """카페의 게시판 권한(계정별)을 **하루 단위 DB 캐시**로 가져온다.
+
+    같은 날 같은 카페는 프로세스가 달라도 API를 다시 부르지 않는다.
+    계정이 늘어나면 캐시에 없는 계정만 추가로 조회한다.
+    반환: `(Menu 목록, 건너뛴 계정→사유)`.
+    """
+    from v2r.api.catalog import Menu
+    from v2r.command.spec import today_kst
+
+    cafe_id = getattr(cafe, "cafe_id", cafe)
+    key = _menu_cache_key(cafe_id, today_kst())
+    try:
+        cached = rt.sources_cache.get(key) or {}
+    except Exception:  # pragma: no cover - 캐시는 보조 수단
+        cached = {}
+    names: dict[int, str] = {}
+    for k, v in (cached.get("menu_names") or {}).items():
+        try:
+            names[int(k)] = v
+        except (TypeError, ValueError):
+            continue
+    by_login: dict[str, list[int]] = {
+        k: [int(x) for x in (v or [])] for k, v in (cached.get("logins") or {}).items()
+    }
+    skipped: dict[str, str] = dict(cached.get("skipped") or {})
+
+    missing = [l for l in logins if l not in by_login and l not in skipped]
+    if missing:
+        fetched = rt.catalog.menus(cafe_id, missing)
+        fresh_skips = dict(getattr(rt.catalog, "last_menu_skips", None) or {})
+        for login_id in missing:
+            if login_id not in fresh_skips:
+                by_login.setdefault(login_id, [])
+        for menu in fetched:
+            names[menu.menu_id] = menu.name
+            for login_id in menu.writable_accounts:
+                ids = by_login.setdefault(login_id, [])
+                if menu.menu_id not in ids:
+                    ids.append(menu.menu_id)
+        skipped.update(fresh_skips)
+        try:
+            rt.sources_cache.put(
+                key,
+                {
+                    "menu_names": {str(k): v for k, v in names.items()},
+                    "logins": by_login,
+                    "skipped": skipped,
+                },
+            )
+            rt.conn.commit()
+        except Exception as exc:  # pragma: no cover - 캐시는 보조 수단
+            log.warning("게시판 권한 캐시 저장 실패: %s", exc)
+
+    wanted = set(logins)
+    merged: dict[int, Menu] = {}
+    for login_id, ids in by_login.items():
+        if login_id not in wanted:
+            continue
+        for menu_id in ids:
+            name = names.get(menu_id)
+            if not name:
+                continue
+            menu = merged.get(menu_id)
+            if menu is None:
+                menu = Menu(menu_id=menu_id, name=name)
+                merged[menu_id] = menu
+            menu.writable_accounts.add(login_id)
+    return list(merged.values()), {k: v for k, v in skipped.items() if k in wanted}
+
+
 def writable_logins(
     rt: Runtime, cafe_name: str, board: str, candidates: list[str]
 ) -> set[str]:
     """`cafe_name`의 `board`에 글을 쓸 수 있는 계정(casefold) 집합.
 
     카페 가입 계정 ∩ `candidates` 로 조회 범위를 좁힌 뒤 게시판 권한을 본다.
-    결과는 실행 중 재사용한다(`rt.scratch`).
+    결과는 실행 중 재사용한다(`rt.scratch`). 조회에서 건너뛴 계정은
+    `rt.scratch["menu_skips"]`에 남겨 호출자가 보정할 수 있게 한다.
     """
     from v2r.api.catalog import match_name
 
@@ -1039,13 +1138,52 @@ def writable_logins(
     cache: dict = rt.scratch.setdefault("writable_logins", {})
     key = (_norm(cafe_name), _norm(board), tuple(sorted(logins)))
     if key not in cache:
-        menus = rt.catalog.menus(cafe.cafe_id, logins) if logins else []
+        menus, skipped = cafe_menus(rt, cafe, logins) if logins else ([], {})
+        skips: dict = rt.scratch.setdefault("menu_skips", {})
+        skips.setdefault(_norm(cafe_name), {}).update(skipped)
         if not menus:
             cache[key] = set()
         else:
             menu = match_name(board, menus, key=lambda x: x.name)
             cache[key] = {a.casefold() for a in menu.writable_accounts}
     return cache[key]
+
+
+#: 자사 카페에서 "게시판 권한 조회가 부분 실패했다"고 볼 기준 (규칙: 시트가 기준).
+SELF_POOL_MIN = 5
+SELF_POOL_RATIO = 0.5
+
+
+def _repair_self_pool(
+    rt: Runtime, cafe_name: str, board: str, pool: list[Account], narrowed: list[Account]
+) -> list[Account]:
+    """자사 카페에서 권한 조회가 부분 실패하면 **시트 기준**으로 풀을 되살린다.
+
+    (쓰기 가능 ∩ 후보)가 후보의 절반 미만이거나 5개 미만이면 경고를 남기고,
+    조회에서 건너뛰어진 계정 중 시트 후보에 있는 계정을 다시 풀에 넣는다
+    (사용자 원칙 2026-09-21: 시트 '자사 카페' 회원이면 쓸 수 있다고 본다).
+    """
+    if not pool or not is_self_cafe(rt, cafe_name):
+        return narrowed
+    if len(narrowed) >= SELF_POOL_MIN and len(narrowed) >= len(pool) * SELF_POOL_RATIO:
+        return narrowed
+    skipped = (rt.scratch.get("menu_skips") or {}).get(_norm(cafe_name)) or {}
+    plan_event(
+        rt,
+        "warn",
+        f"게시판 권한 조회가 부분 실패: {len(narrowed)}/{len(pool)}"
+        f" — 시트 기준으로 진행 ({cafe_name}/{board}"
+        + (f", 건너뜀 {len(skipped)}개" if skipped else "")
+        + ")",
+    )
+    if not skipped:
+        return narrowed
+    have = {a.login_id.casefold() for a in narrowed}
+    lowered = {k.casefold() for k in skipped}
+    restored = list(narrowed) + [
+        a for a in pool if a.login_id.casefold() in lowered and a.login_id.casefold() not in have
+    ]
+    return restored
 
 
 def _pool_for_cafe(
@@ -1069,6 +1207,7 @@ def _pool_for_cafe(
             f"'{cafe_name}' 카페의 '{board}' 게시판 권한을 확인하지 못했습니다: {exc}"
         ) from exc
     narrowed = [a for a in pool if a.login_id.casefold() in allowed]
+    narrowed = _repair_self_pool(rt, cafe_name, board, pool, narrowed)
     if not narrowed:
         raise AssignError(
             f"'{cafe_name}' 카페의 '{board}' 게시판에 글을 쓸 수 있는 계정이 없습니다"
@@ -1326,6 +1465,21 @@ def plan(rt: Runtime, spec: TaskSpec, manuscripts: list[Manuscript]) -> list[Slo
                     mode="auto",
                     count=min(need, len(pool)),
                     last_used=rt.account_state.last_used_map(),
+                )
+            # 계획 근거를 한 줄로 남긴다 — 풀이 조용히 쪼그라드는 일을 바로 보이게 (2026-09-21)
+            if self_daily_pick:
+                today = rt.scratch.get("self_daily_accounts") or []
+                plan_event(
+                    rt,
+                    "info",
+                    f"{cafe_name}/{board}: 계정 풀 {len(pool)}개"
+                    f" / 오늘 {len(today)}개 중 {len(chosen)}개 사용",
+                )
+            else:
+                plan_event(
+                    rt,
+                    "info",
+                    f"{cafe_name}/{board}: 계정 풀 {len(pool)}개 / {len(chosen)}개 사용",
                 )
             # 순번은 카페 단위로 이어 간다 — 게시판마다 0부터 다시 세면 앞쪽 계정만 쓰게 된다
             offsets: dict[str, int] = rt.scratch.setdefault("account_rotation_offset", {})
@@ -2135,6 +2289,9 @@ def run_slot(
 
 __all__ = [
     "DEFERRED_ACCOUNT",
+    "cafe_menus",
+    "flush_plan_events",
+    "plan_event",
     "PublishError",
     "RetryWithOtherAccount",
     "Slot",

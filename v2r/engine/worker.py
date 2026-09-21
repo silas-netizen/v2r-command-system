@@ -1447,6 +1447,8 @@ def _run_publish(
     try:
         slots = publish_mod.plan(rt, spec, manuscripts)
     except NoPhotoError as exc:
+        # 계획 도중 모아 둔 이벤트(계정 풀 요약·권한 조회 경고)를 먼저 남긴다
+        publish_mod.flush_plan_events(rt, job_id)
         # 사진 원본이 아예 없다 → 텔레그램 등 채널로 바로 알린다 (결정 1)
         rt.events.log(job_id, "error", str(exc))
         notify_all(rt.channels, str(exc))
@@ -1460,6 +1462,8 @@ def _run_publish(
             "dry_run": spec.dry_run,
             "message": str(exc),
         }
+    # 계획 단계 이벤트(카페별 계정 풀 N개 / 오늘 10개 중 M개 사용, 권한 조회 경고)
+    publish_mod.flush_plan_events(rt, job_id)
     paced = bool(getattr(spec, "per_cafe", False))
     # 각색 xlsx의 행 순서(카페가 행마다 번갈아 옴)를 그대로 지킨다 — 라운드로빈으로
     # 다시 섞지 않는다 (사용자 절대 규칙, 규칙 §2)

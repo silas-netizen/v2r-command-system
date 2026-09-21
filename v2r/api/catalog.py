@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import logging
 import re
+import time
 from dataclasses import dataclass, field as dc_field
 from typing import Any, Callable, Iterable
 
 from .client import V2RClient, field, walk_dicts
 from .errors import V2RApiError, classify
+
+log = logging.getLogger(__name__)
 
 PATH_ACCOUNTS = "/navers/accounts"
 PATH_JOIN_CAFES = "/naver_cafes/naver_join_cafes"
@@ -15,6 +19,14 @@ PATH_JOIN_CAFE = "/naver_cafes/naver_join_cafe"
 PATH_SYNC_ACCOUNT = "/naver_cafes/naver_join_cafe/sync/account"
 PATH_MENUS = "/naver_cafes/menus"
 PATH_HEADS = "/naver_cafes/heads"
+
+#: 게시판 권한 조회가 일시 오류(429·5xx·네트워크)로 실패했을 때 다시 부르기 전 대기(초).
+#: 응답에 `Retry-After`가 있으면 그 값을 먼저 쓴다(상한 `MENU_RETRY_MAX_WAIT`).
+MENU_RETRY_WAITS = (2.0, 5.0, 10.0, 20.0)
+#: 한 번 기다릴 수 있는 최대 시간(초). 이보다 긴 제한은 기다리지 않고 건너뛴다.
+MENU_RETRY_MAX_WAIT = 60.0
+#: 다시 부르면 풀릴 수 있는 오류 종류 — 절대 조용히 건너뛰지 않는다.
+TRANSIENT_MENU_KINDS = {"rate_limited", "server", "ambiguous", "network", "other"}
 
 
 class CatalogError(Exception):
@@ -135,7 +147,10 @@ class Catalog:
 
     def __init__(self, client: V2RClient) -> None:
         self.client = client
+        #: 게시판 권한 조회에서 끝내 건너뛴 계정 → 사유(누적).
         self.unhealthy_accounts: dict[str, str] = {}
+        #: 마지막 `menus()` 호출에서 건너뛴 계정 → 사유(호출자가 이벤트로 남긴다).
+        self.last_menu_skips: dict[str, str] = {}
 
     # ---- 계정 ----
     def accounts(self) -> list[dict]:
@@ -209,16 +224,61 @@ class Catalog:
         return out
 
     # ---- 게시판 ----
-    def menus(self, cafe_id: int, login_ids: list[str]) -> list[Menu]:
-        """계정별 쓰기 가능 게시판의 합집합. 비정상 계정은 건너뛴다."""
-        merged: dict[int, Menu] = {}
-        for login_id in login_ids:
+    def _menus_payload(self, cafe_id: int, login_id: str) -> dict:
+        """한 계정의 게시판 목록. 일시 오류는 지수 백오프로 다시 부른다.
+
+        429·5xx·네트워크 오류는 **건너뛰지 않는다**(그렇게 건너뛰면 쓰기 가능 계정이
+        조용히 쪼그라든다 — 2026-09-21 실측). 영구 오류만 그대로 올려보낸다.
+        """
+        last: Exception | None = None
+        for attempt in range(len(MENU_RETRY_WAITS) + 1):
             try:
-                payload = self.client.get(
+                return self.client.get(
                     PATH_MENUS, params={"cafe_id": cafe_id, "naver_login_id": login_id}
                 )
             except V2RApiError as exc:
-                self.unhealthy_accounts[login_id] = exc.kind or classify(exc)
+                kind = exc.kind or classify(exc)
+                if kind not in TRANSIENT_MENU_KINDS:
+                    raise
+                wait = MENU_RETRY_WAITS[min(attempt, len(MENU_RETRY_WAITS) - 1)]
+                if exc.retry_after is not None:
+                    wait = float(exc.retry_after)
+                if wait > MENU_RETRY_MAX_WAIT:
+                    raise  # 장기 제한 — 기다리지 않고 호출자가 판단한다
+                last = exc
+            except Exception as exc:  # 네트워크·타임아웃 등
+                wait = MENU_RETRY_WAITS[min(attempt, len(MENU_RETRY_WAITS) - 1)]
+                last = exc
+            if attempt >= len(MENU_RETRY_WAITS):
+                break
+            log.warning(
+                "게시판 권한 조회 재시도(%s, %d회차, %.0f초 대기): %s",
+                login_id, attempt + 1, wait, last,
+            )
+            time.sleep(wait)
+        assert last is not None
+        raise last
+
+    def menus(self, cafe_id: int, login_ids: list[str]) -> list[Menu]:
+        """계정별 쓰기 가능 게시판의 합집합.
+
+        일시 오류는 재시도하고, 영구 오류(계정 없음·권한 없음 등)만 건너뛴다.
+        건너뛴 계정과 사유는 `unhealthy_accounts`와 `last_menu_skips`에 남는다.
+        """
+        merged: dict[int, Menu] = {}
+        self.last_menu_skips = {}
+        for login_id in login_ids:
+            try:
+                payload = self._menus_payload(cafe_id, login_id)
+            except V2RApiError as exc:
+                kind = exc.kind or classify(exc)
+                self.unhealthy_accounts[login_id] = kind
+                self.last_menu_skips[login_id] = kind
+                continue
+            except Exception as exc:  # 네트워크 오류가 끝까지 안 풀린 경우
+                self.unhealthy_accounts[login_id] = "network"
+                self.last_menu_skips[login_id] = "network"
+                log.warning("게시판 권한 조회 실패(%s): %s", login_id, exc)
                 continue
             for d in walk_dicts(payload):
                 menu_id = _as_int(field(d, "menuId", "menu_id"))
