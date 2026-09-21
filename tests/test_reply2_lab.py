@@ -185,3 +185,99 @@ def test_latest_manuscript_reads_generated_plan(tmp_path, monkeypatch):
 @pytest.mark.parametrize("payload", [["가"], {"candidates": ["가"]}, [{"text": "가"}]])
 def test_model_answer_shapes_are_all_understood(payload):
     assert lab._as_list(payload) == ["가"]
+
+
+# --- 골든 문장 (사용자가 고른 본보기, 2026-09-21) --------------------
+GOLDEN_YAML = {"우아덤": {"질문형": [GOOD]}}
+
+
+def test_golden_is_loaded_per_brand_and_type():
+    assert bw.load_golden_reply2("우아덤", "질문형", GOLDEN_YAML) == [GOOD]
+    assert bw.load_golden_reply2("우아덤", "후기형", GOLDEN_YAML) == []
+    assert bw.load_golden_reply2("없는브랜드", "질문형", GOLDEN_YAML) == []
+
+
+def test_real_config_has_the_picked_sentences():
+    assert len(bw.load_golden_reply2("우아덤", "질문형")) == 3
+    assert len(bw.load_golden_reply2("코숨핏", "질문형")) == 3
+    assert len(bw.load_golden_reply2("팥순이", "질문형")) == 4
+    assert len(bw.load_golden_reply2("팥순이", "후기형")) == 4
+
+
+def test_golden_goes_in_front_as_a_must_follow_flow():
+    rule = bw.rule_for("우아덤")
+    block = bw.golden_block(rule, [GOOD])
+    assert "반드시 따른다" in "\n".join(block)
+    assert "1. " + GOOD in block
+
+
+def test_comments_prompt_puts_golden_before_sheet_examples():
+    rule = bw.rule_for("우아덤")
+    system, _ = lab.build_prompt(rule, "본문", "비타민C", [GOOD, "시트 예시에요"], 5, golden=[GOOD])
+    assert system.index("골든 문장") < system.index("기존 완성 원고의 대대댓글2")
+    assert system.count(GOOD) == 1  # 골든은 아래 예시 목록에서 빠진다
+
+
+# --- 브랜드 고유 논리 (장으뜸·뉴더미스) -----------------------------
+def test_jangeuddeum_needs_absorption_and_blend_logic():
+    rule = bw.rule_for("장으뜸")
+    bad = ("장으뜸 장어즙이라고 있어요 산부인과 원장님이 권하셔서 먹었어요 "
+           "그냥 참고 버티는걸로는 안되더라구요 검색해보시면 후기 많아요")
+    assert any("브랜드 논리" in p for p in bw.reply2_problems(bad, rule))
+    good = ("장으뜸 장어즙이라고 있어요 배합이랑 원물 함량을 따져 만들어서 몸에 흡수가 "
+            "잘된대요ㅎㅎ 아무거나 먹으면 소용없더라구요 검색해보시면 후기 많아요")
+    assert bw.reply2_problems(good, rule) == []
+
+
+def test_newdermis_needs_barrier_logic():
+    rule = bw.rule_for("뉴더미스")
+    bad = ("자연방패 항문세정제라고 있어요 항문외과 의사가 추천하는 세정제에요 "
+           "좌욕만으로는 한계가 있더라구요 검색해보시면 후기 많아요")
+    assert any("브랜드 논리" in p for p in bw.reply2_problems(bad, rule))
+    good = ("자연방패 항문세정제라고 있어요 항문 보호막을 강화해주는 성분이 들어가서 "
+            "접근이 달라요ㅋㅋ 그냥 씻기만 하는건 소용없더라구요 검색해보시면 후기 많아요")
+    assert bw.reply2_problems(good, rule) == []
+
+
+def test_logic_note_is_written_into_the_prompt():
+    rule = bw.rule_for("장으뜸")
+    system, _ = lab.build_prompt(rule, "본문", "배란일", [GOOD], 5)
+    assert "배합과 원물 함량" in system
+
+
+# --- 팥순이 후기형 감량 수치 ----------------------------------------
+REVIEW_OK = "저도 이거 먹는중인데 6주만에 9kg 빠졌어요 정부기관 실험에서 체지방 25% 줄었다는 결과 나온 성분이래요"
+
+
+def test_review_reply2_needs_at_least_8kg():
+    rule = bw.rule_for("팥순이", "후기형")
+    assert bw.REVIEW_MIN_KG == 8
+    assert bw.reply2_problems(REVIEW_OK, rule) == []
+    small = REVIEW_OK.replace("9kg", "5kg")
+    assert any("감량 수치" in p for p in bw.reply2_problems(small, rule))
+    none = REVIEW_OK.replace("6주만에 9kg 빠졌어요", "6주째인데 많이 빠졌어요")
+    assert any("감량 수치" in p for p in bw.reply2_problems(none, rule))
+
+
+def test_review_type_skips_the_copy_check():
+    """후기형은 기존 예시와 같아도 된다 (사용자 결정 2026-09-21)."""
+    rule = bw.rule_for("팥순이", "후기형")
+    assert lab.candidate_problems(REVIEW_OK, rule, [REVIEW_OK]) == []
+    viral = bw.rule_for("우아덤")
+    assert any("베끼기" in p for p in lab.candidate_problems(GOOD, viral, [GOOD]))
+
+
+# --- 여러 브랜드를 한 번에 -------------------------------------------
+def test_bundles_for_takes_several_brands():
+    assert lab.bundles_for("장으뜸,뉴더미스", "") == [
+        ("장으뜸", "질문형"),
+        ("뉴더미스", "질문형"),
+    ]
+
+
+def test_report_can_carry_the_golden_table():
+    result = lab.BundleResult(brand="장으뜸", manuscript_type="질문형", passed=[GOOD])
+    text = lab.report_markdown([result], day="2026-09-21", title="2차 후보", golden=True)
+    assert text.startswith("# 2차 후보 (2026-09-21)")
+    assert "## 채택된 골든 문장" in text
+    assert "### 우아덤(질문형)" in text

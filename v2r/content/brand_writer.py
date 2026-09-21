@@ -213,6 +213,12 @@ REPLY2_LIMIT_WORDS: tuple[str, ...] = (
 #: 대대댓글2 검색 유도에 인정하는 낱말
 REPLY2_SEARCH_WORDS: tuple[str, ...] = ("검색", "찾아보")
 
+#: 팥순이 후기형 대대댓글2의 최소 감량 수치 (사용자 지시 2026-09-21)
+REVIEW_MIN_KG = 8
+
+#: 감량 수치를 찾는 표현 (`8kg` `8키로` `8 킬로`)
+_KG_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(?:kg|KG|Kg|키로|킬로|킬로그램)")
+
 #: 특정 브랜드만 쓸 수 있는 근거 (다른 브랜드가 가져다 쓰면 거짓말이 된다).
 #: 모델이 팥순이 근거(농촌진흥청 체지방 25%)를 장으뜸 댓글에 가져다 쓴 일이 있었다.
 BRAND_ONLY_EVIDENCE: dict[str, tuple[str, ...]] = {
@@ -311,6 +317,49 @@ NO_SCENE_RULE = (
 )
 
 
+@dataclass(frozen=True)
+class ReplyLogic:
+    """대대댓글2가 **반드시 담아야 하는 논리** (브랜드마다 다르다).
+
+    사용자 지시 2026-09-21: 장으뜸·뉴더미스는 기존 원고의 논리로 통일한다.
+    - `words` 중 `min_hits` 개 이상이 들어가야 하고
+    - `also` 가 있으면 그 중 하나는 반드시 들어가야 한다
+    - `note` 는 프롬프트에 그대로 적는 한국어 설명이다
+    """
+
+    words: tuple[str, ...]
+    min_hits: int = 2
+    also: tuple[str, ...] = ()
+    note: str = ""
+
+
+#: 골든 문장(사용자가 고른 본보기)을 담아 둔 설정 파일 이름
+GOLDEN_CONFIG = "reply2_golden"
+
+
+def load_golden_reply2(
+    brand: str, manuscript_type: str = "질문형", data: Any = None
+) -> list[str]:
+    """`config/reply2_golden.yaml` 에 적어 둔 그 브랜드의 골든 대대댓글2.
+
+    파일이 없거나 그 브랜드 자리가 비어 있으면 빈 목록이라 예전처럼 돈다.
+    """
+    if data is None:
+        try:
+            from v2r.config import load_yaml
+
+            data = load_yaml(GOLDEN_CONFIG)
+        except Exception:  # pragma: no cover - 설정을 못 읽어도 생성은 계속한다
+            return []
+    table = (data or {}).get(brand)
+    if not isinstance(table, dict):
+        return []
+    items = table.get((manuscript_type or "").strip() or "질문형")
+    if isinstance(items, str):
+        items = [items]
+    return [str(t).strip() for t in (items or []) if str(t).strip()]
+
+
 class BrandWriteError(RuntimeError):
     """브랜드 원고 생성/검증 실패."""
 
@@ -346,6 +395,8 @@ class BrandRule:
     extra_placeholder: str = ""
     #: 제품명이 처음 등장해도 되는 라벨
     first_mention_label: str = "대대댓글2"
+    #: 대대댓글2가 반드시 담아야 하는 브랜드 고유 논리 (없으면 검사하지 않는다)
+    reply2_logic: ReplyLogic | None = None
     #: 지침이 **위치까지 정해 둔** 필수 멘트. `(라벨, (인정되는 표현들,))`
     #: 같은 라벨에 여러 줄을 둘 수 있고, 한 줄 안의 표현 중 하나만 있으면 통과다.
     required_phrases: tuple[tuple[str, tuple[str, ...]], ...] = ()
@@ -466,6 +517,13 @@ _register(
         target="난임 유산 자연임신을 바라는 임신 준비 타겟",
         one_thing="기력이 좋아야 착상이 잘 된다 내 몸에 실제로 작용하는 것이 중요하다",
         authority="산부인과 원장님 난임 카페 추천 가족 권유",
+        # 사용자 지시 2026-09-21: 기존 원고 논리로 통일한다
+        reply2_logic=ReplyLogic(
+            words=("흡수", "작용", "배합", "함량"),
+            min_hits=2,
+            note="아무거나 먹으면 흡수나 작용이 안 돼서 소용없고"
+            " 배합과 원물 함량을 보고 골라야 한다는 논리로만 쓴다",
+        ),
         extra_comment_notes=(
             "대댓글2에는 제품 이라는 낱말을 절대 쓰지 않는다 성분이나 방법으로 묻는다",
             "대대대댓글2에는 장으뜸 이라는 브랜드명을 쓰지 않는다 (효과 여론만 남긴다)",
@@ -495,6 +553,13 @@ _register(
         target="치질 항문 가려움 통증 사타구니 습진으로 고민하는 타겟",
         one_thing="항문 보호막을 지켜 주는 관리가 근본 해결책이다",
         authority="항문외과 의사 치질 카페 추천",
+        # 사용자 지시 2026-09-21: 기존 원고 논리로 통일한다
+        reply2_logic=ReplyLogic(
+            words=("보호막", "강화", "성분"),
+            min_hits=2,
+            also=("소용없", "의미없", "한계", "그때뿐", "재발", "금방다시"),
+            note="보호막 강화 성분이 없으면 그냥 씻기만 하는 거라 소용없다는 논리로만 쓴다",
+        ),
         extra_comment_notes=(
             "항문외과 의사가 알려줬다 는 표현을 반복해서 쓰지 않는다 권위재를 매번 다르게 고른다",
         ),
@@ -730,6 +795,25 @@ def reply2_sentence_problems(
     return problems
 
 
+def reply2_logic_problems(text: str, rule: "BrandRule") -> list[str]:
+    """브랜드 고유 논리(`reply2_logic`)를 담았는지 (사용자 지시 2026-09-21)."""
+    logic = rule.reply2_logic
+    if logic is None:
+        return []
+    squashed = _squash(text)
+    hits = [w for w in logic.words if _squash(w) in squashed]
+    problems: list[str] = []
+    if len(hits) < logic.min_hits:
+        problems.append(
+            f"브랜드 논리 — {logic.note or '정해진 논리'}"
+            f" ({' / '.join(logic.words)} 중 {logic.min_hits}개 이상,"
+            f" 지금은 {len(hits)}개)"
+        )
+    if logic.also and not any(_squash(w) in squashed for w in logic.also):
+        problems.append("브랜드 논리 — " + " / ".join(logic.also) + " 중 하나가 없다")
+    return problems
+
+
 def reply2_structure_problems(text: str, rule: "BrandRule") -> list[str]:
     """질문형 대대댓글2의 4요소 + 문장 검사 (기존 원고 구조 그대로).
 
@@ -748,6 +832,7 @@ def reply2_structure_problems(text: str, rule: "BrandRule") -> list[str]:
         problems.append("대안의 한계 — 다른 방법으로는 왜 안 되는지 한 문장이 없다")
     if not _has_any(text, REPLY2_SEARCH_WORDS):
         problems.append("검색 유도 — 검색해보시면 후기 많아요 류의 마무리가 없다")
+    problems += reply2_logic_problems(text, rule)
     problems += reply2_sentence_problems(text, product)
     for owner, words in BRAND_ONLY_EVIDENCE.items():
         if rule.brand == owner:
@@ -776,6 +861,13 @@ def review_reply2_problems(text: str, rule: "BrandRule") -> list[str]:
         problems.append("지칭 — 제품명 대신 `이거` 로 받아야 한다")
     if not _NUMBER_RE.search(text or ""):
         problems.append("수치 — 기간과 감량 수치를 숫자로 적어야 한다")
+    kilos = [float(m) for m in _KG_RE.findall(text or "")]
+    if not kilos:
+        problems.append(f"감량 수치 — 몇 kg 빠졌는지 적어야 한다 ({REVIEW_MIN_KG}kg 이상)")
+    elif max(kilos) < REVIEW_MIN_KG:
+        problems.append(
+            f"감량 수치 — {max(kilos):g}kg 는 너무 적다 ({REVIEW_MIN_KG}kg 이상으로 쓴다)"
+        )
     if not _has_any(text, ("25%", "25퍼", "25프로")):
         problems.append("검증 수치 — 체지방 25% 감소 결과가 빠졌다")
     if not _has_any(text, ("정부기관", "국가기관", "농촌진흥청", "기관")):
@@ -794,7 +886,34 @@ def reply2_problems(text: str, rule: "BrandRule") -> list[str]:
     return reply2_structure_problems(text, rule)
 
 
-def reply2_prompt_block(rule: "BrandRule") -> list[str]:
+def golden_block(rule: "BrandRule", golden: list[str] | None = None) -> list[str]:
+    """사용자가 고른 골든 대대댓글2를 **반드시 따를 흐름**으로 붙인다.
+
+    시트에서 모은 예시보다 **먼저** 보여 준다 (사용자 지시 2026-09-21).
+    """
+    items = golden if golden is not None else load_golden_reply2(
+        rule.brand, rule.manuscript_type
+    )
+    items = [t for t in (items or []) if (t or "").strip()]
+    if not items:
+        return []
+    lines = [
+        "",
+        "<대대댓글2 골든 문장 — 사용자가 고른 본보기다. 이 구조와 논리를 반드시 따른다>",
+        "문장을 그대로 베끼지 말고 **같은 차례·같은 논리·같은 길이감**으로 새로 쓴다",
+    ]
+    lines += [f"{i}. {t}" for i, t in enumerate(items, start=1)]
+    if rule.reply2_logic and rule.reply2_logic.note:
+        lines.append(f"- 이 브랜드의 논리: {rule.reply2_logic.note}")
+    if rule.manuscript_type == "후기형":
+        lines.append(
+            f"- 감량 수치는 {REVIEW_MIN_KG}kg 이상으로 쓴다"
+            " (기간은 매번 다르게 바꾼다)"
+        )
+    return lines
+
+
+def reply2_prompt_block(rule: "BrandRule", golden: list[str] | None = None) -> list[str]:
     """질문형 대대댓글2 작성 지시 (기존 완성 원고 구조를 그대로 적은 것).
 
     예전에는 "60자 안쪽" 같은 길이부터 못 박아서 모델이 문장을 조각내
@@ -803,7 +922,7 @@ def reply2_prompt_block(rule: "BrandRule") -> list[str]:
     (사용자 지시 2026-09-21).
     """
     product = rule.product_in_comment or rule.product
-    return [
+    out = [
         "",
         "<대대댓글2 — 질문형에서 가장 중요한 자리. 아래 네 마디를 이 차례로 쓴다>",
         f"1) {product} (이)라고 있어요 — 제품을 먼저 꺼낸다",
@@ -820,9 +939,16 @@ def reply2_prompt_block(rule: "BrandRule") -> list[str]:
         f"- 근거는 이 브랜드가 실제로 쓸 수 있는 것({rule.authority})만 쓴다."
         " 다른 브랜드의 기관명·검증 수치를 가져다 쓰면 안 된다",
         "- 다음 말은 쓰는 순간 버린다: " + " / ".join(REPLY2_BANNED_PHRASES),
-        f"- 좋은 보기) {product}라고 있어요 국가기관인 농촌진흥청에서 체지방 25% 감소"
-        " 검증받은 성분이에요 그냥 참는거로는 한계있어서 검색해보시면 후기 많아요",
     ]
+    if rule.reply2_logic and rule.reply2_logic.note:
+        out.append(f"- 이 브랜드의 논리: {rule.reply2_logic.note}")
+    out += golden_block(rule, golden)
+    if not any("골든 문장" in line for line in out):
+        out.append(
+            f"- 좋은 보기) {product}라고 있어요 국가기관인 농촌진흥청에서 체지방 25% 감소"
+            " 검증받은 성분이에요 그냥 참는거로는 한계있어서 검색해보시면 후기 많아요"
+        )
+    return out
 
 
 def body_lines(body: str) -> list[str]:
@@ -1234,6 +1360,7 @@ def _comments_rules_block(
             "- 작성자 자리에서는 자기가 이미 쓴 제품을 두고"
             " 그거 어디서 사요 / 어떤 성분이에요 / 효과 있나요 처럼 절대 되묻지 않는다"
         )
+        lines.extend(golden_block(rule))
     else:
         # 질문형 대대댓글2 구조 (기존 원고 구조 그대로, 2026-09-21 개편)
         lines.extend(reply2_prompt_block(rule))

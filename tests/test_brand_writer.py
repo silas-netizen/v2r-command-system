@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -774,7 +775,12 @@ def test_combined_prompt_holds_both_rule_sets():
     system, user = bw.build_combined_prompt("우아덤", KEYWORD)
     assert "## 본문 규칙" in system and "## 댓글 규칙" in system
     assert "250자" in system and "40자를 넘지 않는다" in system
-    assert KEYWORD in user and KEYWORD not in system
+    # 키워드는 user 쪽에만 있어야 캐시가 걸린다.
+    # (골든 문장에 우연히 같은 낱말이 있을 수 있어 그 줄은 빼고 본다)
+    rules_only = "\n".join(
+        line for line in system.splitlines() if not re.match(r"^\d+\.\s", line)
+    )
+    assert KEYWORD in user and KEYWORD not in rules_only
 
 
 def test_default_mode_is_single():

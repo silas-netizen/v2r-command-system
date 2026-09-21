@@ -138,7 +138,8 @@ def candidate_problems(
         problems.append(f"길이 — {size}자로 너무 길다 ({cap}자 이하)")
     if has_emoji(value):
         problems.append("이모지 — 그림 이모지는 쓰지 않는다")
-    for one in examples or []:
+    # 후기형은 "기존 예시와 같아도 된다"는 사용자 결정(2026-09-21)이라 베끼기 검사를 뺀다
+    for one in [] if rule.manuscript_type == "후기형" else (examples or []):
         if similarity(value, one) >= SIMILARITY_MAX:
             problems.append(f"베끼기 — 기존 예시와 {int(similarity(value, one) * 100)}% 같다")
             break
@@ -167,6 +168,7 @@ def build_prompt(
     examples: list[str],
     n: int,
     problems: list[str] | None = None,
+    golden: list[str] | None = None,
 ) -> tuple[str, str]:
     """`(system, user)` 프롬프트. system은 브랜드마다 고정이라 캐시를 탄다."""
     from v2r.llm.prompts import HUMAN_TONE_RULES, NO_INTERNAL_TERMS_RULE
@@ -188,18 +190,23 @@ def build_prompt(
             f"- 제품명({product})을 다시 쓰지 말고 `이거` 로 받는다",
             "- 기간과 감량 수치를 숫자로 적는다 (5주만에 7kg 처럼 매번 다르게)",
             "- 정부기관 실험에서 체지방 25% 감소 결과가 나왔다는 근거를 한 문장으로 붙인다",
+            f"- 감량 수치는 {bw.REVIEW_MIN_KG}kg 이상으로 쓴다 (기간은 매번 다르게 바꾼다)",
             "- 완전한 문장으로 쓰고 반드시 서술 어미(~요 ~에요 ~더라구요)로 끝낸다",
         ]
+        lines += bw.golden_block(rule, golden)
     else:
-        lines += bw.reply2_prompt_block(rule)
+        lines += bw.reply2_prompt_block(rule, golden)
     if rule.required_phrases:
         need = [o for label, o in rule.required_phrases if label == "대대댓글2"]
         if need:
             lines.append("")
             lines.append("<반드시 들어가야 하는 멘트>")
             lines.extend("- " + " 또는 ".join(o) + " 를 반드시 넣는다" for o in need)
-    lines += ["", "<기존 완성 원고의 대대댓글2 — 이 구조와 길이감을 그대로 따른다>"]
-    lines += [f"{i}. {t}" for i, t in enumerate(examples, start=1)]
+    picked = {re.sub(r"\s+", "", t) for t in (golden or [])}
+    rest = [t for t in examples if re.sub(r"\s+", "", t) not in picked]
+    if rest:
+        lines += ["", "<기존 완성 원고의 대대댓글2 — 이 구조와 길이감을 그대로 따른다>"]
+        lines += [f"{i}. {t}" for i, t in enumerate(rest, start=1)]
     lines += [
         "",
         "위 예시와 **같은 구조·같은 길이감**으로 쓴다."
@@ -235,6 +242,7 @@ class BundleResult:
     manuscript_type: str
     keyword: str = ""
     examples: list[str] = field(default_factory=list)
+    golden: list[str] = field(default_factory=list)
     passed: list[str] = field(default_factory=list)
     rejected: list[tuple[str, list[str]]] = field(default_factory=list)
     rounds: int = 0
@@ -282,7 +290,12 @@ def run_bundle(
         result.error = "기존 대대댓글2 예시를 찾지 못했습니다"
         return result
     result.examples = ranked
-    few = ranked[:FEW_SHOT_COUNT]
+    # 사용자가 고른 골든 문장이 있으면 예시 **맨 앞**에 둔다 (시트 예시보다 우선)
+    golden = bw.load_golden_reply2(brand, rule.manuscript_type)
+    result.golden = list(golden)
+    seen_few = {re.sub(r"\s+", "", t) for t in golden}
+    few = golden + [t for t in ranked if re.sub(r"\s+", "", t) not in seen_few]
+    few = few[:FEW_SHOT_COUNT]
 
     data = source if source is not None else latest_manuscript(brand, rule.manuscript_type)
     body = str(data.get("body") or "")
@@ -297,7 +310,9 @@ def run_bundle(
     for round_no in range(1, max(1, int(max_rounds)) + 1):
         result.rounds = round_no
         want = n - len(result.passed)
-        system, user = build_prompt(rule, body, keyword, few, want + 2, notes[-6:])
+        system, user = build_prompt(
+            rule, body, keyword, few, want + 2, notes[-6:], golden=golden
+        )
         try:
             payload = llm.complete_json("brand_comments", system, user, max_tokens=1800)
         except Exception as exc:
@@ -342,11 +357,27 @@ def _as_list(payload: Any) -> list[str]:
 
 
 # ------------------------------------------------------------------ 보고서
-def report_markdown(results: list[BundleResult], day: str = "") -> str:
+def golden_table(day: str = "") -> list[str]:
+    """`config/reply2_golden.yaml` 에 저장된 골든 문장 표."""
+    lines = ["", "## 채택된 골든 문장 (`config/reply2_golden.yaml`)", ""]
+    empty = True
+    for brand, mtype in DEFAULT_BUNDLES:
+        items = bw.load_golden_reply2(brand, mtype)
+        if not items:
+            continue
+        empty = False
+        lines += ["", f"### {brand}({mtype}) — {len(items)}개", ""]
+        lines += [f"{i}. {t}" for i, t in enumerate(items, start=1)]
+    return [] if empty else lines
+
+
+def report_markdown(
+    results: list[BundleResult], day: str = "", title: str = "", golden: bool = False
+) -> str:
     """사람이 번호로 고를 수 있는 후보 문서."""
     day = day or date.today().isoformat()
     lines = [
-        f"# 대대댓글2 후보 ({day})",
+        f"# {title or '대대댓글2 후보'} ({day})",
         "",
         "기존 원고의 대대댓글2 구조([제품 소개] → [근거 문장] → [대안의 한계] →"
         " [검색 유도])를 그대로 따르게 다시 뽑은 것입니다.",
@@ -379,32 +410,39 @@ def report_markdown(results: list[BundleResult], day: str = "") -> str:
                 lines.append(f"  - 사유: {' / '.join(problems)}")
         else:
             lines.append("(없음)")
+    if golden:
+        lines += golden_table(day)
     return "\n".join(lines) + "\n"
 
 
-def save_report(results: list[BundleResult], day: str = "", out_dir: Any = None) -> Path:
+def save_report(
+    results: list[BundleResult],
+    day: str = "",
+    out_dir: Any = None,
+    name: str = "",
+    title: str = "",
+    golden: bool = False,
+) -> Path:
     day = day or date.today().isoformat()
     folder = Path(out_dir or REPORT_DIR)
     folder.mkdir(parents=True, exist_ok=True)
-    path = folder / f"reply2-candidates-{day}.md"
-    path.write_text(report_markdown(results, day), encoding="utf-8")
+    path = folder / (name or f"reply2-candidates-{day}.md")
+    path.write_text(report_markdown(results, day, title, golden), encoding="utf-8")
     return path
 
 
 # ------------------------------------------------------------------ 명령
 def bundles_for(brand: str, manuscript_type: str) -> list[tuple[str, str]]:
     """`--brand` / `--type` 을 실제 묶음 목록으로 바꾼다."""
-    brand = (brand or "전체").strip()
+    raw = (brand or "전체").strip()
     want_type = (manuscript_type or "").strip()
-    out = [
-        (b, t)
-        for b, t in DEFAULT_BUNDLES
-        if brand in ("전체", "all", "") or b == brand
-    ]
+    names = [p.strip() for p in raw.replace(",", " ").split() if p.strip()]
+    everything = not names or any(n in ("전체", "all") for n in names)
+    out = [(b, t) for b, t in DEFAULT_BUNDLES if everything or b in names]
     if want_type:
         out = [(b, t) for b, t in out if t == want_type]
-        if not out and brand not in ("전체", "all", ""):
-            out = [(brand, want_type)]
+        if not out and not everything:
+            out = [(n, want_type) for n in names]
     return out
 
 
@@ -416,6 +454,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--n", type=int, default=5)
     parser.add_argument("--rounds", type=int, default=MAX_ROUNDS)
     parser.add_argument("--out", default="")
+    parser.add_argument("--name", default="", help="보고서 파일 이름")
+    parser.add_argument("--title", default="", help="보고서 제목")
+    parser.add_argument(
+        "--golden", action="store_true", help="채택된 골든 문장 표를 보고서에 붙인다"
+    )
     args = parser.parse_args(argv)
 
     from v2r.llm.router import LLMRouter
@@ -435,7 +478,13 @@ def main(argv: list[str] | None = None) -> int:
             f" 오류: {result.error}" if result.error else "",
         )
         results.append(result)
-    path = save_report(results, out_dir=args.out or None)
+    path = save_report(
+        results,
+        out_dir=args.out or None,
+        name=args.name,
+        title=args.title,
+        golden=args.golden,
+    )
     log.info("보고서: %s", path)
     return 0
 
