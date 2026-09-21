@@ -15,6 +15,7 @@ _FIELDS = (
     "account",
     "cafe",
     "menu_id",
+    "board",
     "scheduled_at",
 )
 
@@ -142,6 +143,39 @@ class PublicationStore:
             if _same_cafe(cafe, str(r["cafe"] or "")):
                 n += 1
         return n
+
+    def last_board_today(
+        self,
+        cafe: str,
+        kst_date: str,
+        *,
+        exclude_sources: "set[str] | None" = None,
+    ) -> str:
+        """오늘 그 카페에 **마지막으로** 올린 일상 글의 게시판 표시.
+
+        게시판 연속 방지(사용자 결정 2026-09-22 A안)가 실행 시작 시점의 "직전 글"을
+        알아야 해서 쓴다. `menu_id`가 있으면 `menu_id`, 없으면 게시판 이름을 돌려준다.
+        `publish.board_key`와 같은 모양(`menu:<id>` / 정규화된 이름)으로 맞춘다.
+        """
+        if not cafe or not kst_date:
+            return ""
+        rows = self.conn.execute(
+            "SELECT cafe, source_key, menu_id, board FROM publications"
+            " WHERE status IN (?, ?) AND substr(created_at, 1, 10) = ?"
+            " ORDER BY updated_at, rowid",
+            (*BLOCKING_STATUSES, kst_date),
+        ).fetchall()
+        skip = {str(s) for s in (exclude_sources or set())}
+        last = ""
+        for r in rows:
+            if str(r["source_key"] or "") in skip:
+                continue
+            if not _same_cafe(cafe, str(r["cafe"] or "")):
+                continue
+            from v2r.engine.publish import board_key
+
+            last = board_key(str(r["menu_id"] or ""), str(r["board"] or ""))
+        return last
 
     def by_source_id(self, source_id: str) -> dict | None:
         """V2R source_id로 조회."""

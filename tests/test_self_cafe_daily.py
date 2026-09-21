@@ -149,7 +149,7 @@ def test_prepare_per_cafe_keeps_sheet_order_across_files(tmp_path, monkeypatch):
     assert [s["seq"] for s in seq] == [1, 2, 3, 4, 5, 6]
     assert seq[3] == {
         "seq": 4, "source": "각색_0902", "row": 51, "cafe": "글로시 마이",
-        "title": picked[3].title,
+        "board": picked[3].board, "title": picked[3].title,
     }
 
 
@@ -899,6 +899,119 @@ def test_declump_breaks_runs_of_three_and_keeps_order_otherwise():
     # 몰림 없는 시트는 그대로
     seq2 = [{"cafe": c} for c in ["A", "B", "A", "B"]]
     assert publish_mod.declump_by_cafe([0, 1, 2, 3], seq2)[0] == [0, 1, 2, 3]
+
+
+# --------------------------------------------------------------------
+# 8-B. 같은 카페 같은 게시판 연속 금지 (사용자 결정 2026-09-22 A안)
+# --------------------------------------------------------------------
+def _board_seq(pairs, rows=None):
+    """(카페, 게시판) 목록 → 순서표."""
+    return [
+        {"cafe": c, "board": b, "row": (rows[i] if rows else i + 1)}
+        for i, (c, b) in enumerate(pairs)
+    ]
+
+
+def test_board_declump_swaps_consecutive_same_board():
+    seq = _board_seq([("A", "일상"), ("A", "일상"), ("A", "후기")])
+    out, out_seq, notes = publish_mod.declump_by_board([0, 1, 2], seq)
+    assert [e["board"] for e in out_seq] == ["일상", "후기", "일상"]
+    # 미룬 글은 바로 그다음 차례에 나오고, 누락은 없다
+    assert out == [0, 2, 1] and sorted(out) == [0, 1, 2]
+    assert notes == ["게시판 연속 방지: 2행 → 뒤로"]
+
+
+def test_board_declump_keeps_order_when_no_alternative_in_lookahead():
+    seq = _board_seq([("A", "일상")] * 3)
+    out, out_seq, notes = publish_mod.declump_by_board([0, 1, 2], seq)
+    assert out == [0, 1, 2] and notes == []
+    assert [e["board"] for e in out_seq] == ["일상"] * 3
+
+
+def test_board_declump_lookahead_window_limited():
+    # 2행째를 정할 때 다른 게시판(23행)은 뒤로 21행 떨어져 있다 → 그대로 올린다.
+    # 3행째에서야 20행 안에 들어와 바뀐다. 어느 쪽이든 누락은 없다.
+    pairs = [("A", "일상")] * 22 + [("A", "후기")]
+    items = list(range(len(pairs)))
+    out, _out_seq, notes = publish_mod.declump_by_board(items, _board_seq(pairs))
+    assert out[:3] == [0, 1, 22]
+    assert notes == ["게시판 연속 방지: 3행 → 뒤로"]
+    assert sorted(out) == items
+
+
+def test_board_declump_does_not_touch_cafe_order():
+    seq = _board_seq([("A", "일상"), ("B", "수다"), ("A", "일상"), ("B", "수다"), ("A", "후기")])
+    out, out_seq, _notes = publish_mod.declump_by_board(list(range(5)), seq)
+    # 카페가 나오는 자리(A,B,A,B,A)는 그대로
+    assert [e["cafe"] for e in out_seq] == ["A", "B", "A", "B", "A"]
+    # A 안에서만 바뀌었고 B는 손대지 않았다
+    assert [e["board"] for e in out_seq if e["cafe"] == "A"] == ["일상", "후기", "일상"]
+    assert [e["board"] for e in out_seq if e["cafe"] == "B"] == ["수다", "수다"]
+    assert sorted(out) == list(range(5))
+
+
+def test_board_declump_uses_last_published_board_of_today():
+    # 실행 시작 시점의 "직전 글"이 같은 게시판이면 첫 글부터 미룬다
+    seq = _board_seq([("A", "일상"), ("A", "후기")])
+    out, out_seq, notes = publish_mod.declump_by_board(
+        [0, 1], seq, {"A": publish_mod.board_key("", "일상")}
+    )
+    assert [e["board"] for e in out_seq] == ["후기", "일상"] and out == [1, 0]
+    assert notes == ["게시판 연속 방지: 1행 → 뒤로"]
+
+
+def test_prepare_per_cafe_applies_board_rule_without_losing_rows(tmp_path, monkeypatch):
+    rt = make_runtime(tmp_path)
+    rt.cafes_cfg = {
+        "self_owned": [
+            {"name": "고요한 아침", "cafe_id": 1, "board": "반말일기"},
+            {"name": "글로시 마이", "cafe_id": 2, "board": "자유 톡"},
+        ]
+    }
+    boards = {"고요한 아침": ["일상", "일상", "후기"], "글로시 마이": ["수다", "먹방", "수다"]}
+    items = []
+    for cafe in ("고요한 아침", "글로시 마이"):
+        for i, board in enumerate(boards[cafe]):
+            m = _m(cafe, i if cafe == "고요한 아침" else i + 10)
+            m.board = board
+            items.append(m)
+    _fake_sources(monkeypatch, [("각색_전체_1", items)])
+
+    spec = TaskSpec(task="publish_daily", count=3, per_cafe=True)
+    picked = publish_mod.prepare_per_cafe(rt, spec, [])
+    assert len(picked) == 6  # 누락 0
+    seq = rt.scratch["per_cafe_sequence"]
+    assert [s["seq"] for s in seq] == [1, 2, 3, 4, 5, 6]
+    # 한 카페 안에서 같은 게시판이 연달아 나오지 않는다
+    for cafe in boards:
+        got = [s["board"] for s in seq if s["cafe"] == cafe]
+        assert all(got[i] != got[i - 1] for i in range(1, len(got))), got
+    assert rt.scratch["board_declump_notes"]
+
+
+def test_last_board_today_seeds_from_db(tmp_path):
+    rt = make_runtime(tmp_path)
+    rt.publications.mark("각색_전체_9", 1, "h1", "done", None, cafe="고요한 아침", board="일상")
+    rt.publications.mark("각색_전체_9", 2, "h2", "done", None, cafe="고요한 아침", board="후기")
+    # 다른 카페 기록은 섞이지 않는다
+    rt.publications.mark("각색_전체_9", 3, "h3", "done", None, cafe="글로시 마이", board="수다")
+    got = publish_mod.last_board_by_cafe(rt, ["고요한 아침", "글로시 마이", "없는 카페"])
+    assert got["고요한 아침"] == publish_mod.board_key("", "후기")
+    assert got["글로시 마이"] == publish_mod.board_key("", "수다")
+    assert got["없는 카페"] == ""
+
+
+def test_board_key_prefers_menu_id_then_normalized_name():
+    assert publish_mod.board_key(77, "일상") == "menu:77"
+    assert publish_mod.board_key("", " 일상 이야기 ") == publish_mod.board_key("", "일상이야기")
+    assert publish_mod.board_key("", "") == ""
+
+
+def test_board_declump_ignores_rows_without_board():
+    # 게시판을 모르는 행은 비교하지 않고 그대로 둔다
+    seq = _board_seq([("A", ""), ("A", ""), ("A", "일상")])
+    out, _out_seq, notes = publish_mod.declump_by_board([0, 1, 2], seq)
+    assert out == [0, 1, 2] and notes == []
 
 
 # --------------------------------------------------------------------

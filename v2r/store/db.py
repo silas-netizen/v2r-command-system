@@ -55,6 +55,7 @@ CREATE TABLE IF NOT EXISTS publications (
     account      TEXT,
     cafe         TEXT,
     menu_id      TEXT,
+    board        TEXT,
     scheduled_at TEXT,
     created_at   TEXT NOT NULL,
     updated_at   TEXT NOT NULL,
@@ -135,6 +136,8 @@ CREATE INDEX IF NOT EXISTS idx_events_job ON events(job_id, id);
 #: 예전 DB에 뒤늦게 붙인 칸들 — (테이블, 칸 이름, 칸 정의)
 MIGRATIONS = (
     ("jobs", "lease_scope", "TEXT NOT NULL DEFAULT 'main'"),
+    # 게시판 연속 방지(사용자 결정 2026-09-22 A안)가 "직전 글의 게시판"을 알아야 한다
+    ("publications", "board", "TEXT"),
 )
 
 

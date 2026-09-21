@@ -26,6 +26,10 @@ from v2r.engine.scheduler import KST, plan_slots, revision_at
 
 #: 같은 카페 연속 허용 상한(이 수 이상 몰리면 다른 카페 원고를 끌어와 섞는다, 사용자 규칙 2026-09-20)
 MAX_SAME_CAFE_RUN = 3
+#: 한 카페 안에서 같은 게시판이 연속으로 허용되는 상한 (사용자 결정 2026-09-22 A안)
+MAX_SAME_BOARD_RUN = 1
+#: 같은 게시판이 연속될 때 대신 올릴 글을 찾아볼 범위(그 카페의 남은 순서 중 뒤쪽 행 수)
+BOARD_LOOKAHEAD = 20
 from v2r.sources import sheets
 
 log = logging.getLogger(__name__)
@@ -380,6 +384,22 @@ def count_today_for_cafe(rt: Runtime, cafe: str, kst_date: str = "") -> int:
     return rt.publications.count_today(cafe, date, exclude_sources=brand_source_keys(rt))
 
 
+def last_board_by_cafe(rt: Runtime, cafes: list[str], kst_date: str = "") -> dict[str, str]:
+    """카페마다 오늘 **마지막으로** 올린 일상 글의 게시판 표시 (사용자 결정 2026-09-22 A안).
+
+    실행을 시작할 때의 "직전 글"이다. 조회가 안 되면 그 카페는 빈 값 — 비교하지 않는다.
+    """
+    date = kst_date or datetime.now(KST).date().isoformat()
+    exclude = brand_source_keys(rt)
+    out: dict[str, str] = {}
+    for cafe in cafes:
+        try:
+            out[cafe] = rt.publications.last_board_today(cafe, date, exclude_sources=exclude)
+        except Exception:  # 조회 실패는 "직전 글 없음"으로 본다
+            out[cafe] = ""
+    return out
+
+
 def prepare_per_cafe(
     rt: Runtime, spec: TaskSpec, skipped: list[dict] | None = None
 ) -> list[Manuscript]:
@@ -530,6 +550,7 @@ def prepare_per_cafe(
                     "source": name,
                     "row": m.source_row,
                     "cafe": cafe,
+                    "board": m.board,
                     "title": m.title,
                 }
             )
@@ -539,6 +560,17 @@ def prepare_per_cafe(
     # 사용자 규칙(2026-09-20): 같은 카페가 몰린 구간이 있으면 섞는다.
     # 카페 안 순서(파일→행)는 그대로 두고, 카페끼리만 번갈아 나오게 재배열한다.
     picked, sequence = declump_by_cafe(picked, sequence)
+    # 사용자 결정(2026-09-22 A안): 한 카페에서 같은 게시판이 연속되지 않게 한다.
+    # 카페 간 순서·간격은 그대로 두고, 카페 안에서만 최소로 바꾼다.
+    picked, sequence, board_notes = declump_by_board(
+        picked, sequence, last_board_by_cafe(rt, targets, today)
+    )
+    rt.scratch["board_declump_notes"] = board_notes
+    for note in board_notes:
+        try:
+            rt.events.log(None, "info", note)
+        except Exception:  # 기록이 안 돼도 발행은 계속한다
+            pass
     for i, entry in enumerate(sequence, start=1):
         entry["seq"] = i
     rt.scratch["per_cafe_sequence"] = sequence
@@ -574,6 +606,88 @@ def declump_by_cafe(items: list, sequence: list[dict], max_run: int = MAX_SAME_C
         else:
             run_cafe, run_len = cafe, 1
     return [items[i] for i in out], [sequence[i] for i in out]
+
+
+def board_key(menu_id: Any = "", board: Any = "") -> str:
+    """게시판 두 개가 같은 게시판인지 비교할 때 쓰는 표시.
+
+    `menu_id`가 있으면 그것으로(`menu:<id>`), 없으면 게시판 이름을 정규화해서 쓴다
+    (사용자 결정 2026-09-22 A안). 둘 다 비면 빈 문자열 — 비교하지 않는다.
+    """
+    from v2r.api.catalog import normalize_name
+
+    mid = str(menu_id or "").strip()
+    if mid:
+        return f"menu:{mid}"
+    return normalize_name(str(board or ""))
+
+
+def declump_by_board(
+    items: list,
+    sequence: list[dict],
+    last_board: dict[str, str] | None = None,
+    *,
+    max_run: int = MAX_SAME_BOARD_RUN,
+    lookahead: int = BOARD_LOOKAHEAD,
+) -> tuple[list, list[dict], list[str]]:
+    """같은 카페에서 **같은 게시판이 연속되지 않게** 한다 (사용자 결정 2026-09-22 A안).
+
+    한 카페의 다음 글이 직전에 그 카페에 올린 글과 같은 게시판이면, **그 카페의
+    남은 순서 중 뒤쪽 최대 `lookahead`행 안에서** 다른 게시판 글을 먼저 올리고,
+    미룬 글은 **바로 그다음 차례**에 올린다. 범위 안에 다른 게시판이 없으면 그대로
+    올린다(누락 없음).
+
+    카페 간 순서는 손대지 않는다: 각 카페가 원래 차지하던 전체 자리에, 그 카페 안에서만
+    다시 배열한 순서를 도로 끼워 넣는다. `last_board`는 실행 시작 시점의 "직전 글"
+    (그 카페에 오늘 마지막으로 올린 글의 게시판 표시)이다.
+
+    (바뀐 원고, 바뀐 순서표, 미룬 사실 한 줄짜리 기록들)을 돌려준다.
+    """
+    notes: list[str] = []
+    n = len(items)
+    if n != len(sequence) or n == 0:
+        return items, sequence, notes
+
+    def key_of(i: int) -> str:
+        return board_key(sequence[i].get("menu_id"), sequence[i].get("board"))
+
+    by_cafe: dict[str, list[int]] = {}
+    for i in range(n):
+        by_cafe.setdefault(str(sequence[i].get("cafe") or ""), []).append(i)
+
+    order: dict[str, list[int]] = {}
+    for cafe, idx in by_cafe.items():
+        prev = str((last_board or {}).get(cafe, "") or "")
+        run = 1 if prev else 0
+        rest = list(idx)
+        out: list[int] = []
+        while rest:
+            cur = rest[0]
+            cur_key = key_of(cur)
+            if cur_key and prev and cur_key == prev and run >= max_run:
+                window = rest[1 : 1 + max(0, lookahead)]
+                alt = next((j for j in window if key_of(j) and key_of(j) != prev), None)
+                if alt is not None:
+                    rest.remove(alt)
+                    out.append(alt)
+                    prev, run = key_of(alt), 1
+                    notes.append(
+                        f"게시판 연속 방지: {sequence[cur].get('row') or '?'}행 → 뒤로"
+                    )
+                    continue
+            rest.pop(0)
+            out.append(cur)
+            run = run + 1 if cur_key and cur_key == prev else 1
+            prev = cur_key
+        order[cafe] = out
+
+    cursor = {c: 0 for c in order}
+    new_idx: list[int] = []
+    for i in range(n):
+        cafe = str(sequence[i].get("cafe") or "")
+        new_idx.append(order[cafe][cursor[cafe]])
+        cursor[cafe] += 1
+    return [items[i] for i in new_idx], [sequence[i] for i in new_idx], notes
 
 
 def prepare_manuscripts(
@@ -2102,6 +2216,7 @@ def run_slot(
                 account=slot.account,
                 cafe=slot.cafe,
                 menu_id=str(getattr(menu, "menu_id", "")),
+                board=str(getattr(menu, "name", "") or slot.board or ""),
                 scheduled_at=slot.scheduled_at.isoformat() if slot.scheduled_at else None,
             )
             daily_id, daily_pending = _create_and_verify(
@@ -2171,6 +2286,7 @@ def run_slot(
                 account=slot.account,
                 cafe=slot.cafe,
                 menu_id=str(getattr(menu, "menu_id", "")),
+                board=str(getattr(menu, "name", "") or slot.board or ""),
                 scheduled_at=slot.scheduled_at.isoformat() if slot.scheduled_at else None,
             )
             source_id, pending = _create_and_verify(
@@ -2311,6 +2427,9 @@ __all__ = [
     "prepare_per_cafe",
     "brand_source_keys",
     "count_today_for_cafe",
+    "board_key",
+    "declump_by_board",
+    "last_board_by_cafe",
     "self_cafe_names",
     "refresh_source",
     "resolve_board",

@@ -4,7 +4,7 @@
 
 ## 1. 브랜드 원고 생성기 — 시스템 구축의 핵심 결정 (가장 급함)
 09-19에 새 생성기(Sonnet)로 브랜드 5 × 키워드 5 = 25건을 만들어 기존 시트 원고와 나란히 놓고, 10항목 100점 채점표로 평가했습니다.
-- 파일: `brand-draft-compare-2026-09-19.md`(원문 25쌍), `brand-draft-eval-2026-09-19.md`(점수·총평), `comment-length-stats-2026-09-19.md`(길이 통계).
+- 파일: [brand-draft-compare-2026-09-19.md](file:///D:/v2r%20%EC%9E%90%EB%8F%99%ED%99%94/v2r-command-system/docs/reports/brand-draft-compare-2026-09-19.md)(원문 25쌍), [brand-draft-eval-2026-09-19.md](file:///D:/v2r%20%EC%9E%90%EB%8F%99%ED%99%94/v2r-command-system/docs/reports/brand-draft-eval-2026-09-19.md)(점수·총평), [comment-length-stats-2026-09-19.md](file:///D:/v2r%20%EC%9E%90%EB%8F%99%ED%99%94/v2r-command-system/docs/reports/comment-length-stats-2026-09-19.md)(길이 통계).
 - 결과 요약: **새 원고 62.4점 / 기존 68.6점**, 25쌍 중 기존 22승. 새 원고는 숫자 규칙(글자 수·키워드 횟수)은 더 잘 지키지만 자연스러움·구체성·댓글 구조·브랜드 노출 설계에서 밀림. 가장 큰 결함은 대대댓글2에 내부 용어("프레임")가 새고 "제품보다 방법이 중요하니 검색해보세요"가 25편 중 15편 반복.
 - **결정할 것**
   - 1-1. 채점표 10항목·배점이 맞는지(항목 추가/삭제/가중치).
@@ -14,7 +14,7 @@
   - 1-5. 기존 시트 원고에도 결함이 있음(키워드 2회뿐인 행 17편, 댓글2에서 브랜드 먼저 꺼내는 행, 팥순이 광고성 문장). 기존 원고를 그대로 발행할지, 생성기로 손볼지.
 
 ## 2. 브랜드 시트 관련
-- 2-1. **팥순이 24행** 본문이 127자에서 끊김(`patsooni-row24-2026-09-19.md`). 시트에서 보완 vs 그 행 제외.
+- 2-1. **팥순이 24행** 본문이 127자에서 끊김([patsooni-row24-2026-09-19.md](file:///D:/v2r%20%EC%9E%90%EB%8F%99%ED%99%94/v2r-command-system/docs/reports/patsooni-row24-2026-09-19.md)). 시트에서 보완 vs 그 행 제외.
 - 2-2. **밀려남 키워드**(각 브랜드 시트 두 번째 탭 '노출 현황')로 원고를 쓰는 방식 — 09-19에 브랜드별 5개씩 만든 것이 위 25건. 이 방식(밀려난 키워드 우선)을 계속 쓸지.
 - 2-3. 웨딩 노트·헬씨 트리 브랜드/카페 합류 시점.
 
@@ -26,8 +26,8 @@
 - 4-1. 사진 첨부 글 https://v2r.daboja.im/nc/articleDetail/01M2VN6X1VXBTXH3RXYJJH4H1Q — 사진 위치·크기.
 - 4-2. 제휴 글(풀 일상 글 → 수정글 → 댓글 12) https://v2r.daboja.im/nc/articleDetail/01M2VKRYAVW9BX5JGCX7Y9V3WG — 문구·댓글 순서.
 - 4-3. GPT 생성 사진 3장(우아덤 2·장으뜸 1) 승인 흐름이 마음에 드는지.
-- 4-4. 제휴 일상 글 풀: 제가 중복 소재 15개를 골라 정리안을 냈음(`affiliate-pool-review-2026-09-20.md`). 삭제해도 되는지.
-- 4-5. 자사 일상 글 발행분 몇 개 열어 말투·댓글 자연스러움(`self-daily-2026-09-19.md`, `dashboard-2026-09-20.md`).
+- 4-4. 제휴 일상 글 풀: 제가 중복 소재 15개를 골라 정리안을 냈음([affiliate-pool-review-2026-09-20.md](file:///D:/v2r%20%EC%9E%90%EB%8F%99%ED%99%94/v2r-command-system/docs/reports/affiliate-pool-review-2026-09-20.md)). 삭제해도 되는지.
+- 4-5. 자사 일상 글 발행분 몇 개 열어 말투·댓글 자연스러움([self-daily-2026-09-19.md](file:///D:/v2r%20%EC%9E%90%EB%8F%99%ED%99%94/v2r-command-system/docs/reports/self-daily-2026-09-19.md), [dashboard-2026-09-20.md](file:///D:/v2r%20%EC%9E%90%EB%8F%99%ED%99%94/v2r-command-system/docs/reports/dashboard-2026-09-20.md)).
 - 4-6. 현황판에 더 필요한 항목이 있는지.
 
 ## 5. 텔레그램에서 직접 시험해 볼 명령 (아직 안 해 본 것)
