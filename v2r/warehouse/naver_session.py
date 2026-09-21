@@ -190,7 +190,15 @@ def login_interactive(profile_dir: str | Path | None = None, timeout: int = LOGI
         next_notice = time.monotonic() + 30
         while time.monotonic() < deadline:
             time.sleep(3)
-            if has_login_cookies(_cookies(context)) and not _looks_logged_out(page):
+            if has_login_cookies(_cookies(context)) and "nidlogin" not in (page.url or "").lower():
+                # 쿠키가 생겼으면 로그인 필수 페이지로 가서 진짜 로그인인지 확인한다
+                try:
+                    page.goto(TOUCH_URL, wait_until="domcontentloaded", timeout=60000)
+                    page.wait_for_timeout(1500)
+                except Exception:
+                    continue
+                if _looks_logged_out(page):
+                    continue
                 n = export_cookies(_cookies(context), cookies_path(path), web_crawler_cookie_targets())
                 print(f"네이버 로그인 확인됨. 쿠키 {n}개 저장. 이제 창을 닫아도 됩니다.", flush=True)
                 return True
