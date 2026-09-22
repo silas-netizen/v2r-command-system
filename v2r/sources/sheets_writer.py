@@ -151,7 +151,7 @@ def _write_tsv_at(spreadsheet_id: str, gid: str | int, cell: str, tsv: str) -> N
     from playwright.sync_api import sync_playwright
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = launch_chromium(p, headless=True)
         try:
             context = browser.new_context()  # 로그인 없는 새 컨텍스트
             page = context.new_page()
@@ -486,7 +486,7 @@ def _list_tabs(spreadsheet_id: str) -> list[tuple[str, int]]:
     from playwright.sync_api import sync_playwright
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = launch_chromium(p, headless=True)
         try:
             context = browser.new_context()
             page = context.new_page()
@@ -717,3 +717,19 @@ __all__ = [
     "sync_keywords_all",
     "apply_exposure",
 ]
+
+
+def launch_chromium(pw, headless: bool = True):
+    """헤드리스 크로미움을 띄운다. 기본 헤드리스 셸이 "Executable doesn't exist"로 실패하면
+    (2026-09-23 실행기 숨김 실행에서 재현) 전체 크로미움(chromium-*/chrome.exe)으로 대신 띄운다."""
+    import os, glob
+    try:
+        return pw.chromium.launch(headless=headless)
+    except Exception as exc:  # noqa: BLE001
+        if "Executable doesn't exist" not in str(exc):
+            raise
+    base = os.environ.get("PLAYWRIGHT_BROWSERS_PATH") or os.path.join(os.environ.get("LOCALAPPDATA", ""), "ms-playwright")
+    cands = sorted(glob.glob(os.path.join(base, "chromium-*", "chrome-win64", "chrome.exe")), reverse=True)
+    if not cands:
+        raise RuntimeError(f"크로미움 실행 파일을 찾지 못함: {base}")
+    return pw.chromium.launch(headless=headless, executable_path=cands[0], args=["--headless=new"] if headless else None)

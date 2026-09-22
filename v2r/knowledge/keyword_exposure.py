@@ -677,7 +677,7 @@ def fetch_integrated_search_dom(
     storage_state = str(cookies_path) if cookies_path and Path(cookies_path).exists() else None
 
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=headless)
+        browser = launch_chromium(pw, headless=headless)
         try:
             context = browser.new_context(
                 storage_state=storage_state,
@@ -1549,7 +1549,7 @@ def fetch_article_text(
 
     storage_state = str(cookies_path) if cookies_path and Path(cookies_path).exists() else None
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=headless)
+        browser = launch_chromium(pw, headless=headless)
         try:
             context = browser.new_context(storage_state=storage_state)
             page = context.new_page()
@@ -1753,3 +1753,19 @@ __all__ = [
     # 연결 3: 연관도 DB 병합
     "_relevance_eligible_keywords",
 ]
+
+
+def launch_chromium(pw, headless: bool = True):
+    """헤드리스 크로미움을 띄운다. 기본 헤드리스 셸이 "Executable doesn't exist"로 실패하면
+    (2026-09-23 실행기 숨김 실행에서 재현) 전체 크로미움(chromium-*/chrome.exe)으로 대신 띄운다."""
+    import os, glob
+    try:
+        return pw.chromium.launch(headless=headless)
+    except Exception as exc:  # noqa: BLE001
+        if "Executable doesn't exist" not in str(exc):
+            raise
+    base = os.environ.get("PLAYWRIGHT_BROWSERS_PATH") or os.path.join(os.environ.get("LOCALAPPDATA", ""), "ms-playwright")
+    cands = sorted(glob.glob(os.path.join(base, "chromium-*", "chrome-win64", "chrome.exe")), reverse=True)
+    if not cands:
+        raise RuntimeError(f"크로미움 실행 파일을 찾지 못함: {base}")
+    return pw.chromium.launch(headless=headless, executable_path=cands[0], args=["--headless=new"] if headless else None)
