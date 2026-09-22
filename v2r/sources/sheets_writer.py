@@ -427,6 +427,282 @@ def set_cell(
     return {"written": res.get("mode") == "sheets", "mode": res.get("mode"), **({"error": res["error"]} if res.get("error") else {})}
 
 
+# --------------------------------------------------------------------------
+# 브랜드 설정(config/brands.yaml) — spreadsheet_id 조회
+# --------------------------------------------------------------------------
+
+DEFAULT_BRANDS_CONFIG = "config/brands.yaml"
+DEFAULT_KEYWORDS_DIR = "data/keywords"
+
+#: 시트 두 번째 탭(노출 현황류) 이름 — 명령 로그·보고서 표기용
+EXPOSURE_TAB_NAME = "노출 현황"
+
+#: `relevance_llm` 값 -> 본문 분류 라벨(0=가장 직접적, 값이 커질수록 느슨해진다는
+#: 기존 연관도 재산정 스케일 전제. `data/keywords/<브랜드>.sqlite`를 만드는
+#: keyword_relevance.py 쪽 스케일이 바뀌면 이 매핑도 같이 바꿔야 한다.)
+RELEVANCE_LABELS = {0: "직접", 1: "근접", 2: "확장"}
+IRRELEVANT_LABEL = "무관"
+IRRELEVANT_NOTE = "연관도 무관(자동)"
+
+
+def _load_brands_config(repo_root: str | Path = ".", config_path: str = DEFAULT_BRANDS_CONFIG) -> dict:
+    import yaml  # type: ignore
+
+    path = Path(repo_root) / config_path
+    with open(path, encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+
+def get_spreadsheet_id(
+    brand: str, repo_root: str | Path = ".", config_path: str = DEFAULT_BRANDS_CONFIG
+) -> str | None:
+    """`config/brands.yaml`에서 브랜드의 시트 ID를 찾는다.
+
+    `spreadsheet_id:` 키를 우선 보고, 없으면 기존 `sheets: [id, ...]`의
+    첫 값을 쓴다(둘 다 결국 config/sources.yaml `brand_sheets`와 같은 ID).
+    """
+    cfg = _load_brands_config(repo_root, config_path)
+    entry = (cfg.get("brands") or {}).get(brand)
+    if not entry:
+        return None
+    if entry.get("spreadsheet_id"):
+        return str(entry["spreadsheet_id"])
+    sheets = entry.get("sheets") or []
+    return str(sheets[0]) if sheets else None
+
+
+def list_configured_brands(repo_root: str | Path = ".", config_path: str = DEFAULT_BRANDS_CONFIG) -> list[str]:
+    cfg = _load_brands_config(repo_root, config_path)
+    return list((cfg.get("brands") or {}).keys())
+
+
+# --------------------------------------------------------------------------
+# 시트 탭 목록(gid) — "두 번째 탭"을 이름 없이 찾기 위해
+# --------------------------------------------------------------------------
+
+
+def _list_tabs(spreadsheet_id: str) -> list[tuple[str, int]]:
+    """시트의 탭들을 `[(이름, gid), ...]`(왼쪽부터 순서대로)로 돌려준다."""
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        try:
+            context = browser.new_context()
+            page = context.new_page()
+            page.goto(
+                EDIT_URL.format(sid=spreadsheet_id, gid=0), wait_until="domcontentloaded", timeout=45000
+            )
+            page.wait_for_selector("#t-name-box", timeout=45000)
+            page.wait_for_timeout(1000)
+            names = page.eval_on_selector_all(".docs-sheet-tab", "els => els.map(e => e.innerText)")
+            tabs: list[tuple[str, int]] = []
+            for i, name in enumerate(names):
+                page.click(f".docs-sheet-tab:nth-child({i + 1})")
+                page.wait_for_timeout(400)
+                m = page.url.split("gid=")
+                gid = int(m[-1]) if len(m) > 1 else 0
+                tabs.append((name, gid))
+            return tabs
+        finally:
+            browser.close()
+
+
+def _second_tab_gid(spreadsheet_id: str) -> int:
+    """두 번째 탭(대개 "노출 현황"류)의 gid. 탭이 하나뿐이면 그 탭."""
+    tabs = _list_tabs(spreadsheet_id)
+    if len(tabs) >= 2:
+        return tabs[1][1]
+    if tabs:
+        return tabs[0][1]
+    return 0
+
+
+# --------------------------------------------------------------------------
+# 명령 `시트 키워드 반영 <브랜드|전체>`
+# --------------------------------------------------------------------------
+
+
+def _keyword_search_url(keyword: str) -> str:
+    from urllib.parse import quote
+
+    return "https://search.naver.com/search.naver?query=" + quote(keyword)
+
+
+def sync_keywords_to_sheet(
+    brand: str,
+    *,
+    repo_root: str | Path = ".",
+    config_path: str = DEFAULT_BRANDS_CONFIG,
+    keywords_dir: str = DEFAULT_KEYWORDS_DIR,
+) -> dict[str, Any]:
+    """`data/keywords/<브랜드>.sqlite`에서 최종 원고 대상 키워드를 골라 시트
+    두 번째 탭에 append한다.
+
+    최종 원고 대상 = `relevance_llm`·`relevance_codex` 둘 다 0~2이고
+    `needs_review`가 아님. 두 열이 아예 없으면(아직 재산정 전) 건너뛴다.
+    이미 시트 H열에 있는 키워드는 다시 넣지 않는다. 1,000행 단위(append_rows
+    가 알아서 나눈다).
+    """
+    import sqlite3
+
+    sid = get_spreadsheet_id(brand, repo_root, config_path)
+    if not sid:
+        return {"brand": brand, "skipped": True, "reason": "config/brands.yaml에 spreadsheet_id 없음"}
+
+    db_path = Path(repo_root) / keywords_dir / f"{brand}.sqlite"
+    if not db_path.exists():
+        return {"brand": brand, "skipped": True, "reason": f"키워드 DB 없음: {db_path}"}
+
+    con = sqlite3.connect(str(db_path))
+    try:
+        cols = {row[1] for row in con.execute("PRAGMA table_info(keywords)")}
+        required = {"relevance_llm", "relevance_codex", "needs_review"}
+        if not required.issubset(cols):
+            return {"brand": brand, "skipped": True, "reason": f"미산정 열 없음: {required - cols}"}
+
+        rows = con.execute(
+            """
+            select keyword, total, rationale, relevance_llm
+            from keywords
+            where relevance_llm between 0 and 2
+              and relevance_codex between 0 and 2
+              and (needs_review is null or needs_review = 0)
+            order by total desc
+            """
+        ).fetchall()
+    finally:
+        con.close()
+
+    if not rows:
+        return {"brand": brand, "skipped": False, "picked": 0, "appended": 0}
+
+    gid = _second_tab_gid(sid)
+    try:
+        table = _read_export_csv(sid, gid)
+    except Exception as exc:
+        return {"brand": brand, "skipped": True, "reason": f"시트 읽기 실패: {exc}"}
+    header = table[0][:15] if table else [
+        "카페", "url", "발행시간", "작성자 아이디", "작성자 비밀번호", "발행 URL",
+        "노출 상태", "키워드", "통합검색", "최종 편집 일시", "키워드 검색량",
+        "노출된 검색량", "비고", "본문 분류", "1~5순위 진입",
+    ]
+    existing = {r[7].strip() for r in table[1:] if len(r) > 7 and r[7].strip()}
+
+    out_rows: list[dict[str, Any]] = []
+    for kw, total, rationale, rel_llm in rows:
+        if kw in existing:
+            continue
+        d = {h: "" for h in header}
+        d["노출 상태"] = "미확인"
+        d["키워드"] = kw
+        d["통합검색"] = _keyword_search_url(kw)
+        d["키워드 검색량"] = f"{total:,}" if total else ""
+        d["비고"] = rationale or ""
+        d["본문 분류"] = RELEVANCE_LABELS.get(rel_llm, str(rel_llm))
+        out_rows.append(d)
+
+    if not out_rows:
+        return {"brand": brand, "skipped": False, "picked": len(rows), "appended": 0, "reason": "이미 시트에 있음"}
+
+    res = append_rows(sid, EXPOSURE_TAB_NAME, out_rows, header=header, gid=gid, repo_root=repo_root)
+    return {
+        "brand": brand,
+        "skipped": False,
+        "picked": len(rows),
+        "appended": res.get("written", 0),
+        "mode": res.get("mode"),
+        **({"error": res["error"]} if res.get("error") else {}),
+    }
+
+
+def sync_keywords_all(
+    repo_root: str | Path = ".",
+    config_path: str = DEFAULT_BRANDS_CONFIG,
+    keywords_dir: str = DEFAULT_KEYWORDS_DIR,
+) -> dict[str, Any]:
+    """명령 `시트 키워드 반영 전체` — 설정된 모든 브랜드에 대해 실행."""
+    results = {}
+    for brand in list_configured_brands(repo_root, config_path):
+        db_path = Path(repo_root) / keywords_dir / f"{brand}.sqlite"
+        if not db_path.exists():
+            continue
+        results[brand] = sync_keywords_to_sheet(
+            brand, repo_root=repo_root, config_path=config_path, keywords_dir=keywords_dir
+        )
+    return results
+
+
+# --------------------------------------------------------------------------
+# 노출 순환 연동 훅 — keyword_exposure.py가 호출하는 지점 (호출부는 그 파일
+# 담당 일꾼이 붙인다. 이 모듈에는 훅 함수만 둔다.)
+# --------------------------------------------------------------------------
+
+
+def apply_exposure(
+    brand: str,
+    rows: list[dict[str, Any]],
+    *,
+    totals: dict[str, Any] | None = None,
+    repo_root: str | Path = ".",
+    config_path: str = DEFAULT_BRANDS_CONFIG,
+) -> dict[str, Any]:
+    """노출 확인 결과를 브랜드 시트 두 번째 탭에 반영한다.
+
+    `rows`는 각 항목이 최소 `keyword`(H열 매칭 키)를 담고, 나머지는
+    다음 중 있는 것만 반영한다:
+      - `status`      -> G(노출 상태)
+      - `final_url`   -> I(통합검색/최종 검색어 URL)
+      - `edited_at`   -> J(최종 편집 일시)
+      - `exposed_total` -> L(노출된 검색량)
+      - `rank`        -> O(1~5순위 진입)
+
+    `totals`(선택)는 `{"P1": ..., "Q1": ...}` 형태로 시트 1행 합계 셀에 쓴다.
+
+    호출부: `v2r/knowledge/keyword_exposure.py`(다른 일꾼 담당, 이 함수는
+    아직 어디서도 호출되지 않는다) — 노출 확인 주기가 끝나고 브랜드별 결과를
+    모은 다음 `sheets_writer.apply_exposure(brand, rows, totals=...)`를
+    호출하도록 그쪽에서 연결해야 한다. 자세한 위치는 보고서 참고.
+    """
+    sid = get_spreadsheet_id(brand, repo_root, config_path)
+    if not sid:
+        return {"brand": brand, "skipped": True, "reason": "config/brands.yaml에 spreadsheet_id 없음"}
+    gid = _second_tab_gid(sid)
+
+    col_map = {
+        "status": "G",
+        "final_url": "I",
+        "edited_at": "J",
+        "exposed_total": "L",
+        "rank": "O",
+    }
+
+    written = 0
+    errors: list[str] = []
+    for row in rows:
+        kw = row.get("keyword")
+        if not kw:
+            continue
+        updates = {col_map[k]: v for k, v in row.items() if k in col_map and v is not None}
+        if not updates:
+            continue
+        res = update_by_key(sid, EXPOSURE_TAB_NAME, str(kw), updates, key_column="H", gid=gid, repo_root=repo_root)
+        written += res.get("written", 0)
+        if res.get("error"):
+            errors.append(f"{kw}: {res['error']}")
+
+    if totals:
+        for cell, value in totals.items():
+            res = set_cell(sid, EXPOSURE_TAB_NAME, cell, value, gid=gid, repo_root=repo_root)
+            if not res.get("written"):
+                errors.append(f"{cell}: {res.get('error', '실패')}")
+
+    out = {"brand": brand, "written": written, "rows": len(rows)}
+    if errors:
+        out["error"] = "; ".join(errors)
+    return out
+
+
 __all__ = [
     "SheetsWriteError",
     "DEFAULT_TOKEN_PATH",
@@ -435,4 +711,9 @@ __all__ = [
     "append_rows",
     "update_by_key",
     "set_cell",
+    "get_spreadsheet_id",
+    "list_configured_brands",
+    "sync_keywords_to_sheet",
+    "sync_keywords_all",
+    "apply_exposure",
 ]

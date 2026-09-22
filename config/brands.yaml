@@ -56,6 +56,7 @@ brands:
     image_count: 1
     comment_type: manuscript
     sheets: [1QYhQFnZznQ-NjIjwiIlmJcf6zkQlb6t3TBK-W6OwJm0]   # 원고 시트 (config/sources.yaml brand_sheets)
+    spreadsheet_id: 1QYhQFnZznQ-NjIjwiIlmJcf6zkQlb6t3TBK-W6OwJm0   # sheets_writer.py(2026-09-23)
 
   코숨핏:
     description: 코숨핏 — 코골이·비염 개선(기도 근육 강화) 제품. 사진은 제품 자체나 사용 장면 클로즈업(제품명·로고 없이)
@@ -87,6 +88,7 @@ brands:
     image_count: 1
     comment_type: manuscript
     sheets: [1Ey_laLK5-yJx2malh8s0vbmECpVW7CZQklCGKT3x0ek]   # 원고 시트 (config/sources.yaml brand_sheets)
+    spreadsheet_id: 1Ey_laLK5-yJx2malh8s0vbmECpVW7CZQklCGKT3x0ek   # sheets_writer.py(2026-09-23)
 
   뉴더미스:
     description: 뉴더미스 — 항문·사타구니 부위 케어 제품. 사진은 제품 자체 클로즈업(제품명·로고 없이, 신체 노출 없이)
@@ -103,6 +105,7 @@ brands:
     image_count: 1
     comment_type: manuscript
     sheets: [1mgqghfeNrSZ1bTSrfTYWojtPGMc0u-K4VXEikxrHLOw]   # 원고 시트 (config/sources.yaml brand_sheets)
+    spreadsheet_id: 1mgqghfeNrSZ1bTSrfTYWojtPGMc0u-K4VXEikxrHLOw   # sheets_writer.py(2026-09-23)
 
   장으뜸:
     description: 장으뜸 장어즙 — 장어 추출 건강즙(파우치·즙 형태). 사진은 즙 파우치·컵에 따른 모습 등 음식 클로즈업
@@ -119,6 +122,7 @@ brands:
     image_count: 1
     comment_type: manuscript
     sheets: [1J8Nq-UQxLzrt3fOqIkZ2HRskZJTFQlOjmFjIh3wlzBs]   # 원고 시트 (config/sources.yaml brand_sheets)
+    spreadsheet_id: 1J8Nq-UQxLzrt3fOqIkZ2HRskZJTFQlOjmFjIh3wlzBs   # sheets_writer.py(2026-09-23)
 
   팥순이:
     description: 팥순이 — 팥순 추출물 다이어트 식품. 사진은 팥·분말·차·스틱 등 음식 클로즈업
@@ -139,6 +143,7 @@ brands:
     image_count: 1
     comment_type: manuscript
     sheets: [1OwR_LSjO1ofOojldtSIqoxv0gieNSMx_t35_5G1VTCc]   # 원고 시트 (config/sources.yaml brand_sheets)
+    spreadsheet_id: 1OwR_LSjO1ofOojldtSIqoxv0gieNSMx_t35_5G1VTCc   # sheets_writer.py(2026-09-23)
 
 # 브랜드 폴더가 아닌 인박스 폴더 (사진 수집에서 건너뛴다)
 ignored_inbox_folders:

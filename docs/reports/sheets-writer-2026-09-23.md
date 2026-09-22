@@ -89,11 +89,90 @@ TSV 조립, 셀 파싱(`_col_letter`/`_parse_cell`), 검증 일치/불일치, �
 행 계산. `pytest -q` 전체 스위트 결과는 별도로 확인(느린 통합 테스트 다수
 포함, 장부 파수꾼 관련 실패는 다른 일꾼 작업 중이라 무시).
 
+## 추가분(같은 날, 코디네이터 후속 지시)
+
+### 1) relevance 3(무관) 오분류 100행 정정
+
+처음 100개 시험 append는 "연관도 순위 상위"로 골랐는데, 실제 스케일은
+**`relevance_llm` 값이 작을수록(0에 가까울수록) 연관도가 높고, 3은 무관**
+이었다 — 정반대로 골라 넣은 것. 사람이 헷갈리지 않도록 그 100행(연속
+8220~8319행)을 다시 정정했다:
+
+- `M8220:M8319` → `연관도 무관(자동)`(전부 일괄, 1회 paste)
+- `N8220:N8319` → `무관`(전부 일괄, 1회 paste)
+- CSV로 재확인: 100행 모두 새 값으로 바뀐 것, 예전 라벨(`relevance_llm=3`)이
+  하나도 남지 않은 것 확인.
+
+### 2) 명령 `시트 키워드 반영 <브랜드|전체>`
+
+`sheets_writer.sync_keywords_to_sheet(brand)` / `sync_keywords_all()`로
+구현했다(파서/스펙 파일은 다른 일꾼이 동시에 고치고 있어 손대지 않음 —
+명령 라우팅은 그쪽에서 이 두 함수를 호출하도록 붙이면 된다).
+
+- 대상 조건: `data/keywords/<브랜드>.sqlite`에서 `relevance_llm`·
+  `relevance_codex` 둘 다 0~2 **그리고** `needs_review`가 아님(0/NULL).
+  `relevance_llm`·`relevance_codex`·`needs_review` 열이 하나라도 없으면
+  "아직 미산정"으로 보고 그 브랜드는 건너뛴다.
+- `config/brands.yaml`에 `spreadsheet_id:`를 5개 브랜드(우아덤·팥순이·
+  장으뜸·뉴더미스·코숨핏) 전부에 명시로 추가했다(기존 `sheets: [id]`와
+  같은 값 — 코숨핏은 `data/brand_sheet_코숨핏.xlsx`를 열어봤지만 내부에
+  시트 ID가 저장돼 있지 않아, 기존 `config/sources.yaml brand_sheets`의
+  값을 그대로 썼다).
+- 시트 "두 번째 탭"은 이름이 아니라 **탭 순서**로 찾는다
+  (`sheets_writer._list_tabs`가 헤드리스로 탭 목록을 읽어 gid를 얻는다) —
+  브랜드마다 두 번째 탭 이름이 다를 수 있어서.
+- H열에 이미 있는 키워드는 건너뛰고, `append_rows`가 1,000행 단위로
+  나눠 쓴다. 매핑: G=미확인, H=키워드, I=통합검색 URL, K=검색량(천단위
+  콤마), M=비고(`rationale`), N=라벨(`relevance_llm` 0→직접·1→근접·
+  2→확장).
+- **실제 시험(우아덤)**: 조건에 맞는 97개를 찾아 전부 append →
+  `{'picked': 97, 'appended': 97, 'mode': 'sheets'}`. CSV로 재확인: 시트
+  행 수 8,319 → 8,416(정확히 +97), 실제 `rationale` 문장과 `직접/근접/
+  확장` 라벨이 제대로 들어간 것 확인.
+
+### 3) 노출 순환 연동 훅 `sheets_writer.apply_exposure`
+
+`keyword_exposure.py`는 다른 일꾼이 동시에 작업 중이라 그 파일은 건드리지
+않고, 훅 함수만 `sheets_writer.py`에 추가했다:
+
+```python
+sheets_writer.apply_exposure(
+    brand,
+    rows=[{"keyword": "...", "status": "...", "final_url": "...",
+           "edited_at": "...", "exposed_total": "...", "rank": ...}, ...],
+    totals={"P1": ..., "Q1": ...},  # 선택
+)
+```
+
+열 매핑: `status`→G(노출 상태), `final_url`→I(최종 검색어 URL),
+`edited_at`→J(최종 편집 일시), `exposed_total`→L(노출된 검색량),
+`rank`→O(1~5순위 진입). 내부적으로 브랜드마다 `update_by_key(...,
+key_column="H", gid=두_번째_탭)`를 키워드 하나당 한 번씩 부르고, `totals`가
+있으면 `set_cell`로 P1/Q1도 쓴다.
+
+**호출 지점(그쪽 담당자가 연결)**: `v2r/knowledge/keyword_exposure.py`에서
+노출 확인 주기 하나가 끝나고 브랜드별 결과(키워드·상태·최종 URL·확인
+시각·노출 검색량·순위)를 모은 직후, 그 리스트를 그대로
+`sheets_writer.apply_exposure(brand, rows, totals={...})`에 넘기면 된다.
+이 함수는 아직 어디서도 호출되지 않는다 — 실제 연결은 안 했음(그 파일은
+읽기만 하라는 지시).
+
+### 테스트·전체 스위트
+
+`tests/test_sheets_writer.py`가 10개 → **15개**로 늘었다(신규 5개:
+`get_spreadsheet_id` 명시 키 우선, `list_configured_brands`,
+`sync_keywords_to_sheet`가 관련도/검토대기/기존행 필터링을 SQL·append
+양쪽에서 제대로 거르는지, `apply_exposure` 열 매핑+합계 셀). 전부 가짜
+CSV/함수로 순수 로직만 검증(실제 브라우저·네트워크 없음). 15개 전부 통과.
+`pytest -q -k "sheets_writer or brands"` 20 passed.
+
 ## 남은 일
 
-- 명령 `시트 키워드 반영 <브랜드|전체>` — 연관도 재산정이 끝난 나머지
-  키워드(브랜드당 1만 개 목표)를 이번에 확인한 방식으로 붙이는 명령. 이번
-  구현의 `append_rows`를 그대로 호출하면 되므로 재산정 완료 후 바로 연결
-  가능.
-- `M`(비고) 열은 현재 대부분 `rationale`이 비어 있어 빈 칸으로 들어갔다 —
-  재산정 결과에 근거가 채워지면 그 값으로 다시 채우면 된다.
+- 파서/스펙에 `시트 키워드 반영 <브랜드|전체>` 명령 자체를 연결하는 일은
+  `v2r/command/parser.py`·`spec.py` 담당 일꾼이 `sheets_writer.sync_keywords_to_sheet`/
+  `sync_keywords_all`을 호출하도록 붙여야 한다(이번엔 손대지 않음).
+- `keyword_exposure.py`에서 노출 순환 주기 끝에 `apply_exposure` 호출을
+  실제로 연결하는 일(위 "호출 지점" 참고).
+- 아직 relevance 산정이 안 된 브랜드(sqlite에 relevance 열 없음)는
+  `sync_keywords_all()`이 조용히 건너뛴다 — 재산정 끝나는 대로 다시
+  돌리면 된다.

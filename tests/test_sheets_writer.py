@@ -175,3 +175,144 @@ def test_append_rows_starts_after_last_row(monkeypatch, tmp_path):
     assert result["mode"] == "sheets"
     assert captured["cell"] == "A3"  # 헤더 1행 + 데이터 1행 다음 = 3행부터
     assert captured["rows"] == [["kw2", "url2"]]
+
+
+# --------------------------------------------------------------------------
+# 2026-09-23 추가분: 브랜드 설정 조회, 탭 gid 조회, sync_keywords_*, apply_exposure
+# --------------------------------------------------------------------------
+
+
+def test_get_spreadsheet_id_prefers_explicit_key(tmp_path):
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    (cfg / "brands.yaml").write_text(
+        "brands:\n"
+        "  브랜드A:\n"
+        "    spreadsheet_id: sid-explicit\n"
+        "    sheets: [sid-from-sheets-list]\n"
+        "  브랜드B:\n"
+        "    sheets: [sid-only-list]\n",
+        encoding="utf-8",
+    )
+    assert sw.get_spreadsheet_id("브랜드A", tmp_path) == "sid-explicit"
+    assert sw.get_spreadsheet_id("브랜드B", tmp_path) == "sid-only-list"
+    assert sw.get_spreadsheet_id("없는브랜드", tmp_path) is None
+
+
+def test_list_configured_brands(tmp_path):
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    (cfg / "brands.yaml").write_text(
+        "brands:\n  가:\n    sheets: [x]\n  나:\n    sheets: [y]\n", encoding="utf-8"
+    )
+    assert sorted(sw.list_configured_brands(tmp_path)) == ["가", "나"]
+
+
+def test_sync_keywords_to_sheet_skips_when_columns_missing(tmp_path, monkeypatch):
+    import sqlite3
+
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    (cfg / "brands.yaml").write_text(
+        "brands:\n  테스트브랜드:\n    spreadsheet_id: sid1\n", encoding="utf-8"
+    )
+    kw_dir = tmp_path / "data" / "keywords"
+    kw_dir.mkdir(parents=True)
+    con = sqlite3.connect(str(kw_dir / "테스트브랜드.sqlite"))
+    con.execute("create table keywords (keyword text, total integer)")
+    con.commit()
+    con.close()
+
+    res = sw.sync_keywords_to_sheet("테스트브랜드", repo_root=tmp_path)
+    assert res["skipped"] is True
+    assert "미산정" in res["reason"]
+
+
+def test_sync_keywords_to_sheet_picks_only_target_rows(tmp_path, monkeypatch):
+    import sqlite3
+
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    (cfg / "brands.yaml").write_text(
+        "brands:\n  테스트브랜드:\n    spreadsheet_id: sid1\n", encoding="utf-8"
+    )
+    kw_dir = tmp_path / "data" / "keywords"
+    kw_dir.mkdir(parents=True)
+    con = sqlite3.connect(str(kw_dir / "테스트브랜드.sqlite"))
+    con.execute(
+        "create table keywords (keyword text, total integer, rationale text, "
+        "relevance_llm integer, relevance_codex integer, needs_review integer)"
+    )
+    con.executemany(
+        "insert into keywords values (?, ?, ?, ?, ?, ?)",
+        [
+            ("직접키워드", 100, "딱맞음", 0, 0, 0),
+            ("무관키워드", 50, "", 3, 3, 0),  # relevance 3 = 무관 -> 제외
+            ("검토대기", 30, "", 1, 1, 1),  # needs_review -> 제외
+            ("이미시트에있음", 20, "", 2, 2, 0),  # 시트에 이미 있음 -> 제외
+        ],
+    )
+    con.commit()
+    con.close()
+
+    header_row = ["A", "B", "C", "D", "E", "F", "G", "H"]
+    existing_row = ["", "", "", "", "", "", "", "이미시트에있음"]
+    monkeypatch.setattr(sw, "_second_tab_gid", lambda sid: 999)
+    monkeypatch.setattr(
+        sw, "_read_export_csv", lambda sid, gid, timeout=15.0: [header_row, existing_row]
+    )
+    captured = {}
+
+    def fake_append_rows(sid, sheet, rows, *, header=None, gid=0, repo_root="."):
+        captured["rows"] = rows
+        return {"written": len(rows), "mode": "sheets"}
+
+    monkeypatch.setattr(sw, "append_rows", fake_append_rows)
+
+    res = sw.sync_keywords_to_sheet("테스트브랜드", repo_root=tmp_path)
+    # SQL 단계에서 무관키워드(relevance 3)·검토대기(needs_review) 제외 -> 2건 picked
+    assert res["picked"] == 2
+    # 그중 이미시트에있음은 시트 H열에 이미 있어 append에서 다시 제외 -> 1건만 appended
+    assert res["appended"] == 1
+    kws = [r["키워드"] for r in captured["rows"]]
+    assert kws == ["직접키워드"]
+
+
+def test_apply_exposure_maps_columns_and_writes_totals(tmp_path, monkeypatch):
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    (cfg / "brands.yaml").write_text(
+        "brands:\n  테스트브랜드:\n    spreadsheet_id: sid1\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(sw, "_second_tab_gid", lambda sid: 999)
+
+    calls = []
+
+    def fake_update_by_key(sid, sheet, key_value, updates, *, key_column="H", gid=0, repo_root="."):
+        calls.append((key_value, updates))
+        return {"written": len(updates), "mode": "sheets"}
+
+    cell_calls = []
+
+    def fake_set_cell(sid, sheet, cell, value, *, gid=0, repo_root="."):
+        cell_calls.append((cell, value))
+        return {"written": True, "mode": "sheets"}
+
+    monkeypatch.setattr(sw, "update_by_key", fake_update_by_key)
+    monkeypatch.setattr(sw, "set_cell", fake_set_cell)
+
+    res = sw.apply_exposure(
+        "테스트브랜드",
+        [
+            {"keyword": "kw1", "status": "노출", "final_url": "https://x", "rank": 2},
+            {"keyword": "kw2", "exposed_total": "1,234"},
+        ],
+        totals={"P1": 10, "Q1": 20},
+        repo_root=tmp_path,
+    )
+    assert res["written"] == 4  # kw1: 3개(G,I,O) + kw2: 1개(L)
+    assert calls[0][0] == "kw1"
+    assert calls[0][1] == {"G": "노출", "I": "https://x", "O": 2}
+    assert calls[1][1] == {"L": "1,234"}
+    assert ("P1", 10) in cell_calls
+    assert ("Q1", 20) in cell_calls
