@@ -35,6 +35,7 @@ from typing import Any
 
 from v2r.engine.recovery_rules import KNOWN_ACTIONS, match_rule, rule_by_name, rule_names
 from v2r.engine.scheduler import KST
+from v2r.store.jobs import RESUMABLE_TASKS
 
 log = logging.getLogger(__name__)
 
@@ -584,9 +585,50 @@ def _watch_running(rt: Any, state: dict, job: dict, now: datetime) -> list[dict]
 
     if idle >= STALL_S and not js.get("stall_alert"):
         js["stall_alert"] = True
-        _alert(rt, state, f"작업 {job_id} 정체 {int(idle // 60)}분 — 계속 지켜봅니다")
-        rt.events.log(job_id, "warn", f"감시: 진행 없음 {int(idle // 60)}분")
-        acts.append({"job_id": job_id, "action": "stalled"})
+        task = str(job.get("task") or "")
+        recovered = False
+        # publish_daily 처럼 남은 건수를 다시 계산하는 작업은 15분 정체 +
+        # 리스 없음이면 30분(DEAD_S)까지 기다리지 않고 바로 이어서 실행한다
+        # (사고 2026-09-22: 감시가 경고만 남기고 1시간 동안 복구하지 않았다).
+        # `requeue_running`은 status='running' + 리스 만료 조건에서만 원자적으로
+        # 바뀌므로 중복 실행을 막는다. 같은 명령이 이미 큐에 따로 있으면
+        # (예: 사용자가 재명령해 다른 job이 만들어졌다면) 건드리지 않는다 —
+        # 기존 자동 복구 규칙의 중복 방지(has_open_job)와 같은 취지다.
+        idem_key = str(job.get("idem_key") or "")
+        already_queued_elsewhere = False
+        if idem_key:
+            try:
+                other = rt.jobs.find_by_idem(idem_key)
+                already_queued_elsewhere = bool(
+                    other and int(other.get("id", 0)) != job_id and other.get("status") == "queued"
+                )
+            except Exception:  # noqa: BLE001
+                already_queued_elsewhere = False
+        if (
+            task in RESUMABLE_TASKS
+            and (lease_until is None or lease_until <= now)
+            and not already_queued_elsewhere
+        ):
+            try:
+                recovered = bool(rt.jobs.requeue_running(job_id))
+            except Exception as exc:  # noqa: BLE001
+                log.warning("정체 작업 자동 복구 실패: %s", exc)
+        if recovered:
+            rt.events.log(
+                job_id, "info", f"감시: 진행 없음 {int(idle // 60)}분 — 리스 없음, 큐에 되돌려 이어서 실행"
+            )
+            _alert(
+                rt,
+                state,
+                f"작업 {job_id} 정체 {int(idle // 60)}분 — 실행기 리스가 끊겨"
+                " 자동으로 큐에 되돌렸습니다(이어서 실행)",
+            )
+            _daily(state, now)["recovered"] += 1
+            acts.append({"job_id": job_id, "action": "stall_recovered"})
+        else:
+            _alert(rt, state, f"작업 {job_id} 정체 {int(idle // 60)}분 — 계속 지켜봅니다")
+            rt.events.log(job_id, "warn", f"감시: 진행 없음 {int(idle // 60)}분")
+            acts.append({"job_id": job_id, "action": "stalled"})
 
     if idle >= DEAD_S and (lease_until is None or lease_until <= now) and not js.get("reaped"):
         js["reaped"] = True

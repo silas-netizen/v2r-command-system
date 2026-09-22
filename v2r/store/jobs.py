@@ -12,6 +12,12 @@ from v2r.store.db import KST, now_iso
 OPEN_STATUSES = ("queued", "running")
 STATUSES = ("queued", "running", "done", "failed", "uncertain", "cancelled")
 
+#: 실행기가 죽어도 **이어서** 돌릴 수 있는 작업(남은 건수를 다시 계산하는
+#: idempotent 작업). 이 목록에 없는 작업은 재시작 시 uncertain 으로만 정리한다
+#: (사고 2026-09-22: publish_daily 가 uncertain 으로만 정리되고 아무도 이어받지
+#: 않아 1시간 발행이 멈췄다).
+RESUMABLE_TASKS = frozenset({"publish_daily", "publish_batch"})
+
 
 def _parse(ts: str | None) -> datetime | None:
     if not ts:
@@ -99,26 +105,71 @@ class JobStore:
         ).fetchone()
         return row is not None
 
-    def reap_stale_running(self, error: str = "실행기 중단") -> int:
-        """리스가 만료된 running 작업을 uncertain으로 정리한다."""
+    def reap_stale_running(
+        self, error: str = "실행기 중단", resumable_tasks: frozenset[str] | None = None
+    ) -> list[dict]:
+        """리스가 만료된 running 작업을 정리한다.
+
+        재개 가능한 작업(``resumable_tasks``, 기본 `RESUMABLE_TASKS`)은
+        **queued로 되돌려 이어서 실행**한다. 그 외는 지금까지처럼 uncertain으로
+        정리한다(사람 확인이 필요할 수 있는 작업).
+
+        돌려주는 값은 ``[{"id", "task", "action": "queued"|"uncertain"}, ...]``.
+        총 처리 건수는 ``len(...)``으로 잰다(기존 int 반환과 같은 뜻).
+        """
+        resumable = RESUMABLE_TASKS if resumable_tasks is None else resumable_tasks
         rows = self.conn.execute(
-            "SELECT id, lease_until FROM jobs WHERE status = 'running'"
+            "SELECT id, task, lease_until FROM jobs WHERE status = 'running'"
         ).fetchall()
         stale = []
         for row in rows:
             until = _parse(row["lease_until"])
             if until is None or until <= datetime.now(KST):
-                stale.append(int(row["id"]))
+                stale.append((int(row["id"]), str(row["task"] or "")))
         if not stale:
-            return 0
+            return []
         ts = now_iso()
-        for job_id in stale:
-            self.conn.execute(
-                "UPDATE jobs SET status = 'uncertain', error = ?, lease_owner = NULL,"
-                " lease_until = NULL, updated_at = ? WHERE id = ?",
-                (error, ts, job_id),
-            )
-        return len(stale)
+        out: list[dict] = []
+        for job_id, task in stale:
+            if task in resumable:
+                self.conn.execute(
+                    "UPDATE jobs SET status = 'queued', lease_owner = NULL,"
+                    " lease_until = NULL, updated_at = ? WHERE id = ?",
+                    (ts, job_id),
+                )
+                out.append({"id": job_id, "task": task, "action": "queued"})
+            else:
+                self.conn.execute(
+                    "UPDATE jobs SET status = 'uncertain', error = ?, lease_owner = NULL,"
+                    " lease_until = NULL, updated_at = ? WHERE id = ?",
+                    (error, ts, job_id),
+                )
+                out.append({"id": job_id, "task": task, "action": "uncertain"})
+        return out
+
+    def revive_to_queued(self, job_id: int) -> bool:
+        """uncertain(또는 멈춘) 작업을 queued로 되살린다(같은 작업을 이어서 실행)."""
+        cur = self.conn.execute(
+            "UPDATE jobs SET status = 'queued', error = NULL, lease_owner = NULL,"
+            " lease_until = NULL, updated_at = ? WHERE id = ?",
+            (now_iso(), job_id),
+        )
+        return cur.rowcount > 0
+
+    def requeue_running(self, job_id: int) -> bool:
+        """리스가 끊긴 running 작업 1건을 (원자적으로) queued로 되돌린다.
+
+        `status='running'`이고 리스가 비었거나 만료된 경우에만 바뀐다 —
+        이미 다른 곳에서 처리됐으면 아무 일도 하지 않는다(중복 실행 방지).
+        """
+        now_s = datetime.now(KST).isoformat(timespec="seconds")
+        cur = self.conn.execute(
+            "UPDATE jobs SET status = 'queued', lease_owner = NULL, lease_until = NULL,"
+            " updated_at = ? WHERE id = ? AND status = 'running'"
+            " AND (lease_until IS NULL OR lease_until <= ?)",
+            (now_iso(), job_id, now_s),
+        )
+        return cur.rowcount > 0
 
     # --- 리스 ---
     def _take_lease(self, owner: str, lease_seconds: int) -> bool:

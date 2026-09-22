@@ -121,8 +121,10 @@ def test_release_stale_lease(tmp_path):
 # 2) 멈춘 실행 중 작업
 # --------------------------------------------------------------------
 def test_running_job_stall_alert_then_reap_and_requeue(tmp_path):
+    """재개 불가 작업(publish_* 가 아님)은 예전처럼: 정체 경고 → 30분 뒤 실패
+    처리 + 재등록. (publish_daily 처럼 재개 가능한 작업의 즉시 복구는 별도 테스트.)"""
     rt = make_rt(tmp_path)
-    job_id = add_job(rt, status="running", ago_min=16)
+    job_id = add_job(rt, task="repair_comments", status="running", ago_min=16)
     out = monitor.tick(rt, NOW)
     assert [a["action"] for a in out["actions"]] == ["stalled"]
     assert any("정체" in t for t in rt.channels[0].sent)
@@ -138,6 +140,32 @@ def test_running_job_stall_alert_then_reap_and_requeue(tmp_path):
     assert reaped and reaped[0]["new_job_id"]
     assert rt.jobs.get(job_id)["status"] == "failed"
     assert rt.jobs.get(reaped[0]["new_job_id"])["status"] == "queued"
+    rt.close()
+
+
+def test_publish_daily_정체시_즉시_큐로_되돌려_이어서_실행한다(tmp_path):
+    """사고 2026-09-22: publish_daily가 리스 끊긴 채 15분 정체하면 감시가
+    경고만 남기고 30분(DEAD_S)까지 기다리지 않는다 — 재개 가능한 작업은
+    바로 queued로 되돌려 이어서 실행해야 한다."""
+    rt = make_rt(tmp_path)
+    job_id = add_job(rt, task="publish_daily", status="running", ago_min=16)
+    # 리스가 비어 있다(add_job은 lease_until을 안 채운다) = 실행기가 끊긴 상태
+    out = monitor.tick(rt, NOW)
+    assert [a["action"] for a in out["actions"]] == ["stall_recovered"]
+    row = rt.jobs.get(job_id)
+    assert row["status"] == "queued"
+    assert any("이어서 실행" in t or "되돌렸습니다" in t for t in rt.channels[0].sent)
+    rt.close()
+
+
+def test_publish_daily_정체여도_리스가_살아있으면_그대로_둔다(tmp_path):
+    rt = make_rt(tmp_path)
+    job_id = add_job(rt, task="publish_daily", status="running", ago_min=16)
+    future = (NOW + timedelta(minutes=10)).isoformat(timespec="seconds")
+    rt.conn.execute("UPDATE jobs SET lease_until = ? WHERE id = ?", (future, job_id))
+    out = monitor.tick(rt, NOW)
+    assert [a["action"] for a in out["actions"]] == ["stalled"]
+    assert rt.jobs.get(job_id)["status"] == "running"
     rt.close()
 
 

@@ -828,8 +828,44 @@ def test_리스가_끊긴_running_작업을_정리한다(tmp_path):
         "UPDATE jobs SET lease_until = ? WHERE id = ?",
         ((datetime.now(KST) - timedelta(hours=1)).isoformat(timespec="seconds"), job["id"]),
     )
-    assert rt.jobs.reap_stale_running() == 1
+    reaped = rt.jobs.reap_stale_running()
+    assert len(reaped) == 1 and reaped[0]["action"] == "uncertain"
     assert rt.jobs.get(int(job["id"]))["status"] == "uncertain"
+    rt.close()
+
+
+def test_리스가_끊긴_publish_daily는_uncertain이_아니라_이어서_실행된다(tmp_path):
+    """사고 2026-09-22: 실행기 재시작 때 publish_daily가 uncertain으로 정리되고
+    아무도 이어받지 않아 1시간 발행이 멈췄다. 재개 가능한 작업은 queued로 되돌려야 한다."""
+    rt = make_runtime(tmp_path)
+    job_id = rt.jobs.enqueue(TaskSpec(task="publish_daily"), "pub-key-1")
+    rt.jobs.acquire("죽은실행기", scope="main")
+    rt.conn.execute(
+        "UPDATE jobs SET lease_until = ? WHERE id = ?",
+        ((datetime.now(KST) - timedelta(hours=1)).isoformat(timespec="seconds"), job_id),
+    )
+    reaped = rt.jobs.reap_stale_running()
+    assert len(reaped) == 1 and reaped[0]["action"] == "queued"
+    row = rt.jobs.get(int(job_id))
+    assert row["status"] == "queued"
+    assert row["error"] is None
+    rt.close()
+
+
+def test_uncertain_발행_작업에_재명령하면_새로_안_만들고_되살린다(tmp_path):
+    """사고 2026-09-22 11:41: 재명령이 새 작업을 안 만들고 uncertain job id만
+    돌려주고 아무 일도 안 했다. 같은 idem_key의 uncertain 작업은 queued로
+    되살려야 한다."""
+    rt = make_runtime(tmp_path)
+    first = worker.handle_text(rt, "일상 글 3개 올려")
+    job_id = first["job_id"]
+    rt.jobs.finish(job_id, "uncertain", None, "실행기 중단")
+    assert rt.jobs.get(job_id)["status"] == "uncertain"
+
+    second = worker.handle_text(rt, "일상 글 3개 올려")
+    assert second["job_id"] == job_id
+    row = rt.jobs.get(job_id)
+    assert row["status"] == "queued"
     rt.close()
 
 

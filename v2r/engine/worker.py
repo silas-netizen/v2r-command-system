@@ -66,6 +66,12 @@ def _enqueue_key(rt: Runtime, text: str, task: str) -> str:
     if rt.jobs.has_open_job(key):
         return key  # 대기·실행 중이면 그대로 재사용(중복 등록 방지)
     previous = rt.jobs.find_by_idem(key)
+    if previous is not None and str(previous.get("status")) == "uncertain":
+        # 실행기 중단으로 미확정이 된 같은 명령: 새 작업을 만들지 않고
+        # 그 작업을 이어서 실행하도록 되살린다(사고 2026-09-22: 재명령이
+        # job id만 돌려주고 아무 일도 안 했던 문제).
+        rt.jobs.revive_to_queued(int(previous["id"]))
+        return key
     if previous is not None and previous.get("status") in ("failed", "cancelled"):
         from v2r.store.db import now_iso
 
@@ -443,7 +449,10 @@ def _generate_brand(rt: Runtime, spec: TaskSpec) -> dict:
     xlsx = Path(rt.settings.repo_root) / "data" / f"brand_sheet_{brand}.xlsx"
     try:
         pool = load_pushed_keywords(
-            brand, rt.sources_cfg, xlsx_path=str(xlsx) if xlsx.exists() else None
+            brand,
+            rt.sources_cfg,
+            xlsx_path=str(xlsx) if xlsx.exists() else None,
+            conn=rt.conn,
         )
     except Exception as exc:
         return {"ok": False, "error": f"키워드 목록을 읽지 못했습니다: {exc}"}
@@ -1938,8 +1947,74 @@ def dispatch(rt: Runtime, job: Any, owner: str | None = None) -> dict:
         from v2r.engine import monitor as monitor_mod
 
         return {"ok": True, "report": monitor_mod.monitor_report(rt)}
+    if task == "keyword_exposure":
+        return _keyword_exposure(rt, spec)
 
     raise ValueError(f"처리기가 없는 작업: {task}")
+
+
+def _keyword_exposure(rt: Runtime, spec: TaskSpec) -> dict:
+    """브랜드별 키워드 노출 현황을 네이버 검색으로 조회해 보고서를 보낸다."""
+    from v2r.knowledge import keyword_exposure as ke_mod
+
+    brand = (spec.brand or "").strip()
+    brands = [brand] if brand else list((rt.sources_cfg.get("brand_sheets") or {}).keys())
+    if not brands:
+        return {"ok": False, "error": "조회할 브랜드 시트가 없습니다"}
+
+    all_rows: list = []
+    per_brand: dict[str, int] = {}
+    for b in brands:
+        try:
+            rows = ke_mod.run_check(rt, b, limit=spec.count or 0)
+        except Exception as exc:
+            log.warning("키워드 노출 조회 실패(%s): %s", b, exc)
+            continue
+        all_rows.extend(rows)
+        per_brand[b] = len(rows)
+
+    if not all_rows:
+        return {"ok": False, "error": "검사한 키워드가 없습니다"}
+
+    label = brand or "전체"
+    md_path, csv_path = ke_mod.write_report(rt, all_rows, label)
+    sent = _send_report_pair(rt, md_path, csv_path, f"키워드 노출 현황 {label}")
+    return {
+        "ok": True,
+        "checked": len(all_rows),
+        "per_brand": per_brand,
+        "path": str(md_path),
+        "csv_path": str(csv_path),
+        "sent": sent,
+        "message": f"키워드 노출 현황({label}) 검사 {len(all_rows)}건, {sent}곳 전송",
+    }
+
+
+def _log_reaped(rt: Runtime, reaped: list[dict]) -> None:
+    """`reap_stale_running` 결과를 이벤트·로그에 남긴다(재개/미확정 구분)."""
+    if not reaped:
+        return
+    queued = [r for r in reaped if r.get("action") == "queued"]
+    uncertain = [r for r in reaped if r.get("action") == "uncertain"]
+    for item in queued:
+        try:
+            rt.events.log(
+                int(item["id"]), "info", "감시: 실행기 재시작 후 이어서 실행"
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("이어서 실행 이벤트 기록 실패: %s", exc)
+    if queued:
+        log.warning(
+            "리스가 끊긴 작업 %d건을 이어서 실행하도록 큐에 되돌렸습니다: %s",
+            len(queued),
+            ", ".join(str(r["id"]) for r in queued),
+        )
+    if uncertain:
+        log.warning(
+            "리스가 끊긴 작업 %d건을 불확실로 정리했습니다: %s",
+            len(uncertain),
+            ", ".join(str(r["id"]) for r in uncertain),
+        )
 
 
 # --------------------------------------------------------------------
@@ -1956,8 +2031,7 @@ def run_once(
     owner = owner or default_owner()
     if scope != "light":
         reaped = rt.jobs.reap_stale_running()  # 죽은 실행기의 고아 작업 정리 (M-5)
-        if reaped:
-            log.warning("리스가 끊긴 작업 %d건을 불확실로 정리했습니다", reaped)
+        _log_reaped(rt, reaped)
     job = rt.jobs.acquire(owner, scope=scope)
     if job is None:
         return None
@@ -2134,12 +2208,12 @@ def serve_poll(
     # 죽은 실행기가 남긴 작업 정리 (M-5). run_once 안에서도 하지만
     # 큐가 비어 있는 동안에도 주기적으로 돌아야 한다.
     try:
-        reaped = rt.jobs.reap_stale_running()
-        if reaped:
-            log.warning("리스가 끊긴 작업 %d건을 불확실로 정리했습니다", reaped)
+        reaped_list = rt.jobs.reap_stale_running()
+        _log_reaped(rt, reaped_list)
     except Exception as exc:
         log.warning("고아 작업 정리 실패: %s", exc)
-        reaped = 0
+        reaped_list = []
+    reaped = len(reaped_list)  # 기존 int 반환과 같은 뜻(호환)
 
     if stop_requested(rt):
         # 중지 플래그가 살아 있으면 새 작업을 꺼내지 않는다. 새 명령이 오면 풀린다.
