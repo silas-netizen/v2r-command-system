@@ -6,6 +6,7 @@ docs/reports/keyword-program-plan-2026-09-22.md A1~A3 구현.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -14,8 +15,10 @@ from v2r.knowledge.naver_keyword_tool import (
     DEFAULT_TARGET,
     SEED_BATCH_SIZE,
     KeywordRow,
+    _make_response_capture,
     compute_relevance,
     discover,
+    fetch_related_keywords,
     parse_keyword_download_rows,
     parse_keyword_response,
 )
@@ -294,3 +297,163 @@ def test_parse_keyword_download_rows():
 def test_parse_keyword_download_rows_empty():
     assert parse_keyword_download_rows([]) == []
     assert parse_keyword_download_rows(SAMPLE_DOWNLOAD_ROWS[:2]) == []  # 헤더만
+
+
+# --- run_for_brand 스모크(브라우저는 전부 가짜) -------------------------------
+def test_run_for_brand_smoke_no_name_errors(tmp_path, monkeypatch):
+    """브라우저 계층을 전부 가짜로 바꿔 `run_for_brand`가 (재기동 경로 포함)
+    `NameError` 같은 코드 버그 없이 끝까지 도는지 확인한다 — `acct` 변수 누락
+    회귀(2026-09-23, 병렬 실행 중 실측)를 다시 잡기 위한 가드."""
+    import v2r.knowledge.naver_keyword_tool as kt_mod
+
+    repo = tmp_path
+    (repo / "data").mkdir()
+    (repo / "warehouse" / "guides" / "정리본").mkdir(parents=True)
+
+    class _Settings:
+        repo_root = repo
+
+    class _RT:
+        settings = _Settings()
+        sources_cfg = {}
+
+    monkeypatch.setattr(kt_mod, "seeds_from_sheet", lambda *a, **kw: ["씨앗1", "씨앗2"])
+    monkeypatch.setattr(kt_mod, "extract_guide_keywords", lambda *a, **kw: [])
+
+    class _FakePage:
+        url = "https://ads.naver.com"
+
+        def inner_text(self, _sel):
+            return "정상 페이지"
+
+    calls: list[tuple] = []
+
+    def _fake_open(profile_dir=None, headless=True, offscreen=True):
+        return ("pw", "ctx", _FakePage(), True)
+
+    def _fake_fetch(page, keywords, account_id, download_dir=None):
+        calls.append((tuple(keywords), account_id))
+        return []  # 결과 없음 → consecutive_bad가 쌓여 10회째 멈춘다(정상 종료 경로)
+
+    monkeypatch.setattr(kt_mod, "open_keyword_tool_page", _fake_open)
+    monkeypatch.setattr(kt_mod, "fetch_related_keywords", _fake_fetch)
+    monkeypatch.setattr("v2r.warehouse.naver_session._looks_logged_out", lambda page: False)
+    monkeypatch.setattr("v2r.warehouse.naver_session._close", lambda *a, **kw: None)
+
+    out = kt_mod.run_for_brand(_RT(), "테스트브랜드", target=50, headless=True)
+
+    assert out["ok"] is True
+    assert calls, "fetch_related_keywords가 최소 한 번은 불려야 한다"
+    # 모든 호출이 같은(정상적인) 계정 id를 썼는지 — acct NameError 회귀 가드
+    assert all(acc == "685753" for _, acc in calls)
+
+
+# --- 조회 XHR 응답 가로채기 (2026-09-23 01:22, 다운로드 버그 우회) --------------
+class _FakeResponse:
+    def __init__(self, ctype: str, body: Any):
+        self._ctype = ctype
+        self._body = body
+
+    @property
+    def headers(self):
+        return {"content-type": self._ctype}
+
+    def json(self):
+        if isinstance(self._body, Exception):
+            raise self._body
+        return self._body
+
+
+def test_response_capture_picks_up_keyword_list_json():
+    on_response, captured = _make_response_capture(page=None)
+    on_response(_FakeResponse("text/html", {}))  # 딴 응답은 무시
+    on_response(_FakeResponse("application/json", {"unrelated": True}))  # keywordList 없음
+    assert "data" not in captured
+    on_response(_FakeResponse("application/json; charset=utf-8", {"keywordList": [{"relKeyword": "a"}]}))
+    assert captured["data"]["keywordList"] == [{"relKeyword": "a"}]
+    # 먼저 잡힌 뒤로는 다른 응답이 와도 덮어쓰지 않는다
+    on_response(_FakeResponse("application/json", {"keywordList": [{"relKeyword": "b"}]}))
+    assert captured["data"]["keywordList"] == [{"relKeyword": "a"}]
+
+
+def test_response_capture_ignores_non_json_body_errors():
+    on_response, captured = _make_response_capture(page=None)
+    on_response(_FakeResponse("application/json", ValueError("bad body")))
+    assert "data" not in captured
+
+
+class _FakeLocator:
+    def __init__(self, n=1, disabled=None):
+        self._n = n
+        self._disabled = disabled
+
+    def count(self):
+        return self._n
+
+    @property
+    def first(self):
+        return self
+
+    def click(self, timeout=None):
+        pass
+
+    def fill(self, text):
+        pass
+
+    def get_attribute(self, name):
+        return self._disabled
+
+
+class _FakePageForFetch:
+    """`fetch_related_keywords`가 쓰는 최소 Playwright 표면만 흉내(응답 가로채기
+    경로 확인용 — 실제 브라우저 없이 조회 XHR JSON이 잡히면 다운로드를 아예
+    건드리지 않는지 본다)."""
+
+    def __init__(self, response_payload: dict | None):
+        self.url = "https://ads.naver.com/manage/ad-accounts/685753/sa/tool/keyword-planner"
+        self._handlers: dict[str, list] = {}
+        self._response_payload = response_payload
+        self.download_button_touched = False
+
+    def goto(self, *a, **kw):
+        pass
+
+    def locator(self, *_a, **_kw):
+        return _FakeLocator()
+
+    def get_by_text(self, text, exact=False):
+        if text == "전체 다운로드" or (not exact and "다운로드" in text):
+            self.download_button_touched = True
+            return _FakeLocator(n=0)  # 다운로드 버튼은 아예 안 씀
+        return _FakeLocator()
+
+    def on(self, event, cb):
+        self._handlers.setdefault(event, []).append(cb)
+        if event == "response" and self._response_payload is not None:
+            cb(_FakeResponse("application/json", self._response_payload))
+
+    def remove_listener(self, event, cb):
+        self._handlers.get(event, []).remove(cb)
+
+    def wait_for_timeout(self, _ms):
+        pass
+
+
+def test_fetch_related_keywords_uses_response_capture_not_download():
+    page = _FakePageForFetch({"keywordList": [{"relKeyword": "가려움증", "monthlyPcQcCnt": "650", "monthlyMobileQcCnt": "3250"}]})
+    rows = fetch_related_keywords(page, ["씨앗"], "685753")
+    assert [r.keyword for r in rows] == ["가려움증"]
+    assert page.download_button_touched is False  # 다운로드 버튼을 아예 안 봤다
+
+
+def test_fetch_related_keywords_falls_back_to_dom_when_no_response(monkeypatch):
+    import v2r.knowledge.naver_keyword_tool as kt_mod
+
+    page = _FakePageForFetch(response_payload=None)
+    monkeypatch.setattr(
+        kt_mod, "_scrape_table_rows", lambda _page: [KeywordRow(keyword="대안", pc=1, mobile=1)]
+    )
+    monkeypatch.setattr(kt_mod, "RESPONSE_CAPTURE_TIMEOUT_SEC", 0.0)
+    rows = fetch_related_keywords(page, ["씨앗"], "685753", response_capture_timeout_sec=0.0, timeout_ms=0)
+    assert [r.keyword for r in rows] == ["대안"]
+    assert page.download_button_touched is False  # 기본은 다운로드로 안 넘어간다(use_download_fallback=False)

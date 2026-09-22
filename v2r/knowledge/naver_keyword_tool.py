@@ -22,6 +22,7 @@ BFS, 연관도 계산, 시트/가이드 씨앗 추출)을 분리한다 — 순�
 from __future__ import annotations
 
 import logging
+import os
 import random
 import re
 import time
@@ -325,23 +326,66 @@ def _scrape_table_rows(page: Any) -> list[KeywordRow]:
 
 
 # --- 브라우저 자동화 ------------------------------------------------------
+#: 조회 XHR 응답을 기다리는 최대 시간(초) — 이 안에 `keywordList`가 든 JSON
+#: 응답이 안 잡히면 DOM 표 긁기로 넘어간다.
+RESPONSE_CAPTURE_TIMEOUT_SEC = 30.0
+
+
+def _make_response_capture(page: Any) -> tuple[Callable[[Any], None], dict[str, Any]]:
+    """`keywordList`가 든 JSON 응답을 가로채는 `page.on("response", ...)` 핸들러.
+
+    지시(2026-09-23 01:22, 사용자 절대 규칙): 다운로드 버튼을 클릭하면 헤드리스
+    에서 브라우저가 통째로 닫히는 버그가 재현됐다 — 다운로드 자체를 쓰지 않고
+    조회 결과 XHR JSON을 직접 가로챈다. 정확한 엔드포인트 URL을 몰라도(문서화된
+    바 없음) 응답 바디 모양(`{"keywordList": [...]}`, 네이버 검색광고 공식 API
+    필드명)만 보고 판정한다 — 페이지의 다른 XHR과 안 헷갈린다.
+    """
+    captured: dict[str, Any] = {}
+
+    def _on_response(response: Any) -> None:
+        if "data" in captured:
+            return
+        try:
+            ctype = (response.headers or {}).get("content-type", "")
+        except Exception:  # noqa: BLE001
+            ctype = ""
+        if "json" not in ctype:
+            return
+        try:
+            body = response.json()
+        except Exception:  # noqa: BLE001
+            return
+        if isinstance(body, dict) and isinstance(body.get("keywordList"), list):
+            captured["data"] = body
+
+    return _on_response, captured
+
+
 def fetch_related_keywords(
     page: Any,
     seeds: list[str],
     account_id: str,
     download_dir: str | Path | None = None,
-    timeout_ms: int = 20000,
+    timeout_ms: int = 30000,
     download_retries: int = DOWNLOAD_RETRY_COUNT,
+    download_click_timeout_ms: int = 30000,
+    download_wait_timeout_ms: int = 30000,
+    response_capture_timeout_sec: float = RESPONSE_CAPTURE_TIMEOUT_SEC,
+    use_download_fallback: bool = False,
 ) -> list[KeywordRow]:
     """씨앗 키워드 최대 `SEED_BATCH_SIZE`(5)개를 한 번에 조회해 연관 키워드를 받는다.
 
     실측(2026-09-23, 사람이 직접 페이지를 열어 확인): 씨앗 입력창은 placeholder
     `"한줄에 하나씩 입력하세요.\\n(최대 5개까지)"`(줄바꿈으로 씨앗 구분, 최대 5개),
-    조회 버튼은 정확히 `"조회하기"`. 결과 표를 직접 긁지 않고 `"전체 다운로드"`
-    버튼으로 xlsx를 받아 파싱한다(표가 페이지네이션돼 있어도 다운로드는 전체).
-    헤드리스에서 다운로드 이벤트가 가끔 안 잡히는 것으로 실측됐다 — 같은 조회
-    결과를 다시 누르는 방식으로 `download_retries`번까지 재시도하고, 그래도
-    안 되면 결과 표를 DOM에서 직접 긁는다(`_scrape_table_rows`).
+    조회 버튼은 정확히 `"조회하기"`.
+
+    **2026-09-23 01:22 사용자 절대 규칙**: `"전체 다운로드"` 버튼을 클릭하면
+    헤드리스에서 다운로드 저장 직전에 브라우저가 통째로 닫히는 버그가 병렬
+    실행에서도 재현됐다(장으뜸 10회째). 그래서 기본 경로는 다운로드를 아예
+    쓰지 않는다: `조회하기`를 누르기 전에 `page.on("response", ...)`를 걸어
+    조회 XHR JSON 응답(`keywordList`가 든 응답)을 가로채고, 그게 안 잡히면
+    결과 표를 DOM에서 직접 긁는다(`_scrape_table_rows`). `use_download_fallback`
+    (기본 False)을 켜야만 마지막 수단으로 다운로드를 시도한다.
 
     **`FORBIDDEN_BUTTON_TEXTS`(광고 만들기·전체추가·바로추가·월간 예상 실적
     보기)는 절대 클릭하지 않는다** — 광고 계정 설정에 영향을 줄 수 있다.
@@ -366,10 +410,47 @@ def fetch_related_keywords(
         raise RuntimeError("'조회하기' 버튼을 찾지 못했습니다(페이지 구조 확인 필요)")
     if btn.get_attribute("disabled") is not None:
         raise RuntimeError("'조회하기' 버튼이 비활성 상태입니다(씨앗 입력 확인 필요)")
-    btn.click(timeout=10000)
-    page.wait_for_timeout(timeout_ms)
 
+    on_response, captured = _make_response_capture(page)
+    page.on("response", on_response)
+    try:
+        btn.click(timeout=10000)
+        deadline = time.monotonic() + max(float(response_capture_timeout_sec), 0.0)
+        while "data" not in captured and time.monotonic() < deadline:
+            page.wait_for_timeout(200)
+    finally:
+        try:
+            page.remove_listener("response", on_response)
+        except Exception:  # noqa: BLE001
+            pass
+
+    if "data" in captured:
+        rows = parse_keyword_response(captured["data"])
+        if rows:
+            return rows
+        # keywordList가 있었지만 빈 배열 — 정말 결과가 없다는 뜻이라 그대로 반환
+
+    # 응답 가로채기 실패(구조가 다르거나 늦음) — 결과 표를 DOM에서 직접 긁는다.
+    page.wait_for_timeout(max(int(timeout_ms) - int(response_capture_timeout_sec * 1000), 0))
+    try:
+        rows = _scrape_table_rows(page)
+        if rows:
+            return rows
+    except Exception as exc:  # noqa: BLE001
+        log.warning("DOM 표 긁기 실패: %s", exc)
+
+    if not use_download_fallback:
+        return []
+
+    # 마지막 수단(기본 꺼짐) — 다운로드는 헤드리스에서 브라우저를 닫히게 하는
+    # 것으로 실측됐으니 offscreen/headful 호출에서만 켜서 쓴다.
     dl_btn = page.get_by_text(DOWNLOAD_BUTTON_TEXT_HINT, exact=False).first
+    waited = 0
+    poll = 1000
+    while dl_btn.count() == 0 and waited < download_wait_timeout_ms:
+        page.wait_for_timeout(poll)
+        waited += poll
+        dl_btn = page.get_by_text(DOWNLOAD_BUTTON_TEXT_HINT, exact=False).first
     if dl_btn.count() == 0:
         raise RuntimeError("'전체 다운로드' 버튼을 찾지 못했습니다(결과가 없거나 페이지 구조 변경)")
 
@@ -380,8 +461,8 @@ def fetch_related_keywords(
     for attempt in range(1, max(int(download_retries), 1) + 1):
         tmp_path = tmp_dir / f"dl_{int(time.time() * 1000)}_{attempt}.xlsx"
         try:
-            with page.expect_download(timeout=15000) as dl_info:
-                dl_btn.click(timeout=10000)
+            with page.expect_download(timeout=download_click_timeout_ms) as dl_info:
+                dl_btn.click(timeout=download_click_timeout_ms)
             download = dl_info.value
             download.save_as(str(tmp_path))
             try:
@@ -435,7 +516,7 @@ def open_keyword_tool_page(
             path, headless=True, user_agent=user_agent, purpose="keyword_discovery"
         )
     else:
-        lock = naver_session.acquire_profile_lock("keyword_discovery")
+        lock = naver_session.acquire_profile_lock("keyword_discovery", profile_dir=path)
         playwright = sync_playwright().start()
         kwargs: dict[str, Any] = dict(
             headless=False,
@@ -500,6 +581,7 @@ def discover(
     sleep_fn: Callable[[float], None] = time.sleep,
     rest_fn: Callable[[float], None] | None = None,
     rest_sec: float = DEFAULT_REST_SEC,
+    on_progress: Callable[[DiscoveryStats], None] | None = None,
 ) -> DiscoveryStats:
     """씨앗 키워드로 꼬리 물기 BFS. 순수 로직 — 한 번에 최대 `batch_size`개 씨앗을
 
@@ -574,6 +656,8 @@ def discover(
             if rows_to_save:
                 store.save_many(conn, rows_to_save)
                 stats.collected += len(rows_to_save)
+                if on_progress is not None:
+                    on_progress(stats)  # 의도적으로 안 감쌈: TimeoutError 등으로 멈추게 할 수 있다
 
             if queue and stats.collected < target:
                 sleep_fn(random.uniform(*delay_range))
@@ -620,6 +704,11 @@ def run_for_brand(
     headless: bool = True,
     offscreen: bool = True,
     account_id: str = "",
+    profile_dir: str | Path | None = None,
+    session_cap: int = DEFAULT_SESSION_CAP,
+    rest_sec: float = DEFAULT_REST_SEC,
+    delay_range: tuple[float, float] = (MIN_DELAY_SEC, MAX_DELAY_SEC),
+    progress_cb: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """실행기에서 부르는 진입점. 실 브라우저로 씨앗→BFS 전체를 돈다.
 
@@ -627,6 +716,12 @@ def run_for_brand(
     (`fetch_related_keywords`의 `download_retries`)와 DOM 직접 긁기 대안으로
     다운로드 실패 문제를 흡수한다. `headless=False`로 부르면 이전처럼 화면 밖
     창(`offscreen`)을 띄운다.
+
+    `profile_dir`을 주면 그 프로필로 연다(예: 브랜드별 복제 프로필) — 기본은
+    공유 프로필(`naver_session.default_profile_dir()`). 서로 다른 `profile_dir`은
+    각자 독립된 잠금을 써서(`naver_session.lock_file_path`) 병렬로 돌 수 있다.
+    복제 프로필은 기존 쿠키로만 쓰고, 로그인이 풀려 있으면 여기서도 로그인은
+    시도하지 않고 즉시 실패로 보고한다(철칙: 재로그인 금지).
     """
     from v2r.warehouse import naver_session
 
@@ -640,10 +735,15 @@ def run_for_brand(
         return {"ok": False, "error": f"{brand} 씨앗 키워드가 없습니다(시트·정리본 확인 필요)"}
 
     acct = account_id or "685753"
+    pdir = profile_dir or naver_session.default_profile_dir()
     playwright, context, page, logged_in = open_keyword_tool_page(
-        profile_dir=naver_session.default_profile_dir(), headless=headless, offscreen=offscreen
+        profile_dir=pdir, headless=headless, offscreen=offscreen,
     )
     try:
+        log.info(
+            "%s: 브라우저 열림(pid=%s, profile=%s, headless=%s, offscreen=%s)",
+            brand, os.getpid(), pdir, headless, offscreen,
+        )
         if not logged_in:
             return {
                 "ok": False,
@@ -653,10 +753,84 @@ def run_for_brand(
 
         download_dir = repo / "data" / "keywords" / "_tmp"
 
+        #: 로그인 풀림·캡차·429·빈 결과가 연속으로 이만큼 나오면(단발성은 흡수)
+        #: `RuntimeError`를 던져 `discover`를 멈춘다 — 그 브랜드 프로세스만 중단,
+        #: 재로그인은 절대 시도하지 않는다. "브라우저가 닫혔다" 종류는 그 자체로는
+        #: 세지 않고(아래) 브라우저를 이 프로세스 안에서만 다시 띄워 이어간다.
+        consecutive_bad = 0
+        relaunch_count = 0
+        MAX_RELAUNCH = 3
+
+        def _looks_blocked() -> bool:
+            try:
+                if naver_session._looks_logged_out(page):
+                    return True
+                body = page.inner_text("body")[:2000]
+                return any(m in body for m in ("캡차", "자동입력 방지", "비정상적인 접근", "일시적으로 제한"))
+            except Exception:  # noqa: BLE001
+                return False
+
+        def _is_closed_error(exc: Exception) -> bool:
+            s = str(exc)
+            return "has been closed" in s or "Target closed" in s or "Connection closed" in s
+
+        def _reopen() -> bool:
+            """이 프로세스가 연 자기 브라우저만 닫고 같은 프로필로 다시 연다(다른
+            프로세스의 브라우저는 건드리지 않는다 — `context`/`playwright`는 이
+            함수 지역 변수라 다른 프로세스와 아예 공유되지 않는다)."""
+            nonlocal playwright, context, page, logged_in
+            try:
+                naver_session._close(playwright, context, page)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                playwright, context, page, logged_in = open_keyword_tool_page(
+                    profile_dir=pdir, headless=headless, offscreen=offscreen,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning("%s: 브라우저 재기동 실패: %s", brand, exc)
+                return False
+            log.info("%s: 브라우저 재기동 성공(로그인=%s)", brand, logged_in)
+            return bool(logged_in)
+
         def _fetch(keywords: list[str], depth: int) -> list[KeywordRow]:
-            return fetch_related_keywords(page, keywords, acct, download_dir=download_dir)
+            nonlocal consecutive_bad, relaunch_count
+            last_err: str | None = None
+            try:
+                rows = fetch_related_keywords(page, keywords, acct, download_dir=download_dir)
+            except Exception as exc:  # noqa: BLE001 - 연속 횟수로 판단, 단발은 흡수
+                rows = []
+                last_err = str(exc)
+                if _is_closed_error(exc) and relaunch_count < MAX_RELAUNCH:
+                    relaunch_count += 1
+                    log.warning(
+                        "%s: 브라우저가 닫힘(시도 %d/%d) — 같은 프로필로 재기동 후 이어감: %s",
+                        brand, relaunch_count, MAX_RELAUNCH, exc,
+                    )
+                    if _reopen():
+                        try:
+                            rows = fetch_related_keywords(page, keywords, acct, download_dir=download_dir)
+                            last_err = None
+                        except Exception as exc2:  # noqa: BLE001
+                            rows = []
+                            last_err = str(exc2)
+            bad = (not rows) or last_err is not None or _looks_blocked()
+            consecutive_bad = consecutive_bad + 1 if bad else 0
+            if consecutive_bad >= 10:
+                raise RuntimeError(
+                    f"연속 10회 문제 감지(로그인풀림/캡차/429/빈결과) — 마지막 오류: {last_err}"
+                )
+            return rows
 
         db_path = db_path_for_brand(brand, repo / "data")
+
+        def _rest(sec: float) -> None:
+            time.sleep(sec)
+
+        def _on_progress(stats: DiscoveryStats) -> None:
+            if progress_cb is not None:
+                progress_cb({"brand": brand, "collected": stats.collected, "queries": stats.queries})
+
         stats = discover(
             brand,
             seeds,
@@ -664,8 +838,25 @@ def run_for_brand(
             _fetch,
             db_path,
             target=target,
-            rest_fn=lambda sec: time.sleep(sec),
+            session_cap=session_cap,
+            delay_range=delay_range,
+            rest_fn=_rest,
+            rest_sec=rest_sec,
+            on_progress=_on_progress,
         )
+        if progress_cb is not None:
+            try:
+                progress_cb(
+                    {
+                        "brand": brand,
+                        "collected": stats.collected,
+                        "queries": stats.queries,
+                        "stopped_reason": stats.stopped_reason,
+                        "done": True,
+                    }
+                )
+            except Exception:  # noqa: BLE001
+                pass
     finally:
         naver_session._close(playwright, context, page)
 

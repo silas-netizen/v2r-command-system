@@ -153,6 +153,28 @@ def test_lock_reclaims_dead_pid(tmp_path, monkeypatch):
     lock.release()
 
 
+def test_lock_file_path_independent_per_profile(tmp_path, monkeypatch):
+    """다른 프로필(브랜드별 복제본)은 서로 다른 잠금 파일 — 병렬 실행의 전제."""
+    monkeypatch.setattr(ns, "_data_dir", lambda: tmp_path)
+    default = ns.default_profile_dir()
+    clone_a = tmp_path / "browser-profile-naver-kw-우아덤"
+    clone_b = tmp_path / "browser-profile-naver-kw-장으뜸"
+    assert ns.lock_file_path() == ns.lock_file_path(default)
+    assert ns.lock_file_path(clone_a) != ns.lock_file_path(clone_b)
+    assert ns.lock_file_path(clone_a) != ns.lock_file_path()
+
+
+def test_lock_two_different_profiles_do_not_block_each_other(tmp_path, monkeypatch):
+    monkeypatch.setattr(ns, "_data_dir", lambda: tmp_path)
+    clone_a = tmp_path / "browser-profile-naver-kw-우아덤"
+    clone_b = tmp_path / "browser-profile-naver-kw-장으뜸"
+    lock_a = ns.acquire_profile_lock("worker-a", profile_dir=clone_a)
+    # clone_b는 clone_a가 잠긴 동안에도(대기 0초로도) 바로 잡을 수 있어야 한다
+    lock_b = ns.acquire_profile_lock("worker-b", max_wait=0.5, profile_dir=clone_b)
+    lock_a.release()
+    lock_b.release()
+
+
 def test_launch_and_close_hold_lock(tmp_path, monkeypatch):
     """`_launch`/`_close`가 잠금을 자동으로 잡고 놓는지 실제 브라우저 없이 확인."""
     monkeypatch.setattr(ns, "_data_dir", lambda: tmp_path)

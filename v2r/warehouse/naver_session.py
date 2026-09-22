@@ -136,8 +136,17 @@ class ProfileLockTimeout(RuntimeError):
     """네이버 프로필 잠금을 제한 시간 안에 얻지 못했을 때."""
 
 
-def lock_file_path() -> Path:
-    return _data_dir() / LOCK_DIR_NAME / LOCK_FILENAME
+def lock_file_path(profile_dir: str | Path | None = None) -> Path:
+    """프로필별 잠금 파일. 기본 프로필은 기존 이름(`naver-profile.lock`) 그대로 —
+    다른 프로필(브랜드별 복제본 등)은 프로필 폴더 이름을 붙인 별도 파일이라
+    서로 잠그지 않는다(각자 독립된 프로필이라 진짜 동시 접근 충돌이 없다)."""
+    base = _data_dir() / LOCK_DIR_NAME
+    if profile_dir is None:
+        return base / LOCK_FILENAME
+    name = Path(profile_dir).name
+    if name == default_profile_dir().name:
+        return base / LOCK_FILENAME
+    return base / f"naver-profile-{name}.lock"
 
 
 def _pid_alive(pid: int) -> bool:
@@ -210,15 +219,19 @@ class ProfileLock:
             pass
 
 
-def acquire_profile_lock(purpose: str, max_wait: float = LOCK_MAX_WAIT_SEC) -> ProfileLock:
+def acquire_profile_lock(
+    purpose: str, max_wait: float = LOCK_MAX_WAIT_SEC, profile_dir: str | Path | None = None
+) -> ProfileLock:
     """잠금을 얻을 때까지 최대 `max_wait`초 기다린다. 못 얻으면 `ProfileLockTimeout`.
 
     잠금 보유자 pid·시작 시각·용도를 lock 파일에 JSON으로 남긴다. 잠금 파일의
     주인(pid)이 죽어 있으면(예: 강제 종료) 자동으로 회수하고 다시 시도한다.
+    `profile_dir`을 주면 그 프로필 전용 잠금 파일을 쓴다(기본 프로필과 별도 —
+    서로 다른 프로필끼리는 기다리지 않는다).
     """
     import msvcrt
 
-    path = lock_file_path()
+    path = lock_file_path(profile_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
     deadline = time.monotonic() + max(float(max_wait), 0.0)
     while True:
@@ -255,7 +268,7 @@ def acquire_profile_lock(purpose: str, max_wait: float = LOCK_MAX_WAIT_SEC) -> P
 def _launch(path: Path, headless: bool, user_agent: str | None = None, purpose: str = ""):
     from playwright.sync_api import sync_playwright
 
-    lock = acquire_profile_lock(purpose or "naver_session")
+    lock = acquire_profile_lock(purpose or "naver_session", profile_dir=path)
     path.mkdir(parents=True, exist_ok=True)
     playwright = sync_playwright().start()
     last_exc: Exception | None = None
