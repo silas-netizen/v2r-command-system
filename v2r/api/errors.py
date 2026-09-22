@@ -136,6 +136,30 @@ def parse_error_body(body: str) -> tuple[str | None, str | None, dict | None]:
     return code, reason, extra
 
 
+#: 네이버가 "하루치 글을 너무 많이 썼다"고 막을 때 돌려주는 문구 조각들.
+#: 실측(2026-09-21 18:36~18:38, peecics): V2R 글 목록의 경고 아이콘 문구가
+#: "ID/IP당 게시글 등록 제한을 초과해 신규 게시글 등록이 잠시 제한됩니다"였다.
+POST_LIMIT_PHRASES = (
+    "게시글 등록 제한",
+    "등록 제한을 초과",
+    "신규 게시글 등록이",
+    "id/ip당",
+    "글쓰기가 제한",
+)
+
+
+def is_post_limit(text: Any) -> bool:
+    """이 문구가 "하루 게시글 등록 제한"에 걸린 것인가.
+
+    이 상태는 **글이 올라가지 않았다**는 뜻이다. 계정을 바꿔 다시 올려야 하며
+    완료로 확정해서는 안 된다 (장애 2026-09-21 #제한).
+    """
+    low = str(text or "").casefold()
+    if not low:
+        return False
+    return any(p in low for p in POST_LIMIT_PHRASES)
+
+
 def _retry_after(response: Any, extra: dict | None) -> float | None:
     """`Retry-After` 헤더 또는 `error.extra.retry_after`(초)."""
     headers = getattr(response, "headers", None)
@@ -183,6 +207,8 @@ def classify(exc_or_response: Any) -> str:
         return "server"
     if "27000" in code_field:
         return "account_restricted"
+    if is_post_limit(haystack):
+        return "post_limit"
     if "20004" in code_field or "연속으로 등록" in haystack:
         return "consecutive_limit"
     if "33007" in code_field:

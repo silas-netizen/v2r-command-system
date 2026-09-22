@@ -555,6 +555,8 @@ def test_reconcile는_uncertain을_done으로_확정(tmp_path, monkeypatch):
         "checked": 1,
         "done": 1,
         "failed": 0,
+        "limited": 0,
+        "limited_rows": [],
         "unresolved": [],
         "errors": [],
     }

@@ -23,6 +23,7 @@ from v2r.content.manuscript import Manuscript
 from v2r.engine import article_sync
 from v2r.engine.context import Runtime
 from v2r.engine.scheduler import KST, plan_slots, revision_at
+from v2r.store.publications import LIMIT_STAGE
 
 #: 같은 카페 연속 허용 상한(이 수 이상 몰리면 다른 카페 원고를 끌어와 섞는다, 사용자 규칙 2026-09-20)
 MAX_SAME_CAFE_RUN = 3
@@ -42,6 +43,12 @@ DEFERRED_ACCOUNT = "(실행 시 결정)"
 CAFE_SCAN_LIMIT = 500
 RESTRICT_DAYS = 30
 RESTRICT_CODE = "27000"
+#: 한 계정이 **하루에** 올릴 수 있는 글 수 상한(안전 여유).
+#: 실측 2026-09-21: peecics가 그날 151번째 글에서 네이버 등록 제한에 걸렸다(실제 상한 약 150).
+#: 거기에 닿기 전에 스스로 멈춘다 (사용자 결정 2026-09-22).
+ACCOUNT_DAILY_LIMIT = 100
+#: 등록 제한으로 그날 제외할 때 `account_state.restrict_code`에 남기는 표시
+POST_LIMIT_CODE = "POST_LIMIT"
 WAIT_WRITTEN_MAX_S = 120.0
 
 # 서버가 요청 자체를 거부한 경우(글이 생기지 않음) → 다른 계정으로 재시도 가능하게 failed로 내린다
@@ -859,6 +866,52 @@ def restricted_accounts(rt: Runtime) -> set[str]:
     }
 
 
+def today_kst(rt: Runtime | None = None) -> str:
+    """오늘 날짜(KST, `YYYY-MM-DD`)."""
+    del rt
+    return datetime.now(KST).strftime("%Y-%m-%d")
+
+
+def accounts_over_daily_limit(rt: Runtime, today: str | None = None) -> set[str]:
+    """오늘 하루 상한(`ACCOUNT_DAILY_LIMIT`)을 채운 계정 집합.
+
+    네이버는 한 계정이 하루에 너무 많이 쓰면 "ID/IP당 게시글 등록 제한"으로 막는다
+    (2026-09-21 peecics가 151번째 글에서 걸렸다 — 실제 상한 약 150). 거기에 닿기
+    전에 스스로 멈추려고 **100건**에서 그날은 그 계정을 더 쓰지 않는다.
+    """
+    day = today or today_kst()
+    try:
+        counts = rt.publications.counts_today_by_account(day)
+    except Exception:  # noqa: BLE001 - 집계 실패가 발행을 막아서는 안 된다
+        return set()
+    return {login for login, n in counts.items() if n >= ACCOUNT_DAILY_LIMIT}
+
+
+def day_end_kst(now: datetime | None = None) -> datetime:
+    """오늘 자정 직전(KST) — "그날 하루" 제한의 끝."""
+    ref = now or datetime.now(KST)
+    if ref.tzinfo is None:
+        ref = ref.replace(tzinfo=KST)
+    return ref.replace(hour=23, minute=59, second=59, microsecond=0)
+
+
+def block_for_today(rt: Runtime, login_id: str, note: str) -> None:
+    """이 계정을 **오늘 하루** 더 쓰지 않는다(등록 제한/상한 도달)."""
+    login = str(login_id or "").strip()
+    if not login:
+        return
+    try:
+        rt.account_state.restrict(login, day_end_kst(), POST_LIMIT_CODE, note[:200])
+    except Exception as exc:  # noqa: BLE001
+        log.warning("계정 하루 제외 기록 실패(%s): %s", login, exc)
+    blocked = rt.scratch.setdefault("restricted_now", set())
+    try:
+        blocked.add(login)
+    except AttributeError:  # list로 들어 있는 경우도 받아 준다
+        if login not in blocked:
+            blocked.append(login)
+
+
 # --------------------------------------------------------------------
 # 카페·게시판 해석
 # --------------------------------------------------------------------
@@ -1513,6 +1566,15 @@ def plan(rt: Runtime, spec: TaskSpec, manuscripts: list[Manuscript]) -> list[Slo
     # --- 계정 배정 (카페별 work_type을 지켜 나눠 배정) ---
     pool_all = load_accounts(rt, prefer_cache=bool(spec.dry_run))
     restricted = set(restricted_accounts(rt)) | set(rt.scratch.get("restricted_now") or set())
+    # 오늘 상한(100건)을 채운 계정은 그날 더 쓰지 않는다 (사용자 결정 2026-09-22)
+    over_limit = accounts_over_daily_limit(rt)
+    if over_limit:
+        restricted |= over_limit
+        plan_event(
+            rt,
+            "warn",
+            f"오늘 하루 상한({ACCOUNT_DAILY_LIMIT}건)을 채운 계정 {len(over_limit)}개는 제외합니다",
+        )
     comment_only = all_comment_accounts(rt)
     assigned: dict[int, str] = {}
     chosen_by_cafe: dict[str, list[str]] = {}
@@ -2325,6 +2387,28 @@ def run_slot(
         elif kind not in api_articles.AMBIGUOUS_KINDS:
             # 본 글이 아직 안 만들어졌고 모호한 오류도 아니다 → failed
             _mark_precreate_failed(f"{kind}: {exc}")
+        if kind == "post_limit":
+            # 네이버가 "ID/IP당 게시글 등록 제한"으로 막았다 → 글이 올라가지 않았다.
+            # 그 계정은 **오늘 하루** 빼고, 같은 행을 다른 계정으로 1회 다시 시도한다.
+            rt.publications.mark(*key, "failed", LIMIT_STAGE)
+            try:
+                rt.republish.add(
+                    *key,
+                    reason=f"게시글 등록 제한: {exc}"[:300],
+                    cafe=str(slot.cafe or ""),
+                    board=str(slot.board or ""),
+                    account=str(slot.account or ""),
+                    source_id=str(locals().get("source_id") or ""),
+                )
+            except Exception as qexc:  # noqa: BLE001
+                log.warning("재발행 대기 등록 실패: %s", qexc)
+            block_for_today(rt, slot.account, "게시글 등록 제한(하루 제외)")
+            rt.events.log(
+                job_id,
+                "warn",
+                f"게시글 등록 제한 — {slot.account} 오늘 제외, 다른 계정으로 재시도: {m.title}",
+            )
+            raise RetryWithOtherAccount(f"게시글 등록 제한: {slot.account}") from exc
         if kind == "account_restricted":
             until = datetime.now(KST) + timedelta(days=RESTRICT_DAYS)
             rt.account_state.restrict(slot.account, until, RESTRICT_CODE, "계정 제한(27000)")

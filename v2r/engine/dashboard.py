@@ -135,9 +135,9 @@ def _executor_state(rt: Runtime) -> tuple[str, str]:
 
 
 def _today_summary(rt: Runtime) -> dict[str, int]:
-    """오늘 발행 성공/실패/미확정 + 진행 중·대기 작업 수."""
+    """오늘 발행 성공/실패/미확정/제한 + 진행 중·대기 작업 수."""
     today = _today()
-    out = {"done": 0, "failed": 0, "uncertain": 0, "running": 0, "queued": 0}
+    out = {"done": 0, "failed": 0, "uncertain": 0, "running": 0, "queued": 0, "limited": 0}
     rows = rt.conn.execute(
         "SELECT status, COUNT(*) AS n FROM publications"
         " WHERE substr(created_at, 1, 10) = ? GROUP BY status",  # 오늘 = 발행(생성) 시각 기준(수정으로 갱신된 행 제외)
@@ -153,6 +153,8 @@ def _today_summary(rt: Runtime) -> dict[str, int]:
     ).fetchall()
     for row in jobs:
         out[str(row["status"])] = int(row["n"])
+    # 등록 제한으로 못 올라간 글(실패로 집계하되 따로도 보여 준다, 2026-09-22)
+    out["limited"] = rt.publications.count_limited(today)
     return out
 
 
@@ -174,7 +176,7 @@ def _open_jobs(rt: Runtime) -> list[dict]:
 
 
 def _cafe_rows(rt: Runtime) -> list[dict]:
-    """카페별 오늘 done / 전체 done / uncertain / failed / 마지막 발행 시각."""
+    """카페별 오늘 done / 전체 done / uncertain / failed / 제한 / 마지막 발행 시각."""
     today = _today()
     rows = rt.conn.execute(
         "SELECT COALESCE(NULLIF(TRIM(COALESCE(cafe, '')), ''), '(미지정)') AS cafe_name,"
@@ -183,6 +185,8 @@ def _cafe_rows(rt: Runtime) -> list[dict]:
         " SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END) AS total_done,"
         " SUM(CASE WHEN status = 'uncertain' THEN 1 ELSE 0 END) AS uncertain,"
         " SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed,"
+        " SUM(CASE WHEN status = 'failed' AND COALESCE(stage, '') LIKE '%제한%'"
+        "   THEN 1 ELSE 0 END) AS limited,"
         " MAX(created_at) AS last_at"
         " FROM publications GROUP BY cafe_name ORDER BY total_done DESC, cafe_name",
         (today,),
@@ -218,7 +222,8 @@ def _last_reconcile(rt: Runtime) -> str:
     return (
         f"{stamp} 점검 {_label(data.get('status'))} —"
         f" 확인 {result.get('checked', 0)}건, 완료 {result.get('done', 0)}건,"
-        f" 실패 {result.get('failed', 0)}건, 미해결 {len(unresolved)}건"
+        f" 실패 {result.get('failed', 0)}건(그중 제한 {result.get('limited', 0)}건),"
+        f" 미해결 {len(unresolved)}건"
     )
 
 
@@ -361,6 +366,7 @@ def render_html(rt: Runtime) -> str:
     cards = [
         ("오늘 발행 성공", summary["done"]),
         ("오늘 실패", summary["failed"]),
+        ("제한 걸린 글", summary["limited"]),
         ("오늘 미확정", summary["uncertain"]),
         ("진행 중 작업", summary["running"]),
         ("대기 작업", summary["queued"]),
@@ -406,6 +412,7 @@ def render_html(rt: Runtime) -> str:
             _esc(row["total_done"]),
             _esc(row["uncertain"]),
             _esc(row["failed"]),
+            _esc(row["limited"]),
             _short_time(row["last_at"]),
         ]
         for row in _cafe_rows(rt)
@@ -414,7 +421,7 @@ def render_html(rt: Runtime) -> str:
         "<section>"
         f"<h2>{html.escape(SECTION_TITLES['cafes'])}</h2>"
         + _table(
-            ["카페", "오늘 완료", "전체 완료", "미확정", "실패", "마지막 발행"],
+            ["카페", "오늘 완료", "전체 완료", "미확정", "실패", "제한 걸린 글", "마지막 발행"],
             cafe_rows,
             "발행 기록이 없습니다.",
         )

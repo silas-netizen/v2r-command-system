@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 import httpx
 
 from .client import V2RClient, field, walk_dicts
-from .errors import V2RApiError
+from .errors import V2RApiError, is_post_limit
 
 log = logging.getLogger(__name__)
 
@@ -465,6 +465,53 @@ def get_article(client: V2RClient, source_id: str) -> dict:
     return client.get(PATH_ARTICLE, params={"source_id": source_id})
 
 
+#: 실패 사유가 들어오는 칸 이름들(상세 응답·글 목록 행 공통, 실측 2026-09-22)
+FAIL_REASON_KEYS = (
+    "fail_reason",
+    "failReason",
+    "reserved_comment_fail_reason",
+    "error_message",
+    "message",
+)
+
+#: 아직 올라가지 않은 상태(V2R 글 목록 상태 열 "준비")
+PENDING_STATUSES = {"RESERVED", "READY", "WAITING", "PENDING"}
+
+
+def limit_reason_of(payload: Any) -> str:
+    """"게시글 등록 제한"에 걸린 흔적이 있으면 그 문구를, 없으면 빈 문자열.
+
+    어디서 오는가 (실측 2026-09-22, peecics 4건):
+
+    * `GET /naver_cafe_articles/article?source_id=…`
+      → `naver_cafe_article_history.fail_reason`,
+        `naver_cafe_article_destination.fail_reason`
+      (같은 묶음의 `status`는 그때 `RESERVED`="준비"였다)
+    * `POST /naver_cafe_articles/board_histories/search` (V2R 글 목록)
+      → 행의 `status`, `fail_reason` (경고 아이콘 문구가 곧 `fail_reason`이다)
+
+    상태값만으로는 구분할 수 없다. `RESERVED`는 정상 예약 대기에도 쓰이므로
+    **실패 사유 문구**로 판단한다.
+    """
+    if payload is None:
+        return ""
+    if isinstance(payload, str):
+        return payload if is_post_limit(payload) else ""
+    for d in walk_dicts(payload):
+        if not isinstance(d, dict):
+            continue
+        for key in FAIL_REASON_KEYS:
+            text = d.get(key)
+            if isinstance(text, str) and is_post_limit(text):
+                return text.strip()
+    return ""
+
+
+def is_limited(payload: Any) -> bool:
+    """`limit_reason_of`가 무언가 찾았는가."""
+    return bool(limit_reason_of(payload))
+
+
 PATH_UPDATE = "/naver_cafe_articles/article"
 
 
@@ -589,11 +636,22 @@ def wait_written(
         status = str(field(history, "status", default="") or "").upper()
         if status in DONE_STATUSES:
             return detail
-        if status == "FAIL":
+        limit_reason = limit_reason_of(detail)
+        if limit_reason:
+            # 글이 **올라가지 않았다**. 완료로 보면 안 되고, 계정을 바꿔 다시 올려야 한다.
             raise V2RApiError(
-                f"글 등록 실패: {field(history, 'fail_reason', default='사유 없음')}",
+                f"게시글 등록 제한: {limit_reason}",
+                code="POST_LIMIT",
+                reason=limit_reason,
+                kind="post_limit",
+            )
+        if status == "FAIL":
+            reason = str(field(history, "fail_reason", default=""))
+            raise V2RApiError(
+                f"글 등록 실패: {reason or '사유 없음'}",
                 code="FAIL",
-                reason=str(field(history, "fail_reason", default="")),
+                reason=reason,
+                kind="post_limit" if is_post_limit(reason) else None,
             )
         if time.monotonic() > deadline:
             raise V2RApiError(
@@ -824,6 +882,10 @@ __all__ = [
     "find_recent_source",
     "flatten_comment_nodes",
     "get_article",
+    "is_limited",
+    "limit_reason_of",
+    "FAIL_REASON_KEYS",
+    "PENDING_STATUSES",
     "to_iso_z",
     "verify_article",
     "wait_written",

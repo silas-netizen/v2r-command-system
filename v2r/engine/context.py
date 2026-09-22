@@ -16,6 +16,7 @@ from v2r.store.db import connect, init_schema
 from v2r.store.events import EventLog
 from v2r.store.jobs import JobStore
 from v2r.store.publications import PublicationStore
+from v2r.store.republish import RepublishQueue
 from v2r.store.sources_cache import SourceCache
 
 
@@ -31,6 +32,7 @@ class Runtime:
     account_state: AccountStateStore
     sources_cache: SourceCache
     events: EventLog
+    republish: RepublishQueue = None  # type: ignore[assignment]
     cafes_cfg: dict = field(default_factory=dict)
     sources_cfg: dict = field(default_factory=dict)
     accounts_cfg: dict = field(default_factory=dict)
@@ -44,6 +46,11 @@ class Runtime:
     _channels: Any = None
     # 실행 중 보조 상태(제휴 일상 글 풀 등)
     scratch: dict = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        # Runtime을 직접 만든 곳(테스트 등)에서도 재발행 대기 줄은 항상 쓸 수 있어야 한다
+        if self.republish is None and self.conn is not None:
+            self.republish = RepublishQueue(self.conn)
 
     # ---- 생성/정리 ----
     @classmethod
@@ -61,6 +68,7 @@ class Runtime:
             account_state=AccountStateStore(connection),
             sources_cache=SourceCache(connection),
             events=EventLog(connection),
+            republish=RepublishQueue(connection),
             cafes_cfg=load_yaml("cafes"),
             sources_cfg=load_yaml("sources"),
             accounts_cfg=load_yaml("accounts_sources"),

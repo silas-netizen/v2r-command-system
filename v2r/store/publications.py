@@ -6,6 +6,9 @@ import sqlite3
 
 from v2r.store.db import now_iso
 
+#: 등록 제한(네이버 "ID/IP당 게시글 등록 제한")으로 못 올라간 건의 `stage` 표시
+LIMIT_STAGE = "제한"
+
 # 이미 발행된 것으로 간주하는 상태
 BLOCKING_STATUSES = ("uncertain", "done")
 
@@ -176,6 +179,59 @@ class PublicationStore:
 
             last = board_key(str(r["menu_id"] or ""), str(r["board"] or ""))
         return last
+
+    def count_today_for_account(self, login_id: str, kst_date: str) -> int:
+        """오늘(KST `kst_date`) 그 계정으로 올린(또는 올리는 중인) 글 수.
+
+        계정별 하루 상한(규칙 2026-09-22)을 지키려고 쓴다. 제한에 걸려 `failed`가 된
+        건은 실제로 올라가지 않았으므로 세지 않는다.
+        """
+        if not login_id or not kst_date:
+            return 0
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM publications"
+            " WHERE status IN (?, ?) AND substr(created_at, 1, 10) = ?"
+            " AND LOWER(COALESCE(account, '')) = LOWER(?)",
+            (*BLOCKING_STATUSES, kst_date, login_id),
+        ).fetchone()
+        return int(row["n"])
+
+    def counts_today_by_account(self, kst_date: str) -> dict[str, int]:
+        """오늘 계정별 발행 건수 `{계정(소문자): 건수}` — 한 번에 읽는다."""
+        if not kst_date:
+            return {}
+        rows = self.conn.execute(
+            "SELECT LOWER(COALESCE(account, '')) AS login, COUNT(*) AS n FROM publications"
+            " WHERE status IN (?, ?) AND substr(created_at, 1, 10) = ?"
+            " GROUP BY login",
+            (*BLOCKING_STATUSES, kst_date),
+        ).fetchall()
+        return {str(r["login"]): int(r["n"]) for r in rows if r["login"]}
+
+    def count_limited(self, kst_date: str = "") -> int:
+        """등록 제한에 걸려 못 올라간 글 수(오늘 또는 전체)."""
+        sql = (
+            "SELECT COUNT(*) AS n FROM publications"
+            " WHERE status = 'failed' AND COALESCE(stage, '') LIKE '%제한%'"
+        )
+        params: list[object] = []
+        if kst_date:
+            sql += " AND substr(created_at, 1, 10) = ?"
+            params.append(kst_date)
+        return int(self.conn.execute(sql, params).fetchone()["n"])
+
+    def list_limited(self, kst_date: str = "") -> list[dict]:
+        """등록 제한으로 실패한 행 목록."""
+        sql = (
+            "SELECT * FROM publications"
+            " WHERE status = 'failed' AND COALESCE(stage, '') LIKE '%제한%'"
+        )
+        params: list[object] = []
+        if kst_date:
+            sql += " AND substr(created_at, 1, 10) = ?"
+            params.append(kst_date)
+        sql += " ORDER BY updated_at DESC, rowid DESC"
+        return [dict(r) for r in self.conn.execute(sql, params).fetchall()]
 
     def by_source_id(self, source_id: str) -> dict | None:
         """V2R source_id로 조회."""

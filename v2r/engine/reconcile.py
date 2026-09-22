@@ -11,6 +11,7 @@ from v2r.api import articles as api_articles
 from v2r.api.client import field, walk_dicts
 from v2r.api.errors import V2RApiError, classify
 from v2r.engine.context import Runtime
+from v2r.store.publications import LIMIT_STAGE
 
 DONE_STATUSES = {"DONE", "SUCCESS"}
 RESERVED_STATUS = "RESERVED"
@@ -75,6 +76,30 @@ def _title_for(rt: Runtime, pub: dict) -> str:
     return ""
 
 
+def _limit_fail(rt: Runtime, pub: dict, key: tuple, reason: str, result: dict) -> None:
+    """"게시글 등록 제한"에 걸린 건 → `failed`(제한) + 재발행 대기 줄.
+
+    목록에 글 번호가 보인다고 완료로 확정하면 안 된다. 제한에 걸린 글은 **올라가지
+    않았고**, 같은 시트 행을 다른 계정으로 다시 올려야 한다 (장애 2026-09-21).
+    """
+    rt.publications.mark(*key, "failed", LIMIT_STAGE)
+    result["failed"] += 1
+    result["limited"] = int(result.get("limited", 0)) + 1
+    label = f"{pub['source_key']}#{pub['row_number']}"
+    result.setdefault("limited_rows", []).append(label)
+    try:
+        rt.republish.add(
+            *key,
+            reason=f"게시글 등록 제한: {reason}"[:300],
+            cafe=str(pub.get("cafe") or ""),
+            board=str(pub.get("board") or ""),
+            account=str(pub.get("account") or ""),
+            source_id=str(pub.get("source_id") or ""),
+        )
+    except Exception as exc:  # noqa: BLE001 - 대기 줄 기록 실패가 확정을 막지 않는다
+        result["errors"].append(f"{label}: 재발행 대기 등록 실패 {exc}")
+
+
 def _verdict(status: str, *, scheduled: bool) -> str | None:
     """등록 상태 → done/failed. 판단 불가면 None.
 
@@ -137,7 +162,15 @@ def _find_child(rt: Runtime, cafe_id: Any, parent_id: str, pub: dict) -> dict | 
 
 def reconcile(rt: Runtime) -> dict:
     """미확정 발행 건을 done/failed로 확정한다."""
-    result = {"checked": 0, "done": 0, "failed": 0, "unresolved": [], "errors": []}
+    result = {
+        "checked": 0,
+        "done": 0,
+        "failed": 0,
+        "limited": 0,
+        "limited_rows": [],
+        "unresolved": [],
+        "errors": [],
+    }
 
     for pub in rt.publications.list_uncertain():
         result["checked"] += 1
@@ -161,6 +194,10 @@ def reconcile(rt: Runtime) -> dict:
                 continue
             if child is None:
                 result["unresolved"].append(label)
+                continue
+            limit_reason = api_articles.limit_reason_of(child)
+            if limit_reason:
+                _limit_fail(rt, pub, key, limit_reason, result)
                 continue
             child_status = str(field(child, "status", default="") or "").upper()
             verdict = _verdict(child_status, scheduled=True)  # 수정글은 항상 예약 등록
@@ -191,6 +228,10 @@ def reconcile(rt: Runtime) -> dict:
                     continue
                 result["errors"].append(f"{label}: {exc}")
                 result["unresolved"].append(label)
+                continue
+            limit_reason = api_articles.limit_reason_of(detail)
+            if limit_reason:
+                _limit_fail(rt, pub, key, limit_reason, result)
                 continue
             status = _status_of(detail)
             verdict = _verdict(status, scheduled=scheduled)
@@ -248,6 +289,10 @@ def reconcile(rt: Runtime) -> dict:
             result["unresolved"].append(label)
             continue
         found = candidates[0]
+        limit_reason = api_articles.limit_reason_of(found)
+        if limit_reason:
+            _limit_fail(rt, pub, key, limit_reason, result)
+            continue
         status = str(field(found, "status", default="") or "").upper()
         sid = field(found, "source_id", "sourceId")
         if _verdict(status, scheduled=scheduled) == "done" and sid:
@@ -268,4 +313,4 @@ def reconcile(rt: Runtime) -> dict:
     return result
 
 
-__all__ = ["reconcile"]
+__all__ = ["reconcile", "LIMIT_STAGE"]

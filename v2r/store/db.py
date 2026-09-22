@@ -123,6 +123,24 @@ CREATE TABLE IF NOT EXISTS article_index (
     PRIMARY KEY (cafe_id, source_id)
 );
 
+-- 게시글 등록 제한 등으로 **올라가지 않은** 글의 재발행 대기 줄 (2026-09-22)
+-- 한 행 = 각색 시트의 같은 행을 **다른 계정으로 다시 올려야 한다**는 표시.
+CREATE TABLE IF NOT EXISTS republish_queue (
+    source_key   TEXT NOT NULL,
+    row_number   INTEGER NOT NULL,
+    content_hash TEXT NOT NULL,
+    reason       TEXT NOT NULL DEFAULT '',
+    cafe         TEXT,
+    board        TEXT,
+    account      TEXT,
+    source_id    TEXT,
+    status       TEXT NOT NULL DEFAULT 'pending',
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL,
+    PRIMARY KEY (source_key, row_number, content_hash)
+);
+
+CREATE INDEX IF NOT EXISTS idx_republish_status ON republish_queue(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status, id);
 CREATE INDEX IF NOT EXISTS idx_jobs_scope ON jobs(status, lease_scope, id);
 CREATE INDEX IF NOT EXISTS idx_article_index_title ON article_index(title_norm);

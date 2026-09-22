@@ -24,6 +24,7 @@ from v2r.engine import reconcile as reconcile_mod
 from v2r.engine import status as status_mod
 from v2r.engine.context import Runtime
 from v2r.api.auth import MAINTAIN_TICK_S
+from v2r.api.errors import is_post_limit
 from v2r.engine.publish import KST
 
 log = logging.getLogger(__name__)
@@ -1306,7 +1307,7 @@ def write_daily_report(
         lines.append((
             seq,
             "| {seq} | {source} | {row} | {cafe} | {board} | {account} | {at} | {comments} |"
-            " {status} |".format(
+            " {status} | {limited} |".format(
                 seq=seq,
                 source=r.get("source", ""),
                 row=r.get("row", ""),
@@ -1316,15 +1317,17 @@ def write_daily_report(
                 at=r.get("scheduled_at", ""),
                 comments=r.get("comments", 0),
                 status=r.get("url") or r.get("status", ""),
+                limited="-",
             ),
         ))
+    limited_n = sum(1 for _slot, error in failed if is_post_limit(error))
     for order, (slot, error) in enumerate(failed, start=len(results) + 1):
         m = slot.manuscript
         seq = _seq(getattr(m, "source", ""), getattr(m, "source_row", 0), order)
         lines.append((
             seq,
             "| {seq} | {source} | {row} | {cafe} | {board} | {account} | {at} | - |"
-            " 실패: {err} |".format(
+            " 실패: {err} | {limited} |".format(
                 seq=seq,
                 source=getattr(m, "source", ""),
                 row=getattr(m, "source_row", ""),
@@ -1333,6 +1336,7 @@ def write_daily_report(
                 account=publish_mod.mask_login(slot.account),
                 at=slot.scheduled_at.isoformat() if slot.scheduled_at else "즉시",
                 err=" ".join(str(error).split())[:120],
+                limited="제한" if is_post_limit(error) else "-",
             ),
         ))
     # 사용자가 각색 xlsx 순서 그대로 확인할 수 있게 순서대로 적는다
@@ -1342,11 +1346,12 @@ def write_daily_report(
             f"# 자사 카페 일상 글 발행 보고 ({spec.start_date})",
             "",
             f"- 모드: {'모의 실행' if spec.dry_run else '실제 발행'}",
-            f"- 성공 {len(results)}건 / 실패 {len(failed)}건",
+            f"- 성공 {len(results)}건 / 실패 {len(failed)}건"
+            f" (그중 제한 걸린 글 {limited_n}건 — 다른 계정으로 재발행 대기)",
             "- 순서: 각색 엑셀 파일 이름 오름차순 → 행 순서 그대로 (카페별로 묶지 않음)",
             "",
-            "| 순서 | 파일 | 행 | 카페 | 게시판 | 계정 | 발행 시각 | 댓글 | URL/상태 |",
-            "|---|---|---|---|---|---|---|---|---|",
+            "| 순서 | 파일 | 행 | 카페 | 게시판 | 계정 | 발행 시각 | 댓글 | URL/상태 | 제한 걸린 글 |",
+            "|---|---|---|---|---|---|---|---|---|---|",
             *rows,
             "",
         ]
@@ -1464,7 +1469,12 @@ def _other_account(rt: Runtime, spec: TaskSpec, slot: Any) -> str | None:
         return None
     from v2r.accounts.rules import eligible, work_type_for
 
-    restricted = set(publish_mod.restricted_accounts(rt)) | {slot.account}
+    restricted = (
+        set(publish_mod.restricted_accounts(rt))
+        | set(rt.scratch.get("restricted_now") or set())
+        | publish_mod.accounts_over_daily_limit(rt)  # 오늘 상한을 채운 계정도 제외
+        | {slot.account}
+    )
     blocked = {r.casefold() for r in restricted} | publish_mod.not_staff_accounts(rt, slot.cafe or "")
     work_type = work_type_for(spec.task, slot.cafe, rt.cafes_cfg)
     usable = eligible(pool, work_type, publish_mod.all_comment_accounts(rt), restricted)
