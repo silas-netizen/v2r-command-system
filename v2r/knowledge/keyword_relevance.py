@@ -113,31 +113,45 @@ def brand_summary(brand: str, guides_dir: str | Path, max_chars: int = 300) -> s
     text = candidates[0].read_text(encoding="utf-8")
 
     lines = text.splitlines()
-    picked: list[str] = []
-    in_role_block = False
+
+    # 1단계: 브랜드/제품/타깃 정체성이 담긴 메타 줄을 (파일 안 위치와 무관하게)
+    # 전부 먼저 모은다. 예전에는 "[절대 규칙]" 같은 작성 지침 블록이 이 줄들보다
+    # 앞에 오면 300자 한도에서 정체성 줄이 아예 밀려나(장으뜸·뉴더미스 사례),
+    # 모델이 "브랜드 정보가 없다"며 JSON 대신 거부 응답을 내는 원인이 됐다
+    # (2026-09-23 연관도 재산정 실패 조사).
+    identity: list[str] = []
+    identity_keywords = ("브랜드", "제품", "타겟", "타깃")
     for line in lines:
         stripped = line.strip()
-        if not stripped:
+        if not stripped or stripped.startswith("#") or stripped.startswith("```"):
             continue
-        if stripped.startswith("#") and not picked:
-            continue  # 제목 줄은 건너뛴다
-        if stripped.startswith(("- 브랜드", "- 제품", "- 타겟", "- 타깃")):
-            picked.append(stripped.lstrip("- "))
-            continue
-        if stripped in ("[역할]", "[절대 규칙]"):
-            in_role_block = True
-            continue
-        if stripped.startswith("[") and stripped.endswith("]"):
-            in_role_block = False
-            continue
-        if stripped.startswith("```"):
-            in_role_block = False
-            continue
-        if in_role_block:
-            picked.append(stripped)
-        joined = " ".join(picked)
-        if len(joined) >= max_chars:
-            break
+        if stripped.startswith("-") and any(k in stripped[:12] for k in identity_keywords):
+            identity.append(stripped.lstrip("- "))
+
+    # 2단계: 정체성 줄만으로 부족하면 [역할]/[절대 규칙] 블록으로 채운다(예전 동작).
+    picked: list[str] = list(identity)
+    if len(" ".join(picked)) < max_chars:
+        in_role_block = False
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped.startswith("#") and not picked:
+                continue  # 제목 줄은 건너뛴다
+            if stripped in ("[역할]", "[절대 규칙]"):
+                in_role_block = True
+                continue
+            if stripped.startswith("[") and stripped.endswith("]"):
+                in_role_block = False
+                continue
+            if stripped.startswith("```"):
+                in_role_block = False
+                continue
+            if in_role_block:
+                picked.append(stripped)
+            joined = " ".join(picked)
+            if len(joined) >= max_chars:
+                break
 
     summary = " ".join(picked).strip()
     if not summary:

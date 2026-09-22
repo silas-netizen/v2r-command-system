@@ -7,10 +7,15 @@
 진짜 사용량 장부(`data/llm_usage-2026-09.jsonl`)에 쌓였다(실측: 11회분 121줄).
 요금제 잠금 파일·잠금 알림도 같은 경로로 새 나갈 수 있었다.
 
-그래서 **모든 시험**에서 아래 두 가지를 임시 폴더로 돌린다.
+그래서 **모든 시험**에서 아래를 임시 폴더로 돌린다.
 
 - `V2R_USAGE_LEDGER_DIR` — 사용량 장부 폴더
 - `V2R_DATA_DIR` — 설정이 읽는 데이터 폴더 (`get_settings()` 캐시도 비운다)
+- `V2R_REPO_ROOT` — `Settings.repo_root` 기본값(2026-09-23 추가). `docs/reports/*`
+  처럼 `repo_root` 밑 경로에 쓰는 보고서 생성기가 `out_dir`을 안 받고 불리면
+  이 가짜 저장소 폴더로 간다. (사고: 03:31 pytest 실행이 `make_runtime`류
+  도우미가 `Settings(...)`에 `repo_root`를 안 넘긴 탓에 진짜
+  `docs/reports/dashboard-2026-09-22.*`를 빈 DB 결과로 덮어썼다.)
 """
 
 from __future__ import annotations
@@ -24,10 +29,12 @@ from v2r.llm.usage_ledger import LEDGER_DIR_ENV
 
 @pytest.fixture(autouse=True)
 def _isolate_data_dirs(tmp_path_factory, monkeypatch):
-    """시험이 저장소의 진짜 `data/`를 건드리지 못하게 막는다."""
+    """시험이 저장소의 진짜 `data/`·`docs/reports`를 건드리지 못하게 막는다."""
     sandbox = tmp_path_factory.mktemp("v2r-data")
+    repo_sandbox = tmp_path_factory.mktemp("v2r-repo")
     monkeypatch.setenv(LEDGER_DIR_ENV, str(sandbox))
     monkeypatch.setenv("V2R_DATA_DIR", str(sandbox))
+    monkeypatch.setenv("V2R_REPO_ROOT", str(repo_sandbox))
 
     from v2r import config
 
@@ -51,4 +58,25 @@ def _no_real_data_dir_writes(_isolate_data_dirs):
         if path.exists() and path.stat().st_size != size:
             raise AssertionError(
                 f"시험이 진짜 사용량 장부를 건드렸습니다: {path}"
+            )
+
+
+@pytest.fixture(autouse=True)
+def _no_real_docs_reports_writes():
+    """진짜 `docs/reports/*` 파일이 시험 중 바뀌면 바로 잡아낸다(파수꾼,
+    2026-09-23 — 03:31 pytest 실행이 `dashboard-2026-09-22.*`를 빈 DB 결과로
+    덮어쓴 사고 재발 방지)."""
+    from pathlib import Path
+
+    real = Path(__file__).resolve().parents[1] / "docs" / "reports"
+    files = sorted(p for p in real.glob("*") if p.is_file())
+    before = {p: (p.stat().st_size, p.stat().st_mtime) for p in files}
+    yield
+    for path, stamp in before.items():
+        if not path.exists():
+            raise AssertionError(f"시험이 진짜 보고서 파일을 지웠습니다: {path}")
+        after = (path.stat().st_size, path.stat().st_mtime)
+        if after != stamp:
+            raise AssertionError(
+                f"시험이 진짜 보고서 파일을 건드렸습니다(docs/reports 격리 실패): {path}"
             )

@@ -36,7 +36,15 @@ class Settings:
     slack_allowed_channel_ids: list[str] = field(default_factory=list)
     slack_webhook_url: str = ""
     anthropic_api_key: str = ""
-    repo_root: Path = REPO_ROOT
+    #: `V2R_REPO_ROOT`를 `default_factory`로 매번 읽는다(클래스 정의 시점에
+    #: 한 번 굳어버리는 값이 아니라). 시험이 이 값을 환경변수로 가짜 폴더로
+    #: 돌려놓으면, `Settings(...)`를 직접 만드는 시험 도우미(`make_runtime` 등)가
+    #: `repo_root`를 깜빡 빠뜨려도 진짜 저장소의 `docs/reports`를 건드리지
+    #: 않는다(2026-09-23, `docs/reports/dashboard-2026-09-22.*`가 시험 실행으로
+    #: 덮어써진 사고 조사 후 추가).
+    repo_root: Path = field(
+        default_factory=lambda: Path(os.getenv("V2R_REPO_ROOT") or REPO_ROOT)
+    )
     data_dir: Path = REPO_ROOT / "data"
     warehouse_dir: Path = REPO_ROOT / "warehouse"
     config_dir: Path = REPO_ROOT / "config"
@@ -76,7 +84,9 @@ class Settings:
 
 def _build_settings() -> Settings:
     load_dotenv(REPO_ROOT / ".env")
-    root = REPO_ROOT
+    #: `V2R_REPO_ROOT`가 있으면 그쪽을 쓴다(시험 격리용, 2026-09-23). 평소엔
+    #: 안 쓰여서 진짜 실행에는 영향이 없다.
+    root = Path(os.getenv("V2R_REPO_ROOT") or REPO_ROOT)
     data_dir = Path(os.getenv("V2R_DATA_DIR") or (root / "data"))
     warehouse_dir = Path(os.getenv("V2R_WAREHOUSE_DIR") or (root / "warehouse"))
     config_dir = root / "config"
