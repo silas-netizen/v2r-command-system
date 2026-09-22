@@ -22,8 +22,14 @@ plan_lock_hours: 5
 # 판정은 **우리가 정한 체크리스트 번호 안에서만** 받고, 점수는 (통과 수 / 전체)로
 # 우리가 계산합니다. `min_score` 미만이면 "GPT 지적"으로 **한 번만** 부분 재시도합니다.
 # codex 를 못 찾거나 시간이 넘으면 "미검증"으로 넘어가고 생성은 막지 않습니다.
+#
+# scope: brand_only — 교차 검증은 **브랜드 원고에만** 씁니다 (사용자 결정 2026-09-22).
+# 자사 카페 일상 글과 일상 글 댓글은 한 줄짜리라 GPT를 부를 이유가 없고,
+# 부르면 시간과 한도만 헛되이 씁니다. 코드에서도 브랜드 원고가 아니면
+# codex 를 아예 부르지 않습니다 (`gpt_crosscheck.allowed_for`).
 crosscheck:
   enabled: true
+  scope: brand_only
   min_score: 60
   model: gpt-5.6-sol
   effort: medium

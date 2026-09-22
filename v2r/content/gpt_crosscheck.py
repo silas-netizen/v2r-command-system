@@ -42,6 +42,9 @@ DEFAULT_EFFORT = "medium"
 #: 한 원고당 기다리는 최대 시간(초). 넘으면 "미검증"이다
 DEFAULT_TIMEOUT = 300
 DEFAULT_MIN_SCORE = 60
+#: 교차 검증을 **어디에만** 쓰는가 (사용자 결정 2026-09-22).
+#: `brand_only` = 브랜드 원고에만. 일상 글·일상 글 댓글에서는 절대 부르지 않는다.
+DEFAULT_SCOPE = "brand_only"
 
 #: 정리본의 **말투·형식** 규칙 (부자연스러운 문장도 이 번호로만 잡게 한다)
 TONE_ITEMS: tuple[str, ...] = (
@@ -53,6 +56,10 @@ TONE_ITEMS: tuple[str, ...] = (
     "나열식 금지 — 번호 매김이나 항목 나열로 정리하지 않는다",
     "줄 나눔 — 본문은 한 줄 20자 안팎, 한 문단 4줄 이내로 자주 끊는다",
     "같은 표현·패턴을 연속 3회 이상 되풀이하지 않는다",
+    # 정리본 [AI 티 제거] 규칙 (사용자 결정 2026-09-22). **있음 = 통과**다
+    "의도적 오탈자·띄어쓰기 오류가 본문에 있는가"
+    " (정리본 규칙: 맞춤법 1~2개, 띄어쓰기 2~3개를 일부러 틀린다."
+    " 하나라도 있으면 통과, 하나도 없이 너무 반듯하면 위반)",
 )
 
 #: 대대댓글2 **4요소 구조** (우리가 정한 핵심 규칙)
@@ -92,7 +99,22 @@ def load_config(data: dict | None = None) -> dict:
         "model": str(cfg.get("model") or DEFAULT_MODEL),
         "effort": str(cfg.get("effort") or DEFAULT_EFFORT),
         "timeout": int(cfg.get("timeout_sec") or DEFAULT_TIMEOUT),
+        # 빈 값이면 가장 좁은 쪽(brand_only)으로 둔다 — 설정을 잊어도 일상 글로 새지 않게
+        "scope": str(cfg.get("scope") or DEFAULT_SCOPE).strip() or DEFAULT_SCOPE,
     }
+
+
+def allowed_for(manuscript: Any, scope: str = DEFAULT_SCOPE) -> bool:
+    """이 원고에 교차 검증을 써도 되는가 (사용자 결정 2026-09-22).
+
+    `brand_only` 면 **브랜드 원고에만** 쓴다. 일상 글·일상 글 댓글은 Haiku 한 줄짜리라
+    GPT를 부를 이유가 없고, 부르면 시간과 한도를 헛되이 쓴다.
+    """
+    if (scope or DEFAULT_SCOPE) != "brand_only":
+        return True
+    from v2r.content import brand_writer as bw
+
+    return bool(bw.is_brand_manuscript(manuscript))
 
 
 def find_codex() -> str:
@@ -402,18 +424,27 @@ def crosscheck_manuscript(
     from v2r.content import brand_writer as bw
 
     cfg = cfg or load_config()
-    rule = rule or bw.rule_for(bw.brand_of(manuscript), manuscript.manuscript_type)
-    if not cfg.get("enabled"):
-        result = {
+
+    def _skip(reason: str) -> dict:
+        out = {
             "gpt_checked": False,
             "gpt_score": None,
             "gpt_verdict": "미검증",
             "gpt_notes": [],
-            "gpt_error": "crosscheck.enabled=false",
+            "gpt_error": reason,
         }
         if stats is not None:
-            stats.update(result)
-        return result
+            stats.update(out)
+        return out
+
+    if not cfg.get("enabled"):
+        return _skip("crosscheck.enabled=false")
+    # 브랜드 원고가 아니면 **규칙을 찾기도 전에** 끝낸다
+    # (일상 글·일상 글 댓글 경로에서는 codex 를 절대 부르지 않는다, 사용자 결정 2026-09-22)
+    scope = str(cfg.get("scope") or DEFAULT_SCOPE)
+    if not allowed_for(manuscript, scope):
+        return _skip(f"crosscheck.scope={scope} (브랜드 원고가 아니라 부르지 않았습니다)")
+    rule = rule or bw.rule_for(bw.brand_of(manuscript), manuscript.manuscript_type)
     first = review(manuscript, rule, guide_text, cfg)
     result = dict(first)
     min_score = int(cfg.get("min_score", DEFAULT_MIN_SCORE))

@@ -330,8 +330,110 @@ WORRY_WORDS: tuple[str, ...] = (
     "눈물",
     "포기",
 )
-#: 고민 문장에 붙으면 안 되는 웃음 표기 (ㅠㅠ 는 권장)
+#: 고민 문장에 붙으면 안 되는 웃음 표기 (ㅠㅠ 는 **있으면 좋을 뿐 필수가 아니다**,
+#: 사용자 결정 2026-09-22 — 검증기는 ㅋㅋ ㅎㅎ 가 붙었는지만 본다)
 WORRY_LAUGH_RE = re.compile(r"[ㅋㅎ]+")
+
+# --- 의도적 오탈자·띄어쓰기 (정리본 [AI 티 제거] 규칙, 사용자 결정 2026-09-22) -------
+#: 정리본이 못 박은 규칙: "본문에 띄어쓰기 2~3개, 맞춤법 1~2개를 의도적으로 틀린다".
+#: 하나도 없으면 글이 너무 반듯해서 AI 티가 난다 → **경고**로만 알린다 (원고는 버리지 않는다).
+#: 온라인에서 다들 틀리는 맞춤법 (정리본의 보기 그대로: 되/돼, 웬/왠, 에요/예요 …)
+COMMON_TYPO_WORDS: tuple[str, ...] = (
+    # 되/돼 (정리본 보기: 안돼요 → 안되요)
+    "안되요",
+    "안되네",
+    "안되서",
+    "되요",
+    "됬",
+    "됀",
+    # 웬/왠 (정리본 보기)
+    "왠만",
+    "웬지",
+    # 에요/예요 혼용 (정리본 보기)
+    "거에요",
+    "네요에요",
+    "이예요",
+    # 않/안 뒤바뀜
+    "않하",
+    "않되",
+    # 구어체 표기 흔들림 (`~더라구요` 는 이미 모든 원고가 쓰는 말이라 빼고 센다)
+    "네여",
+    "구여",
+    "맞아욬",
+    "그쵸",
+    "어떻해",
+    "금새",
+    "몆",
+)
+#: 온라인에서 다들 **붙여 쓰는** 자리 (원래는 띄어야 맞다 — 정리본 보기: 할수있어)
+COMMON_SPACING_WORDS: tuple[str, ...] = (
+    "할수",
+    "볼수",
+    "갈수",
+    "될수",
+    "먹을수",
+    "그때뿐",
+    "한번더",
+    "몇번이나",
+    "안빠져",
+    "안빠지",
+    "잘안",
+    "못참",
+    "다시안",
+    "제일많",
+    "진짜많",
+)
+#: 본문에서 이 개수 미만이면 경고 (0개 = 하나도 안 틀렸다)
+TYPO_MIN_COUNT = 1
+
+#: 프롬프트에 박는 규칙 한 줄 — 일부러 틀리기
+INTENTIONAL_TYPO_RULE = (
+    "본문은 **일부러 조금 틀리게** 쓴다 (정리본 [AI 티 제거] 규칙)."
+    " 온라인에서 다들 안 지키는 맞춤법을 1~2개"
+    " (되/돼 → `안되요`, 웬/왠 → `왠지`, 에요/예요 혼용),"
+    " 띄어쓰기를 2~3개 (`할 수 있어` → `할수있어`, `그 때뿐` → `그때뿐`)"
+    " 자연스럽게 틀린다. 글이 너무 반듯하면 AI가 쓴 티가 난다"
+)
+
+# --- 마이너스 카피 근거 (사용자 결정 2026-09-22) -------------------------------
+#: 근거 문장을 **"이게 없으면 효과가 없다"** 꼴로 쓰는 브랜드.
+#: 플러스 카피(`배합이랑 원물 함량을 따져 만들어서 흡수가 잘된대요`)는 광고문으로 읽히고,
+#: 마이너스 카피(`배합이랑 원물 함량을 안 따지면 흡수가 안 돼서 소용없대요`)는
+#: 안 사면 손해라는 쪽으로 읽힌다.
+MINUS_COPY_BRANDS: tuple[str, ...] = ("장으뜸", "뉴더미스")
+#: 앞쪽 부정형 (`없으면` / `안 …` / `못 …`)
+MINUS_COPY_NEGATIVE_WORDS: tuple[str, ...] = (
+    "없으면",
+    "없이",
+    "없는건",
+    "없는게",
+    "없다면",
+    "안따지",
+    "안보고",
+    "안맞추",
+    "안챙기",
+    "안들어",
+    "못따지",
+    "못챙기",
+    "못맞추",
+)
+#: 뒤쪽 "그래서 소용없다"
+MINUS_COPY_USELESS_WORDS: tuple[str, ...] = (
+    "소용없",
+    "소용이없",
+    "효과없",
+    "효과가없",
+    "안돼",
+    "안되",
+    "의미없",
+)
+#: 프롬프트에 박는 규칙 한 줄 — 마이너스 카피
+MINUS_COPY_RULE = (
+    "대대댓글2의 **근거 문장은 마이너스 카피**로 쓴다 —"
+    " `이게 있어서 좋다`가 아니라 **`이게 없으면 소용없다`** 로 적는다."
+    " 나쁜 보기) 배합이랑 원물 함량을 따져 만들어서 흡수가 잘된대요."
+    " 좋은 보기) 배합이랑 원물 함량을 안 따지면 흡수가 안 돼서 소용없대요"
+)
 
 #: 프롬프트에 박는 규칙 한 줄 — 근거 출처는 하나만
 ONE_SOURCE_RULE = (
@@ -606,6 +708,8 @@ _VIRAL_BODY_NOTES = (
     "제품명이나 브랜드명을 본문에서 절대 말하지 않는다 (댓글에서 나오게 남겨 둔다)",
     WORRY_LAUGH_RULE,
     DEORAGUYO_RULE,
+    # 정리본 [AI 티 제거] 규칙 (사용자 결정 2026-09-22)
+    INTENTIONAL_TYPO_RULE,
 )
 _VIRAL_COMMENT_NOTES = (
     "댓글1은 제품과 무관하게 작성자의 질문에 답하는 중립적 정보다 (광고 아님을 증명)",
@@ -1012,6 +1116,64 @@ def strip_evidence_laughter(text: str) -> str:
     return " ".join(s for s in out if s)
 
 
+def is_minus_copy_sentence(sentence: str) -> bool:
+    """이 문장이 **마이너스 카피**인가 — `…이 없으면 … 소용없다` 꼴.
+
+    앞쪽 부정형(`없으면` / `안 따지면` / `못 챙기면`)과
+    뒤쪽 `소용없 / 효과 없 / 안 돼` 가 **한 문장 안에 같이** 있어야 한다.
+    """
+    squashed = _squash(sentence)
+    has_negative = any(_squash(w) in squashed for w in MINUS_COPY_NEGATIVE_WORDS)
+    has_useless = any(_squash(w) in squashed for w in MINUS_COPY_USELESS_WORDS)
+    return has_negative and has_useless
+
+
+def minus_copy_problems(text: str, rule: "BrandRule") -> list[str]:
+    """장으뜸·뉴더미스 대대댓글2의 근거 문장이 마이너스 카피인가 (사용자 결정 2026-09-22).
+
+    `배합이랑 원물 함량을 따져 만들어서 흡수가 잘된대요` (플러스) 는 광고문으로 읽힌다.
+    `배합이랑 원물 함량을 안 따지면 흡수가 안 돼서 소용없대요` (마이너스) 로 써야
+    "이게 없으면 효과가 없다" 는 쪽으로 읽힌다. **필수 위반**이라 다시 시킨다.
+    """
+    if rule.brand not in MINUS_COPY_BRANDS:
+        return []
+    evidence = [s for s in reply2_sentences(text) if is_evidence_sentence(s)]
+    if not evidence:
+        return []  # 근거 문장이 아예 없는 것은 `reply2_structure_problems` 가 잡는다
+    if any(is_minus_copy_sentence(s) for s in evidence):
+        return []
+    return [
+        f"마이너스 카피 — {rule.brand} 근거 문장은 `이게 없으면 소용없다` 꼴로 쓴다"
+        f" (지금 근거 문장: `{evidence[0].strip()}`)."
+        " 좋은 보기: 배합이랑 원물 함량을 안 따지면 흡수가 안 돼서 소용없대요"
+    ]
+
+
+def intentional_typo_hits(text: str) -> list[str]:
+    """본문에서 찾은 **의도적 오탈자·띄어쓰기 붙임** 목록 (정리본 [AI 티 제거] 규칙)."""
+    squashed = _squash(text)
+    hits = [w for w in COMMON_TYPO_WORDS if w in squashed]
+    # 띄어쓰기는 "원래 띄어야 하는데 붙여 썼다"를 봐야 하므로 공백을 지우지 않고 본다
+    raw = text or ""
+    hits += [w for w in COMMON_SPACING_WORDS if w in raw]
+    return sorted(set(hits))
+
+
+def intentional_typo_problems(body: str) -> list[str]:
+    """하나도 안 틀렸으면 경고 (사용자 결정 2026-09-22).
+
+    정리본은 "본문에 띄어쓰기 2~3개, 맞춤법 1~2개를 의도적으로 틀린다"고 못 박았다.
+    글이 너무 반듯하면 AI가 쓴 티가 난다. 다만 **경고**라 원고를 버리지는 않는다.
+    """
+    hits = intentional_typo_hits(body)
+    if len(hits) >= TYPO_MIN_COUNT:
+        return []
+    return [
+        "의도적 오탈자·띄어쓰기 — 본문이 하나도 안 틀렸다"
+        " (정리본 [AI 티 제거] 규칙: 맞춤법 1~2개, 띄어쓰기 2~3개를 일부러 틀린다)"
+    ]
+
+
 def reply2_logic_problems(text: str, rule: "BrandRule") -> list[str]:
     """브랜드 고유 논리(`reply2_logic`)를 담았는지 (사용자 지시 2026-09-21)."""
     logic = rule.reply2_logic
@@ -1050,6 +1212,7 @@ def reply2_structure_problems(text: str, rule: "BrandRule") -> list[str]:
     if not _has_any(text, REPLY2_SEARCH_WORDS):
         problems.append("검색 유도 — 검색해보시면 후기 많아요 류의 마무리가 없다")
     problems += reply2_logic_problems(text, rule)
+    problems += minus_copy_problems(text, rule)
     problems += reply2_sentence_problems(text, product)
     problems += evidence_laughter_problems(text)
     for owner, words in BRAND_ONLY_EVIDENCE.items():
@@ -1107,17 +1270,39 @@ def review_reply2_problems(text: str, rule: "BrandRule") -> list[str]:
     return problems
 
 
-def shared_authority_words(*texts: str) -> list[str]:
-    """여러 글에 **함께** 나오는 권위 근거 낱말."""
+def authority_words_in(text: str) -> set[str]:
+    """이 글에 들어 있는 권위 근거 **명사**의 집합 (정규화 후).
+
+    긴 낱말 안에 들어앉은 짧은 낱말은 뺀다 (`국가기관` 이 있으면 `기관` 은 세지 않는다).
+    그래야 `정부기관` 과 `농촌진흥청` 처럼 **서로 다른 말**이 같은 낱말로 묶이지 않는다
+    (사용자 결정 2026-09-22).
+    """
     words = tuple(AUTHORITY_PLACE_WORDS) + tuple(AUTHORITY_OTHER_WORDS)
-    squashed = [_squash(t) for t in texts]
-    return [w for w in words if all(w in one for one in squashed)]
+    squashed = _squash(text)
+    found = {w for w in words if _squash(w) in squashed}
+    return {w for w in found if not any(o != w and w in o for o in found)}
+
+
+def shared_authority_words(*texts: str) -> list[str]:
+    """여러 글에 **함께** 나오는 권위 근거 낱말 (정규화 후 **같은 낱말**일 때만).
+
+    `정부기관` 과 `농촌진흥청` 은 서로 다른 말이라 중복이 아니다 (사용자 결정 2026-09-22).
+    """
+    if not texts:
+        return []
+    order = tuple(AUTHORITY_PLACE_WORDS) + tuple(AUTHORITY_OTHER_WORDS)
+    sets = [authority_words_in(t) for t in texts]
+    common = set.intersection(*sets) if sets else set()
+    return [w for w in order if w in common]
 
 
 def duplicate_authority_problems(comment2: str, reply2: str) -> list[str]:
     """권위 근거는 원고 전체에서 한 번만 (사용자 원고 피드백 2026-09-22).
 
     댓글2에서 `항문외과 의사` 를 썼으면 대대댓글2에서는 성분·원리·체감으로 간다.
+    보는 자리는 **댓글2 ↔ 대대댓글2 둘뿐**이다. 팥순이 후기형 대대대댓글2의
+    "국가기관 인증" 은 정리본이 못 박은 **고정 멘트**라 여기서 보지 않는다
+    (사용자 결정 2026-09-22).
     """
     shared = shared_authority_words(comment2, reply2)
     if not shared:
@@ -1340,6 +1525,8 @@ def reply2_prompt_block(rule: "BrandRule", golden: list[str] | None = None) -> l
     ]
     if rule.reply2_logic and rule.reply2_logic.note:
         out.append(f"- 이 브랜드의 논리: {rule.reply2_logic.note}")
+    if rule.brand in MINUS_COPY_BRANDS:
+        out.append(f"- {MINUS_COPY_RULE}")
     out += golden_block(rule, golden)
     if not any("골든 문장" in line for line in out):
         out.append(
@@ -2462,13 +2649,29 @@ def validate(
         checks.append(
             _check(
                 f"고민 문장 웃음 표기({scope})",
-                "걱정·고민을 말하는 문장에는 ㅠㅠ (ㅋㅋ ㅎㅎ 금지)",
+                "걱정·고민을 말하는 문장에 ㅋㅋ ㅎㅎ 가 붙었는가만 본다"
+                " (ㅠㅠ 는 있으면 좋지만 없어도 위반이 아니다)",
                 " / ".join(found) if found else "없음",
                 not found,
                 hard=False,
                 scope=scope,
             )
         )
+
+    # --- 의도적 오탈자·띄어쓰기 (경고): 너무 반듯하면 AI 티가 난다 (사용자 결정 2026-09-22)
+    typo_bad = intentional_typo_problems(body)
+    typo_hits = intentional_typo_hits(body)
+    checks.append(
+        _check(
+            "의도적 오탈자·띄어쓰기",
+            "정리본 [AI 티 제거] 규칙 — 맞춤법 1~2개, 띄어쓰기 2~3개를 일부러 틀린다"
+            f" (본문에 {TYPO_MIN_COUNT}개 이상)",
+            ", ".join(typo_hits) if typo_hits else "0개 (하나도 안 틀렸다)",
+            not typo_bad,
+            hard=False,
+            scope="본문",
+        )
+    )
     return checks
 
 
@@ -2503,6 +2706,20 @@ def brand_of(manuscript: Manuscript) -> str:
     """원고에 새겨 둔 브랜드 이름 (`source`가 `generated:<브랜드>`)."""
     src = manuscript.source or ""
     return src.split(":", 1)[1] if ":" in src else src
+
+
+def is_brand_manuscript(manuscript: Any) -> bool:
+    """이 원고가 **브랜드 원고**인가 (일상 글·일상 글 댓글과 가르는 기준).
+
+    브랜드 원고는 `source` 가 `generated:<브랜드>` 이고 그 브랜드가
+    `BRAND_RULES` 에 등록돼 있다. 자사 카페 일상 글(xlsx에서 읽어 온 글)과
+    제휴 일상 글은 여기에 해당하지 않는다 (사용자 결정 2026-09-22).
+    """
+    src = str(getattr(manuscript, "source", "") or "")
+    if not src.startswith("generated:"):
+        return False
+    brand = src.split(":", 1)[1].strip()
+    return any(rule.brand == brand for rule in BRAND_RULES.values())
 
 
 # ------------------------------------------------------------------ 생성
@@ -2545,6 +2762,26 @@ def _clean_body(body: str) -> str:
     out = re.sub(r"^\s*본문\s*[:：]\s*", "", out)
     out = re.sub(r"\n{3,}", "\n\n", out)
     return out.strip("\n")
+
+
+def violation_names(items: list[str]) -> list[str]:
+    """위반 문장(`항목 — 기준 … 인데 실제 …`)에서 **항목 이름만** 뽑는다."""
+    return [str(t).split(" — ", 1)[0].strip() for t in items if str(t).strip()]
+
+
+def _note_retry(stats: dict | None, slot: str, bad: list[str]) -> None:
+    """이번 시도에서 **무엇 때문에** 다시 시키는지 `stats` 에 적어 둔다.
+
+    (사용자 지시 2026-09-22 토큰 절약 후속 — 재시도 원인을 집계하려면 원인이
+    남아 있어야 한다. 예전에는 시도 **횟수**만 남아서 왜 10번 돌았는지 알 수 없었다.)
+
+    남는 모양: `stats["retry_reasons"] = {"본문": [[...], ...], "댓글": [[...], ...]}`
+    — 리스트 한 칸이 시도 한 번이고, 그 안에 그때 걸린 항목 이름이 들어 있다.
+    """
+    if stats is None:
+        return
+    table = stats.setdefault("retry_reasons", {})
+    table.setdefault(slot, []).append(violation_names(bad))
 
 
 def _retry_note(items: list[str]) -> str:
@@ -2642,6 +2879,7 @@ def generate_manuscript(
             content_hash=content_hash(title, body),
         )
         bad = violations(validate(candidate, rule), scope="본문")
+        _note_retry(stats, "본문", bad)
         # 위반이 적은 쪽을 들고 간다 (끝내 못 지켜도 버리지 않기 위해)
         if draft is None or len(bad) < len(body_bad):
             draft, body_bad = candidate, bad
@@ -2823,6 +3061,16 @@ def _finish(
     stats["body_attempts"] = body_attempts
     stats["comment_attempts"] = comment_attempts
     stats["attempts"] = body_attempts + comment_attempts
+    # 재시도를 부른 항목을 많이 걸린 차례로 (사용자 지시 2026-09-22 — 원인 집계용)
+    from collections import Counter
+
+    counter: Counter = Counter()
+    for rounds in (stats.get("retry_reasons") or {}).values():
+        for names in rounds:
+            counter.update(names)
+    stats["retry_top"] = [
+        {"항목": name, "걸린 시도 수": n} for name, n in counter.most_common()
+    ]
     stats["unresolved"] = unresolved
     stats["unresolved_hard"] = hard
     stats["ok"] = not hard
@@ -2917,6 +3165,7 @@ def _fill_comments(
                 raise BrandWriteError(f"댓글 생성 실패({brand}/{keyword}): {exc}") from exc
             draft.comments = merge_comments(best_comments, payload)
         bad = violations(validate(draft, rule), scope="댓글")
+        _note_retry(stats, "댓글", bad)
         if not best_comments or len(bad) < len(comment_bad):
             best_comments, comment_bad = list(draft.comments), bad
         if not bad:
@@ -3243,4 +3492,16 @@ __all__ = [
     "violations",
     "MAX_ATTEMPTS",
     "write_review_md",
+    # --- 사용자 결정 2026-09-22
+    "MINUS_COPY_BRANDS",
+    "MINUS_COPY_RULE",
+    "INTENTIONAL_TYPO_RULE",
+    "authority_words_in",
+    "shared_authority_words",
+    "duplicate_authority_problems",
+    "is_minus_copy_sentence",
+    "minus_copy_problems",
+    "intentional_typo_hits",
+    "intentional_typo_problems",
+    "is_brand_manuscript",
 ]
