@@ -42,13 +42,23 @@ DEFAULT_REST_SEC = 15 * 60
 #: 조회 사이 대기(초) — 네이버 차단 방지
 MIN_DELAY_SEC = 3.0
 MAX_DELAY_SEC = 6.0
+#: 한 번 조회에 넣을 수 있는 씨앗 개수(실측 2026-09-23: 최대 5개, 줄바꿈 구분)
+SEED_BATCH_SIZE = 5
 
 #: 네이버 검색광고 키워드 도구 페이지 (계정 번호는 브랜드마다 다를 수 있어 인자로 받는다)
 KEYWORD_PLANNER_URL = (
     "https://ads.naver.com/manage/ad-accounts/{account_id}/sa/tool/keyword-planner"
 )
-#: 이 페이지가 실제로 호출하는 연관 키워드 XHR (경로에 이 조각이 들어있으면 잡는다)
-KEYWORD_XHR_HINT = "keywordstool"
+#: 씨앗 입력창 placeholder(실측 2026-09-23)
+SEED_TEXTAREA_PLACEHOLDER_HINT = "한줄에 하나씩"
+#: 조회 버튼 정확한 텍스트(실측 2026-09-23) — 이 텍스트로만 정확히 찾는다.
+#: 페이지에 "광고 만들기"·"전체추가"·"바로추가"·"월간 예상 실적 보기" 등 광고
+#: 계정에 영향을 줄 수 있는 버튼이 함께 있으니 **절대 건드리지 않는다.**
+SEARCH_BUTTON_TEXT = "조회하기"
+#: 결과 표 전체를 받는 다운로드 버튼 텍스트 조각(표를 긁는 대신 이걸 받아 파싱)
+DOWNLOAD_BUTTON_TEXT_HINT = "전체 다운로드"
+#: 절대 클릭하지 않는 버튼들(광고 계정에 영향)
+FORBIDDEN_BUTTON_TEXTS = ("광고 만들기", "전체추가", "바로추가", "월간 예상 실적 보기")
 
 #: "< 10" 같은 표기 → 대략값(5)로. 네이버 키워드 도구는 10 미만을 이렇게 감춘다.
 _RE_UNDER_TEN = re.compile(r"^\s*[<＜]\s*10\s*$")
@@ -110,6 +120,44 @@ def parse_keyword_response(data: dict[str, Any]) -> list[KeywordRow]:
     return out
 
 
+#: 다운로드 xlsx 헤더는 2행(1행: 큰 분류, 2행: PC/모바일 세부) — 데이터는 3행부터.
+#: A=연관키워드, B=월간검색수(PC), C=월간검색수(모바일), H=경쟁정도(있으면).
+_DOWNLOAD_HEADER_ROWS = 2
+
+
+def parse_keyword_download_rows(rows: list[tuple[Any, ...]]) -> list[KeywordRow]:
+    """`전체 다운로드` xlsx를 openpyxl로 읽은 행(튜플) 목록 → `KeywordRow` 목록.
+
+    실측(2026-09-23): 1~2행은 헤더(연관키워드 / 월간검색수 PC·모바일 / ...),
+    3행부터 데이터. 검색수는 "3,250" 같은 천단위 콤마 문자열.
+    """
+    out: list[KeywordRow] = []
+    for row in rows[_DOWNLOAD_HEADER_ROWS:]:
+        if not row or not row[0]:
+            continue
+        kw = str(row[0]).strip()
+        if not kw:
+            continue
+        pc = _to_count(row[1] if len(row) > 1 else None)
+        mobile = _to_count(row[2] if len(row) > 2 else None)
+        comp = str(row[7]).strip() if len(row) > 7 and row[7] else ""
+        out.append(KeywordRow(keyword=kw, pc=pc, mobile=mobile, comp_idx=comp))
+    return out
+
+
+def parse_keyword_download_file(path: str | Path) -> list[KeywordRow]:
+    """`전체 다운로드` xlsx 파일 경로 → `KeywordRow` 목록."""
+    import openpyxl
+
+    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    try:
+        ws = wb.active
+        rows = list(ws.iter_rows(values_only=True))
+    finally:
+        wb.close()
+    return parse_keyword_download_rows(rows)
+
+
 # --- 씨앗 키워드 -------------------------------------------------------------
 def seeds_from_sheet(
     brand: str, cfg: dict | None = None, xlsx_path: str | Path | None = None
@@ -145,19 +193,43 @@ def seeds_from_sheet(
     return out
 
 
-#: 정리본 md에서 핵심어를 뽑는 자리 — "브랜드/제품:" 줄과 첫 문단의 결핍/증상
-#: 낱말(쉼표·가운뎃점 구분)을 쓴다.
+#: 정리본 md에서 핵심어를 뽑는 자리 — "브랜드/제품:" 줄, "결핍: A, B, C" 나열,
+#: "네이버 카페에 A, B, C 결핍을 가진 타겟", "목록 상세(A, B, C)" 꼴을 모두 본다.
 _RE_GUIDE_PRODUCT_LINE = re.compile(r"^-\s*브랜드/제품\s*:\s*(.+)$", re.M)
-#: "네이버 카페에 <A>, <B>, <C> 결핍을 가진 타겟" 처럼 나열된 결핍 낱말
-_RE_GUIDE_TARGET_LINE = re.compile(r"타겟을?\s*대상으로")
+#: "결핍: 색소침착, 미백, 착색 등" — 콜론 뒤 나열
+_RE_DEFICIT_COLON = re.compile(r"결핍\s*[:：]\s*([^\n]+)")
+#: "네이버 카페에 착색, 미백, 색소침착 결핍을 가진 타겟" — "카페에(서)"와 "결핍" 사이
+_RE_DEFICIT_BEFORE = re.compile(r"카페에(?:서)?\s*(.+?)\s*결핍")
+#: "타겟 결핍 목록 상세(기미, 흑자, 검버섯, ...)" — "목록" 옆 괄호 안 나열만(이모티콘
+#: 괄호처럼 "결핍"이라는 낱말이 같은 줄 앞쪽에만 있는 무관한 괄호는 거른다)
+_RE_PAREN_LIST = re.compile(r"목록\s*상세[^(\n]*\(([^)]+)\)")
 _RE_SPLIT = re.compile(r"[,·/、]+")
+#: 나열 항목 끝의 "등"·순번("2.")·조사 찌꺼기 제거
+_RE_TRAILING_ETC = re.compile(r"\s*등\s*$")
+_RE_LEADING_NUM = re.compile(r"^\s*\d+[.)]\s*")
+#: 낱말 양끝 따옴표·괄호 찌꺼기
+_RE_STRIP_PUNCT = re.compile(r'^[\s"\'“”‘’(){}\[\]]+|[\s"\'“”‘’(){}\[\]]+$')
+
+
+def _clean_word_list(raw: list[str]) -> list[str]:
+    out: list[str] = []
+    for w in raw:
+        w = _RE_LEADING_NUM.sub("", str(w or "")).strip()
+        w = _RE_TRAILING_ETC.sub("", w).strip()
+        w = _RE_STRIP_PUNCT.sub("", w).strip()
+        if w and 1 < len(w) <= 12 and not w.isdigit() and not re.fullmatch(r"[ㄱ-ㅎㅏ-ㅣ]+", w):
+            out.append(w)
+    return out
 
 
 def extract_guide_keywords(brand: str, guides_dir: str | Path | None = None) -> list[str]:
     """`warehouse/guides/정리본/<브랜드>.md`에서 브랜드 논리 낱말을 뽑는다.
 
-    파일이 없거나 패턴이 안 맞으면 `config/brands.yaml`의 `description`을
-    낱말 단위로 잘라 대신 쓴다(둘 다 없으면 빈 목록).
+    "결핍: A, B, C" · "카페에 A, B, C 결핍을 가진 타겟" · "목록 상세(A, B, C)"
+    세 형태를 모두 찾아 합친다(하나만 있어도 되고, 여러 개면 다 모은다 — 논리
+    낱말이 많을수록 `compute_relevance`의 0~3 분포가 고르게 나온다). 파일이
+    없거나 아무 패턴도 안 맞으면 `config/brands.yaml`의 `description`을 대신
+    쓴다(둘 다 없으면 빈 목록).
     """
     base = Path(guides_dir) if guides_dir else Path("warehouse") / "guides" / "정리본"
     path = base / f"{brand}.md"
@@ -166,21 +238,22 @@ def extract_guide_keywords(brand: str, guides_dir: str | Path | None = None) -> 
         text = path.read_text(encoding="utf-8", errors="ignore")
         m = _RE_GUIDE_PRODUCT_LINE.search(text)
         if m:
-            words.extend(w.strip() for w in _RE_SPLIT.split(m.group(1)) if w.strip())
-        # "착색, 미백, 색소침착 결핍을 가진 타겟" 꼴의 줄에서 결핍 낱말도 뽑는다
-        for line in text.splitlines():
-            if "결핍" in line and ("타겟" in line or "가진" in line):
-                lead = line.split("결핍")[0]
-                # 마지막 콤마 구분 나열만 취한다(문장 앞머리 잡동사니 제거)
-                lead = lead.split("에")[-1].split("에서")[-1]
-                words.extend(w.strip() for w in _RE_SPLIT.split(lead) if w.strip() and len(w.strip()) <= 12)
+            words.extend(_RE_SPLIT.split(m.group(1)))
+        for pattern in (_RE_DEFICIT_COLON, _RE_DEFICIT_BEFORE, _RE_PAREN_LIST):
+            for m in pattern.finditer(text):
+                chunk = m.group(1)
+                # 맞춤법/AI-티 제거 규칙 같은 무관한 줄(화살표·물결·과도하게 긴 나열)은 거른다
+                if len(chunk) > 100 or "→" in chunk or "~" in chunk:
+                    continue
+                words.extend(_RE_SPLIT.split(chunk))
+    words = _clean_word_list(words)
     if not words:
         try:
             import yaml
 
             cfg = yaml.safe_load(Path("config/brands.yaml").read_text(encoding="utf-8"))
             desc = ((cfg or {}).get("brands") or {}).get(brand, {}).get("description", "")
-            words.extend(w.strip() for w in re.split(r"[·,\-—]", desc) if w.strip())
+            words = _clean_word_list(re.split(r"[·,\-—]", desc))
         except Exception:  # noqa: BLE001
             pass
     seen: set[str] = set()
@@ -196,119 +269,148 @@ def extract_guide_keywords(brand: str, guides_dir: str | Path | None = None) -> 
 def compute_relevance(keyword: str, guide_keywords: list[str], depth: int) -> int:
     """연관도 0(직접)~3(멀음).
 
-    브랜드 논리 낱말 중 하나가 키워드에 그대로 들어있으면(또는 반대로 키워드가
-    논리 낱말에 들어있으면) 0. 아니면 BFS 깊이를 그대로 0~3으로 자른다(깊이
-    0=씨앗 자체는 논리 낱말이 아니어도 직접 입력한 것이므로 1로 본다).
+    실측(2026-09-23, 우아덤 1,000개): BFS가 한두 단계만에 목표에 도달하면 거의
+    모든 키워드의 깊이가 같아져(예: 전부 1) 깊이만으로는 0~3이 고르게 안
+    나온다. 그래서 텍스트 근접도를 한 단계 더 본다:
+
+    0 = 브랜드 논리 낱말이 키워드에 그대로 들어있음(또는 반대로 포함됨) — 직접.
+    1 = 논리 낱말과 2글자 이상 겹치는 부분(부분 일치)이 있음 — 꽤 가까움.
+    2~3 = 텍스트로는 안 겹치고 BFS 깊이만 남음 — 깊이를 2~3으로 잘라 쓴다
+    (깊이 0~1도 텍스트가 안 겹치면 최소 2로 본다 — 논리 낱말과 전혀 안
+    겹치면 아무리 얕아도 "직접"은 아니라서).
     """
     kw = str(keyword or "")
-    for g in guide_keywords or []:
-        g = str(g or "").strip()
-        if g and (g in kw or kw in g):
+    guides = [str(g or "").strip() for g in (guide_keywords or []) if str(g or "").strip()]
+    for g in guides:
+        if g in kw or kw in g:
             return 0
-    return max(1, min(int(depth), 3))
+    for g in guides:
+        for i in range(len(g) - 1):
+            if g[i : i + 2] in kw:
+                return 1
+    return max(2, min(int(depth) + 1, 3))
 
 
 # --- 브라우저 자동화 ------------------------------------------------------
 def fetch_related_keywords(
-    page: Any, seed: str, account_id: str, timeout_ms: int = 20000
+    page: Any,
+    seeds: list[str],
+    account_id: str,
+    download_dir: str | Path | None = None,
+    timeout_ms: int = 20000,
 ) -> list[KeywordRow]:
-    """씨앗 키워드 1개를 키워드 도구에 입력해 연관 키워드 XHR 응답을 잡는다.
+    """씨앗 키워드 최대 `SEED_BATCH_SIZE`(5)개를 한 번에 조회해 연관 키워드를 받는다.
 
-    실 서비스 DOM은 바뀔 수 있으니 보수적으로 짠다: 씨앗 입력창에 값을 넣고
-    조회 버튼을 누른 뒤, `KEYWORD_XHR_HINT`가 URL에 들어간 응답을 기다려 JSON을
-    파싱한다. 셀렉터를 못 찾으면 `RuntimeError`.
+    실측(2026-09-23, 사람이 직접 페이지를 열어 확인): 씨앗 입력창은 placeholder
+    `"한줄에 하나씩 입력하세요.\\n(최대 5개까지)"`(줄바꿈으로 씨앗 구분, 최대 5개),
+    조회 버튼은 정확히 `"조회하기"`. 결과 표를 직접 긁지 않고 `"전체 다운로드"`
+    버튼으로 xlsx를 받아 파싱한다(표가 페이지네이션돼 있어도 다운로드는 전체).
+
+    **`FORBIDDEN_BUTTON_TEXTS`(광고 만들기·전체추가·바로추가·월간 예상 실적
+    보기)는 절대 클릭하지 않는다** — 광고 계정 설정에 영향을 줄 수 있다.
     """
+    if len(seeds) > SEED_BATCH_SIZE:
+        raise ValueError(f"한 번에 최대 {SEED_BATCH_SIZE}개까지만 조회할 수 있습니다")
+
     url = KEYWORD_PLANNER_URL.format(account_id=account_id)
     if account_id not in (page.url or ""):
         page.goto(url, wait_until="domcontentloaded", timeout=60000)
         page.wait_for_timeout(3000)
 
-    captured: dict[str, Any] = {}
+    ta = page.locator(f'textarea[placeholder*="{SEED_TEXTAREA_PLACEHOLDER_HINT}"]').first
+    if ta.count() == 0:
+        raise RuntimeError("씨앗 입력창을 찾지 못했습니다(페이지 구조 확인 필요)")
+    ta.click()
+    ta.fill("\n".join(str(s).strip() for s in seeds if str(s or "").strip()))
+    page.wait_for_timeout(500)
 
-    def _on_response(resp: Any) -> None:
-        try:
-            if KEYWORD_XHR_HINT in (resp.url or "") and resp.status == 200:
-                captured["data"] = resp.json()
-        except Exception:  # noqa: BLE001
-            pass
+    btn = page.get_by_text(SEARCH_BUTTON_TEXT, exact=True).first
+    if btn.count() == 0:
+        raise RuntimeError("'조회하기' 버튼을 찾지 못했습니다(페이지 구조 확인 필요)")
+    if btn.get_attribute("disabled") is not None:
+        raise RuntimeError("'조회하기' 버튼이 비활성 상태입니다(씨앗 입력 확인 필요)")
+    btn.click(timeout=10000)
+    page.wait_for_timeout(timeout_ms)
 
-    page.on("response", _on_response)
+    dl_btn = page.get_by_text(DOWNLOAD_BUTTON_TEXT_HINT, exact=False).first
+    if dl_btn.count() == 0:
+        raise RuntimeError("'전체 다운로드' 버튼을 찾지 못했습니다(결과가 없거나 페이지 구조 변경)")
+
+    tmp_dir = Path(download_dir) if download_dir else Path.cwd() / "data" / "keywords" / "_tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    with page.expect_download(timeout=15000) as dl_info:
+        dl_btn.click(timeout=10000)
+    download = dl_info.value
+    tmp_path = tmp_dir / f"dl_{int(time.time() * 1000)}.xlsx"
+    download.save_as(str(tmp_path))
     try:
-        # 씨앗 입력창(정확한 셀렉터는 실제 페이지에 맞춰 조정 필요 — 우선 흔한
-        # placeholder/aria-label 후보를 순서대로 시도한다)
-        input_locator = None
-        for sel in [
-            'textarea[placeholder*="키워드"]',
-            'input[placeholder*="키워드"]',
-            'textarea',
-        ]:
-            loc = page.locator(sel).first
-            try:
-                if loc.count() > 0:
-                    input_locator = loc
-                    break
-            except Exception:  # noqa: BLE001
-                continue
-        if input_locator is None:
-            raise RuntimeError("키워드 입력창을 찾지 못했습니다(페이지 구조 확인 필요)")
-
-        # 실측(2026-09-22): 입력만으로는 조회 버튼이 `disabled` 상태로 남는다.
-        # Enter를 눌러 키워드를 칩(chip)으로 확정해야 버튼이 활성화되는데, 페이지
-        # JS 번들이 늦게 붙으면 첫 Enter가 씹힐 때가 있어 최대 3번 재시도한다.
-        btn = None
-        for sel in ['button:has-text("조회하기")', 'button:has-text("조회")', 'button[type="submit"]']:
-            loc = page.locator(sel).first
-            if loc.count() > 0:
-                btn = loc
-                break
-        if btn is None:
-            raise RuntimeError("조회 버튼을 찾지 못했습니다(페이지 구조 확인 필요)")
-
-        enabled = False
-        for attempt in range(3):
-            input_locator.click()
-            input_locator.fill(seed)
-            input_locator.press("Enter")
-            deadline = time.monotonic() + 6
-            while time.monotonic() < deadline:
-                try:
-                    if btn.count() > 0 and btn.get_attribute("disabled") is None:
-                        enabled = True
-                        break
-                except Exception:  # noqa: BLE001
-                    pass
-                page.wait_for_timeout(300)
-            if enabled:
-                break
-        if not enabled:
-            raise RuntimeError(f"'{seed}' 조회 버튼이 활성화되지 않았습니다(칩 등록 실패로 보임)")
-
-        btn.click(timeout=10000)
-        page.wait_for_timeout(timeout_ms)
+        return parse_keyword_download_file(tmp_path)
     finally:
         try:
-            page.remove_listener("response", _on_response)
+            tmp_path.unlink(missing_ok=True)
         except Exception:  # noqa: BLE001
             pass
 
-    data = captured.get("data")
-    if data is None:
-        raise RuntimeError(f"'{seed}' 조회 응답을 못 받았습니다(XHR 미포착)")
-    return parse_keyword_response(data)
+
+#: 실측(2026-09-23): 헤드리스(`headless=True`)로 이 페이지에서 "전체 다운로드"를
+#: 받으면 다운로드 저장 직전에 브라우저가 통째로 닫히는 문제가 재현됐다(같은
+#: 프로필을 화면에 띄운 상태로는 최소 1회 조회가 성공했다). 원인이 100% 확정될
+#: 때까지는 화면 밖으로 창을 옮겨 띄우는 `offscreen` 모드를 기본으로 쓴다 —
+#: 실제 화면에는 안 보이면서도 진짜 창이 있는 헤드풀 모드라 다운로드가 이전에
+#: 성공했던 경로와 같다.
+OFFSCREEN_ARGS = ["--window-position=-32000,-32000", "--window-size=1280,900"]
 
 
-def open_keyword_tool_page(profile_dir: str | Path | None = None, headless: bool = False):
+def open_keyword_tool_page(
+    profile_dir: str | Path | None = None, headless: bool = False, offscreen: bool = True
+):
     """네이버 로그인 프로필로 키워드 도구 창을 연다. 로그아웃/재로그인 절대 금지.
+
+    `headless=True`면 완전 헤드리스로(다운로드가 불안정한 것으로 실측됐으니
+    되도록 `offscreen`을 쓴다). `headless=False`고 `offscreen=True`(기본)면
+    실제 창을 화면 밖(`OFFSCREEN_ARGS`)에 최소화해 띄운다 — 사람 눈에는
+    안 보이지만 헤드리스보다 다운로드가 안정적이다.
 
     반환: `(playwright, context, page, logged_in)`. `logged_in`이 False면
     조회 없이 즉시 닫고 호출 쪽에서 중단해야 한다(로그인 자동 처리 금지).
     """
+    from playwright.sync_api import sync_playwright
+
     from v2r.warehouse import naver_session
 
     path = Path(profile_dir) if profile_dir else naver_session.default_profile_dir()
-    playwright, context, page = naver_session._launch(
-        path, headless=headless, user_agent=naver_session.saved_user_agent(path)
-    )
+    path.mkdir(parents=True, exist_ok=True)
+    user_agent = naver_session.saved_user_agent(path)
+
+    if headless:
+        playwright, context, page = naver_session._launch(path, headless=True, user_agent=user_agent)
+    else:
+        playwright = sync_playwright().start()
+        kwargs: dict[str, Any] = dict(
+            headless=False,
+            viewport={"width": 1280, "height": 900},
+            locale="ko-KR",
+        )
+        if user_agent:
+            kwargs["user_agent"] = user_agent
+        if offscreen:
+            kwargs["args"] = OFFSCREEN_ARGS
+        context = None
+        last_exc: Exception | None = None
+        for channel in ("chrome", "msedge", None):
+            try:
+                kw = dict(kwargs)
+                if channel:
+                    kw["channel"] = channel
+                context = playwright.chromium.launch_persistent_context(str(path), **kw)
+                break
+            except Exception as exc:  # noqa: BLE001 - 다음 채널 시도
+                last_exc = exc
+        if context is None:
+            playwright.stop()
+            raise RuntimeError(f"브라우저를 열 수 없습니다: {last_exc}")
+        page = context.pages[0] if context.pages else context.new_page()
+
     logged_in = naver_session.has_login_cookies(naver_session._cookies(context))
     return playwright, context, page, logged_in
 
@@ -332,17 +434,24 @@ def discover(
     brand: str,
     seeds: list[str],
     guide_keywords: list[str],
-    fetch_fn: Callable[[str, int], list[KeywordRow]],
+    fetch_fn: Callable[[list[str], int], list[KeywordRow]],
     db_path: str | Path,
     target: int = DEFAULT_TARGET,
     max_depth: int = DEFAULT_MAX_DEPTH,
     session_cap: int = DEFAULT_SESSION_CAP,
+    batch_size: int = SEED_BATCH_SIZE,
     delay_range: tuple[float, float] = (MIN_DELAY_SEC, MAX_DELAY_SEC),
     sleep_fn: Callable[[float], None] = time.sleep,
     rest_fn: Callable[[float], None] | None = None,
     rest_sec: float = DEFAULT_REST_SEC,
 ) -> DiscoveryStats:
-    """씨앗 키워드로 꼬리 물기 BFS. 순수 로직 — `fetch_fn(keyword, depth) -> list[KeywordRow]`만 준다.
+    """씨앗 키워드로 꼬리 물기 BFS. 순수 로직 — 한 번에 최대 `batch_size`개 씨앗을
+
+    묶어 `fetch_fn(keywords, depth) -> list[KeywordRow]`를 부른다(네이버 키워드
+    도구가 한 조회당 최대 5개 씨앗을 받는다, 실측 2026-09-23). 같은 깊이인
+    항목끼리만 묶는다(BFS 단계가 섞이지 않게). 새로 찾은 키워드의 `source_seed`는
+    그 조회에 쓴 씨앗들을 콤마로 이어 적는다(어느 씨앗에서 왔는지 응답이 구분해
+    주지 않는다).
 
     `fetch_fn`이 예외를 던지면(차단 등) 그 자리에서 멈추고 이유를 남긴다.
     한 세션에서 `session_cap`번 조회하면 `rest_fn`(주면)으로 쉬고 계속한다
@@ -355,16 +464,21 @@ def discover(
         existing = store.count(conn)
         stats.collected = existing
         seen: set[str] = set(store.all_keywords(conn))
-        queue: list[tuple[str, str, int]] = []  # (keyword, source_seed, depth)
+        queue: list[tuple[str, int]] = []  # (keyword, depth)
         for s in seeds:
             s = str(s or "").strip()
             if s and s not in seen:
-                queue.append((s, s, 0))
+                queue.append((s, 0))
                 seen.add(s)
 
         session_count = 0
         while queue and stats.collected < target:
-            keyword, source_seed, depth = queue.pop(0)
+            depth = queue[0][1]
+            batch: list[str] = []
+            while queue and len(batch) < batch_size and queue[0][1] == depth:
+                batch.append(queue.pop(0)[0])
+            source_seed = ",".join(batch)
+
             if session_count >= session_cap:
                 if rest_fn is None:
                     stats.stopped_reason = "세션 조회 상한 도달(휴식 없음 — 테스트/일회성 호출)"
@@ -372,10 +486,10 @@ def discover(
                 rest_fn(rest_sec)
                 session_count = 0
             try:
-                related = fetch_fn(keyword, depth)
+                related = fetch_fn(batch, depth)
             except Exception as exc:  # noqa: BLE001
                 stats.stopped_reason = f"조회 실패(차단 가능성): {exc}"
-                log.warning("키워드 도구 조회 중단(%s, 씨앗=%s): %s", brand, keyword, exc)
+                log.warning("키워드 도구 조회 중단(%s, 씨앗=%s): %s", brand, batch, exc)
                 break
             stats.queries += 1
             session_count += 1
@@ -398,7 +512,7 @@ def discover(
                     }
                 )
                 if depth + 1 <= max_depth:
-                    queue.append((kr.keyword, source_seed, depth + 1))
+                    queue.append((kr.keyword, depth + 1))
                 if stats.collected + len(rows_to_save) >= target:
                     break
             if rows_to_save:
@@ -423,14 +537,40 @@ def db_path_for_brand(brand: str, data_dir: str | Path = "data") -> Path:
     return p
 
 
+def recompute_relevance(db_path: str | Path, guide_keywords: list[str]) -> dict[int, int]:
+    """이미 저장된 키워드의 연관도를 최신 `guide_keywords`로 다시 계산해 저장한다.
+
+    가이드 낱말 목록을 나중에 보강했을 때(예: 정리본 추출 규칙 개선) 브라우저를
+    다시 돌리지 않고 기존 행만 갱신하는 용도. 갱신 후 연관도 분포를 돌려준다.
+    """
+    store = _store()
+    conn = store.open_db(db_path)
+    try:
+        rows = store.all_rows(conn)
+        updates = [
+            (r["keyword"], compute_relevance(r["keyword"], guide_keywords, r["depth"]))
+            for r in rows
+        ]
+        store.update_relevance(conn, updates)
+        return store.relevance_distribution(conn)
+    finally:
+        conn.close()
+
+
 def run_for_brand(
     rt: Any,
     brand: str,
     target: int = DEFAULT_TARGET,
     headless: bool = False,
+    offscreen: bool = True,
     account_id: str = "",
 ) -> dict[str, Any]:
-    """실행기에서 부르는 진입점. 실 브라우저로 씨앗→BFS 전체를 돈다."""
+    """실행기에서 부르는 진입점. 실 브라우저로 씨앗→BFS 전체를 돈다.
+
+    기본값은 화면 밖 창(`offscreen=True`, `headless=False`) — 헤드리스는
+    실측(2026-09-23)에서 다운로드 저장 직전에 브라우저가 닫히는 문제가
+    있었다. PC 화면에는 보이지 않는다.
+    """
     from v2r.warehouse import naver_session
 
     cfg = getattr(rt, "sources_cfg", None)
@@ -444,7 +584,7 @@ def run_for_brand(
 
     acct = account_id or "685753"
     playwright, context, page, logged_in = open_keyword_tool_page(
-        profile_dir=naver_session.default_profile_dir(), headless=headless
+        profile_dir=naver_session.default_profile_dir(), headless=headless, offscreen=offscreen
     )
     try:
         if not logged_in:
@@ -454,8 +594,10 @@ def run_for_brand(
                 "scripts\\naver-login.cmd 로 직접 로그인해 주세요.",
             }
 
-        def _fetch(keyword: str, depth: int) -> list[KeywordRow]:
-            return fetch_related_keywords(page, keyword, acct)
+        download_dir = repo / "data" / "keywords" / "_tmp"
+
+        def _fetch(keywords: list[str], depth: int) -> list[KeywordRow]:
+            return fetch_related_keywords(page, keywords, acct, download_dir=download_dir)
 
         db_path = db_path_for_brand(brand, repo / "data")
         stats = discover(
@@ -488,6 +630,9 @@ __all__ = [
     "KeywordRow",
     "DiscoveryStats",
     "parse_keyword_response",
+    "parse_keyword_download_rows",
+    "parse_keyword_download_file",
+    "SEED_BATCH_SIZE",
     "seeds_from_sheet",
     "extract_guide_keywords",
     "compute_relevance",
@@ -495,5 +640,6 @@ __all__ = [
     "open_keyword_tool_page",
     "discover",
     "db_path_for_brand",
+    "recompute_relevance",
     "run_for_brand",
 ]

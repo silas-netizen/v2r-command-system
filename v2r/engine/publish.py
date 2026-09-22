@@ -1484,13 +1484,20 @@ def _last_published_account_today(rt: Runtime, cafe_name: str) -> str:
     재시작 직후에도 순번이 처음부터 다시 돌지 않도록, 있으면 그 계정 바로
     다음부터 이어간다 (사용자 지시 2026-09-22). 없으면 빈 문자열.
     """
+    # 실측(2026-09-23, 자정~오전 9시 KST 사이): `date(created_at)`는 SQLite가
+    # created_at의 "+09:00" 오프셋을 무시하고 UTC로 계산해, KST로는 이미 오늘인데
+    # UTC로는 아직 어제라 "오늘 발행"을 못 찾는 버그가 있었다(`date('now','localtime')`은
+    # OS 로컬 시간대 기준이라 이 머신에서 KST와 우연히 같을 뿐, created_at 쪽은 여전히
+    # UTC로 잘못 계산됨). `now_iso()`가 항상 `YYYY-MM-DD`로 시작하는 KST ISO 문자열을
+    # 쓰므로, SQLite 시간대 함수 대신 문자열 앞 10자로 직접 비교한다.
+    today_kst = datetime.now(KST).strftime("%Y-%m-%d")
     try:
         row = rt.conn.execute(
             "SELECT account FROM publications"
-            " WHERE cafe = ? AND date(created_at) = date('now', 'localtime')"
+            " WHERE cafe = ? AND substr(created_at, 1, 10) = ?"
             " AND account IS NOT NULL AND account != ''"
             " ORDER BY created_at DESC, rowid DESC LIMIT 1",
-            (cafe_name,),
+            (cafe_name, today_kst),
         ).fetchone()
     except Exception:  # noqa: BLE001 - DB 조회 실패는 그냥 기본 시작점을 쓴다
         return ""

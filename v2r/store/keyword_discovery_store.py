@@ -67,6 +67,28 @@ def count(conn: sqlite3.Connection) -> int:
     return int(conn.execute("SELECT COUNT(*) FROM keywords").fetchone()[0])
 
 
+def all_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """전체 행(키워드·깊이 등 포함) — 연관도 재계산 등에서 쓴다."""
+    rows = conn.execute(
+        "SELECT keyword, pc, mobile, total, source_seed, depth, relevance, collected_at FROM keywords"
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def update_relevance(conn: sqlite3.Connection, updates: list[tuple[str, int]]) -> int:
+    """`[(keyword, relevance), ...]` 로 연관도만 갱신한다(가이드 낱말이 나중에
+    보강됐을 때 재계산용). 바뀐 행 수를 돌려준다."""
+    n = 0
+    for keyword, relevance in updates:
+        cur = conn.execute(
+            "UPDATE keywords SET relevance = ? WHERE keyword = ? AND relevance != ?",
+            (int(relevance), str(keyword), int(relevance)),
+        )
+        n += cur.rowcount
+    conn.commit()
+    return n
+
+
 def all_keywords(conn: sqlite3.Connection) -> list[str]:
     return [row[0] for row in conn.execute("SELECT keyword FROM keywords")]
 

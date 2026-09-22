@@ -85,7 +85,9 @@ def test_all_tasks_covered_by_tests():
     # + 새 모양 보고서 2건(daily_report·progress_report, 2026-09-22)
     # + 키워드 노출 현황 1건(keyword_exposure, 2026-09-22)
     # + 채널 연결 점검 2건(slack_check·telegram_check, 2026-09-22)
-    assert len(ALLOWED_TASKS) == 44
+    # + 노출 순환기 3건(exposure_cycle_start·exposure_cycle_stop·exposure_cycle_status, 2026-09-22)
+    # + 키워드 발굴 2건(keyword_discovery·keyword_discovery_status, 2026-09-22)
+    assert len(ALLOWED_TASKS) == 49
 
 
 def test_wash_photos_count():
