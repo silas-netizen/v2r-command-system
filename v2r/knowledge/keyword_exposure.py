@@ -1186,6 +1186,116 @@ def is_our_cafe_url(url: str, registry: list[dict]) -> bool:
     return False
 
 
+#: 실제 통검 결과 링크는 카페번호가 아니라 **URL 별칭**(영문, 예:
+#: `cafe.naver.com/llchyll/12345?art=<jwt>`) 형태다. `config/cafes.yaml`은
+#: 카페번호와 한국어 표시 이름만 알고 있어(2026-09-23 재현율 시험에서 발견)
+#: `is_our_cafe_url`만으로는 후보를 거의 못 찾는다 — 별칭을 실제로 찾아
+#: 카페번호로 바꿔 봐야 한다.
+_RE_CAFE_ALIAS = re.compile(r"cafe\.naver\.com/(?!ca-fe/)([A-Za-z0-9_\-]{2,})", re.I)
+_RE_CLUBID = re.compile(r"clubid=(\d+)", re.I)
+#: 별칭→카페번호 조회 결과 캐시(data/ 아래) — 카페-별칭 결합은 거의 안 바뀐다
+CAFE_ALIAS_CACHE_FILE = "exposure_cafe_alias_cache.json"
+
+
+def cafe_alias_from_url(url: str) -> str:
+    """카페 글 URL에서 별칭(영문 URL 경로 첫 조각)을 뽑는다. 못 찾으면 빈 문자열."""
+    m = _RE_CAFE_ALIAS.search(str(url or ""))
+    alias = m.group(1) if m else ""
+    if alias.lower() in ("m", "articleread.nhn", "cafeprofile.nhn"):
+        return ""
+    return alias
+
+
+def _alias_cache_path(rt: Any) -> Path:
+    return Path(rt.settings.data_dir) / CAFE_ALIAS_CACHE_FILE
+
+
+def _alias_cache_load(rt: Any) -> dict:
+    p = _alias_cache_path(rt)
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _alias_cache_save(rt: Any, data: dict) -> None:
+    p = _alias_cache_path(rt)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, p)
+
+
+def resolve_cafe_alias_id(
+    rt: Any, alias: str, cookies: dict[str, str] | None = None, timeout: float = 8.0
+) -> int | None:
+    """카페 URL 별칭 → 카페번호(clubid). `https://cafe.naver.com/<별칭>` 페이지의
+    `clubid=` 값을 읽는다(회원이 아니어도 보이는 페이지엔 대개 있다). 캐시.
+    실패/못 찾으면 `None`(캐시에도 `None`으로 남겨 매번 다시 조회하지 않는다).
+    """
+    if not alias:
+        return None
+    cache = _alias_cache_load(rt)
+    if alias in cache:
+        return cache[alias]
+    cid: int | None = None
+    try:
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            )
+        }
+        resp = httpx.get(
+            f"https://cafe.naver.com/{alias}",
+            cookies=cookies or {}, headers=headers, timeout=timeout, follow_redirects=True,
+        )
+        m = _RE_CLUBID.search(resp.text)
+        if m:
+            cid = int(m.group(1))
+    except Exception as exc:
+        log.warning("카페 별칭(%s) 조회 실패: %s", alias, exc)
+    cache[alias] = cid
+    _alias_cache_save(rt, cache)
+    return cid
+
+
+#: 카페 "홈"/클러스터 카드 링크(글이 아니라 카페 전체)는 후보로 열어봐야
+#: 소용없다 — 실제 글 링크(번호가 붙은 경로 또는 ca-fe/cafes/.../articles/...)만
+#: 후보로 삼는다(2026-09-23 재현율 시험에서 발견: 카페 홈 링크가 섞여 있었다).
+_RE_CAFE_ARTICLE_LIKE = re.compile(
+    r"cafe\.naver\.com/(?:ca-fe/cafes/\d+/articles/\d+|[^/?]+/\d+)", re.I
+)
+
+
+def looks_like_cafe_article_url(url: str) -> bool:
+    """이 URL이 카페 "글"(번호 붙은 게시물)처럼 보이는가 — 카페 홈은 제외."""
+    return bool(_RE_CAFE_ARTICLE_LIKE.search(str(url or "")))
+
+
+def is_our_cafe_candidate(
+    rt: Any, url: str, registry: list[dict], cookies: dict[str, str] | None = None
+) -> bool:
+    """이 통검 결과 링크가 우리 제휴·자사 카페 소속 후보인가.
+
+    먼저 `is_our_cafe_url`(카페번호 경로·등록된 별칭)로 빠르게 보고, 아니면
+    URL의 별칭을 실제로 조회(`resolve_cafe_alias_id`, 캐시됨)해 카페번호가
+    레지스트리에 있는지 확인한다 — 통검 결과 링크는 거의 다 별칭 형태라 이
+    2단계가 없으면 후보를 거의 못 찾는다(2026-09-23 재현율 시험에서 발견).
+    """
+    if is_our_cafe_url(url, registry):
+        return True
+    alias = cafe_alias_from_url(url)
+    if not alias:
+        return False
+    cid = resolve_cafe_alias_id(rt, alias, cookies=cookies)
+    if cid is None:
+        return False
+    return any(c.get("cafe_id") == cid for c in registry)
+
+
 def extract_ordered_result_links(html: str) -> list[dict]:
     """통검 최종 DOM에서 문서 링크를 화면(작성 순서) 순서대로(중복 제거)."""
     seen: set[str] = set()
@@ -1269,7 +1379,13 @@ def fetch_article_text(
     """글 상세(댓글 포함) 페이지 텍스트. Playwright(네이버 프로필, headless)로 연다.
 
     카페 글은 본문·댓글이 `cafe_main` iframe 안에 있는 경우가 많아 그 프레임을
-    우선 읽고, 없으면 메인 프레임을 읽는다. 실패 시 예외.
+    우선 읽고, 없으면 메인 프레임을 읽는다.
+
+    2026-09-23 재현율 시험에서 발견: `cafe_main` 프레임은 바로 안 뜬다(SPA가
+    비동기로 붙인다) — 800ms만 기다리면 프레임을 못 찾거나(빈 텍스트) 댓글이
+    아직 안 붙은 채로 읽힌다. 프레임을 최대 5번(500ms 간격) 찾아보고,
+    찾으면 그 프레임이 `networkidle`(댓글 API 포함)까지 갈 때까지 기다린다.
+    실패 시 예외.
     """
     from playwright.sync_api import sync_playwright
 
@@ -1280,12 +1396,23 @@ def fetch_article_text(
             context = browser.new_context(storage_state=storage_state)
             page = context.new_page()
             page.goto(url, timeout=15000, wait_until="domcontentloaded")
-            page.wait_for_timeout(800)
             frame = None
-            try:
-                frame = page.frame(name="cafe_main")
-            except Exception:
-                frame = None
+            for _ in range(5):
+                try:
+                    frame = page.frame(name="cafe_main")
+                except Exception:
+                    frame = None
+                if frame is not None:
+                    break
+                page.wait_for_timeout(500)
+            if frame is not None:
+                try:
+                    frame.wait_for_load_state("networkidle", timeout=8000)
+                except Exception:
+                    pass
+                frame.wait_for_timeout(1200)
+            else:
+                page.wait_for_timeout(1500)
             target = frame or page.main_frame
             return target.inner_text("body")
         finally:
@@ -1364,6 +1491,7 @@ def judge_keyword_exposure(
     )
     registry = cafe_registry if cafe_registry is not None else load_cafe_registry(rt)
     idents = identifiers if identifiers is not None else brand_identifiers(rt, brand)
+    cookies = _cookie_dict(cookies_path) if cookies_path else {}
 
     try:
         html = dom_html if dom_html is not None else fetch_integrated_search_dom(query, cookies_path=cookies_path)
@@ -1376,7 +1504,10 @@ def judge_keyword_exposure(
 
     ordered = extract_ordered_result_links(html)
     candidates = [
-        (i + 1, item) for i, item in enumerate(ordered) if is_our_cafe_url(item["url"], registry)
+        (i + 1, item)
+        for i, item in enumerate(ordered)
+        if looks_like_cafe_article_url(item["url"])
+        and is_our_cafe_candidate(rt, item["url"], registry, cookies=cookies)
     ]
 
     opened = 0
@@ -1444,6 +1575,11 @@ __all__ = [
     "MAX_CANDIDATES_TO_OPEN",
     "load_cafe_registry",
     "is_our_cafe_url",
+    "cafe_alias_from_url",
+    "resolve_cafe_alias_id",
+    "is_our_cafe_candidate",
+    "looks_like_cafe_article_url",
+    "CAFE_ALIAS_CACHE_FILE",
     "extract_ordered_result_links",
     "brand_identifiers",
     "cached_verdict",

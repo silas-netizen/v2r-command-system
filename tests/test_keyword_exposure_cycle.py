@@ -132,6 +132,78 @@ def test_is_our_cafe_url_카페번호로_판별():
     assert not ke.is_our_cafe_url("https://blog.naver.com/someone/1", REGISTRY)
 
 
+# --------------------------------------------------------------------
+# 2026-09-23 재현율 시험에서 발견: 실제 통검 결과 링크는 카페번호가 아니라
+# 별칭(alias, 영문) 경로다 — 별칭→카페번호 조회 경로
+# --------------------------------------------------------------------
+def test_cafe_alias_from_url():
+    assert ke.cafe_alias_from_url("https://cafe.naver.com/llchyll/12345?art=abc") == "llchyll"
+    assert ke.cafe_alias_from_url("https://cafe.naver.com/ca-fe/cafes/555/articles/1") == ""
+    assert ke.cafe_alias_from_url("https://blog.naver.com/someone/1") == ""
+    assert ke.cafe_alias_from_url("https://cafe.naver.com/m/") == ""
+
+
+def test_resolve_cafe_alias_id_캐시(tmp_path, monkeypatch):
+    rt = make_runtime(tmp_path)
+    rt.settings.repo_root = tmp_path
+    calls = []
+
+    class FakeResp:
+        text = "... clubid=555 ..."
+
+    import httpx as _httpx
+
+    def fake_get(url, cookies=None, headers=None, timeout=8.0, follow_redirects=True):
+        calls.append(url)
+        return FakeResp()
+
+    monkeypatch.setattr(_httpx, "get", fake_get)
+    assert ke.resolve_cafe_alias_id(rt, "mycafe") == 555
+    assert ke.resolve_cafe_alias_id(rt, "mycafe") == 555  # 캐시로 재사용
+    assert len(calls) == 1
+
+
+def test_resolve_cafe_alias_id_못찾으면_None_캐시(tmp_path, monkeypatch):
+    rt = make_runtime(tmp_path)
+    rt.settings.repo_root = tmp_path
+
+    class FakeResp:
+        text = "회원이 아닙니다"
+
+    import httpx as _httpx
+
+    monkeypatch.setattr(_httpx, "get", lambda *a, **kw: FakeResp())
+    assert ke.resolve_cafe_alias_id(rt, "othercafe") is None
+
+
+def test_is_our_cafe_candidate_빠른경로_먼저(tmp_path):
+    rt = make_runtime(tmp_path)
+    rt.settings.repo_root = tmp_path
+    # 등록된 별칭("mycafe")이면 네트워크 없이도 바로 확정
+    assert ke.is_our_cafe_candidate(rt, OUR_URL, REGISTRY) is True
+
+
+def test_looks_like_cafe_article_url_카페홈은_제외():
+    assert ke.looks_like_cafe_article_url("https://cafe.naver.com/cantsb/3566853?art=abc")
+    assert ke.looks_like_cafe_article_url("https://cafe.naver.com/ca-fe/cafes/555/articles/1")
+    assert not ke.looks_like_cafe_article_url("https://cafe.naver.com/cantsb")
+    assert not ke.looks_like_cafe_article_url("https://cafe.naver.com/")
+
+
+def test_is_our_cafe_candidate_별칭_조회로_확정(tmp_path, monkeypatch):
+    rt = make_runtime(tmp_path)
+    rt.settings.repo_root = tmp_path
+    registry_no_alias = [{"name": "마이카페", "cafe_id": 555, "aliases": []}]
+    monkeypatch.setattr(ke, "resolve_cafe_alias_id", lambda rt_, alias, cookies=None: 555 if alias == "llchyll" else None)
+
+    assert ke.is_our_cafe_candidate(
+        rt, "https://cafe.naver.com/llchyll/12345?art=abc", registry_no_alias
+    ) is True
+    assert ke.is_our_cafe_candidate(
+        rt, "https://cafe.naver.com/othercafe/1", registry_no_alias
+    ) is False
+
+
 def test_extract_ordered_result_links_화면_순서대로_중복제거():
     html = f"""
     <a href="https://blog.naver.com/a/1">블로그</a>
@@ -205,6 +277,29 @@ def test_judge_keyword_exposure_후보중_확정되면_노출완(tmp_path, monke
     assert out["candidates"] == 1  # 다른카페는 등록 카페가 아니라 후보 아님
     assert out["opened"] == 1
     assert out["matched_url"] == OUR_URL
+
+
+def test_judge_keyword_exposure_카페홈_링크는_후보에서_제외(tmp_path, monkeypatch):
+    """카페 홈(글 번호 없음) 링크가 검색 결과에 섞여 있어도 후보로 열지 않는다
+    (2026-09-23 재현율 시험에서 실제로 섞여 있는 걸 발견)."""
+    rt = make_runtime(tmp_path)
+    rt.settings.repo_root = tmp_path
+    html = f"""
+    <a href="https://cafe.naver.com/mycafe">카페 홈</a>
+    <a href="{OUR_URL}">우리 글</a>
+    """
+    monkeypatch.setattr(ke, "load_cafe_registry", lambda rt_: REGISTRY)
+    monkeypatch.setattr(ke, "brand_identifiers", lambda rt_, brand: IDENTS)
+    opened_urls = []
+    monkeypatch.setattr(
+        ke, "confirm_our_article",
+        lambda rt_, brand, url, idents, **kw: opened_urls.append(url) or (url == OUR_URL),
+    )
+    out = ke.judge_keyword_exposure(
+        rt, "우아덤", "비건세제", dom_html=html, search_query="비건세제", sleep_fn=lambda s: None,
+    )
+    assert out["candidates"] == 1  # 카페 홈은 후보에서 빠지고 글 링크만 남는다
+    assert opened_urls == [OUR_URL]
 
 
 def test_judge_keyword_exposure_후보있어도_식별어없으면_밀려남(tmp_path, monkeypatch):
