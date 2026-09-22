@@ -7,6 +7,18 @@
 catch_up_minutes: null   # 전체 기본값
 
 entries:
+  # 브랜드 키워드 발굴(꼬리 물기 BFS) 일괄 — 브랜드 5개 순차, main 스코프(무거운
+  # 작업이라 사이드카가 아닌 발행 줄에서 돈다). 09:00 발행 전 끝나야 해서 01:00에
+  # 시작하고 최대 6시간 상한(worker.KEYWORD_DISCOVERY_ALL_MAX_SEC)을 둔다.
+  # 같은 네이버 프로필(data/browser-profile-naver)을 여는 다른 작업(노출 순환기,
+  # 예약 "네이버 세션 점검")과는 naver_session의 프로세스 간 파일 잠금
+  # (data/locks/naver-profile.lock)으로 자동으로 순서를 맞춘다.
+  - name: 키워드 발굴 전체
+    time: "01:00"
+    days: daily
+    enabled: true
+    command: 키워드 발굴 전체 500개
+
   - name: 아침 일상 글
     time: "09:00"
     days: daily
@@ -147,3 +159,13 @@ entries:
     days: [sun]
     enabled: true
     command: 정기 정비
+
+  # 밀려남 키워드 → 브랜드 원고 대량 생성 (2026-09-23). 요금제 길만 쓰고
+  # (config/bulk.yaml allow_paid_fallback: false) 09:00 전에 끝나도록 작게
+  # 시작한다. 상한 5시간(요금제 창) 안에 끝나지 않아도 다음 발행에 지장 없게
+  # 새벽 시간을 골랐다.
+  - name: 대량 원고 새벽 배치
+    time: "02:10"
+    days: daily
+    enabled: true
+    command: 대량 원고 전체 20건

@@ -19,8 +19,11 @@
 
 from __future__ import annotations
 
+import contextlib
+import datetime as _dt
 import json
 import logging
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -113,10 +116,146 @@ def export_cookies(cookies: list[dict[str, Any]], path: Path, extra_targets: lis
     return len(picked)
 
 
+# --- 프로세스 간 파일 잠금 ----------------------------------------------------
+# 문제(docs/reports/keyword-discovery-2026-09-22.md 3절): 키워드 발굴, 노출
+# 순환기, 예약 "네이버 세션 점검"이 동시에 `data/browser-profile-naver`를 열어
+# Chromium 프로필 잠금 충돌로 브라우저가 통째로 닫혔다. 같은 프로필을 여는
+# 모든 경로(_launch/_close)가 이 잠금을 자동으로 거쳐 줄을 선다.
+LOCK_DIR_NAME = "locks"
+LOCK_FILENAME = "naver-profile.lock"
+#: 최대 대기(초) — 이 안에 잠금을 못 얻으면 포기하고 예외를 던진다(무한 대기 금지)
+LOCK_MAX_WAIT_SEC = 10 * 60
+LOCK_POLL_SEC = 2.0
+#: 잠글 바이트 위치 — 내용(JSON, offset 0부터)과 겹치면 다른 프로세스가 그 파일을
+#: '읽기'만 해도 Windows에서 공유 위반(PermissionError)이 난다. 내용과 절대 안
+#: 겹치게 파일 앞부분 훨씬 뒤(EOF 너머도 잠글 수 있다)를 잠근다.
+LOCK_BYTE_OFFSET = 4096
+
+
+class ProfileLockTimeout(RuntimeError):
+    """네이버 프로필 잠금을 제한 시간 안에 얻지 못했을 때."""
+
+
+def lock_file_path() -> Path:
+    return _data_dir() / LOCK_DIR_NAME / LOCK_FILENAME
+
+
+def _pid_alive(pid: int) -> bool:
+    """Windows에서 pid가 아직 살아 있는지(못 확인하면 보수적으로 True)."""
+    if pid <= 0:
+        return False
+    try:
+        import ctypes
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)  # type: ignore[attr-defined]
+        if not handle:
+            return False
+        ctypes.windll.kernel32.CloseHandle(handle)  # type: ignore[attr-defined]
+        return True
+    except Exception:
+        return True
+
+
+def _read_lock_info(path: Path) -> dict[str, Any] | None:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _reclaim_if_dead(path: Path) -> None:
+    """죽은 프로세스가 남긴 잠금 파일이면 지워서 회수한다."""
+    info = _read_lock_info(path)
+    if not info:
+        return
+    holder_pid = int(info.get("pid") or 0)
+    if holder_pid and holder_pid != os.getpid() and not _pid_alive(holder_pid):
+        try:
+            path.unlink(missing_ok=True)
+            log.warning("죽은 프로세스(pid=%s)가 남긴 네이버 프로필 잠금을 회수했습니다", holder_pid)
+        except Exception:
+            pass
+
+
+class ProfileLock:
+    """`data/locks/naver-profile.lock`을 잡은 동안의 핸들. `release()`로 놓는다."""
+
+    def __init__(self, fd: int, path: Path):
+        self._fd = fd
+        self._path = path
+        self._released = False
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        try:
+            import msvcrt
+
+            os.lseek(self._fd, LOCK_BYTE_OFFSET, os.SEEK_SET)
+            with contextlib.suppress(Exception):
+                msvcrt.locking(self._fd, msvcrt.LK_UNLCK, 1)
+        except Exception:
+            pass
+        try:
+            os.close(self._fd)
+        except Exception:
+            pass
+        try:
+            info = _read_lock_info(self._path)
+            if info and int(info.get("pid") or -1) == os.getpid():
+                self._path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def acquire_profile_lock(purpose: str, max_wait: float = LOCK_MAX_WAIT_SEC) -> ProfileLock:
+    """잠금을 얻을 때까지 최대 `max_wait`초 기다린다. 못 얻으면 `ProfileLockTimeout`.
+
+    잠금 보유자 pid·시작 시각·용도를 lock 파일에 JSON으로 남긴다. 잠금 파일의
+    주인(pid)이 죽어 있으면(예: 강제 종료) 자동으로 회수하고 다시 시도한다.
+    """
+    import msvcrt
+
+    path = lock_file_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + max(float(max_wait), 0.0)
+    while True:
+        _reclaim_if_dead(path)
+        fd = os.open(str(path), os.O_CREAT | os.O_RDWR | os.O_BINARY)
+        try:
+            os.lseek(fd, LOCK_BYTE_OFFSET, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        except OSError:
+            os.close(fd)
+        else:
+            info = {
+                "pid": os.getpid(),
+                "started_at": _dt.datetime.now().isoformat(timespec="seconds"),
+                "purpose": purpose,
+            }
+            payload = json.dumps(info, ensure_ascii=False).encode("utf-8")
+            try:
+                os.ftruncate(fd, 0)
+                os.lseek(fd, 0, os.SEEK_SET)
+                os.write(fd, payload)
+            except Exception:
+                pass
+            return ProfileLock(fd, path)
+        if time.monotonic() >= deadline:
+            raise ProfileLockTimeout(
+                f"네이버 프로필 잠금을 {max_wait:.0f}초 안에 얻지 못했습니다"
+                f"(현재 보유자: {_read_lock_info(path)}, 용도: {purpose})"
+            )
+        time.sleep(LOCK_POLL_SEC)
+
+
 # --- 브라우저 -----------------------------------------------------------------
-def _launch(path: Path, headless: bool, user_agent: str | None = None):
+def _launch(path: Path, headless: bool, user_agent: str | None = None, purpose: str = ""):
     from playwright.sync_api import sync_playwright
 
+    lock = acquire_profile_lock(purpose or "naver_session")
     path.mkdir(parents=True, exist_ok=True)
     playwright = sync_playwright().start()
     last_exc: Exception | None = None
@@ -138,12 +277,22 @@ def _launch(path: Path, headless: bool, user_agent: str | None = None):
             last_exc = exc
     if context is None:
         playwright.stop()
+        lock.release()
         raise RuntimeError(f"브라우저를 열 수 없습니다: {last_exc}")
     page = context.pages[0] if context.pages else context.new_page()
+    try:
+        context._v2r_profile_lock = lock  # type: ignore[attr-defined]
+    except Exception:
+        pass
     return playwright, context, page
 
 
 def _close(playwright, context, page) -> None:
+    lock = None
+    try:
+        lock = getattr(context, "_v2r_profile_lock", None)
+    except Exception:
+        lock = None
     for fn in (
         lambda: page and page.close(),
         lambda: context and context.close(),
@@ -153,6 +302,8 @@ def _close(playwright, context, page) -> None:
             fn()
         except Exception:
             pass
+    if lock is not None:
+        lock.release()
 
 
 def _cookies(context) -> list[dict[str, Any]]:
@@ -177,7 +328,7 @@ def _looks_logged_out(page) -> bool:
 def login_interactive(profile_dir: str | Path | None = None, timeout: int = LOGIN_TIMEOUT) -> bool:
     """보이는 창을 띄우고 사용자가 로그인할 때까지 기다린다. 성공 시 쿠키 내보내기."""
     path = Path(profile_dir) if profile_dir is not None else default_profile_dir()
-    playwright, context, page = _launch(path, headless=False)
+    playwright, context, page = _launch(path, headless=False, purpose="login_interactive")
     try:
         if has_login_cookies(_cookies(context)):
             # 이미 로그인돼 있으면 확인만 하고 연장
@@ -294,7 +445,9 @@ def _check_once(path: Path) -> dict:
     out: dict[str, Any] = {"ok": True, "logged_in": False, "profile": str(path), "note": ""}
     playwright = context = page = None
     try:
-        playwright, context, page = _launch(path, headless=True, user_agent=saved_user_agent(path))
+        playwright, context, page = _launch(
+            path, headless=True, user_agent=saved_user_agent(path), purpose="naver_session_check"
+        )
         before = _cookies(context)
         if not has_login_cookies(before):
             out["note"] = "로그인 쿠키(NID_AUT/NID_SES) 없음 → 풀림"

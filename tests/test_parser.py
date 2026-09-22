@@ -64,6 +64,7 @@ def test_legacy_example_sentence():
         ("현황판 갱신", "dashboard"),
         ("우아덤 원고 1개 만들어줘", "generate_brand"),
         ("정기 정비", "maintenance"),
+        ("키워드 발굴 전체 500개", "keyword_discovery_all"),
     ],
 )
 def test_each_task_pattern(text, task):
@@ -87,7 +88,9 @@ def test_all_tasks_covered_by_tests():
     # + 채널 연결 점검 2건(slack_check·telegram_check, 2026-09-22)
     # + 노출 순환기 3건(exposure_cycle_start·exposure_cycle_stop·exposure_cycle_status, 2026-09-22)
     # + 키워드 발굴 2건(keyword_discovery·keyword_discovery_status, 2026-09-22)
-    assert len(ALLOWED_TASKS) == 49
+    # + 대량 원고 3건(bulk_generate·bulk_generate_all·bulk_generate_status, 다른 작업과 동시 진행)
+    # + 키워드 발굴 전체 1건(keyword_discovery_all, 2026-09-23 — 잠금·헤드리스 작업과 함께)
+    assert len(ALLOWED_TASKS) == 53
 
 
 def test_wash_photos_count():

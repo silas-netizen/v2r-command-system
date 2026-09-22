@@ -25,6 +25,9 @@ TASK_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     # 키워드 발굴 (`우아덤 키워드 발굴 1000개` / `키워드 발굴 현황`) — 노출 패턴 뒤,
     # 일반 status 패턴보다는 앞에 둔다
     ("keyword_discovery_status", re.compile(r"키워드\s*발굴\s*현황")),
+    # 예약 "키워드 발굴 전체 500개" — 브랜드 5개를 순차로 도는 일괄 발굴.
+    # 특정 브랜드용 `keyword_discovery`(예: "우아덤 키워드 발굴 1000개")보다 먼저 본다.
+    ("keyword_discovery_all", re.compile(r"키워드\s*발굴\s*전체")),
     ("keyword_discovery", re.compile(r"키워드\s*발굴")),
     ("pending_report", re.compile(r"미처리\s*(알림|목록|보고|리스트)")),
     # 새 모양 보고서(2026-09-22): 어제 기준 일일 보고 / 오늘 기준 중간 보고
@@ -34,6 +37,11 @@ TASK_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("reconcile", re.compile(r"(끊긴|미완료).*(이어|재개|점검)")),
     ("sync_all_sources", re.compile(r"전체\s*(원본|시트).*(동기화|갱신)")),
     ("sync_sources", re.compile(r"(원본|시트).*(동기화|갱신)")),
+    # 대량 원고 생성(밀려남 키워드 대기열, 2026-09-23) — `원고`라는 낱말이 있어
+    # `generate_brand`보다 먼저 봐야 한다. `현황`이 먼저다(조회가 생성으로 안 잡히게).
+    ("bulk_generate_status", re.compile(r"대량\s*원고\s*현황")),
+    ("bulk_generate_all", re.compile(r"대량\s*원고\s*전체")),
+    ("bulk_generate", re.compile(r"대량\s*원고")),
     # 브랜드 원고 생성 (`브랜드 원고 생성 우아덤 1건` / `우아덤 원고 1개 만들어줘`).
     # `일상 글 생성`보다 앞서지만 `원고`라는 낱말이 있어야만 잡힌다.
     ("generate_brand", re.compile(r"원고.*(생성|만들어|작성)|(생성|만들어|작성).*원고")),
@@ -243,6 +251,7 @@ _NO_SLOT_TASKS = frozenset(
         "progress_report",
         "keyword_exposure",
         "keyword_discovery_status",
+        "keyword_discovery_all",
     }
 )
 
@@ -345,6 +354,8 @@ def parse_korean_command(text: str, now: datetime | None = None) -> TaskSpec | N
         spec["count"] = int(m.group(1))
     elif task in PUBLISH_TASKS | {
         "generate_brand",
+        "bulk_generate",
+        "bulk_generate_all",
         "generate_affiliate_daily",
         "generate_daily",
         "collect_daily",
@@ -352,6 +363,7 @@ def parse_korean_command(text: str, now: datetime | None = None) -> TaskSpec | N
         "generate_photos",
         "keyword_exposure",
         "keyword_discovery",
+        "keyword_discovery_all",
     }:
         # `글` 없이 `N개`만 있어도 개수로 인정. 단 계정 수 표현은 먼저 제거한다.
         m = RE_ANY_COUNT.search(RE_ACCOUNT_COUNT.sub(" ", counting))
@@ -504,6 +516,9 @@ TASK_LABELS: dict[str, str] = {
     "sync_all_sources": "전체 원본 동기화",
     "sync_sources": "원본 동기화",
     "generate_brand": "브랜드 원고 생성",
+    "bulk_generate": "대량 원고 생성",
+    "bulk_generate_all": "대량 원고 전체 생성",
+    "bulk_generate_status": "대량 원고 현황",
     "generate_affiliate_daily": "제휴 일상 글 생성(GPT)",
     "generate_daily": "일상 글 생성",
     "collect_daily": "일상 글 수집",

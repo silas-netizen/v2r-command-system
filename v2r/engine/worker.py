@@ -1970,6 +1970,18 @@ def dispatch(rt: Runtime, job: Any, owner: str | None = None) -> dict:
         return {"ok": True, **out}
     if task == "generate_brand":
         return _generate_brand(rt, spec)
+    if task == "bulk_generate":
+        from v2r.content import bulk_generate
+
+        return bulk_generate.generate_for_brand(rt, spec.brand, spec.count or 5)
+    if task == "bulk_generate_all":
+        from v2r.content import bulk_generate
+
+        return bulk_generate.generate_all(rt, spec.count or 5)
+    if task == "bulk_generate_status":
+        from v2r.content import bulk_generate
+
+        return bulk_generate.status(rt)
     if task == "generate_affiliate_daily":
         return _generate_affiliate_daily(rt, spec)
     if task == "generate_daily":
@@ -2066,6 +2078,8 @@ def dispatch(rt: Runtime, job: Any, owner: str | None = None) -> dict:
         return _exposure_cycle_status(rt, spec)
     if task == "keyword_discovery":
         return _keyword_discovery(rt, spec)
+    if task == "keyword_discovery_all":
+        return _keyword_discovery_all(rt, spec)
     if task == "keyword_discovery_status":
         return _keyword_discovery_status(rt, spec)
 
@@ -2125,6 +2139,54 @@ def _keyword_discovery(rt: Runtime, spec: TaskSpec) -> dict:
     except Exception:  # noqa: BLE001
         pass
     return {**out, "message": msg}
+
+
+#: `키워드 발굴 전체 N개` 예약(config/schedule.yaml 01:00, 09:00 발행 전 끝나야 함)의
+#: 상한 시간(초). 브랜드 하나가 오래 걸려도 이 시간을 넘기면 남은 브랜드는 건너뛴다.
+KEYWORD_DISCOVERY_ALL_MAX_SEC = 6 * 60 * 60
+
+
+def _keyword_discovery_all(rt: Runtime, spec: TaskSpec) -> dict:
+    """`키워드 발굴 전체 N개` — 브랜드 5개(`config/command/parser.BRAND_NAMES`)를
+
+    순차로 돈다(같은 네이버 프로필을 쓰므로 동시에 열지 않는다 — `naver_session`
+    잠금이 어차피 순번을 세우지만, 여기서도 명시적으로 순차 호출한다). 브랜드당
+    목표는 `spec.count`(없으면 `naver_keyword_tool.DEFAULT_TARGET`). 전체 상한
+    시간(`KEYWORD_DISCOVERY_ALL_MAX_SEC`, 6시간)을 넘기면 남은 브랜드는 건너뛰고
+    이유를 남긴다 — 09:00 발행 전에 끝나야 한다.
+    """
+    import time as _time
+
+    from v2r.command.parser import BRAND_NAMES
+    from v2r.knowledge import naver_keyword_tool as kt_mod
+
+    target = int(spec.count) or kt_mod.DEFAULT_TARGET
+    deadline = _time.monotonic() + KEYWORD_DISCOVERY_ALL_MAX_SEC
+    results: dict[str, dict] = {}
+    skipped: list[str] = []
+    for brand in BRAND_NAMES:
+        if _time.monotonic() >= deadline:
+            skipped.append(brand)
+            continue
+        try:
+            results[brand] = kt_mod.run_for_brand(rt, brand, target=target)
+        except Exception as exc:  # noqa: BLE001 - 한 브랜드 실패가 나머지를 막지 않는다
+            results[brand] = {"ok": False, "error": f"{exc.__class__.__name__}: {exc}"}
+
+    lines = []
+    for brand, out in results.items():
+        if out.get("ok"):
+            lines.append(f"{brand} 누적 {out.get('collected', 0)}개(조회 {out.get('queries', 0)}회)")
+        else:
+            lines.append(f"{brand} 실패: {out.get('error')}")
+    if skipped:
+        lines.append(f"시간 상한으로 건너뜀: {', '.join(skipped)}")
+    msg = "키워드 발굴 전체: " + " / ".join(lines)
+    try:
+        notify_all(rt.channels, msg)
+    except Exception:  # noqa: BLE001
+        pass
+    return {"ok": True, "message": msg, "per_brand": results, "skipped": skipped}
 
 
 def _keyword_discovery_status(rt: Runtime, spec: TaskSpec) -> dict:

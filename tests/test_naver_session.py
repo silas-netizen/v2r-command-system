@@ -114,3 +114,76 @@ def test_worker_notifies_warning_and_restore(monkeypatch):
     monkeypatch.setattr(worker, "notify_all", lambda channels, text, **kw: sent.append(text))
     worker._naver_keepalive(_RT(), None)
     assert any("백업" in t for t in sent) and any("w1" in t for t in sent)
+
+
+# --- 프로세스 간 파일 잠금 (docs/reports/keyword-discovery-2026-09-22.md 3절) ----
+def test_lock_acquire_and_release(tmp_path, monkeypatch):
+    monkeypatch.setattr(ns, "_data_dir", lambda: tmp_path)
+    lock = ns.acquire_profile_lock("test-purpose")
+    path = ns.lock_file_path()
+    assert path.exists()
+    info = json.loads(path.read_text(encoding="utf-8"))
+    assert info["purpose"] == "test-purpose"
+    import os
+
+    assert info["pid"] == os.getpid()
+    lock.release()
+    assert not path.exists()  # 자기 소유면 놓을 때 파일도 치운다
+
+
+def test_lock_blocks_second_holder_until_release(tmp_path, monkeypatch):
+    monkeypatch.setattr(ns, "_data_dir", lambda: tmp_path)
+    first = ns.acquire_profile_lock("holder-1")
+    with pytest.raises(ns.ProfileLockTimeout):
+        ns.acquire_profile_lock("holder-2", max_wait=0.5)
+    first.release()
+    second = ns.acquire_profile_lock("holder-2", max_wait=5)
+    second.release()
+
+
+def test_lock_reclaims_dead_pid(tmp_path, monkeypatch):
+    monkeypatch.setattr(ns, "_data_dir", lambda: tmp_path)
+    path = ns.lock_file_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # 절대 쓰이지 않을 만큼 큰 가짜 pid를 '죽은 프로세스'로 기록해 둔다
+    path.write_text(json.dumps({"pid": 999_999_999, "started_at": "x", "purpose": "dead"}), encoding="utf-8")
+    lock = ns.acquire_profile_lock("new-holder", max_wait=5)
+    info = json.loads(path.read_text(encoding="utf-8"))
+    assert info["purpose"] == "new-holder"
+    lock.release()
+
+
+def test_launch_and_close_hold_lock(tmp_path, monkeypatch):
+    """`_launch`/`_close`가 잠금을 자동으로 잡고 놓는지 실제 브라우저 없이 확인."""
+    monkeypatch.setattr(ns, "_data_dir", lambda: tmp_path)
+
+    class _FakeContext:
+        pages: list = []
+
+        def new_page(self):
+            return object()
+
+    class _FakePlaywright:
+        class chromium:
+            @staticmethod
+            def launch_persistent_context(*a, **kw):
+                return _FakeContext()
+
+        def stop(self):
+            pass
+
+    class _FakeSyncAPI:
+        @staticmethod
+        def sync_playwright():
+            class _S:
+                def start(self_inner):
+                    return _FakePlaywright()
+
+            return _S()
+
+    monkeypatch.setattr("playwright.sync_api.sync_playwright", _FakeSyncAPI.sync_playwright)
+    path = tmp_path / "browser-profile-naver"
+    playwright, context, page = ns._launch(path, headless=True, purpose="test-launch")
+    assert ns.lock_file_path().exists()
+    ns._close(playwright, context, page)
+    assert not ns.lock_file_path().exists()  # close가 잠금을 놓았다

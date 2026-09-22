@@ -291,6 +291,39 @@ def compute_relevance(keyword: str, guide_keywords: list[str], depth: int) -> in
     return max(2, min(int(depth) + 1, 3))
 
 
+#: "전체 다운로드"가 헤드리스에서 가끔 실패(다운로드 이벤트를 못 받음)하는 것으로
+#: 실측됐다 — 같은 세션(같은 조회 결과)에서 이만큼 재시도한 뒤에도 안 되면 표를
+#: DOM에서 직접 긁는 대안으로 넘어간다.
+DOWNLOAD_RETRY_COUNT = 3
+#: DOM에서 표를 긁을 때 볼 행 선택자 힌트(결과 표의 데이터 행). 실측(2026-09-23):
+#: 결과 표는 `role=row`를 쓰는 그리드이고, 헤더 행 2개를 제외한 나머지가 데이터.
+TABLE_ROW_SELECTOR = "[role='row']"
+
+
+def _scrape_table_rows(page: Any) -> list[KeywordRow]:
+    """`전체 다운로드`가 계속 실패할 때 결과 표를 DOM에서 직접 긁는 대안.
+
+    각 행의 셀 텍스트를 순서대로 읽어 `parse_keyword_download_rows`와 같은
+    열 배치(A=연관키워드, B=PC, C=모바일, ... H=경쟁정도)로 맞춘다.
+    """
+    rows_locator = page.locator(TABLE_ROW_SELECTOR)
+    n = rows_locator.count()
+    raw_rows: list[tuple[Any, ...]] = []
+    for i in range(n):
+        row = rows_locator.nth(i)
+        cells = row.locator("[role='cell'], [role='gridcell'], td, th")
+        cnt = cells.count()
+        if cnt == 0:
+            continue
+        texts = [cells.nth(j).inner_text().strip() for j in range(cnt)]
+        raw_rows.append(tuple(texts))
+    # 헤더로 보이는 행(첫 칸이 "연관키워드" 등 숫자가 아닌 라벨) 앞부분을 건너뛴다.
+    data_rows = [r for r in raw_rows if r and r[0] and not re.match(r"^(연관\s*키워드|번호|No\.?)$", r[0].strip())]
+    return parse_keyword_download_rows([("", ""), *data_rows]) if False else parse_keyword_download_rows(
+        [("_header1",), ("_header2",), *data_rows]
+    )
+
+
 # --- 브라우저 자동화 ------------------------------------------------------
 def fetch_related_keywords(
     page: Any,
@@ -298,6 +331,7 @@ def fetch_related_keywords(
     account_id: str,
     download_dir: str | Path | None = None,
     timeout_ms: int = 20000,
+    download_retries: int = DOWNLOAD_RETRY_COUNT,
 ) -> list[KeywordRow]:
     """씨앗 키워드 최대 `SEED_BATCH_SIZE`(5)개를 한 번에 조회해 연관 키워드를 받는다.
 
@@ -305,6 +339,9 @@ def fetch_related_keywords(
     `"한줄에 하나씩 입력하세요.\\n(최대 5개까지)"`(줄바꿈으로 씨앗 구분, 최대 5개),
     조회 버튼은 정확히 `"조회하기"`. 결과 표를 직접 긁지 않고 `"전체 다운로드"`
     버튼으로 xlsx를 받아 파싱한다(표가 페이지네이션돼 있어도 다운로드는 전체).
+    헤드리스에서 다운로드 이벤트가 가끔 안 잡히는 것으로 실측됐다 — 같은 조회
+    결과를 다시 누르는 방식으로 `download_retries`번까지 재시도하고, 그래도
+    안 되면 결과 표를 DOM에서 직접 긁는다(`_scrape_table_rows`).
 
     **`FORBIDDEN_BUTTON_TEXTS`(광고 만들기·전체추가·바로추가·월간 예상 실적
     보기)는 절대 클릭하지 않는다** — 광고 계정 설정에 영향을 줄 수 있다.
@@ -338,18 +375,29 @@ def fetch_related_keywords(
 
     tmp_dir = Path(download_dir) if download_dir else Path.cwd() / "data" / "keywords" / "_tmp"
     tmp_dir.mkdir(parents=True, exist_ok=True)
-    with page.expect_download(timeout=15000) as dl_info:
-        dl_btn.click(timeout=10000)
-    download = dl_info.value
-    tmp_path = tmp_dir / f"dl_{int(time.time() * 1000)}.xlsx"
-    download.save_as(str(tmp_path))
-    try:
-        return parse_keyword_download_file(tmp_path)
-    finally:
+
+    last_exc: Exception | None = None
+    for attempt in range(1, max(int(download_retries), 1) + 1):
+        tmp_path = tmp_dir / f"dl_{int(time.time() * 1000)}_{attempt}.xlsx"
         try:
-            tmp_path.unlink(missing_ok=True)
-        except Exception:  # noqa: BLE001
-            pass
+            with page.expect_download(timeout=15000) as dl_info:
+                dl_btn.click(timeout=10000)
+            download = dl_info.value
+            download.save_as(str(tmp_path))
+            try:
+                return parse_keyword_download_file(tmp_path)
+            finally:
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except Exception:  # noqa: BLE001
+                    pass
+        except Exception as exc:  # noqa: BLE001 - 재시도
+            last_exc = exc
+            log.warning("전체 다운로드 실패(시도 %d/%d): %s", attempt, download_retries, exc)
+            page.wait_for_timeout(1000)
+
+    log.warning("전체 다운로드 %d회 모두 실패 — 표를 DOM에서 직접 긁습니다: %s", download_retries, last_exc)
+    return _scrape_table_rows(page)
 
 
 #: 실측(2026-09-23): 헤드리스(`headless=True`)로 이 페이지에서 "전체 다운로드"를
@@ -383,8 +431,11 @@ def open_keyword_tool_page(
     user_agent = naver_session.saved_user_agent(path)
 
     if headless:
-        playwright, context, page = naver_session._launch(path, headless=True, user_agent=user_agent)
+        playwright, context, page = naver_session._launch(
+            path, headless=True, user_agent=user_agent, purpose="keyword_discovery"
+        )
     else:
+        lock = naver_session.acquire_profile_lock("keyword_discovery")
         playwright = sync_playwright().start()
         kwargs: dict[str, Any] = dict(
             headless=False,
@@ -408,8 +459,13 @@ def open_keyword_tool_page(
                 last_exc = exc
         if context is None:
             playwright.stop()
+            lock.release()
             raise RuntimeError(f"브라우저를 열 수 없습니다: {last_exc}")
         page = context.pages[0] if context.pages else context.new_page()
+        try:
+            context._v2r_profile_lock = lock  # type: ignore[attr-defined]
+        except Exception:
+            pass
 
     logged_in = naver_session.has_login_cookies(naver_session._cookies(context))
     return playwright, context, page, logged_in
@@ -561,15 +617,16 @@ def run_for_brand(
     rt: Any,
     brand: str,
     target: int = DEFAULT_TARGET,
-    headless: bool = False,
+    headless: bool = True,
     offscreen: bool = True,
     account_id: str = "",
 ) -> dict[str, Any]:
     """실행기에서 부르는 진입점. 실 브라우저로 씨앗→BFS 전체를 돈다.
 
-    기본값은 화면 밖 창(`offscreen=True`, `headless=False`) — 헤드리스는
-    실측(2026-09-23)에서 다운로드 저장 직전에 브라우저가 닫히는 문제가
-    있었다. PC 화면에는 보이지 않는다.
+    기본값은 완전 헤드리스(`headless=True`, 2026-09-23) — 잠금 아래에서 재시도
+    (`fetch_related_keywords`의 `download_retries`)와 DOM 직접 긁기 대안으로
+    다운로드 실패 문제를 흡수한다. `headless=False`로 부르면 이전처럼 화면 밖
+    창(`offscreen`)을 띄운다.
     """
     from v2r.warehouse import naver_session
 
