@@ -218,7 +218,11 @@ def test_failed_job_rate_limited_rule_is_tier0_and_retries(tmp_path):
     act = [a for a in out["actions"] if a["action"] == "failed"][0]
     assert act["rule"] == "rate_limited"
     text = "\n".join(rt.channels[0].sent)
-    assert f"작업 {job_id} 실패" in text and "Tier 0" in text
+    assert f"작업 {job_id} 실패" in text
+    # 자동 진단 문구("판정: … / Tier …")는 채널로 안 나가고 이벤트 상세에만 남는다
+    # (사용자 지시 2026-09-23: "메시지가 너무 많다").
+    detail = "\n".join(r["message"] for r in rt.events.recent(job_id, limit=20))
+    assert "Tier 0" in detail
     rt.close()
 
 
@@ -291,7 +295,8 @@ def test_cancelled_job_is_never_requeued(tmp_path):
     out = monitor.tick(rt, NOW)
     act = [a for a in out["actions"] if a["action"] == "failed"][0]
     assert act["new_job_id"] is None
-    assert "다시 등록하지 않았습니다" in "\n".join(rt.channels[0].sent)
+    detail = "\n".join(r["message"] for r in rt.events.recent(job_id, limit=20))
+    assert "다시 등록하지 않았습니다" in detail  # 채널이 아니라 이벤트 상세(2026-09-23)
     assert len(rt.jobs.recent(limit=10)) == 1
     assert rt.jobs.get(job_id)["status"] == "failed"
     rt.close()
@@ -348,7 +353,8 @@ def test_partial_success_publish_is_reported_not_retried(tmp_path):
     out = monitor.tick(rt, NOW)
     act = [a for a in out["actions"] if a["action"] == "failed"][0]
     assert act["new_job_id"] is None
-    assert "일부는 성공했습니다" in "\n".join(rt.channels[0].sent)
+    detail = "\n".join(r["message"] for r in rt.events.recent(job_id, limit=20))
+    assert "일부는 성공했습니다" in detail  # 채널이 아니라 이벤트 상세(2026-09-23)
     rt.close()
 
 
@@ -619,14 +625,15 @@ def test_notify_document_all_skips_channels_without_support(tmp_path):
     assert notify_document_all([channel, NoDoc()], doc, "설명") == 1
 
 
-def test_real_schedule_has_five_pending_entries():
+def test_real_schedule_has_one_pending_entry_at_1800():
+    """사용자 지시(2026-09-23, "메시지가 너무 많다"): 하루 5회 → 18:00 1회로 축소."""
     from v2r.config import get_settings
     from v2r.engine import schedule as sched
 
     entries = sched.load_schedule(path=get_settings().config_dir / "schedule.yaml")
     pending = [e for e in entries if e.command == "미처리 알림"]
-    assert len(pending) == 5
-    assert sorted(e.time for e in pending) == ["08:40", "11:00", "14:00", "17:00", "21:00"]
+    assert len(pending) == 1
+    assert [e.time for e in pending] == ["18:00"]
     assert all(e.enabled for e in pending)
 
 

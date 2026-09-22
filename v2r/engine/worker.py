@@ -217,7 +217,7 @@ def handle_text(rt: Runtime, text: str, *, via_channel: bool = False) -> dict:
         request_stop(rt)
         cancelled = rt.jobs.cancel_open(default_owner())
         rt.events.log(None, "warn", f"중지 요청: 진행 중 작업 {cancelled}건 취소")
-        notify_all(rt.channels, f"중지 요청을 받았습니다 (작업 {cancelled}건 취소)")
+        notify_all(rt.channels, f"중지 요청을 받았습니다 (작업 {cancelled}건 취소)", level="always", tag="reply")
         return {
             "ok": True,
             "job_id": None,
@@ -349,7 +349,7 @@ def _generate_affiliate_daily(rt: Runtime, spec: TaskSpec) -> dict:
         cafes, per_cafe, warehouse_dir=rt.warehouse.root
     )
     if out.get("login_pending"):
-        notify_all(rt.channels, f"ChatGPT {out['message']}")
+        notify_all(rt.channels, f"ChatGPT {out['message']}", level="critical", category="gpt_login_pending", tag="login")
     elif out.get("added"):
         notify_all(
             rt.channels,
@@ -557,6 +557,68 @@ def _generate_brand(rt: Runtime, spec: TaskSpec) -> dict:
     }
 
 
+def generate_and_crosscheck_one(
+    rt: Runtime,
+    brand: str,
+    keyword: str,
+    cafe: str,
+    manuscript_type: str,
+    guide: str,
+    examples: Any,
+    recent_openings: Any,
+    closings: list[str],
+    mode: str = "",
+) -> tuple[Any, dict]:
+    """원고 한 건 생성 + GPT 교차 검증 (본문·댓글 만들기와 검증 호출이 여기 한 곳뿐이다).
+
+    `_generate_brand_loop`(단건 명령)과 `bulk_generate`(대량 대기열)가 함께 쓴다 —
+    검증 호출이 여러 군데 흩어지지 않게 하는 게 목적이다(사용자 규칙:
+    `gpt_crosscheck.crosscheck_manuscript` 호출은 `engine/worker.py` 한 곳뿐).
+    실패하면 예외를 그대로 올린다(부르는 쪽에서 처리).
+    """
+    from v2r.content import brand_writer as bw
+    from v2r.content import gpt_crosscheck
+
+    stats: dict = {}
+    m = bw.generate_manuscript(
+        rt,
+        brand,
+        keyword,
+        cafe,
+        manuscript_type,
+        guide_text=guide,
+        stats=stats,
+        mode=mode,
+        examples=examples,
+        recent_openings=recent_openings,
+    )
+    reply2 = next(
+        (c for c in m.comments if c.label.replace(" ", "") == "대대댓글2"), None
+    )
+    if reply2 is not None:
+        closings.append(reply2.text)
+        repeats = bw.repeated_closings(closings)
+        if repeats:
+            # 경고만 남긴다 (사용자 원고 피드백 2026-09-22: 마무리를 매번 바꾼다)
+            stats["closing_repeat"] = repeats
+    # GPT(Codex) 교차 검증 — 실패해도 원고 생성은 막지 않는다 (미검증으로 남긴다)
+    try:
+        gpt_crosscheck.crosscheck_manuscript(
+            rt.llm,
+            m,
+            bw.rule_for(brand, manuscript_type),
+            guide_text=guide,
+            examples=examples,
+            stats=stats,
+        )
+    except Exception as exc:  # 교차 검증은 **덤**이다
+        stats.update(
+            {"gpt_checked": False, "gpt_score": None,
+             "gpt_verdict": "미검증", "gpt_notes": [], "gpt_error": str(exc)}
+        )
+    return m, stats
+
+
 def _generate_brand_loop(
     rt: Runtime,
     spec: TaskSpec,
@@ -569,7 +631,6 @@ def _generate_brand_loop(
 ) -> tuple[list, list[dict], list[dict]]:
     """키워드 목록을 돌며 원고를 만든다 (결과 정리는 부르는 쪽에서)."""
     from v2r.content import brand_writer as bw
-    from v2r.content import gpt_crosscheck
 
     made: list[Any] = []
     failed: list[dict] = []
@@ -577,47 +638,22 @@ def _generate_brand_loop(
     # 한 묶음(같은 브랜드 한 번 실행) 안에서 대대댓글2 마무리가 되풀이되는지 본다
     closings: list[str] = []
     for item in todo:
-        stats: dict = {}
         try:
-            m = bw.generate_manuscript(
+            m, stats = generate_and_crosscheck_one(
                 rt,
                 brand,
                 item["keyword"],
                 item.get("cafe", ""),
                 spec.manuscript_type,
-                guide_text=guide,
-                stats=stats,
+                guide,
+                examples,
+                recent_openings,
+                closings,
                 mode=(spec.generate_mode or "").strip(),
-                examples=examples,
-                recent_openings=recent_openings,
             )
         except Exception as exc:
             failed.append({"keyword": item["keyword"], "error": str(exc)})
             continue
-        reply2 = next(
-            (c for c in m.comments if c.label.replace(" ", "") == "대대댓글2"), None
-        )
-        if reply2 is not None:
-            closings.append(reply2.text)
-            repeats = bw.repeated_closings(closings)
-            if repeats:
-                # 경고만 남긴다 (사용자 원고 피드백 2026-09-22: 마무리를 매번 바꾼다)
-                stats["closing_repeat"] = repeats
-        # GPT(Codex) 교차 검증 — 실패해도 원고 생성은 막지 않는다 (미검증으로 남긴다)
-        try:
-            gpt_crosscheck.crosscheck_manuscript(
-                rt.llm,
-                m,
-                bw.rule_for(brand, spec.manuscript_type),
-                guide_text=guide,
-                examples=examples,
-                stats=stats,
-            )
-        except Exception as exc:  # 교차 검증은 **덤**이다
-            stats.update(
-                {"gpt_checked": False, "gpt_score": None,
-                 "gpt_verdict": "미검증", "gpt_notes": [], "gpt_error": str(exc)}
-            )
         bw.save_json(m, out_dir / f"{item['keyword']}.json", stats)
         if stats.get("unresolved"):
             # 포기하지 않고 최대 횟수까지 다시 시켰는데도 남은 규칙 (사용자 지시 2026-09-19)
@@ -875,7 +911,7 @@ def _generate_photos(rt: Runtime, spec: TaskSpec) -> dict:
                 f" '{photo_approval_command(brand, folder, count)}' 이라고 보내세요."
             )
         message = "\n".join(lines)
-        notify_all(rt.channels, message)
+        notify_all(rt.channels, message, level="always", tag="draft")
         return {
             "ok": True,
             "approved": False,
@@ -903,7 +939,7 @@ def _generate_photos(rt: Runtime, spec: TaskSpec) -> dict:
             sent_one = notify_photo_all(rt.channels, path, caption)
             if not sent_one:
                 # 사진 전송이 안 되는 채널뿐이면 경로만 글로 알린다
-                notify_all(rt.channels, f"{caption}\n{path}")
+                notify_all(rt.channels, f"{caption}\n{path}", level="always", tag="draft")
             photo_sent += sent_one
         out["photo_sent"] = photo_sent
         out["pending_approval"] = True
@@ -913,9 +949,9 @@ def _generate_photos(rt: Runtime, spec: TaskSpec) -> dict:
             f" / 반려: '사진 반려 {brand_name} {folder_name}'"
         )
     if out.get("login_pending"):
-        notify_all(rt.channels, f"ChatGPT {out['message']}")
+        notify_all(rt.channels, f"ChatGPT {out['message']}", level="critical", category="gpt_login_pending", tag="login")
     elif out.get("limited"):
-        notify_all(rt.channels, f"ChatGPT 이미지 사용 한도: {out.get('wait_text', '')}")
+        notify_all(rt.channels, f"ChatGPT 이미지 사용 한도: {out.get('wait_text', '')}", level="critical", category="gpt_image_quota", tag="draft")
     elif out.get("generated"):
         notify_all(
             rt.channels,
@@ -941,7 +977,7 @@ def _approve_photos(rt: Runtime, spec: TaskSpec) -> dict:
         f"사진 승인: 브랜드 {brand} / {folder} 폴더 — 원본 {stats.get('added', 0)}장 적재,"
         f" 세탁본 {stats.get('variants', 0)}장 생성"
     )
-    notify_all(rt.channels, stats["message"])
+    notify_all(rt.channels, stats["message"], level="always", tag="reply")
     return stats
 
 
@@ -959,7 +995,7 @@ def _reject_photos(rt: Runtime, spec: TaskSpec) -> dict:
         f"사진 반려: 브랜드 {out.get('brand') or brand} / {out.get('folder') or folder} 폴더 —"
         f" {out.get('removed', 0)}장 삭제 (원본·세탁본은 그대로)"
     )
-    notify_all(rt.channels, out["message"])
+    notify_all(rt.channels, out["message"], level="always", tag="reply")
     return out
 
 
@@ -970,7 +1006,7 @@ def _gpt_keepalive(rt: Runtime, spec: TaskSpec) -> dict:
     del spec
     out = check_gpt_session()
     if not out.get("logged_in"):
-        notify_all(rt.channels, RELOGIN_NOTICE)
+        notify_all(rt.channels, RELOGIN_NOTICE, level="critical", category="relogin_needed", tag="login")
         out["notified"] = True
     return out
 
@@ -982,12 +1018,12 @@ def _naver_keepalive(rt: Runtime, spec: TaskSpec) -> dict:
     del spec
     out = check_naver_session()
     if not out.get("logged_in"):
-        notify_all(rt.channels, RELOGIN_NOTICE)
+        notify_all(rt.channels, RELOGIN_NOTICE, level="critical", category="relogin_needed", tag="login")
         out["notified"] = True
     elif out.get("restored_from_backup"):
         notify_all(rt.channels, "네이버 세션: 현재 프로필이 풀려 백업으로 복구해 유지 중입니다.")
     for warning in out.get("warnings") or []:
-        notify_all(rt.channels, f"네이버 세션 경고: {warning}")
+        notify_all(rt.channels, f"네이버 세션 경고: {warning}", level="critical", category="naver_session_warning", tag="login")
     return out
 
 
@@ -1000,7 +1036,7 @@ def _web_keepalive(rt: Runtime, spec: TaskSpec) -> dict:
     for key, res in out["sites"].items():
         site = SITES[key]
         if not res.get("logged_in") and "프로필 없음" not in str(res.get("note")):
-            notify_all(rt.channels, RELOGIN_NOTICE.format(name=site.name, key=key))
+            notify_all(rt.channels, RELOGIN_NOTICE.format(name=site.name, key=key), level="critical", category=f"relogin_needed:{key}", tag="login")
             res["notified"] = True
         elif res.get("restored_from_backup"):
             notify_all(rt.channels, f"{site.name} 세션: 풀려서 백업으로 복구해 유지 중입니다.")
@@ -1097,7 +1133,7 @@ def _slack_check(rt: Runtime, spec: TaskSpec) -> dict:
     slack = next((c for c in rt.channels if getattr(c, "name", "") == "slack"), None)
     if slack is None:
         message = "슬랙 채널이 비활성입니다(.env 의 SLACK_BOT_TOKEN 또는 webhook 확인 필요)"
-        notify_all(rt.channels, message)
+        notify_all(rt.channels, message, level="always", tag="reply")
         return {"ok": False, "message": message}
 
     out = slack.check_connection()
@@ -1136,7 +1172,7 @@ def _slack_check(rt: Runtime, spec: TaskSpec) -> dict:
     out["path"] = str(path)
     out["message"] = f"슬랙 점검 완료 ({'정상' if out.get('ok') else '확인 필요'}), 보고서 {sent}곳 전송"
     if not sent:
-        notify_all(rt.channels, out["message"])
+        notify_all(rt.channels, out["message"], level="always", tag="reply")
     return out
 
 
@@ -1146,7 +1182,7 @@ def _telegram_check(rt: Runtime, spec: TaskSpec) -> dict:
     telegram = next((c for c in rt.channels if getattr(c, "name", "") == "telegram"), None)
     if telegram is None:
         message = "텔레그램 채널이 비활성입니다(.env 의 TELEGRAM_BOT_TOKEN·허용 chat_id 확인 필요)"
-        notify_all(rt.channels, message)
+        notify_all(rt.channels, message, level="always", tag="reply")
         return {"ok": False, "message": message}
 
     out = telegram.check_connection()
@@ -1179,7 +1215,7 @@ def _telegram_check(rt: Runtime, spec: TaskSpec) -> dict:
     out["path"] = str(path)
     out["message"] = f"텔레그램 점검 완료 ({'정상' if out.get('ok') else '확인 필요'}), 보고서 {sent}곳 전송"
     if not sent:
-        notify_all(rt.channels, out["message"])
+        notify_all(rt.channels, out["message"], level="always", tag="reply")
     return out
 
 
@@ -1650,7 +1686,7 @@ def _run_publish(
         publish_mod.flush_plan_events(rt, job_id)
         # 사진 원본이 아예 없다 → 텔레그램 등 채널로 바로 알린다 (결정 1)
         rt.events.log(job_id, "error", str(exc))
-        notify_all(rt.channels, str(exc))
+        notify_all(rt.channels, str(exc), level="critical", category="photo_missing", tag="draft")
         # 이어서 GPT 이미지 생성 프롬프트 묶음을 보내 새 사진을 요청한다 (계획 §확보 2단계)
         _request_missing_photos(rt, job_id, spec, exc)
         return {
@@ -1973,15 +2009,21 @@ def dispatch(rt: Runtime, job: Any, owner: str | None = None) -> dict:
     if task == "bulk_generate":
         from v2r.content import bulk_generate
 
-        return bulk_generate.generate_for_brand(rt, spec.brand, spec.count or 5)
+        return bulk_generate.generate_for_brand(
+            rt, spec.brand, spec.count or 5, target=spec.target
+        )
     if task == "bulk_generate_all":
         from v2r.content import bulk_generate
 
-        return bulk_generate.generate_all(rt, spec.count or 5)
+        return bulk_generate.generate_all(rt, spec.count, target=spec.target)
     if task == "bulk_generate_status":
         from v2r.content import bulk_generate
 
         return bulk_generate.status(rt)
+    if task == "vpc_export":
+        from v2r.content import bulk_generate
+
+        return bulk_generate.export_vpc(rt)
     if task == "generate_affiliate_daily":
         return _generate_affiliate_daily(rt, spec)
     if task == "generate_daily":
@@ -2276,13 +2318,32 @@ def _log_reaped(rt: Runtime, reaped: list[dict]) -> None:
 # --------------------------------------------------------------------
 # 큐 실행
 # --------------------------------------------------------------------
+#: LIGHT 작업 1건의 시간 상한 기본값(초). 넘기면 그 작업만 failed 로 끝내고
+#: 사이드카 루프는 계속 돈다 (사고 2026-09-23: keyword_exposure 옛 코드가
+#: 새 예약 명령을 오해석해 15분 넘게 붙잡아 심장박동이 멎었다).
+LIGHT_TASK_TIMEOUT_SECONDS = 120
+#: 작업별 상한을 따로 두고 싶으면 여기 채운다(초). 없으면 기본값.
+LIGHT_TASK_TIMEOUTS: dict[str, int] = {}
+
+
 def run_once(
-    rt: Runtime, owner: str | None = None, scope: str | None = None
+    rt: Runtime,
+    owner: str | None = None,
+    scope: str | None = None,
+    *,
+    timeout_seconds: int | None = None,
+    on_timeout: Any = None,
 ) -> dict | None:
     """큐에서 1건을 실행한다. 없으면 None.
 
     `scope="main"` 이면 사이드카 몫(가벼운 작업)은 건너뛰고,
     `scope="light"` 면 그 몫만 집는다. 기본값은 줄을 가리지 않는다.
+
+    `scope="light"` 일 때는 시간 상한을 둔다(기본 `LIGHT_TASK_TIMEOUT_SECONDS`,
+    작업별로 `LIGHT_TASK_TIMEOUTS` 로 다르게 줄 수 있다). 상한을 넘기면 그
+    작업을 failed 로 끝내고 **바로 돌아온다** — 실행 스레드 자체는 안전하게
+    죽일 수 없어 데몬 스레드로 백그라운드에서 마저 돌지만, 사이드카 루프는
+    막히지 않는다.
     """
     owner = owner or default_owner()
     if scope != "light":
@@ -2295,12 +2356,65 @@ def run_once(
     job_id = int(job["id"])
     spec = TaskSpec.from_json(job["spec_json"])
     description = describe_spec(spec)
+
+    if scope == "light":
+        limit = timeout_seconds or LIGHT_TASK_TIMEOUTS.get(
+            spec.task, LIGHT_TASK_TIMEOUT_SECONDS
+        )
+        box: dict = {}
+
+        def _run() -> None:
+            try:
+                box["result"] = dispatch(rt, job, owner)
+            except Exception as exc:  # noqa: BLE001
+                box["exc"] = exc
+
+        th = threading.Thread(
+            target=_run, name=f"v2r-light-{job_id}", daemon=True
+        )
+        th.start()
+        th.join(limit)
+        if th.is_alive():
+            error = f"시간 상한({limit}초) 초과 — 사이드카가 넘겼습니다"
+            rt.jobs.finish(job_id, "failed", None, error)
+            rt.events.log(
+                job_id, "error", f"가벼운 작업 시간초과({limit}초): {description}"
+            )
+            if callable(on_timeout):
+                try:
+                    on_timeout(job_id, spec, description, limit)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("시간초과 콜백 실패: %s", exc)
+            out = {
+                "job_id": job_id,
+                "status": "failed",
+                "error": error,
+                "description": description,
+                "timed_out": True,
+            }
+            reply_to_origin(out)
+            return out
+        if "exc" in box:
+            exc = box["exc"]
+            rt.jobs.finish(job_id, "failed", None, str(exc))
+            rt.events.log(job_id, "error", f"작업 실패: {exc}")
+            out = {
+                "job_id": job_id,
+                "status": "failed",
+                "error": str(exc),
+                "description": description,
+            }
+            reply_to_origin(out)
+            return out
+        result = box.get("result") or {}
+        return _finish_run(rt, job_id, spec, description, result)
+
     try:
         result = dispatch(rt, job, owner)
     except Exception as exc:
         rt.jobs.finish(job_id, "failed", None, str(exc))
         rt.events.log(job_id, "error", f"작업 실패: {exc}")
-        notify_all(rt.channels, f"작업 {job_id} 실패: {exc}")
+        notify_all(rt.channels, f"작업 {job_id} 실패: {exc}", level="summary")
         out = {
             "job_id": job_id,
             "status": "failed",
@@ -2310,6 +2424,16 @@ def run_once(
         reply_to_origin(out)
         return out
 
+    return _finish_run(rt, job_id, spec, description, result)
+
+
+def _finish_run(
+    rt: Runtime, job_id: int, spec: TaskSpec, description: str, result: dict
+) -> dict:
+    """작업 실행 결과를 마무리한다(상태 판정 → 기록 → 보고 → 답장).
+
+    `run_once` 의 두 경로(일반 / LIGHT 시간상한)가 함께 쓴다.
+    """
     failures = list(result.get("failures") or result.get("errors") or [])
     uncertain = list(result.get("uncertain") or [])
     if result.get("ok") is False or failures:
@@ -2333,7 +2457,9 @@ def run_once(
     rt.events.log(job_id, "info", f"작업 종료({status}): {description}")
     if spec.task in PUBLISH_TASKS or spec.task == "reconcile":
         refresh_dashboard(rt)  # 발행·점검이 끝날 때마다 현황판을 새로 그린다
-    notify_all(rt.channels, format_report(job_id, status, description))
+    # 개별 작업 완료·실패는 "summary" 등급 — 채널로 따로 안 보내고 정기 보고에 담는다
+    # (사용자 지시 2026-09-23: 메시지가 너무 많다).
+    notify_all(rt.channels, format_report(job_id, status, description), level="summary", tag="publish")
     out = {"job_id": job_id, "status": status, "result": result, "description": description}
     if error:
         out["error"] = error
@@ -2578,12 +2704,67 @@ def serve(rt: Runtime, poll_seconds: int = 5, announce: bool = True) -> None:  #
         held.release()
 
 
+#: 사이드카 스레드 재시작을 몇 번까지 스스로 해 보는가. 넘으면 실행기 자체를
+#: 재시작한다(scripts/restart-serve.ps1). 발행 중에는 부르지 않는다(슬롯 사이에서).
+SIDECAR_RESTART_MAX = 3
+#: 사이드카 스레드 재시작 실패 횟수(프로세스 안에서만 유효 — 재시작하면 0으로 돌아간다)
+_sidecar_restart_count = 0
+
+
+def _restart_serve_process(rt: Runtime, reason: str) -> None:
+    """실행기 자체를 재시작한다(scripts/restart-serve.ps1). 발행 중이면 건너뛴다.
+
+    사이드카를 3번 다시 띄워도 죽어 있으면 부른다 — 스레드 자체가 문제라기보단
+    프로세스가 망가진 것으로 본다.
+    """
+    from v2r.engine import sidecar as sidecar_mod
+
+    try:
+        running = [
+            j for j in rt.jobs.running_jobs() if sidecar_mod.scope_for(j.get("task")) != "light"
+        ]
+    except Exception:  # noqa: BLE001
+        running = []
+    if running:
+        log.error("사이드카 재시작 %d회 실패했지만 발행 중이라 실행기 재시작은 다음 슬롯 사이로 미룹니다", SIDECAR_RESTART_MAX)
+        return
+    text = f"사이드카를 {SIDECAR_RESTART_MAX}번 다시 띄워도 안 살아나 실행기를 재시작합니다 ({reason})"
+    log.error("%s", text)
+    try:
+        rt.events.log(None, "error", text)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        notify_all(rt.channels, text, level="critical", category="sidecar_restart_exhausted", tag="schedule")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("사이드카 재시작 한계 알림 실패: %s", exc)
+    try:
+        import subprocess
+
+        script = Path(rt.settings.data_dir).parent / "scripts" / "restart-serve.ps1"
+        if script.exists():
+            subprocess.Popen(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script)],
+                creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+            )
+        else:
+            log.error("실행기 재시작 스크립트를 못 찾았습니다: %s", script)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("실행기 재시작 실패: %s", exc)
+
+
 def ensure_sidecar(rt: Runtime, side: Any) -> Any:
-    """사이드카 스레드가 죽었으면 기록을 남기고 새로 띄운다."""
+    """사이드카 스레드가 죽었으면 기록을 남기고 새로 띄운다.
+
+    3번 다시 띄워도 안 살아나면 실행기 자체를 재시작한다(발행 중이 아니면).
+    """
+    global _sidecar_restart_count
     from v2r.engine import sidecar as sidecar_mod
 
     if side is not None and side.is_alive():
         sidecar_mod.alert_if_stale(rt)
+        sidecar_mod.alert_recovered(rt)
+        _sidecar_restart_count = 0
         return side
     log.error("사이드카 스레드가 죽었습니다 — 다시 시작합니다")
     try:
@@ -2591,11 +2772,21 @@ def ensure_sidecar(rt: Runtime, side: Any) -> Any:
     except Exception as exc:  # noqa: BLE001
         log.warning("사이드카 재시작 이벤트 기록 실패: %s", exc)
     try:
-        notify_all(rt.channels, "사이드카(예약·감시) 스레드가 멈춰서 다시 시작했습니다")
+        notify_all(
+            rt.channels,
+            "사이드카(예약·감시) 스레드가 멈춰서 다시 시작했습니다",
+            level="critical",
+            category="sidecar_died",
+            tag="schedule",
+        )
     except Exception as exc:  # noqa: BLE001
         log.warning("사이드카 재시작 알림 실패: %s", exc)
     fresh = sidecar_mod.SidecarThread(rt.settings)
     fresh.start()
+    _sidecar_restart_count += 1
+    if _sidecar_restart_count >= SIDECAR_RESTART_MAX:
+        _restart_serve_process(rt, f"사이드카 재시작 {_sidecar_restart_count}회")
+        _sidecar_restart_count = 0
     return fresh
 
 

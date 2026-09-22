@@ -77,6 +77,10 @@ class ScheduleEntry:
     days: Any = "daily"
     enabled: bool = True
     catch_up_minutes: int | None = None
+    #: (선택) 이 예약이 정확히 어떤 작업으로 해석돼야 하는가(예: "keyword_discovery_all").
+    #: 비워 두면 검증하지 않는다. 옛 실행기가 새 명령을 다른 작업으로 오해석해
+    #: 발사한 사고(2026-09-23)를 막는다 — 파서가 다른 작업으로 풀면 발사하지 않는다.
+    expect_task: str | None = None
     #: 요일 집합(월=0 … 일=6)
     weekdays: set[int] = field(default_factory=set)
 
@@ -162,6 +166,7 @@ def load_schedule(rt: Any = None, path: Path | str | None = None) -> list[Schedu
             days=raw.get("days", "daily"),
             enabled=bool(raw.get("enabled", True)),
             catch_up_minutes=raw.get("catch_up_minutes", default_catch_up),
+            expect_task=(str(raw["expect_task"]).strip() if raw.get("expect_task") else None),
         )
         entry.weekdays = _weekday_set(entry.days)
         _parse_hhmm(entry.time)  # 형식 검증
@@ -259,12 +264,48 @@ def _handler(rt: Any) -> Callable[[Any, str], dict]:
     return worker.handle_text
 
 
+def _resolved_task(command: str) -> str | None:
+    """그 명령을 지금 코드의 파서가 어떤 작업으로 푸는지(발사 전 확인용)."""
+    from v2r.command.parser import parse_korean_command
+
+    try:
+        spec = parse_korean_command(command)
+    except Exception:  # noqa: BLE001
+        return None
+    return None if spec is None else spec.task
+
+
 def fire(rt: Any, entry: ScheduleEntry, *, handle_text: Callable | None = None) -> dict:
     """예약 1건을 지금 접수한다.
+
+    `entry.expect_task` 가 있으면 발사 **전에** 지금 파서가 이 명령을 정말
+    그 작업으로 푸는지 확인한다. 어긋나면(옛 코드가 새 명령을 다른 작업으로
+    오해석하는 사고 2026-09-23 재발 방지) 발사하지 않고 경고 1회만 남긴다.
 
     옛 `중지` 플래그가 남아 있으면 지운다 — 예약은 중지에 막히면 안 된다.
     """
     from v2r.engine import worker
+
+    if entry.expect_task:
+        resolved = _resolved_task(entry.command)
+        if resolved != entry.expect_task:
+            text = (
+                f"예약 '{entry.name}' 발사 건너뜀 — 명령 '{entry.command}' 을(를) "
+                f"'{entry.expect_task}' 가 아니라 '{resolved}' 로 해석했습니다"
+                " (실행기가 옛 코드일 수 있습니다)"
+            )
+            log.error("%s", text)
+            try:
+                rt.events.log(None, "error", text)
+            except Exception:  # noqa: BLE001 pragma: no cover
+                pass
+            try:
+                from v2r.channels import notify_all
+
+                notify_all(rt.channels, text, level="critical", category=f"schedule_mismatch:{entry.name}", tag="schedule")
+            except Exception as exc:  # noqa: BLE001
+                log.warning("예약 불일치 알림 실패: %s", exc)
+            return {"ok": False, "error": text, "description": "", "skipped_mismatch": True}
 
     try:
         worker.clear_stop(rt)
@@ -325,7 +366,15 @@ def check_pending(
 
         entry = ScheduleEntry(name=name, time="00:00", command=item.get("command", ""))
         if int(item.get("retries", 0)) == 0:
-            notify_all(rt.channels, f"예약 실패: {name} — 자동 재시도")
+            # 예약 미복구 사건의 첫 신호라 critical(작업 미복구 카테고리) — 바로
+            # 뒤에 "자동 복구 실패"가 나면 같은 사건으로 묶여 되풀이 억제된다.
+            notify_all(
+                rt.channels,
+                f"예약 실패: {name} — 자동 재시도",
+                level="critical",
+                category=f"schedule_retry:{name}",
+                tag="schedule",
+            )
             try:
                 rt.events.log(None, "warn", f"예약 감시견: {name} 큐가 움직이지 않아 재시도")
             except Exception:  # noqa: BLE001 pragma: no cover
@@ -344,7 +393,13 @@ def check_pending(
             continue
 
         reason = item.get("error") or "재시도 뒤에도 큐가 움직이지 않았습니다"
-        notify_all(rt.channels, f"예약 실패: {name} — 자동 복구 실패 ({reason})")
+        notify_all(
+            rt.channels,
+            f"예약 실패: {name} — 자동 복구 실패 ({reason})",
+            level="critical",
+            category=f"schedule_recovery_failed:{name}",
+            tag="schedule",
+        )
         try:
             rt.events.log(None, "error", f"예약 복구 실패: {name} — {reason}")
         except Exception:  # noqa: BLE001 pragma: no cover

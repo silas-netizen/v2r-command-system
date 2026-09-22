@@ -150,7 +150,7 @@ def test_틱이_예약과_감시와_수신과_가벼운_작업을_모두_돌린�
     monkeypatch.setattr(
         "v2r.engine.monitor.tick", lambda rt_, *a, **k: seen.append("monitor") or {}
     )
-    monkeypatch.setattr(worker, "notify_all", lambda ch, msg: 0)
+    monkeypatch.setattr(worker, "notify_all", lambda ch, msg, **kw: 0)
 
     out = sidecar_mod.tick_once(rt, "side")
     assert seen == ["schedule", "monitor"]
@@ -192,7 +192,7 @@ def test_긴_작업이_본_루프를_막아도_사이드카가_예약과_수신�
     monkeypatch.setattr(
         "v2r.engine.monitor.tick", lambda rt_, *a, **k: ticks.append("m") or {}
     )
-    monkeypatch.setattr(worker, "notify_all", lambda ch, msg: 0)
+    monkeypatch.setattr(worker, "notify_all", lambda ch, msg, **kw: 0)
 
     side = sidecar_mod.SidecarThread(
         rt.settings,
@@ -221,7 +221,7 @@ def test_긴_작업_중_중지_명령이_즉시_먹힌다(tmp_path, monkeypatch)
     """사이드카가 읽은 `중지` 가 본 루프의 긴 발행을 슬롯 사이에서 멈춘다."""
     rt = make_runtime(tmp_path)
     rt._channels = []
-    monkeypatch.setattr(worker, "notify_all", lambda ch, msg: 0)
+    monkeypatch.setattr(worker, "notify_all", lambda ch, msg, **kw: 0)
     monkeypatch.setattr("v2r.engine.schedule.tick", lambda rt_, *a, **k: {})
     monkeypatch.setattr("v2r.engine.monitor.tick", lambda rt_, *a, **k: {})
 
@@ -275,7 +275,7 @@ def test_사이드카가_죽으면_다시_띄운다(tmp_path, monkeypatch):
     rt = make_runtime(tmp_path)
     rt._channels = []
     notices: list[str] = []
-    monkeypatch.setattr(worker, "notify_all", lambda ch, msg: notices.append(msg))
+    monkeypatch.setattr(worker, "notify_all", lambda ch, msg, **kw: notices.append(msg))
     started: list[object] = []
 
     class _Fresh:
@@ -311,7 +311,7 @@ def test_심장박동이_3분_넘게_낡으면_경고한다(tmp_path, monkeypatc
     rt = make_runtime(tmp_path)
     rt._channels = []
     notices: list[str] = []
-    monkeypatch.setattr("v2r.channels.notify_all", lambda ch, msg: notices.append(msg))
+    monkeypatch.setattr("v2r.channels.notify_all", lambda ch, msg, **kw: notices.append(msg))
 
     sidecar_mod._last_alert = 0.0
     assert sidecar_mod.alert_if_stale(rt) is False  # 파일이 없으면(한 번도 안 켜짐) 조용히
@@ -355,7 +355,7 @@ def test_serve_poll은_사이드카가_읽을_때_채널을_두_번_읽지_않�
     rt = make_runtime(tmp_path)
     channel = _FakeChannel(["현황"])
     rt._channels = [channel]
-    monkeypatch.setattr(worker, "notify_all", lambda ch, msg: 0)
+    monkeypatch.setattr(worker, "notify_all", lambda ch, msg, **kw: 0)
 
     out = worker.serve_poll(rt, "main:1", scope="main", poll=False)
     assert out["received"] == 0
@@ -389,7 +389,7 @@ def test_명령을_보낸_방에_결과가_돌아온다(tmp_path, monkeypatch):
     """접수는 사이드카, 실행은 본 실행기여도 답장은 그 방으로 간다."""
     rt = make_runtime(tmp_path)
     rt._channels = []
-    monkeypatch.setattr(worker, "notify_all", lambda ch, msg: 0)
+    monkeypatch.setattr(worker, "notify_all", lambda ch, msg, **kw: 0)
     channel = _FakeChannel([])
     job_id = rt.jobs.enqueue(TaskSpec(task="status"), "k")
     worker.remember_origin(job_id, channel, "room")  # 사이드카가 기억해 둔 방
@@ -397,4 +397,109 @@ def test_명령을_보낸_방에_결과가_돌아온다(tmp_path, monkeypatch):
     assert out["job_id"] == job_id
     assert channel.sent and channel.sent[0][0] == "room"
     assert worker.pop_origin(job_id) is None  # 한 번만 답한다
+    rt.close()
+
+
+# --------------------------------------------------------------------
+# 6. 자가 복구 (사고 2026-09-23): LIGHT 작업 시간 상한 + 심장박동 분리 + 재시작 한도
+# --------------------------------------------------------------------
+def test_LIGHT_작업이_시간_상한을_넘기면_failed로_끝내고_넘어간다(tmp_path, monkeypatch):
+    """옛 코드가 새 예약 명령을 오해석해 keyword_exposure 를 15분 붙잡은 사고 재현.
+
+    한 작업이 상한을 넘겨도 `run_once` 는 **바로 돌아와야** 한다 — 사이드카
+    루프가 막히지 않는다는 뜻이다.
+    """
+    rt = make_runtime(tmp_path)
+    rt._channels = []
+    monkeypatch.setattr(worker, "notify_all", lambda ch, msg, **kw: 0)
+    job_id = rt.jobs.enqueue(TaskSpec(task="status"), "slow")
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def _slow_dispatch(rt_, job_, owner_=None):
+        started.set()
+        release.wait(5.0)  # 사이드카가 상한을 넘기고 돌아온 뒤에도 계속 돈다(데몬)
+        return {"ok": True, "report": "늦게 끝남"}
+
+    monkeypatch.setattr(worker, "dispatch", _slow_dispatch)
+
+    t0 = time.monotonic()
+    out = worker.run_once(rt, "side", scope="light", timeout_seconds=0.1)
+    elapsed = time.monotonic() - t0
+
+    assert started.is_set()
+    assert elapsed < 2.0  # 0.1초 상한을 거의 바로 지키고 돌아왔다(실제 작업은 5초 안 기다림)
+    assert out["timed_out"] is True
+    assert out["status"] == "failed"
+    assert rt.jobs.get(job_id)["status"] == "failed"
+    assert "시간 상한" in rt.jobs.get(job_id)["error"]
+    release.set()  # 백그라운드로 마저 도는 스레드를 풀어 준다(테스트 정리)
+    rt.close()
+
+
+def test_사이드카_재시작_한도를_넘기면_실행기_재시작을_시도한다(tmp_path, monkeypatch):
+    """사이드카를 SIDECAR_RESTART_MAX 번 다시 띄워도 안 살아나면 실행기를 재시작한다."""
+    rt = make_runtime(tmp_path)
+    rt._channels = []
+    monkeypatch.setattr(worker, "notify_all", lambda ch, msg, **kw: 0)
+
+    class _AlwaysDead:
+        def is_alive(self) -> bool:
+            return False
+
+        def stop(self, timeout: float = 0.0) -> None:
+            pass
+
+    class _Fresh:
+        def __init__(self, settings) -> None:
+            pass
+
+        def start(self):
+            return self
+
+        def is_alive(self) -> bool:
+            return False  # 다시 띄워도 여전히 죽어 있다고 가정
+
+    monkeypatch.setattr(sidecar_mod, "SidecarThread", _Fresh)
+    restart_calls: list[str] = []
+    monkeypatch.setattr(worker, "_restart_serve_process", lambda rt_, reason: restart_calls.append(reason))
+    worker._sidecar_restart_count = 0
+
+    side = _AlwaysDead()
+    for _ in range(worker.SIDECAR_RESTART_MAX):
+        side = worker.ensure_sidecar(rt, side)
+    assert restart_calls  # 한도를 넘기자 실행기 재시작을 시도했다
+    worker._sidecar_restart_count = 0
+    rt.close()
+
+
+def test_실행기_재시작은_발행_중이면_미룬다(tmp_path, monkeypatch):
+    rt = make_runtime(tmp_path)
+    rt._channels = []
+    notices: list[str] = []
+    monkeypatch.setattr(worker, "notify_all", lambda ch, msg, **kw: notices.append(msg))
+    monkeypatch.setattr(rt.jobs, "running_jobs", lambda: [{"task": "publish_daily"}])
+    popen_calls: list[list[str]] = []
+    monkeypatch.setattr(
+        "subprocess.Popen", lambda args, **kw: popen_calls.append(args)
+    )
+    worker._restart_serve_process(rt, "테스트")
+    assert popen_calls == []  # 발행 중이라 재시작 스크립트를 부르지 않았다
+    rt.close()
+
+
+def test_심장박동_스레드는_틱_스레드와_따로_돈다(tmp_path):
+    """`_Status` 가 "지금 뭘 하는지"를 기록하고, 그 값을 심장박동 파일에 쓸 수 있다."""
+    rt = make_runtime(tmp_path)
+    rt._channels = []
+    status = sidecar_mod._Status()
+    status.set("light:keyword_exposure")
+    snap = status.snapshot()
+    assert snap["step"] == "light:keyword_exposure"
+    sidecar_mod.write_heartbeat(rt, busy=snap)
+    import json
+
+    data = json.loads(sidecar_mod.heartbeat_path(rt).read_text(encoding="utf-8"))
+    assert data["busy"]["step"] == "light:keyword_exposure"
     rt.close()

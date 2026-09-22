@@ -270,7 +270,7 @@ def test_shortage_notice_sent_once(tmp_path):
     assert notify_photo_shortage(rt, spec, "우아덤", "키워드", 2, 0) is False
     assert len(channel.sent) == 1
     text = channel.sent[0]
-    assert text.startswith("사진 부족: 브랜드 우아덤 / 키워드 폴더")
+    assert "사진 부족: 브랜드 우아덤 / 키워드 폴더" in text  # 앞에 범주 아이콘(✍️)이 붙는다
     assert "필요 2장, 사용 가능 0장" in text
     assert "'사진 생성 승인 우아덤 키워드 2장' 이라고 보내세요" in text
     # 다른 폴더는 따로 한 번 더 알린다

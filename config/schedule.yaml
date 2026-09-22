@@ -18,6 +18,9 @@ entries:
     days: daily
     enabled: true
     command: 키워드 발굴 전체 500개
+    # 발사 전에 지금 파서가 이 명령을 정말 keyword_discovery_all 로 푸는지 확인한다.
+    # 옛 실행기가 "키워드 노출 현황"으로 오해석해 사이드카를 붙잡은 사고(2026-09-23) 재발 방지.
+    expect_task: keyword_discovery_all
 
   - name: 아침 일상 글
     time: "09:00"
@@ -92,33 +95,11 @@ entries:
     enabled: true
     command: 요금제 세션 점검
 
-  # 미처리 목록(docs/reports/pending.md)을 하루 5번 파일로 보냅니다.
+  # 미처리 목록(docs/reports/pending.md). 사용자 지시(2026-09-23, "메시지가
+  # 너무 많다"): 하루 5회 → 18:00 1회로 축소. summary 등급이라 어차피 채널로
+  # 따로 안 나가고 파일로만 가지만, 실행 자체도 하루 1번이면 충분하다.
   - name: pending-1
-    time: "08:40"
-    days: daily
-    enabled: true
-    command: 미처리 알림
-
-  - name: pending-2
-    time: "11:00"
-    days: daily
-    enabled: true
-    command: 미처리 알림
-
-  - name: pending-3
-    time: "14:00"
-    days: daily
-    enabled: true
-    command: 미처리 알림
-
-  - name: pending-4
-    time: "17:00"
-    days: daily
-    enabled: true
-    command: 미처리 알림
-
-  - name: pending-5
-    time: "21:00"
+    time: "18:00"
     days: daily
     enabled: true
     command: 미처리 알림
@@ -160,12 +141,12 @@ entries:
     enabled: true
     command: 정기 정비
 
-  # 밀려남 키워드 → 브랜드 원고 대량 생성 (2026-09-23). 요금제 길만 쓰고
-  # (config/bulk.yaml allow_paid_fallback: false) 09:00 전에 끝나도록 작게
-  # 시작한다. 상한 5시간(요금제 창) 안에 끝나지 않아도 다음 발행에 지장 없게
-  # 새벽 시간을 골랐다.
+  # 밀려남 키워드 → 브랜드 원고 대량 생성 (2026-09-23). 사용자 결정: 대기열
+  # 적재만 자동으로 두고, **실제 대량 생성은 명령으로만** 시작한다
+  # (`<브랜드> 대량 원고 N건` / `대량 원고 전체 N건`). 그래서 이 예약 항목은
+  # 꺼 둔다 — 자동으로 매일 돌리지 않는다.
   - name: 대량 원고 새벽 배치
     time: "02:10"
     days: daily
-    enabled: true
+    enabled: false
     command: 대량 원고 전체 20건

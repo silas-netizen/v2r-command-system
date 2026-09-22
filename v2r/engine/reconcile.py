@@ -22,6 +22,9 @@ PARENT_STAGES = {"daily_created", "daily_done", "revision_submitting"}
 # 이력 폴백에서 허용하는 시각 오차(초)
 MATCH_SLACK_S = 15
 HISTORY_DAYS = 30
+#: 한 번의 점검에서 "게시글 등록 제한"이 이만큼 걸리면 다발로 보고 즉시 알린다
+#: (사용자 지시 2026-09-23: 계정 등록 제한 다발(5건 이상)은 critical 등급).
+LIMIT_ALERT_THRESHOLD = 5
 
 
 def _status_of(detail: dict) -> str:
@@ -309,6 +312,21 @@ def reconcile(rt: Runtime) -> dict:
             result["failed"] += 1
         else:
             result["unresolved"].append(label)
+
+    limited = int(result.get("limited", 0))
+    if limited >= LIMIT_ALERT_THRESHOLD:
+        try:
+            from v2r.channels import notify_all
+
+            notify_all(
+                rt.channels,
+                f"계정 등록 제한 다발: 이번 점검에서 {limited}건 — 계정별 하루 상한을 확인하세요",
+                level="critical",
+                category="register_limit_spike",
+                tag="publish",
+            )
+        except Exception:  # noqa: BLE001 - 알림 실패로 점검 결과를 못 돌려주면 안 된다
+            pass
 
     return result
 

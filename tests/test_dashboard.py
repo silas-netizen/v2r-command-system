@@ -445,9 +445,11 @@ def test_schedule_yaml_has_report_entries():
         assert entry["time"] == when
         assert entry["command"] == "중간 보고"
         assert entry["enabled"] is True
-    # 기존 미처리 5회 보고는 그대로
-    for i in range(1, 6):
-        assert f"pending-{i}" in entries
+    # 미처리 보고는 사용자 지시(2026-09-23)로 하루 5회 → 18:00 1회로 축소됐다
+    assert "pending-1" in entries
+    assert entries["pending-1"]["time"] == "18:00"
+    for i in range(2, 6):
+        assert f"pending-{i}" not in entries
 
 
 def test_reports_are_light_tasks():

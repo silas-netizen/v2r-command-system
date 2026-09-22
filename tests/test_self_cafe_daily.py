@@ -1123,7 +1123,7 @@ def test_run_publish_은_카페별_간격으로_돈다(tmp_path, monkeypatch):
     monkeypatch.setattr(publish_mod, "eligible", lambda *a, **k: list(pool))
     monkeypatch.setattr(publish_mod, "_pool_for_cafe", lambda rt, spec, c, b, p: (list(p), False))
     monkeypatch.setattr(publish_mod, "in_self_window", lambda now: True)
-    monkeypatch.setattr(worker, "notify_all", lambda ch, msg: None)
+    monkeypatch.setattr(worker, "notify_all", lambda ch, msg, **kw: None)
 
     clock = _Clock()
     monkeypatch.setattr(worker.time, "monotonic", clock)

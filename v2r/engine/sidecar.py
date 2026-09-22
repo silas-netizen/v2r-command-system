@@ -73,8 +73,14 @@ HEARTBEAT_STALE_SECONDS = 180
 TICK_SECONDS = 5
 #: 한 틱에서 처리할 가벼운 작업 수 상한(한 틱이 너무 길어지지 않게)
 LIGHT_LIMIT = 10
-#: 같은 경고를 되풀이하지 않는 간격(초)
+#: 같은 경고를 되풀이하지 않는 간격(초) — v2r.channels 의 critical 등급이 이제
+#: 이 몫을 대신한다(CRITICAL_REPEAT_SECONDS). 옛 이름은 하위 호환으로 남긴다.
 ALERT_REPEAT_SECONDS = 600
+#: 심장박동 전용 스레드 간격(초) — 작업 실행과 분리되어 있어 LIGHT 작업이
+#: 오래 걸려도 이 스레드는 계속 찍는다 (사고 2026-09-23).
+HEARTBEAT_TICK_SECONDS = 5
+#: "심장박동은 안 찍히지만 작업이 진행 중" 표시를 남길 때 쓰는 파일.
+BUSY_FILE = "sidecar_busy.json"
 
 
 def is_light(task: Any) -> bool:
@@ -102,20 +108,27 @@ def heartbeat_path(rt: Any) -> Path:
     return Path(rt.settings.data_dir) / HEARTBEAT_FILE
 
 
-def write_heartbeat(rt: Any, now_kst: datetime | None = None) -> None:
-    """사이드카가 살아 있다는 표시. 실패해도 루프를 세우지 않는다."""
+def write_heartbeat(
+    rt: Any, now_kst: datetime | None = None, *, busy: dict | None = None
+) -> None:
+    """사이드카가 살아 있다는 표시. 실패해도 루프를 세우지 않는다.
+
+    `busy` 를 주면 "지금 뭘 하고 있는지"(단계·경과초)를 같이 남긴다 —
+    작업이 오래 걸려 이 함수가 안 불려도, **별도 심장박동 스레드**가 계속
+    이걸 찍어 감시기가 진짜 죽은 것과 "그냥 바쁜 것"을 구분할 수 있다.
+    """
     now_kst = now_kst or datetime.now(KST)
     path = heartbeat_path(rt)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(
-            json.dumps(
-                {"at": now_kst.isoformat(timespec="seconds"), "pid": os.getpid()},
-                ensure_ascii=False,
-            ),
-            encoding="utf-8",
-        )
+        payload: dict[str, Any] = {
+            "at": now_kst.isoformat(timespec="seconds"),
+            "pid": os.getpid(),
+        }
+        if busy:
+            payload["busy"] = busy
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
         os.replace(tmp, path)
     except Exception as exc:  # noqa: BLE001
         log.warning("사이드카 심장박동 기록 실패: %s", exc)
@@ -153,16 +166,23 @@ def heartbeat_line(rt: Any, now_kst: datetime | None = None) -> str:
     return f"사이드카 심장박동: {int(age)}초 전 — 정상"
 
 
-#: 마지막으로 "사이드카가 멈췄다" 고 알린 시각(단조 시계)
+#: 마지막으로 "사이드카가 멈췄다" 고 알린 시각(단조 시계) — 하위 호환용으로
+#: 남겨 둔다. 실제 되풀이 억제는 이제 v2r.channels 의 critical 등급이 한다.
 _last_alert = 0.0
+#: 알림 사건 구분용 이름
+_STALE_CATEGORY = "sidecar_heartbeat_stale"
 
 
 def alert_if_stale(rt: Any, limit_seconds: int = HEARTBEAT_STALE_SECONDS) -> bool:
     """사이드카 심장박동이 3분 넘게 낡았으면 알린다(본 루프가 부른다).
 
-    한 번도 켜진 적이 없으면(파일 없음) 알리지 않는다.
+    한 번도 켜진 적이 없으면(파일 없음) 알리지 않는다. critical 등급이라
+    같은 사건은 되풀이하지 않고(10분), 10분 넘게 이어지면 1회 더(에스컬레이션),
+    복구되면 `alert_recovered` 가 "복구됨" 1회를 보낸다.
     """
     global _last_alert
+    from v2r.channels import notify_all
+
     age = heartbeat_age_seconds(rt)
     if age is None or age <= limit_seconds:
         return False
@@ -177,21 +197,41 @@ def alert_if_stale(rt: Any, limit_seconds: int = HEARTBEAT_STALE_SECONDS) -> boo
     except Exception as exc:  # noqa: BLE001
         log.warning("사이드카 경고 기록 실패: %s", exc)
     try:
-        from v2r.channels import notify_all
-
-        notify_all(rt.channels, text)
+        notify_all(rt.channels, text, level="critical", category=_STALE_CATEGORY, tag="schedule")
     except Exception as exc:  # noqa: BLE001
         log.warning("사이드카 경고 알림 실패: %s", exc)
+    return True
+
+
+def alert_recovered(rt: Any) -> bool:
+    """심장박동이 되살아났으면 "복구됨" 1회를 보낸다. 경고 중이 아니었으면 조용히."""
+    from v2r.channels import clear_critical, notify_all
+
+    was_alerting = clear_critical(_STALE_CATEGORY)
+    if not was_alerting:
+        return False
+    text = "사이드카(예약·감시) 심장박동이 되살아났습니다 — 복구됨"
+    log.info("%s", text)
+    try:
+        rt.events.log(None, "info", text)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        notify_all(rt.channels, text, level="critical", category=f"{_STALE_CATEGORY}:recovered", tag="schedule")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("사이드카 복구 알림 실패: %s", exc)
     return True
 
 
 # --------------------------------------------------------------------
 # 틱 1회분
 # --------------------------------------------------------------------
-def tick_once(rt: Any, owner: str | None = None) -> dict:
+def tick_once(rt: Any, owner: str | None = None, *, status: "_Status | None" = None) -> dict:
     """사이드카 1회분: 예약 → 감시 → 채널 수신 → 가벼운 작업 → 심장박동.
 
-    어떤 예외로도 스레드를 죽이지 않는다(칸마다 가둔다).
+    어떤 예외로도 스레드를 죽이지 않는다(칸마다 가둔다). `status` 를 주면
+    각 단계·각 LIGHT 작업이 시작될 때마다 무엇을 하고 있는지 남긴다 —
+    별도로 도는 심장박동 스레드가 이걸 읽어 "N초째 진행 중"을 함께 찍는다.
     """
     from v2r.engine import monitor as monitor_mod
     from v2r.engine import schedule as schedule_mod
@@ -199,16 +239,24 @@ def tick_once(rt: Any, owner: str | None = None) -> dict:
 
     owner = owner or sidecar_owner()
     out: dict = {}
+
+    def _mark(step: str) -> None:
+        if status is not None:
+            status.set(step)
+
+    _mark("schedule")
     try:
         out["schedule"] = schedule_mod.tick(rt)
     except Exception as exc:  # noqa: BLE001
         log.exception("사이드카 예약 틱 실패(계속 진행): %s", exc)
         out["schedule"] = {"error": str(exc)}
+    _mark("monitor")
     try:
         out["monitor"] = monitor_mod.tick(rt)
     except Exception as exc:  # noqa: BLE001
         log.exception("사이드카 감시 틱 실패(계속 진행): %s", exc)
         out["monitor"] = {"error": str(exc)}
+    _mark("poll_channels")
     try:
         out["received"] = worker_mod.poll_channels(rt)
     except Exception as exc:  # noqa: BLE001
@@ -216,10 +264,20 @@ def tick_once(rt: Any, owner: str | None = None) -> dict:
         out["received"] = 0
     try:
         # 중지 중이어도 가벼운 작업(현황·미처리 알림)은 돌아야 한다.
-        out["done"] = worker_mod.drain(rt, owner, limit=LIGHT_LIMIT, scope="light")
+        # LIGHT_LIMIT 건까지, 한 건씩 시간 상한을 두고 돈다(run_once 가 직접
+        # 상한을 지킨다) — 하나가 오래 걸려도 나머지·심장박동은 안 막힌다.
+        done: list[dict] = []
+        for _ in range(LIGHT_LIMIT):
+            _mark("light:acquire")
+            out_one = worker_mod.run_once(rt, owner, scope="light")
+            if out_one is None:
+                break
+            done.append(out_one)
+        out["done"] = done
     except Exception as exc:  # noqa: BLE001
         log.exception("사이드카 가벼운 작업 실행 실패(계속 진행): %s", exc)
         out["done"] = []
+    _mark("exposure_cycle")
     try:
         # 무한 순환 작업("long" 슬롯) — 큐에 안 들어가고 매 틱 조금씩 진행한다.
         # 지금은 "노출 순환"(B2, keyword_exposure.cycle_tick) 하나뿐이다.
@@ -229,8 +287,27 @@ def tick_once(rt: Any, owner: str | None = None) -> dict:
     except Exception as exc:  # noqa: BLE001
         log.exception("사이드카 노출 순환 실패(계속 진행): %s", exc)
         out["exposure_cycle"] = {"error": str(exc)}
+    _mark("idle")
     write_heartbeat(rt)
     return out
+
+
+class _Status:
+    """사이드카가 지금 뭘 하고 있는지(스레드 간 공유, 잠금으로 보호)."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._step = "idle"
+        self._since = time.monotonic()
+
+    def set(self, step: str) -> None:
+        with self._lock:
+            self._step = step
+            self._since = time.monotonic()
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return {"step": self._step, "elapsed": round(time.monotonic() - self._since, 1)}
 
 
 # --------------------------------------------------------------------
@@ -254,12 +331,18 @@ class SidecarThread:
         self._runtime_factory = runtime_factory or (lambda: Runtime.open(settings))
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._heartbeat_thread: threading.Thread | None = None
         self.ticks = 0
         self.last_error: str | None = None
+        self._status = _Status()
 
     # --- 수명 ---
     def start(self) -> "SidecarThread":
-        """스레드를 띄운다(이미 돌고 있으면 그대로)."""
+        """스레드를 띄운다(이미 돌고 있으면 그대로).
+
+        틱(예약·감시·채널·LIGHT 작업)과 심장박동을 **분리된 스레드**로 띄운다
+        — 틱 쪽이 오래 걸려도 심장박동은 계속 찍힌다(사고 2026-09-23).
+        """
         if self._thread is not None and self._thread.is_alive():
             return self
         self._stop.clear()
@@ -267,10 +350,14 @@ class SidecarThread:
             target=self._run, name="v2r-sidecar", daemon=True
         )
         self._thread.start()
+        self._heartbeat_thread = threading.Thread(
+            target=self._run_heartbeat, name="v2r-sidecar-heartbeat", daemon=True
+        )
+        self._heartbeat_thread.start()
         return self
 
     def is_alive(self) -> bool:
-        """스레드가 살아 있는가."""
+        """스레드가 살아 있는가(틱 스레드 기준 — 실제 작업을 하는 쪽)."""
         return self._thread is not None and self._thread.is_alive()
 
     def stop(self, timeout: float = 10.0) -> None:
@@ -280,6 +367,10 @@ class SidecarThread:
         if thread is not None and thread.is_alive():
             thread.join(timeout=timeout)
         self._thread = None
+        hb = self._heartbeat_thread
+        if hb is not None and hb.is_alive():
+            hb.join(timeout=timeout)
+        self._heartbeat_thread = None
 
     # --- 본체 ---
     def _run(self) -> None:  # pragma: no cover - 스레드 본체(내용은 tick_once 로 시험)
@@ -290,7 +381,7 @@ class SidecarThread:
             log.info("사이드카 시작(%s)", owner)
             while not self._stop.is_set():
                 try:
-                    tick_once(rt, owner)
+                    tick_once(rt, owner, status=self._status)
                     self.ticks += 1
                 except Exception as exc:  # noqa: BLE001 - 스레드는 절대 죽지 않는다
                     self.last_error = str(exc)
@@ -306,6 +397,20 @@ class SidecarThread:
                 except Exception:  # noqa: BLE001
                     pass
             log.info("사이드카 종료")
+
+    def _run_heartbeat(self) -> None:  # pragma: no cover - 스레드 본체
+        """틱 스레드와 따로 돈다. DB 는 안 건드려서(파일만) 연결이 필요 없다."""
+        import types
+
+        shim = types.SimpleNamespace(settings=self.settings)
+        while not self._stop.is_set():
+            try:
+                snap = self._status.snapshot()
+                busy = snap if snap.get("step") not in (None, "idle") else None
+                write_heartbeat(shim, busy=busy)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("사이드카 심장박동 스레드 오류(계속 진행): %s", exc)
+            self._stop.wait(HEARTBEAT_TICK_SECONDS)
 
 
 __all__ = [

@@ -167,6 +167,59 @@ def test_fire_clears_stop_flag(tmp_path):
 
 
 # --------------------------------------------------------------------
+# 예약 명령 해석 검증 (사고 2026-09-23: 옛 실행기가 새 명령을 다른 작업으로
+# 오해석해 발사 — expect_task 가 있으면 발사 전에 확인한다)
+# --------------------------------------------------------------------
+def test_expect_task가_어긋나면_발사하지_않고_경고한다(tmp_path):
+    from v2r import channels as channels_mod
+
+    channels_mod._CRITICAL_STATE.clear()
+    rt = make_rt(tmp_path)
+    channel = RecordingChannel()
+    rt._channels = [channel]
+    entry = sched.ScheduleEntry(
+        name="키워드 발굴 전체",
+        time="01:00",
+        command="키워드 발굴 전체 500개",
+        expect_task="keyword_discovery_status",  # 일부러 틀리게 준다
+    )
+    out = sched.fire(rt, entry)
+    assert out["ok"] is False
+    assert out.get("skipped_mismatch") is True
+    assert any("해석" in t for t in channel.sent)  # 경고가 채널로 나갔다
+    channels_mod._CRITICAL_STATE.clear()
+    rt.close()
+
+
+def test_expect_task가_맞으면_그대로_발사한다(tmp_path):
+    rt = make_rt(tmp_path)
+    rt._channels = []
+    handler = FakeHandler()
+    entry = sched.ScheduleEntry(
+        name="키워드 발굴 전체",
+        time="01:00",
+        command="키워드 발굴 전체 500개",
+        expect_task="keyword_discovery_all",  # 실제 파서 결과와 같다
+    )
+    out = sched.fire(rt, entry, handle_text=handler)
+    assert len(handler.calls) == 1
+    assert "skipped_mismatch" not in out
+    rt.close()
+
+
+def test_expect_task가_없으면_검증을_건너뛴다(tmp_path):
+    """옛 예약 항목(expect_task 없음)은 그대로 동작한다(하위 호환)."""
+    rt = make_rt(tmp_path)
+    rt._channels = []
+    handler = FakeHandler()
+    entry = sched.ScheduleEntry(name="아무 예약", time="09:00", command="현황")
+    out = sched.fire(rt, entry, handle_text=handler)
+    assert len(handler.calls) == 1
+    assert "skipped_mismatch" not in out
+    rt.close()
+
+
+# --------------------------------------------------------------------
 # 감시견
 # --------------------------------------------------------------------
 class RecordingChannel:

@@ -74,7 +74,7 @@ def test_레이트_제한이면_같은_슬롯을_기다렸다_다시_한다(tmp_
     rt = make_runtime(tmp_path)
     notices: list[str] = []
     rt._channels = []
-    monkeypatch.setattr(worker, "notify_all", lambda ch, msg: notices.append(msg))
+    monkeypatch.setattr(worker, "notify_all", lambda ch, msg, **kw: notices.append(msg))
     waits: list[float] = []
     monkeypatch.setattr(
         worker,
@@ -109,7 +109,7 @@ def test_레이트_제한이면_같은_슬롯을_기다렸다_다시_한다(tmp_
 def test_대기중_중지요청이면_남은_슬롯을_건너뛴다(tmp_path, monkeypatch):
     rt = make_runtime(tmp_path)
     rt._channels = []
-    monkeypatch.setattr(worker, "notify_all", lambda ch, msg: None)
+    monkeypatch.setattr(worker, "notify_all", lambda ch, msg, **kw: None)
     monkeypatch.setattr(worker, "_wait_for_rate_limit", lambda *a, **k: False)
 
     spec = make_spec(dry_run=True)
@@ -130,7 +130,7 @@ def test_대기중_중지요청이면_남은_슬롯을_건너뛴다(tmp_path, mo
 def test_계속_제한이면_정해진_횟수만_기다리고_실패로_남긴다(tmp_path, monkeypatch):
     rt = make_runtime(tmp_path)
     rt._channels = []
-    monkeypatch.setattr(worker, "notify_all", lambda ch, msg: None)
+    monkeypatch.setattr(worker, "notify_all", lambda ch, msg, **kw: None)
     monkeypatch.setattr(worker, "_wait_for_rate_limit", lambda *a, **k: True)
 
     spec = make_spec(dry_run=True)

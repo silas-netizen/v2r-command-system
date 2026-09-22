@@ -1,9 +1,20 @@
-"""채널 묶음: 설정에서 사용 가능한 채널을 만들고 일괄 보고한다."""
+"""채널 묶음: 설정에서 사용 가능한 채널을 만들고 일괄 보고한다.
+
+알림 등급 정책 (사용자 지시 2026-09-23, 설명은 config/notify.yaml):
+  - "critical": 항상 보낸다. 앞에 "🔴"를 붙이고, 같은 사건(같은 category)은
+    CRITICAL_REPEAT_SECONDS 안에 되풀이하지 않는다. 복구되면(clear_critical)
+    "복구됨" 1회를 보낸다. CRITICAL_ESCALATE_SECONDS 넘게 이어지면 1회 더.
+  - "summary": 채널로 보내지 않는다(0을 돌려준다) — 정기 보고에만 담는다.
+  - "info"(기본값): 채널로 보내지 않는다 — 로그·DB 이벤트·현황판에만 남긴다.
+  - "always": 등급 분류 밖. 사용자가 채널에서 직접 보낸 명령의 응답이라
+    무조건 보낸다(기존 동작과 같다).
+"""
 
 from __future__ import annotations
 
 import logging
 import re
+import time as _time
 from typing import Any
 
 from .base import Channel, IncomingCommand, format_report
@@ -22,7 +33,55 @@ __all__ = [
     "notify_all",
     "notify_photo_all",
     "notify_document_all",
+    "clear_critical",
+    "NOTIFY_LEVELS",
 ]
+
+#: 알려진 등급. 모르는 값이 들어오면 "info"로 다룬다(조용히 억제 — 과다 전송보단 안전).
+NOTIFY_LEVELS = ("critical", "summary", "info", "always")
+
+#: 등급 아이콘 (사용자 지시 2026-09-23: 텔레그램·슬랙 메시지에 등급+범주 아이콘).
+LEVEL_ICONS = {"critical": "🔴", "summary": "🟡", "info": "⚪"}
+
+#: 범주 → 아이콘 (config/notify.yaml 의 표와 같다). notify_all 의 `tag` 인자로 고른다.
+CATEGORY_ICONS = {
+    "publish": "📢",  # 일상·브랜드 발행 결과
+    "login": "🔑",  # 로그인·세션
+    "schedule": "⏰",  # 예약·실행기
+    "keyword": "🔍",  # 키워드·노출
+    "draft": "✍️",  # 원고·이미지 생성
+    "dashboard": "📊",  # 현황판·중간/일일 보고
+    "reply": "💬",  # 사용자 직접 명령 응답
+    "maintenance": "🛠",  # 정비
+}
+
+
+def _icon_prefix(level: str, tag: str | None) -> str:
+    """등급·범주 아이콘을 앞에 붙일 문구를 만든다. 없으면 빈 문자열."""
+    cat_icon = CATEGORY_ICONS.get(str(tag)) if tag else ""
+    if level == "always":
+        # 사용자 직접 명령 응답: 범주 아이콘만(있으면). 등급 아이콘은 안 붙인다.
+        return f"{cat_icon} " if cat_icon else ""
+    level_icon = LEVEL_ICONS.get(level, "")
+    parts = "".join(p for p in (level_icon, cat_icon) if p)
+    return f"{parts} " if parts else ""
+
+#: 같은 사건(critical) 경고를 되풀이하지 않는 간격(초)
+CRITICAL_REPEAT_SECONDS = 600
+#: 이 시간 넘게 이어지면 에스컬레이션(다시 한번) 보낸다(초)
+CRITICAL_ESCALATE_SECONDS = 600
+
+#: category → 마지막으로 보낸 시각(단조 시계), 첫 알림 시각, 에스컬레이션 여부
+_CRITICAL_STATE: dict[str, dict[str, Any]] = {}
+
+
+def clear_critical(category: str) -> bool:
+    """그 사건이 끝났다는 표시. 다음에 다시 나면 "복구됨" 1회를 보낸다.
+
+    돌려주는 값은 "그 사건이 실제로 경고 중이었는가"(복구 알림을 보낼지 판단용).
+    """
+    state = _CRITICAL_STATE.pop(str(category), None)
+    return bool(state)
 
 
 def build_channels(settings: Any | None = None) -> list[Channel]:
@@ -77,12 +136,53 @@ def sanitize(text: str, limit: int = 500) -> str:
         out = pat.sub(lambda m: (m.group(1) if m.lastindex else "") + "***", out)
     return out[:limit]
 
-def notify_all(channels: list[Channel], text: str) -> int:
-    """모든 채널에 같은 보고를 보낸다. 성공 건수 반환."""
+def notify_all(
+    channels: list[Channel],
+    text: str,
+    level: str = "info",
+    *,
+    category: str | None = None,
+    tag: str | None = None,
+) -> int:
+    """모든 채널에 같은 보고를 보낸다. 성공 건수 반환.
+
+    `level` 이 등급 정책을 정한다(모듈 docstring 참고). "critical" 은
+    `category`(없으면 text 자체) 로 사건을 구분해 되풀이 전송을 막는다.
+    `tag` 는 범주 아이콘(📢 발행 · 🔑 로그인 · ⏰ 예약 · 🔍 키워드 · ✍️ 원고 ·
+    📊 현황판 · 💬 명령응답 · 🛠 정비, `CATEGORY_ICONS` 참고) — 실제로 보내는
+    메시지(critical/summary/always)에만 앞에 붙는다.
+    """
+    level = str(level or "info")
+    if level not in NOTIFY_LEVELS:
+        level = "info"
+    if level in ("info", "summary"):
+        return 0  # 채널로 안 보낸다 — 로그·DB·정기 보고가 대신한다
+
+    out_text = text
+    if level == "critical":
+        cat = str(category or text)
+        now = _time.monotonic()
+        state = _CRITICAL_STATE.get(cat)
+        if state is not None:
+            since_first = now - state["first"]
+            since_last = now - state["last"]
+            escalate = since_first >= CRITICAL_ESCALATE_SECONDS and not state.get("escalated")
+            if since_last < CRITICAL_REPEAT_SECONDS and not escalate:
+                return 0  # 같은 사건, 되풀이 억제
+            if escalate:
+                state["escalated"] = True
+                out_text = f"{text} (계속됨, {int(since_first)}초째)"
+        else:
+            state = {"first": now, "escalated": False}
+            _CRITICAL_STATE[cat] = state
+        state["last"] = now
+
+    out_text = f"{_icon_prefix(level, tag)}{out_text}"
+
     sent = 0
     for channel in channels or []:
         try:
-            sent += int(channel.broadcast(sanitize(text)) or 0)
+            sent += int(channel.broadcast(sanitize(out_text)) or 0)
         except Exception as exc:  # 알림 실패로 본 작업이 죽지 않게
             log.warning("채널 %s 보고 실패: %s", getattr(channel, "name", "?"), exc)
     return sent

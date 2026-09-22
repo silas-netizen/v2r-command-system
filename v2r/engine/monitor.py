@@ -186,7 +186,7 @@ def _alert(rt: Any, state: dict, text: str) -> None:
     from v2r.channels import notify_all
 
     try:
-        notify_all(rt.channels, text)
+        notify_all(rt.channels, text, level="critical", category=f"monitor_alert:{text[:40]}", tag="schedule")
     except Exception as exc:  # noqa: BLE001 pragma: no cover
         log.warning("감시 알림 실패: %s", exc)
     now = datetime.now(KST)
@@ -523,7 +523,7 @@ def daily_summary(rt: Any, state: dict, now: datetime, cfg: dict) -> str | None:
     from v2r.channels import notify_all
 
     try:
-        notify_all(rt.channels, text)
+        notify_all(rt.channels, text, level="summary", tag="dashboard")
     except Exception as exc:  # noqa: BLE001 pragma: no cover
         log.warning("하루 요약 전송 실패: %s", exc)
     box["summary_sent"] = True
@@ -704,11 +704,23 @@ def _watch_finished(
             _daily(state, now)["recovered"] += 1
         except Exception as exc:  # noqa: BLE001
             lines.append(f"시도함: 토큰 갱신 실패 ({exc})")
+    resume_line = None
     if new_id is None and verdict["action"] != "wait":
         resume = verdict.get("resume") or _command_text(job)
         if resume:
-            lines.append(f"다시 하려면 이렇게 보내세요: {resume}")
-    _alert(rt, state, "\n".join(lines))
+            resume_line = f"다시 하려면 이렇게 보내세요: {resume}"
+            lines.append(resume_line)
+
+    # 자동 진단 문구("판정: … / 조치 … / 시도함 … / 다시 하려면 …")는 채널로
+    # 안 보낸다 — 로그·DB 이벤트 상세에만 남긴다 (사용자 지시 2026-09-23).
+    try:
+        rt.events.log(job_id, "error", "자동 진단:\n" + "\n".join(lines))
+    except Exception:  # noqa: BLE001 pragma: no cover
+        pass
+    channel_lines = [lines[0]]
+    if resume_line:
+        channel_lines.append(resume_line)
+    _alert(rt, state, "\n".join(channel_lines))
     acts.append(
         {
             "job_id": job_id,

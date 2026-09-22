@@ -359,7 +359,7 @@ def test_gpt_keepalive_notifies_when_logged_out(monkeypatch):
         "v2r.warehouse.gpt_images.check_gpt_session",
         lambda **k: {"ok": True, "logged_in": False, "method": "cookie-expiry", "note": ""},
     )
-    monkeypatch.setattr(worker, "notify_all", lambda ch, text: sent.append(text) or 1)
+    monkeypatch.setattr(worker, "notify_all", lambda ch, text, **kw: sent.append(text) or 1)
 
     class _RT:
         channels = []
@@ -377,7 +377,7 @@ def test_gpt_keepalive_quiet_when_logged_in(monkeypatch):
         "v2r.warehouse.gpt_images.check_gpt_session",
         lambda **k: {"ok": True, "logged_in": True, "method": "headless", "note": ""},
     )
-    monkeypatch.setattr(worker, "notify_all", lambda ch, text: sent.append(text) or 1)
+    monkeypatch.setattr(worker, "notify_all", lambda ch, text, **kw: sent.append(text) or 1)
 
     class _RT:
         channels = []

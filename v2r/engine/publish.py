@@ -1116,6 +1116,8 @@ def notify_photo_shortage(
         rt.channels,
         f"사진 부족: 브랜드 {brand} / {folder} 폴더 — 필요 {need}장, 사용 가능 {have}장."
         f" 생성하려면 '{command}' 이라고 보내세요.",
+        level="always",  # 사용자 승인이 필요한 요청이라 등급 억제 대상이 아니다
+        tag="draft",
     )
     return True
 
