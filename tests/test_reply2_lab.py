@@ -224,8 +224,9 @@ def test_jangeuddeum_needs_absorption_and_blend_logic():
     bad = ("장으뜸 장어즙이라고 있어요 산부인과 원장님이 권하셔서 먹었어요 "
            "그냥 참고 버티는걸로는 안되더라구요 검색해보시면 후기 많아요")
     assert any("브랜드 논리" in p for p in bw.reply2_problems(bad, rule))
-    good = ("장으뜸 장어즙이라고 있어요 배합이랑 원물 함량을 따져 만들어서 몸에 흡수가 "
-            "잘된대요 아무거나 먹으면 소용없더라구요 검색해보시면 후기 많아요")
+    # 근거 문장은 마이너스 카피 (사용자 결정 2026-09-22)
+    good = ("장으뜸 장어즙이라고 있어요 배합이랑 원물 함량을 안 따지면 흡수가 "
+            "안 돼서 소용없대요 아무거나 먹을땐 그대로더라구요 검색해보시면 후기 많아요")
     assert bw.reply2_problems(good, rule) == []
 
 
@@ -234,8 +235,8 @@ def test_newdermis_needs_barrier_logic():
     bad = ("자연방패 항문세정제라고 있어요 항문외과 의사가 추천하는 세정제에요 "
            "좌욕만으로는 한계가 있더라구요 검색해보시면 후기 많아요")
     assert any("브랜드 논리" in p for p in bw.reply2_problems(bad, rule))
-    good = ("자연방패 항문세정제라고 있어요 항문 보호막을 강화해주는 성분이 들어가서 "
-            "접근이 달라요 그냥 씻기만 하는건 소용없더라구요 검색해보시면 후기 많아요")
+    good = ("자연방패 항문세정제라고 있어요 항문 보호막을 강화해주는 성분이 없으면 "
+            "세정제를 써도 효과 없대요 그냥 씻기만 하는건 의미없더라구요 검색해보시면 후기 많아요")
     assert bw.reply2_problems(good, rule) == []
 
 
@@ -305,21 +306,21 @@ def test_crying_marks_are_allowed_even_on_evidence():
     """ㅠㅠ 는 웃는 게 아니라 안타까움이라 근거 문장에 붙어도 된다 (2026-09-22)."""
     rule = bw.rule_for("뉴더미스")
     ok = (
-        "자연방패 항문세정제 라고 있어요 치질 카페에서 추천 많이 받은 세정제인데 "
-        "보호막 강화 성분이 핵심이에요 ㅠㅠ 연고나 좌욕만으로는 한계가 있더라구요 "
+        "자연방패 항문세정제 라고 있어요 치질 카페에서 추천 많이 받았는데 "
+        "보호막 강화 성분이 없으면 소용없다고 하더라구요 ㅠㅠ 연고나 좌욕만으로는 한계가 있더라구요 "
         "검색해보시면 후기 많아요"
     )
     assert bw.reply2_problems(ok, rule) == []
     assert bw.strip_evidence_laughter(ok) == ok  # ㅠㅠ 는 지우지 않는다
-    laughing = ok.replace("핵심이에요 ㅠㅠ", "핵심이에요 ㅎㅎ")
+    laughing = ok.replace("하더라구요 ㅠㅠ", "하더라구요 ㅎㅎ")
     assert any("근거 문장 웃음 표기" in p for p in bw.reply2_problems(laughing, rule))
 
 
 def test_laughter_on_the_limit_or_closing_sentence_is_fine():
     rule = bw.rule_for("뉴더미스")
     ok = (
-        "자연방패 항문세정제라는게 있어요 항문 보호막을 지켜주는 성분이 들어 있어서 "
-        "그냥 씻기만 하는 거랑은 원리가 아예 달라요 연고만 바르면 그때뿐이더라구요ㅋㅋ "
+        "자연방패 항문세정제라는게 있어요 항문 보호막을 지켜주는 성분이 없으면 "
+        "아무리 씻어도 소용없대요 연고만 바르면 그때뿐이더라구요ㅋㅋ "
         "후기 검색해보시면 많아요"
     )
     assert bw.reply2_problems(ok, rule) == []

@@ -386,6 +386,11 @@ COMMON_SPACING_WORDS: tuple[str, ...] = (
 #: 본문에서 이 개수 미만이면 경고 (0개 = 하나도 안 틀렸다)
 TYPO_MIN_COUNT = 1
 
+#: 검증 표에는 남기되 **다시 시키지는 않는** 항목의 구간 이름.
+#: 본문·댓글 재시도 고리는 `violations(scope="본문")` `violations(scope="댓글")` 만
+#: 보므로, 이 구간에 둔 항목은 모델을 다시 부르지 않는다 (토큰 절약).
+INFO_SCOPE = "참고"
+
 #: 프롬프트에 박는 규칙 한 줄 — 일부러 틀리기
 INTENTIONAL_TYPO_RULE = (
     "본문은 **일부러 조금 틀리게** 쓴다 (정리본 [AI 티 제거] 규칙)."
@@ -2669,7 +2674,11 @@ def validate(
             ", ".join(typo_hits) if typo_hits else "0개 (하나도 안 틀렸다)",
             not typo_bad,
             hard=False,
-            scope="본문",
+            # 구간을 `참고` 로 둔다 = 검증 표에는 남지만 **재시도를 부르지 않는다**.
+            # (본문/댓글 재시도 고리는 `violations(scope="본문")` `scope="댓글")` 만 본다)
+            # 일부러 틀리라는 규칙 때문에 모델을 다시 부르면 토큰만 더 든다
+            # (사용자 지시 2026-09-22 토큰 절약).
+            scope=INFO_SCOPE,
         )
     )
     return checks
@@ -2689,10 +2698,15 @@ def violations(checks: list[dict], scope: str = "", include_warnings: bool = Tru
 
     사용자 지시(2026-09-19): 한 번 어긋났다고 포기하지 말고, **무엇이 어떻게**
     어긋났는지(`본문 312자 > 250자` 같은 형태로) 짚어서 될 때까지 다시 시킨다.
+
+    구간이 `참고`인 항목은 **다시 시키지 않는 알림**이라 여기서 빼고 돌려준다
+    (검증 표에는 그대로 남는다, 사용자 지시 2026-09-22 토큰 절약).
     """
     out: list[str] = []
     for c in checks:
         if c["통과"]:
+            continue
+        if not scope and c.get("구간") == INFO_SCOPE:
             continue
         if scope and c.get("구간") != scope:
             continue
