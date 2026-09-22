@@ -20,7 +20,9 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
     path = str(db_path)
     if path != ":memory:":
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path, isolation_level=None)
+    # check_same_thread=False: 사이드카가 가벼운 작업을 시간 상한 스레드에서 돌린다
+    # (2026-09-23 07:40 "SQLite objects created in a thread..." 사고). 접근은 호출 쪽이 직렬화한다.
+    conn = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
