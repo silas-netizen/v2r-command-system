@@ -182,6 +182,26 @@ class ArticleIndexStore:
                 return dict(r)
         return None
 
+    def find_by_keyword(self, keyword: str, cafe: str = "", limit: int = 5) -> list[dict]:
+        """제목에 `keyword`가 들어간 색인 행(최근 동기화 순).
+
+        브랜드 키워드 노출 검사(`v2r/knowledge/keyword_exposure.py`)가 "우리가 올린
+        브랜드 글" URL을 만들 때 쓴다. `cafe`를 주면 그 카페로 좁힌다.
+        """
+        kw = normalize_title(keyword)
+        if not kw:
+            return []
+        sql = "SELECT * FROM article_index WHERE title_norm LIKE ?"
+        params: list[Any] = [f"%{kw}%"]
+        if cafe:
+            sql += " AND cafe = ?"
+            params.append(cafe)
+        sql += " ORDER BY synced_at DESC"
+        if limit and limit > 0:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        return [dict(r) for r in self.conn.execute(sql, params).fetchall()]
+
     def rows_missing_body(self, cafe: str = "", limit: int = 0) -> list[dict]:
         """본문 해시가 아직 비어 있는 행."""
         sql = "SELECT * FROM article_index WHERE (body_hash IS NULL OR body_hash = '')"

@@ -5,14 +5,26 @@ docs/reports/keyword-exposure-plan-2026-09-22.md §2 구현.
 
 from __future__ import annotations
 
+import pytest
+
 from v2r.command.parser import parse_korean_command
 from v2r.knowledge.keyword_exposure import (
+    DEFAULT_DAILY_CAP,
     ExposureRow,
+    _naver_article_url,
+    _prioritize,
+    _title_lead_keyword,
     check_keyword,
     parse_cafe_search_rank,
+    parse_cafe_search_title_rank,
+    run_check,
+    target_keywords,
 )
 from v2r.store import keyword_exposure_store as store
+from v2r.store.article_index import normalize_title
 from v2r.store.db import connect, init_schema
+
+from tests.test_engine import make_runtime
 
 OUR_URL = "https://cafe.naver.com/mycafe/12345"
 
@@ -202,3 +214,170 @@ def test_sidecar_light_task():
     from v2r.engine.sidecar import LIGHT_TASKS
 
     assert "keyword_exposure" in LIGHT_TASKS
+
+
+# --------------------------------------------------------------------
+# 우리 글 URL 원천 보강 (2026-09-22 2차)
+# --------------------------------------------------------------------
+@pytest.fixture()
+def rt(tmp_path):
+    runtime = make_runtime(tmp_path)
+    yield runtime
+    runtime.close()
+
+
+def test_parse_cafe_search_rank_우리가_만든_URL도_글번호로_매칭():
+    """`_naver_article_url`이 만드는 ca-fe/cafes/.. 꼴 URL도 검색 결과의
+    별칭(alias) 꼴 링크와 글 번호만 같으면 같은 글로 인식해야 한다."""
+    html = """
+    <ul><li><a href="https://cafe.naver.com/mycafealias/12345">우리 글</a></li></ul>
+    """
+    built = _naver_article_url(25016228, "12345")
+    assert parse_cafe_search_rank(html, built) == 1
+
+
+def test_naver_article_url_카페번호_글번호로_만든다():
+    assert _naver_article_url(25016228, "999") == (
+        "https://cafe.naver.com/ca-fe/cafes/25016228/articles/999"
+    )
+    assert _naver_article_url(None, "999") == ""
+    assert _naver_article_url(25016228, "") == ""
+
+
+def test_title_lead_keyword_제목_맨_앞_토큰():
+    assert _title_lead_keyword("다이어트 3주만에 효과 봤어요") == "다이어트"
+    assert _title_lead_keyword("  [홈트] 오늘도 운동") == "홈트"
+    assert _title_lead_keyword("") == ""
+
+
+def test_parse_cafe_search_title_rank_제목으로_찾는다():
+    html = """
+    <ul>
+      <li><a href="https://cafe.naver.com/othercafe/1">딴 얘기</a></li>
+      <li><a href="https://cafe.naver.com/mycafe/12345">다이어트 3주만에 효과 봤어요!!</a></li>
+    </ul>
+    """
+    target = normalize_title("다이어트 3주만에 효과 봤어요")
+    assert parse_cafe_search_title_rank(html, target) == 2
+    assert parse_cafe_search_title_rank(html, normalize_title("없는 제목")) is None
+    assert parse_cafe_search_title_rank(html, "") is None
+
+
+def test_target_keywords_시트에_없으면_article_index로_URL을_만든다(rt):
+    rt.article_index.upsert(
+        cafe_id=25016228, cafe="씨씨앙", source_id="s1", title="다이어트 3주만에 효과",
+    )
+    rt.article_index.conn.execute(
+        "UPDATE article_index SET article_id = ? WHERE source_id = ?", ("999", "s1"),
+    )
+    rt.article_index.conn.commit()
+
+    from v2r.sources import keyword_list
+
+    def fake_rows_from_xlsx(path, sheet=keyword_list.EXPOSURE_SHEET):
+        return [{"카페": "씨씨앙", "키워드": "다이어트", "노출상태": "밀려남"}]
+
+    import v2r.knowledge.keyword_exposure as ke_mod
+
+    monkeypatch_target = fake_rows_from_xlsx
+    orig = ke_mod.rows_from_xlsx
+    ke_mod.rows_from_xlsx = monkeypatch_target
+    try:
+        out = target_keywords(
+            "우아덤", xlsx_path="dummy.xlsx", article_index=rt.article_index
+        )
+    finally:
+        ke_mod.rows_from_xlsx = orig
+
+    row = next(r for r in out if r["keyword"] == "다이어트")
+    assert row["article_url"] == "https://cafe.naver.com/ca-fe/cafes/25016228/articles/999"
+
+
+def test_target_keywords_url칸이_상태문구면_버린다(rt):
+    """실측: 일부 브랜드 시트 `url` 칸엔 '노출완'/'밀려남' 같은 상태 문구가 들어있다.
+    실제 URL이 아니면 빈 값으로 취급해야 article_index 보강이 동작한다."""
+    from v2r.sources import keyword_list
+    import v2r.knowledge.keyword_exposure as ke_mod
+
+    def fake_rows_from_xlsx(path, sheet=keyword_list.EXPOSURE_SHEET):
+        return [{"카페": "씨씨앙", "키워드": "다이어트", "url": "노출완", "노출상태": "노출완"}]
+
+    orig = ke_mod.rows_from_xlsx
+    ke_mod.rows_from_xlsx = fake_rows_from_xlsx
+    try:
+        out = target_keywords("우아덤", xlsx_path="dummy.xlsx", article_index=None)
+    finally:
+        ke_mod.rows_from_xlsx = orig
+
+    row = next(r for r in out if r["keyword"] == "다이어트")
+    assert row["article_url"] == ""
+
+
+def test_target_keywords_우리가_발행한_키워드도_더한다(rt):
+    rt.article_index.upsert(
+        cafe_id=25016228, cafe="씨씨앙", source_id="s2", title="홈트 매일 30분 후기",
+    )
+
+    from v2r.sources import keyword_list
+    import v2r.knowledge.keyword_exposure as ke_mod
+
+    def fake_rows_from_xlsx(path, sheet=keyword_list.EXPOSURE_SHEET):
+        return [{"카페": "씨씨앙", "키워드": "다이어트", "노출상태": "밀려남"}]
+
+    orig = ke_mod.rows_from_xlsx
+    ke_mod.rows_from_xlsx = fake_rows_from_xlsx
+    try:
+        out = target_keywords(
+            "우아덤", xlsx_path="dummy.xlsx", article_index=rt.article_index
+        )
+    finally:
+        ke_mod.rows_from_xlsx = orig
+
+    keywords = {r["keyword"] for r in out}
+    assert "다이어트" in keywords  # 시트 키워드
+    assert "홈트" in keywords  # 우리가 발행한 글에서 뽑은 키워드
+
+
+def test_check_keyword_URL_없어도_후보제목으로_노출확인(monkeypatch):
+    import v2r.knowledge.keyword_exposure as ke_mod
+
+    html = """
+    <ul><li><a href="https://cafe.naver.com/mycafe/1">다이어트 후기 진짜 좋아요</a></li></ul>
+    """
+    monkeypatch.setattr(ke_mod, "fetch_cafe_search_html", lambda *a, **k: html)
+    target = normalize_title("다이어트 후기 진짜 좋아요")
+    row = check_keyword(
+        "우아덤", "다이어트", "씨씨앙", "", candidate_title_norm=target,
+    )
+    assert row.status == "exposed"
+    assert row.rank == 1
+
+
+def test_prioritize_밀려남과_우리글_있는_것을_앞으로(rt):
+    items = [
+        {"keyword": "미확인1", "article_url": "", "candidate_title_norm": ""},
+        {"keyword": "우리글있음", "article_url": "https://cafe.naver.com/mycafe/1", "candidate_title_norm": ""},
+        {"keyword": "미확인2", "article_url": "", "candidate_title_norm": ""},
+    ]
+    out = _prioritize(rt, "우아덤", items)
+    assert out[0]["keyword"] == "우리글있음"
+
+
+def test_run_check_하루_상한_60개로_자른다(rt, monkeypatch):
+    import v2r.knowledge.keyword_exposure as ke_mod
+
+    many = [
+        {"keyword": f"kw{i}", "cafe": "씨씨앙", "article_url": "", "t0_status": "", "candidate_title_norm": ""}
+        for i in range(80)
+    ]
+    monkeypatch.setattr(ke_mod, "target_keywords", lambda *a, **k: many)
+    seen = []
+
+    def fake_check(*a, **k):
+        seen.append(a[1])
+        return ExposureRow("우아덤", a[1], "씨씨앙", "", None, "unpublished", "2026-09-22T00:00:00+09:00")
+
+    monkeypatch.setattr(ke_mod, "check_keyword", fake_check)
+    results = run_check(rt, "우아덤", sleep_fn=lambda *a, **k: None)
+    assert len(results) == DEFAULT_DAILY_CAP == 60
+    assert len(seen) == 60

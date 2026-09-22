@@ -3,11 +3,18 @@
 설계: `docs/reports/keyword-exposure-plan-2026-09-22.md` 2절.
 
 대상 키워드 = 브랜드 시트 `노출 현황` 탭 **전 행**(v2r.sources.keyword_list 재사용,
-`밀려남`뿐 아니라 전 상태) ∪ 우리가 발행한 브랜드 글(article_index에 브랜드·키워드가
-남아 있는 경우 — 지금 스키마엔 없어 사실상 공집합이지만 나중에 붙게 열어 둔다).
+`밀려남`뿐 아니라 전 상태) ∪ 우리가 발행한 브랜드 글의 키워드(같은 카페의
+`article_index` 글 제목 맨 앞 키워드, 시트에 없는 것만 추가). 하루 브랜드당 최대
+`DEFAULT_DAILY_CAP`(60)개, 넘치면 '밀려남'·우리 글이 확인된 키워드를 우선한다.
 
-각 키워드를 네이버 검색 카페탭에서 조회해 우리 글 URL이 상위 N(기본 10)위 안에
-있으면 `exposed`, 있지만 순위 밖/찾지 못하면 `pushed`, 애초에 게시글 URL이 없으면
+"우리 글 URL"은 (a) 시트에 있으면 그대로, (b) 없으면 `article_index`에서 같은
+카페+제목에 키워드가 들어간 글을 찾아 `cafe_id`+`article_id`로
+`https://cafe.naver.com/ca-fe/cafes/<카페번호>/articles/<글번호>`를 만들고,
+(c) 그래도 없으면 검색 결과 카페 이름+제목 일치로 다시 시도하며, 아무 원천도 없으면
+`unpublished`.
+
+각 키워드를 네이버 검색 카페탭에서 조회해 우리 글이 상위 N(기본 10)위 안에 있으면
+`exposed`, 있지만 순위 밖/찾지 못하면 `pushed`, 애초에 어떤 원천도 없으면
 `unpublished`. 조회 실패(차단·네트워크 오류 등)는 `unknown`.
 
 보안: `노출 현황` 탭의 비밀번호 열은 `keyword_list._drop_password_columns`가 이미
@@ -89,9 +96,61 @@ def _norm_url(url: str) -> str:
     return u.casefold()
 
 
+#: 브랜드별 하루 검사 상한(초과분은 '밀려남'·최근 발행 우선으로 다음 회차에)
+DEFAULT_DAILY_CAP = 60
+
+#: 제목 맨 앞 "키워드" 토큰(공백/괄호/구두점 앞까지)
+_RE_TITLE_LEAD = re.compile(r"^[\s\[\(【]*([^\s\[\]\(\)【】,.!?~]+)")
+
+
+def _naver_article_url(cafe_id: Any, article_id: Any) -> str:
+    """카페 번호+글 번호로 만드는 네이버 카페 글 URL(카페 별칭이 없어도 동작).
+
+    docs/reports/limit-fail-fix-2026-09-22.md 참고 — V2R 글 상세/동기화로 얻는
+    `cafe_id`(clubid)·`article_id`(articleid)만 있으면 만들 수 있는 표준 형태다.
+    """
+    cid = str(cafe_id or "").strip()
+    aid = str(article_id or "").strip()
+    if not cid or not aid:
+        return ""
+    return f"https://cafe.naver.com/ca-fe/cafes/{cid}/articles/{aid}"
+
+
+def _title_lead_keyword(title: str) -> str:
+    """제목 맨 앞 키워드 토큰."""
+    m = _RE_TITLE_LEAD.match(str(title or "").strip())
+    return m.group(1) if m else ""
+
+
+def _resolve_our_article(article_index: Any, keyword: str, cafe: str) -> dict | None:
+    """article_index에서 이 키워드(+카페)로 우리가 올린 글 후보 1건.
+
+    `find_by_keyword`가 없는 낡은/가짜 article_index면 조용히 포기한다.
+    """
+    if article_index is None:
+        return None
+    try:
+        rows = article_index.find_by_keyword(keyword, cafe=cafe)
+    except AttributeError:
+        return None
+    except Exception as exc:  # pragma: no cover - 방어용
+        log.warning("article_index 키워드 조회 실패(%s): %s", keyword, exc)
+        return None
+    return rows[0] if rows else None
+
+
 def _article_id(url: str) -> str:
-    """cafe.naver.com/<카페>/<글번호> 꼴에서 글번호만."""
-    m = re.search(r"cafe\.naver\.com/[^/]+/(\d+)", str(url or ""), re.I)
+    """cafe.naver.com/<카페>/<글번호> 또는 <ca-fe/cafes/카페번호/articles/글번호> 꼴에서
+    글번호만.
+
+    검색 결과 링크는 카페 별칭(alias) 경로("cafe.naver.com/parisienlook/123")를
+    쓰지만, 우리가 별칭을 모를 때 `_naver_article_url`로 만드는 링크는 번호만 쓰는
+    "ca-fe/cafes/<카페번호>/articles/<글번호>" 꼴이다. 글 번호만 같으면 같은 글로
+    본다(카페 번호까지 같은지는 호출 쪽에서 카페 이름/`cafe` 값으로 이미 좁혀 둔다).
+    """
+    m = re.search(
+        r"cafe\.naver\.com/(?:ca-fe/cafes/\d+/articles|[^/]+)/(\d+)", str(url or ""), re.I
+    )
     return m.group(1) if m else ""
 
 
@@ -137,13 +196,22 @@ def target_keywords(
 ) -> list[dict]:
     """브랜드의 조회 대상 키워드 목록.
 
-    반환: `[{"keyword", "cafe", "article_url", "t0_status"}]` — 시트 전 행(밀려남 제한
-    없음) ∪ 우리가 발행한 브랜드 글(article_index에 brand/keyword 칸이 있을 때만).
-    키워드 기준 중복 제거, 시트 순서 우선.
+    반환: `[{"keyword", "cafe", "article_url", "t0_status"}]` — 시트 `노출 현황`
+    전 행(밀려남 제한 없음) ∪ 우리가 발행한 브랜드 글의 키워드(`article_index`에서
+    카페+제목으로 찾은 것). 키워드 기준 중복 제거, 시트 순서 우선.
+
+    "우리 글 URL"은 세 갈래로 채운다:
+      (a) 시트에 이미 있으면 그대로.
+      (b) 없으면 같은 카페에서 이 키워드가 제목에 들어간 `article_index` 행을 찾아
+          `cafe_id`+`article_id`로 `https://cafe.naver.com/ca-fe/cafes/<카페>/articles/<글번호>`
+          를 만든다.
+      (c) 그래도 없으면 빈 채로 둔다 — `check_keyword`가 검색 결과에서 카페 이름+
+          제목 일치로 다시 시도하고, 그마저 안 되면 `unpublished`.
     """
     rows = _sheet_rows(brand, cfg, xlsx_path)
     out: list[dict] = []
     seen: set[str] = set()
+    sheet_cafes: set[str] = set()
     for row in rows:
         keyword = _pick(row, _KEYWORD_HEADERS)
         if not keyword:
@@ -152,41 +220,62 @@ def target_keywords(
         if key in seen:
             continue
         seen.add(key)
+        cafe = _pick(row, _CAFE_HEADERS)
+        if cafe:
+            sheet_cafes.add(cafe)
+        article_url = _pick(row, _ARTICLE_URL_HEADERS)
+        if article_url and not re.match(r"^https?://", article_url.strip(), re.I):
+            # 실측(2026-09-22): '노출 현황' 탭 `url` 칸엔 실제로 '노출완'/'밀려남' 같은
+            # 상태 문구가 들어있는 브랜드 시트가 있다. URL처럼 보이지 않으면 버린다.
+            article_url = ""
+        candidate_title_norm = ""
+        if not article_url:
+            found = _resolve_our_article(article_index, keyword, cafe)
+            if found:
+                built = _naver_article_url(found.get("cafe_id"), found.get("article_id"))
+                if built:
+                    article_url = built
+                else:
+                    candidate_title_norm = str(found.get("title_norm") or "")
         out.append(
             {
                 "keyword": keyword,
-                "cafe": _pick(row, _CAFE_HEADERS),
-                "article_url": _pick(row, _ARTICLE_URL_HEADERS),
+                "cafe": cafe,
+                "article_url": article_url,
                 "t0_status": _pick(row, _T0_HEADERS),
+                "candidate_title_norm": candidate_title_norm,
             }
         )
 
-    # 우리가 발행한 브랜드 글(article_index에 brand/keyword 칸이 있는 스키마일 때만).
-    # 지금 스키마에는 그 칸이 없어 보통은 아무것도 더해지지 않는다.
-    if article_index is not None:
-        try:
-            extra = article_index.brand_keyword_articles(brand)  # type: ignore[attr-defined]
-        except AttributeError:
-            extra = []
-        except Exception as exc:  # pragma: no cover - 방어용
-            log.warning("article_index brand/keyword 조회 실패: %s", exc)
-            extra = []
-        for item in extra or []:
-            keyword = str(item.get("keyword") or "").strip()
-            if not keyword:
-                continue
-            key = _norm(keyword)
-            if key in seen:
-                continue
-            seen.add(key)
-            out.append(
-                {
-                    "keyword": keyword,
-                    "cafe": str(item.get("cafe") or ""),
-                    "article_url": str(item.get("article_url") or ""),
-                    "t0_status": "",
-                }
-            )
+    # 우리가 발행한 브랜드 글: 시트에 등장하는 카페들에서, article_index에 있는
+    # 글 제목 맨 앞 키워드를 뽑아 시트에 없는 키워드만 더한다.
+    if article_index is not None and sheet_cafes:
+        for cafe in sorted(sheet_cafes):
+            try:
+                rows_idx = article_index.rows_for_cafe(cafe)
+            except AttributeError:
+                rows_idx = []
+            except Exception as exc:  # pragma: no cover - 방어용
+                log.warning("article_index 카페 조회 실패(%s): %s", cafe, exc)
+                rows_idx = []
+            for item in rows_idx or []:
+                keyword = _title_lead_keyword(item.get("title") or "")
+                if not keyword:
+                    continue
+                key = _norm(keyword)
+                if key in seen:
+                    continue
+                seen.add(key)
+                article_url = _naver_article_url(item.get("cafe_id"), item.get("article_id"))
+                out.append(
+                    {
+                        "keyword": keyword,
+                        "cafe": cafe,
+                        "article_url": article_url,
+                        "t0_status": "",
+                        "candidate_title_norm": "" if article_url else str(item.get("title_norm") or ""),
+                    }
+                )
     return out
 
 
@@ -235,6 +324,44 @@ def parse_cafe_search_rank(html: str, article_url: str, top_n: int = DEFAULT_TOP
     return None
 
 
+#: 검색 결과 한 항목(제목 포함) — `<a ...>제목</a>` 꼴, 카페 글 링크만.
+_RE_RESULT_TITLE = re.compile(
+    r'<a[^>]+href="(?P<url>https?://(?:m\.)?cafe\.naver\.com/[^"\']+)"[^>]*>(?P<title>.*?)</a>',
+    re.I | re.S,
+)
+_RE_TAG = re.compile(r"<[^>]+>")
+
+
+def _strip_tags(text: str) -> str:
+    return _RE_TAG.sub("", text or "").strip()
+
+
+def parse_cafe_search_title_rank(
+    html: str, title_norm: str, top_n: int = DEFAULT_TOP_N
+) -> int | None:
+    """게시글 URL을 모를 때 — 제목(정규화)이 같은 카페 글의 순위(1부터).
+
+    `article_index.normalize_title`과 같은 정규화를 쓴다(호출 쪽에서 넘겨줌).
+    URL 기반 매칭(`parse_cafe_search_rank`)보다 느슨하니, URL을 만들 수 있으면
+    그쪽을 우선한다.
+    """
+    if not title_norm:
+        return None
+    from v2r.store.article_index import normalize_title
+
+    seen: list[str] = []
+    for m in _RE_RESULT_TITLE.finditer(html or ""):
+        norm = _norm_url(m.group("url"))
+        if norm in seen:
+            continue
+        seen.append(norm)
+        if len(seen) > top_n:
+            break
+        if normalize_title(_strip_tags(m.group("title"))) == title_norm:
+            return len(seen)
+    return None
+
+
 def _looks_blocked(html: str) -> bool:
     text = html or ""
     return any(
@@ -252,19 +379,49 @@ def check_keyword(
     cookies: dict[str, str] | None = None,
     top_n: int = DEFAULT_TOP_N,
     now: str | None = None,
+    candidate_title_norm: str = "",
 ) -> ExposureRow:
-    """키워드 하나를 검색해 판정한다. 글 URL이 없으면 검색 없이 `unpublished`."""
+    """키워드 하나를 검색해 판정한다.
+
+    글 URL이 있으면 URL로 순위를 찾는다. URL이 없어도 `candidate_title_norm`(같은
+    카페에서 이 키워드로 우리가 올렸을 법한 글의 정규화 제목)이 있으면 검색 결과의
+    제목으로 대신 찾는다. 둘 다 없으면 검색 없이 `unpublished`.
+    """
     checked_at = now or now_iso()
-    if not article_url:
+    if not article_url and not candidate_title_norm:
         return ExposureRow(brand, keyword, cafe, "", None, "unpublished", checked_at, t0_status)
     try:
         html = fetch_cafe_search_html(keyword, cookies=cookies)
-        rank = parse_cafe_search_rank(html, article_url, top_n=top_n)
+        if article_url:
+            rank = parse_cafe_search_rank(html, article_url, top_n=top_n)
+        else:
+            rank = parse_cafe_search_title_rank(html, candidate_title_norm, top_n=top_n)
     except Exception as exc:
         log.warning("키워드 검색 실패(%s): %s", keyword, exc)
         return ExposureRow(brand, keyword, cafe, article_url, None, "unknown", checked_at, t0_status)
     status = "exposed" if rank is not None else "pushed"
     return ExposureRow(brand, keyword, cafe, article_url, rank, status, checked_at, t0_status)
+
+
+def _prioritize(rt: Any, brand: str, items: list[dict]) -> list[dict]:
+    """상한(하루 60개)에 걸릴 때 앞에 둘 것 — '밀려남'·우리 글이 있는 키워드 우선.
+
+    안정 정렬이라 같은 우선순위 안에서는 원래 순서(시트 순서 → 발행 글 발견 순서)
+    가 유지된다.
+    """
+    try:
+        from v2r.store import keyword_exposure_store as store
+
+        pushed = {_norm(p["keyword"]) for p in store.pushed_keywords(rt.conn, brand)}
+    except Exception:  # pragma: no cover - DB 문제여도 순서만 못 바꿀 뿐
+        pushed = set()
+
+    def score(item: dict) -> int:
+        has_our_article = bool(item.get("article_url") or item.get("candidate_title_norm"))
+        is_pushed = _norm(item.get("keyword", "")) in pushed
+        return 0 if (has_our_article or is_pushed) else 1
+
+    return sorted(items, key=score)
 
 
 def run_check(
@@ -274,8 +431,14 @@ def run_check(
     top_n: int = DEFAULT_TOP_N,
     delay_range: tuple[float, float] = (MIN_DELAY_SEC, MAX_DELAY_SEC),
     sleep_fn: Any = time.sleep,
+    daily_cap: int = DEFAULT_DAILY_CAP,
 ) -> list[ExposureRow]:
-    """브랜드 키워드를 전부(또는 `limit`개만) 검사해 DB에 이력을 쌓고 결과를 돌려준다."""
+    """브랜드 키워드를 검사해 DB에 이력을 쌓고 결과를 돌려준다.
+
+    대상은 하루 최대 `daily_cap`개(기본 60)로 자른다. `limit`을 주면 그보다 더
+    좁힐 수 있지만(`min(limit, daily_cap)`), `daily_cap`을 넘길 수는 없다. 넘치는
+    분은 `_prioritize`가 '밀려남'·우리 글이 확인된 키워드를 앞으로 보낸 뒤 자른다.
+    """
     import random
 
     from v2r.store import keyword_exposure_store as store
@@ -288,8 +451,14 @@ def run_check(
         xlsx_path=str(xlsx) if xlsx.exists() else None,
         article_index=getattr(rt, "article_index", None),
     )
-    if limit:
-        targets = targets[:limit]
+    targets = _prioritize(rt, brand, targets)
+    cap = max(0, int(daily_cap)) or None
+    if cap and limit:
+        cap = min(cap, limit)
+    elif limit:
+        cap = limit
+    if cap:
+        targets = targets[:cap]
     cookies_path = Path(rt.settings.repo_root) / "data" / "naver_cookies.json"
     cookies = _cookie_dict(cookies_path)
 
@@ -303,13 +472,14 @@ def run_check(
             t0_status=item.get("t0_status", ""),
             cookies=cookies,
             top_n=top_n,
+            candidate_title_norm=item.get("candidate_title_norm", ""),
         )
         results.append(row)
         store.save(rt.conn, row.as_row())
         if row.status == "unknown" and _looks_blocked_result(row):
             log.warning("네이버 차단으로 보여 %s번째에서 멈춥니다: %s", i + 1, brand)
             break
-        if i < len(targets) - 1 and item.get("article_url"):
+        if i < len(targets) - 1 and (item.get("article_url") or item.get("candidate_title_norm")):
             sleep_fn(random.uniform(*delay_range))
     return results
 
@@ -378,10 +548,12 @@ def write_report(
 
 __all__ = [
     "DEFAULT_TOP_N",
+    "DEFAULT_DAILY_CAP",
     "ExposureRow",
     "target_keywords",
     "fetch_cafe_search_html",
     "parse_cafe_search_rank",
+    "parse_cafe_search_title_rank",
     "check_keyword",
     "run_check",
     "summary",

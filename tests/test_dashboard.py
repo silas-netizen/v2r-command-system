@@ -99,6 +99,41 @@ def test_dashboard_has_new_sections(tmp_path):
     assert html.count("<span>0") + html.count("<span>1") + html.count("<span>2") >= 24
 
 
+def test_dashboard_브랜드_키워드_노출_섹션(tmp_path):
+    """collect()가 keyword_exposure.summary(rt)를 그대로 담고, 현황판에 렌더된다."""
+    from v2r.knowledge.keyword_exposure import ExposureRow
+    from v2r.store import keyword_exposure_store as store
+
+    rt = make_runtime(tmp_path)
+    try:
+        store.save(
+            rt.conn,
+            ExposureRow(
+                "우아덤", "다이어트", "씨씨앙",
+                "https://cafe.naver.com/mycafe/1", 3, "exposed",
+                "2026-09-21T08:00:00+09:00",
+            ).as_row(),
+        )
+        store.save(
+            rt.conn,
+            ExposureRow(
+                "우아덤", "홈트", "씨씨앙", "", None, "unpublished",
+                "2026-09-22T08:00:00+09:00",
+            ).as_row(),
+        )
+        data = collect(rt, kind="live")
+        assert data.exposure["우아덤"]["exposed"] == 1
+        assert data.exposure["우아덤"]["unpublished"] == 1
+
+        path = build_dashboard(rt)
+        html = path.read_text(encoding="utf-8")
+    finally:
+        rt.close()
+
+    assert "브랜드 키워드 노출" in html
+    assert "우아덤" in html
+
+
 def test_dashboard_empty_db(tmp_path):
     rt = make_runtime(tmp_path)
     try:

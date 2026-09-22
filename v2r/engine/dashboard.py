@@ -55,6 +55,7 @@ SECTION_TITLES = {
     "hourly": "시간대별 발행 (건)",
     "llm": "브랜드 원고 · LLM",
     "sessions": "로그인 · 세션 유지",
+    "exposure": "브랜드 키워드 노출",
     "progress": "오늘 진행 · 결정 대기",
 }
 
@@ -562,6 +563,7 @@ class ReportData:
     v2r: tuple[str, str, str] = ("-", "", OFF)
     fired: tuple[int, int] = (0, 0)
     pending: str = ""
+    exposure: dict = field(default_factory=dict)
 
     @property
     def target_total(self) -> int:
@@ -586,6 +588,18 @@ class ReportData:
                 f"{SECTION_TITLES['header']} — {self.date} {self.now.strftime('%H:%M')} 기준 · {tag}"
             )
         return f"{SECTION_TITLES['header']} — {self.date} · {tag}"
+
+
+def _exposure_summary(rt: Runtime) -> dict:
+    """브랜드 키워드 노출 요약. `keyword_exposure.summary(rt)`만 쓰고 그 모듈은
+    고치지 않는다(설계 §5) — 실패해도 현황판이 죽지 않게 방어."""
+    try:
+        from v2r.knowledge import keyword_exposure
+
+        return keyword_exposure.summary(rt) or {}
+    except Exception as exc:  # pragma: no cover - 방어용
+        log.warning("키워드 노출 요약 실패: %s", exc)
+        return {}
 
 
 def collect(rt: Runtime, kind: str = "live", date: str = "", now: datetime | None = None) -> ReportData:
@@ -633,6 +647,7 @@ def collect(rt: Runtime, kind: str = "live", date: str = "", now: datetime | Non
         v2r=_v2r_login_note(rt, moment),
         fired=_schedule_fired(rt, day),
         pending=_pending_text(rt),
+        exposure=_exposure_summary(rt),
     )
     return data
 
@@ -909,7 +924,30 @@ def render_html_report(data: ReportData) -> str:
         )
     parts.append("</table></div>")
 
-    # 6) 오늘 진행 · 결정 대기
+    # 6) 브랜드 키워드 노출
+    parts.append(f'<h2>{html.escape(SECTION_TITLES["exposure"])}</h2>')
+    if data.exposure:
+        parts.append('<div class="tbl"><table>')
+        parts.append(
+            "<tr><th>브랜드</th><th>노출</th><th>밀려남</th><th>미발행</th>"
+            "<th>미확인</th><th>새로 밀려난 키워드</th></tr>"
+        )
+        for brand_name in sorted(data.exposure):
+            e = data.exposure[brand_name]
+            newly = "、".join(e.get("newly_pushed") or []) or "-"
+            parts.append(
+                f"<tr><td>{_esc(brand_name)}</td>"
+                f'<td class="n">{int(e.get("exposed", 0) or 0)}</td>'
+                f'<td class="n">{int(e.get("pushed", 0) or 0)}</td>'
+                f'<td class="n">{int(e.get("unpublished", 0) or 0)}</td>'
+                f'<td class="n">{int(e.get("unknown", 0) or 0)}</td>'
+                f"<td>{_esc(newly)}</td></tr>"
+            )
+        parts.append("</table></div>")
+    else:
+        parts.append('<p class="empty">키워드 노출 검사 이력이 없습니다.</p>')
+
+    # 7) 오늘 진행 · 결정 대기
     parts.append(f'<h2>{html.escape(SECTION_TITLES["progress"])}</h2>')
     lines = _pending_lines(data.pending)
     if lines:
@@ -1024,7 +1062,23 @@ def render_md_report(data: ReportData) -> str:
         )
     out.append("")
 
-    out.append(f"## 5. {SECTION_TITLES['progress']}")
+    out.append(f"## 5. {SECTION_TITLES['exposure']}")
+    if data.exposure:
+        out.append("| 브랜드 | 노출 | 밀려남 | 미발행 | 미확인 | 새로 밀려난 키워드 |")
+        out.append("|---|---|---|---|---|---|")
+        for brand_name in sorted(data.exposure):
+            e = data.exposure[brand_name]
+            newly = "、".join(e.get("newly_pushed") or []) or "-"
+            out.append(
+                f"| {brand_name} | {int(e.get('exposed', 0) or 0)} |"
+                f" {int(e.get('pushed', 0) or 0)} | {int(e.get('unpublished', 0) or 0)} |"
+                f" {int(e.get('unknown', 0) or 0)} | {newly} |"
+            )
+    else:
+        out.append("- 키워드 노출 검사 이력이 없습니다.")
+    out.append("")
+
+    out.append(f"## 6. {SECTION_TITLES['progress']}")
     lines = _pending_lines(data.pending)
     if lines:
         out.extend(f"- {line}" for line in lines)

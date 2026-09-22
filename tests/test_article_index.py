@@ -498,3 +498,26 @@ def test_parse_sync_article_index_본문까지_표시():
 def test_parse_duplicate_check():
     spec = parse_korean_command("중복 검사")
     assert spec is not None and spec.task == "duplicate_check"
+
+
+# --------------------------------------------------------------------
+# find_by_keyword — 키워드 노출 검사(keyword_exposure)가 쓰는 조회
+# --------------------------------------------------------------------
+def test_find_by_keyword_제목에_있으면_찾는다(rt):
+    rt.article_index.upsert(cafe_id=101, cafe="고요한 아침", source_id="s1", title="다이어트 3주 후기")
+    rt.article_index.upsert(cafe_id=102, cafe="글로시 마이", source_id="s2", title="상관없는 글")
+    out = rt.article_index.find_by_keyword("다이어트")
+    assert len(out) == 1
+    assert out[0]["source_id"] == "s1"
+
+
+def test_find_by_keyword_카페로_좁힌다(rt):
+    rt.article_index.upsert(cafe_id=101, cafe="고요한 아침", source_id="s1", title="다이어트 후기")
+    rt.article_index.upsert(cafe_id=102, cafe="글로시 마이", source_id="s2", title="다이어트 후기2")
+    out = rt.article_index.find_by_keyword("다이어트", cafe="글로시 마이")
+    assert [r["source_id"] for r in out] == ["s2"]
+
+
+def test_find_by_keyword_없으면_빈목록(rt):
+    assert rt.article_index.find_by_keyword("없는키워드") == []
+    assert rt.article_index.find_by_keyword("") == []
