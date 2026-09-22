@@ -546,6 +546,428 @@ def write_report(
     return md_path, csv_path
 
 
+# =======================================================================
+# B1~B4 (2026-09-22 재설계): 통합검색(통검) 판정 + 무한 순환 + CSV/현황판
+# 설계: docs/reports/keyword-program-plan-2026-09-22.md B절.
+# 기존 카페탭 검사(`check_keyword`/`run_check`)는 보조로 그대로 남긴다.
+# =======================================================================
+
+import csv
+import os
+
+#: 네이버 통합검색(통검) URL — 카페·블로그·VIEW·인플루언서 등 전 영역이 한 페이지에 나온다
+INTEGRATED_SEARCH_URL = "https://search.naver.com/search.naver?query={query}"
+#: 통검 결과에서 우리 글을 찾는 범위(이 안에 있으면 '노출완')
+DEFAULT_TOP_N_INTEGRATED = 30
+#: 이 순위 이내면 O열 "1~5순위 진입"
+TOP5_RANK = 5
+#: 연속 이 횟수만큼 unknown(차단 의심)이면 30분 휴식
+BLOCK_STREAK_LIMIT = 10
+#: 휴식 시간(초)
+BLOCK_REST_SECONDS = 1800
+
+#: 순환기 상태 파일 (data/ 아래)
+CYCLE_STATE_FILE = "exposure_cycle_state.json"
+
+KOREAN_STATUS = {
+    "exposed": "노출완",
+    "pushed": "밀려남",
+    "unpublished": "미발행",
+    "unknown": "미확인",
+}
+
+
+def fetch_integrated_search_html(
+    keyword: str, cookies: dict[str, str] | None = None, timeout: float = 10.0
+) -> str:
+    """네이버 통합검색 결과 HTML을 가져온다. 실패 시 예외."""
+    url = INTEGRATED_SEARCH_URL.format(query=quote(keyword))
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        )
+    }
+    resp = httpx.get(
+        url, headers=headers, cookies=cookies or {}, timeout=timeout, follow_redirects=True
+    )
+    resp.raise_for_status()
+    return resp.text
+
+
+def check_keyword_unified(
+    brand: str,
+    keyword: str,
+    cafe: str,
+    article_url: str,
+    t0_status: str = "",
+    cookies: dict[str, str] | None = None,
+    top_n: int = DEFAULT_TOP_N_INTEGRATED,
+    now: str | None = None,
+    candidate_title_norm: str = "",
+    html: str | None = None,
+) -> ExposureRow:
+    """B1: 통합검색 기준 판정 — 있으면 `exposed`(노출완), 없으면 `pushed`(밀려남).
+
+    `html`을 직접 넘기면 네트워크를 타지 않는다(테스트/재사용용). 기존 카페탭
+    함수(`parse_cafe_search_rank`/`parse_cafe_search_title_rank`)를 그대로
+    재사용한다 — 둘 다 HTML 안의 cafe.naver.com 링크만 보므로 통검 결과에도
+    그대로 적용된다.
+    """
+    checked_at = now or now_iso()
+    if not article_url and not candidate_title_norm:
+        return ExposureRow(brand, keyword, cafe, "", None, "unpublished", checked_at, t0_status)
+    try:
+        page = html if html is not None else fetch_integrated_search_html(keyword, cookies=cookies)
+        if article_url:
+            rank = parse_cafe_search_rank(page, article_url, top_n=top_n)
+        else:
+            rank = parse_cafe_search_title_rank(page, candidate_title_norm, top_n=top_n)
+    except Exception as exc:
+        log.warning("통검 확인 실패(%s): %s", keyword, exc)
+        return ExposureRow(brand, keyword, cafe, article_url, None, "unknown", checked_at, t0_status)
+    status = "exposed" if rank is not None else "pushed"
+    return ExposureRow(brand, keyword, cafe, article_url, rank, status, checked_at, t0_status)
+
+
+def integrated_search_url(keyword: str) -> str:
+    """O열/보고서용 통합검색 URL(사람이 눌러볼 수 있게 인코딩 그대로)."""
+    return INTEGRATED_SEARCH_URL.format(query=quote(keyword))
+
+
+def _discovered_keywords_path(rt: Any, brand: str) -> Path:
+    return Path(rt.settings.repo_root) / "data" / "keywords" / f"{brand}.csv"
+
+
+def known_brands(rt: Any) -> list[str]:
+    """`data/brand_sheet_<브랜드>.xlsx` 파일명에서 뽑은 브랜드 목록."""
+    repo = Path(rt.settings.repo_root)
+    out = []
+    for p in sorted(repo.glob("data/brand_sheet_*.xlsx")):
+        name = p.stem[len("brand_sheet_"):]
+        if name:
+            out.append(name)
+    return out
+
+
+def keyword_universe(rt: Any, brand: str) -> list[dict]:
+    """B2: 전체 키워드 = 시트 둘째 탭(H열, 기존 `target_keywords`) ∪
+    `data/keywords/<브랜드>.csv`(다른 일꾼이 만드는 발굴 결과, 있으면 병합).
+
+    각 항목: `{keyword, cafe, article_url, t0_status, candidate_title_norm, volume}`.
+    발굴 CSV는 아직 형식이 정해지는 중이라 방어적으로 읽는다(없거나 형식이
+    달라도 조용히 건너뛴다).
+    """
+    cfg = getattr(rt, "sources_cfg", None)
+    xlsx = Path(rt.settings.repo_root) / "data" / f"brand_sheet_{brand}.xlsx"
+    try:
+        targets = target_keywords(
+            brand,
+            cfg,
+            xlsx_path=str(xlsx) if xlsx.exists() else None,
+            article_index=getattr(rt, "article_index", None),
+        )
+    except Exception as exc:
+        log.warning("키워드 시트 조회 실패(%s): %s", brand, exc)
+        targets = []
+
+    out: dict[str, dict] = {}
+    for t in targets:
+        out[_norm(t["keyword"])] = {**t, "volume": 0}
+
+    disc_path = _discovered_keywords_path(rt, brand)
+    if disc_path.exists():
+        try:
+            with disc_path.open(encoding="utf-8-sig", newline="") as fh:
+                for row in csv.DictReader(fh):
+                    kw = (row.get("키워드") or row.get("keyword") or "").strip()
+                    if not kw:
+                        continue
+                    key = _norm(kw)
+                    vol = 0
+                    for vh in ("검색량", "월간검색량", "volume", "search_volume"):
+                        raw = row.get(vh)
+                        if raw:
+                            try:
+                                vol = int(re.sub(r"[^\d]", "", str(raw)) or 0)
+                            except Exception:
+                                vol = 0
+                            break
+                    if key in out:
+                        out[key]["volume"] = max(int(out[key].get("volume") or 0), vol)
+                    else:
+                        out[key] = {
+                            "keyword": kw,
+                            "cafe": row.get("카페") or "",
+                            "article_url": row.get("url") or row.get("게시글url") or "",
+                            "t0_status": "",
+                            "candidate_title_norm": "",
+                            "volume": vol,
+                        }
+        except Exception as exc:
+            log.warning("발굴 키워드 CSV 읽기 실패(%s, %s): %s", brand, disc_path, exc)
+    return list(out.values())
+
+
+def next_cycle_batch(rt: Any, brand: str, n: int = 1) -> list[dict]:
+    """B2: 다음에 확인할 키워드 n개 — 검색량 큰 순 → 마지막 확인 오래된 순.
+
+    커서를 따로 두지 않는다: 확인한 키워드는 DB의 `checked_at`이 갱신되어
+    자연히 정렬 맨 뒤로 밀리므로, 매번 이 함수를 부르는 것만으로 끝없이
+    순환한다.
+    """
+    from v2r.store import keyword_exposure_store as store
+
+    universe = keyword_universe(rt, brand)
+    if not universe:
+        return []
+    last_checked = {r["keyword"]: str(r["checked_at"] or "") for r in store.latest_by_keyword(rt.conn, brand)}
+
+    def sort_key(item: dict) -> tuple:
+        vol = -(int(item.get("volume") or 0))
+        last = last_checked.get(item["keyword"], "")  # 빈 문자열(미확인)이 가장 먼저
+        return (vol, last)
+
+    ordered = sorted(universe, key=sort_key)
+    return ordered[: max(0, n)]
+
+
+def cycle_state_path(rt: Any) -> Path:
+    return Path(rt.settings.data_dir) / CYCLE_STATE_FILE
+
+
+def cycle_status(rt: Any) -> dict:
+    """B2: 순환기 현재 상태(`노출 순환 상태` 명령이 그대로 씀)."""
+    p = cycle_state_path(rt)
+    if not p.exists():
+        return {"enabled": False}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {"enabled": False}
+
+
+def _write_cycle_state(rt: Any, state: dict) -> None:
+    p = cycle_state_path(rt)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, p)
+
+
+def cycle_start(rt: Any, brands: list[str] | None = None) -> dict:
+    """`노출 순환 시작`."""
+    state = cycle_status(rt)
+    state.update(
+        {
+            "enabled": True,
+            "brands": brands or state.get("brands") or known_brands(rt),
+            "started_at": now_iso(),
+            "paused_until_mono": None,
+        }
+    )
+    _write_cycle_state(rt, state)
+    return state
+
+
+def cycle_stop(rt: Any) -> dict:
+    """`노출 순환 중지`."""
+    state = cycle_status(rt)
+    state["enabled"] = False
+    _write_cycle_state(rt, state)
+    return state
+
+
+def cycle_tick(rt: Any, now_mono: float | None = None) -> dict | None:
+    """B2: 사이드카 한 틱에서 부른다. 꺼져 있으면 아무 일도 안 한다.
+
+    한 틱에 키워드 1개만 확인한다(3~6초 최소 간격은 상태에 기록한 마지막
+    호출 시각으로 지킨다 — 사이드카 틱 자체가 5초 간격이라 이 정도면 충분).
+    연속 `BLOCK_STREAK_LIMIT`번 unknown(차단 의심)이면 30분 휴식한다.
+    """
+    import random
+
+    state = cycle_status(rt)
+    if not state.get("enabled"):
+        return None
+    mono = time.monotonic() if now_mono is None else now_mono
+
+    paused_until = state.get("paused_until_mono")
+    if paused_until and mono < paused_until:
+        return {"paused": True}
+
+    last_mono = state.get("_last_mono")
+    min_gap = random.uniform(MIN_DELAY_SEC, MAX_DELAY_SEC)
+    if last_mono is not None and (mono - float(last_mono)) < min_gap:
+        return {"waiting": True}
+
+    brands = state.get("brands") or known_brands(rt)
+    if not brands:
+        return {"idle": True}
+    idx = int(state.get("brand_idx", 0)) % len(brands)
+    brand = brands[idx]
+    state["brand_idx"] = (idx + 1) % len(brands)
+
+    batch = next_cycle_batch(rt, brand, n=1)
+    state["_last_mono"] = mono
+    if not batch:
+        _write_cycle_state(rt, state)
+        return {"brand": brand, "checked": 0}
+
+    item = batch[0]
+    cookies_path = Path(rt.settings.repo_root) / "data" / "naver_cookies.json"
+    cookies = _cookie_dict(cookies_path)
+
+    from v2r.store import keyword_exposure_store as store
+
+    row = check_keyword_unified(
+        brand,
+        item["keyword"],
+        item.get("cafe", ""),
+        item.get("article_url", ""),
+        t0_status=item.get("t0_status", ""),
+        cookies=cookies,
+        candidate_title_norm=item.get("candidate_title_norm", ""),
+    )
+    store.save(rt.conn, row.as_row())
+    state["last_checked"] = {
+        "brand": brand,
+        "keyword": item["keyword"],
+        "status": row.status,
+        "at": row.checked_at,
+    }
+    streak = int(state.get("_block_streak", 0))
+    streak = streak + 1 if row.status == "unknown" else 0
+    state["_block_streak"] = streak
+    if streak >= BLOCK_STREAK_LIMIT:
+        state["paused_until_mono"] = mono + BLOCK_REST_SECONDS
+        state["_block_streak"] = 0
+        log.warning("노출 순환: 차단 징후(%s연속 미확인)로 30분 휴식 — %s", BLOCK_STREAK_LIMIT, brand)
+    _write_cycle_state(rt, state)
+
+    try:
+        write_exposure_csv(rt, brand)
+    except Exception as exc:  # pragma: no cover - 방어용
+        log.warning("노출 CSV 갱신 실패(%s): %s", brand, exc)
+
+    return {"brand": brand, "keyword": item["keyword"], "status": row.status, "rank": row.rank}
+
+
+#: B3: `data/exposure/<브랜드>.csv` 열 순서
+EXPOSURE_CSV_HEADERS = [
+    "카페", "url", "발행시간", "작성자 아이디", "비밀번호",
+    "발행 URL", "노출 상태", "키워드", "통합검색 URL", "최종 편집 일시",
+    "키워드 검색량", "노출된 검색량", "비고", "본문 분류", "1~5순위 진입",
+]
+
+
+def exposure_dir(rt: Any) -> Path:
+    return Path(rt.settings.repo_root) / "data" / "exposure"
+
+
+def write_exposure_csv(rt: Any, brand: str) -> tuple[Path, Path]:
+    """B3: DB의 최신 검사 결과 + 키워드 전체(검색량 포함)로
+    `data/exposure/<브랜드>.csv` + `summary.json`을 다시 쓴다.
+
+    비밀번호 열은 항상 빈칸(이 모듈은 비밀번호를 받지도, 저장하지도 않는다).
+    """
+    from v2r.store import keyword_exposure_store as store
+
+    universe = {_norm(i["keyword"]): i for i in keyword_universe(rt, brand)}
+    latest = {r["keyword"]: r for r in store.latest_by_keyword(rt.conn, brand)}
+
+    out_dir = exposure_dir(rt)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = out_dir / f"{brand}.csv"
+    summary_path = out_dir / f"{brand}.summary.json"
+
+    total_volume = 0
+    exposed_volume = 0
+    rows_out = []
+    all_keywords = {**{k: v for k, v in universe.items()}}
+    # DB에만 있고 universe엔 없을 수도 있는(발굴 목록이 바뀐) 키워드도 포함
+    for kw, r in latest.items():
+        all_keywords.setdefault(_norm(kw), {"keyword": kw, "cafe": r["cafe"] or "", "volume": 0})
+
+    for key in sorted(all_keywords, key=lambda k: -(int(all_keywords[k].get("volume") or 0))):
+        item = all_keywords[key]
+        keyword = item["keyword"]
+        r = latest.get(keyword)
+        status = r["status"] if r else "unknown"
+        rank = r["rank"] if r else None
+        vol = int(item.get("volume") or 0)
+        total_volume += vol
+        exposed_vol = vol if status == "exposed" else 0
+        exposed_volume += exposed_vol
+        top5 = "예" if (status == "exposed" and rank is not None and rank <= TOP5_RANK) else ""
+        rows_out.append(
+            [
+                item.get("cafe", "") or (r["cafe"] if r else ""),
+                r["article_url"] if r else item.get("article_url", ""),
+                "",  # 발행시간 — 이 모듈은 모른다(article_index/시트가 채움)
+                "",  # 작성자 아이디
+                "",  # 비밀번호 — 항상 빈칸
+                r["article_url"] if r else item.get("article_url", ""),
+                KOREAN_STATUS.get(status, status),
+                keyword,
+                integrated_search_url(keyword),
+                r["checked_at"] if r else "",
+                vol,
+                exposed_vol,
+                "",  # 비고
+                "",  # 본문 분류
+                top5,
+            ]
+        )
+
+    with csv_path.open("w", newline="", encoding="utf-8-sig") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(EXPOSURE_CSV_HEADERS)
+        writer.writerows(rows_out)
+
+    counts = {"exposed": 0, "pushed": 0, "unpublished": 0, "unknown": 0}
+    for key, item in all_keywords.items():
+        r = latest.get(item["keyword"])
+        status = r["status"] if r else "unknown"
+        counts[status] = counts.get(status, 0) + 1
+
+    summary_data = {
+        "brand": brand,
+        "updated_at": now_iso(),
+        "total_keywords": len(all_keywords),
+        "counts": counts,
+        "total_volume_p1": total_volume,
+        "exposed_volume_q1": exposed_volume,
+        "exposed_volume_ratio": (exposed_volume / total_volume) if total_volume else 0.0,
+    }
+    summary_path.write_text(json.dumps(summary_data, ensure_ascii=False, indent=2), encoding="utf-8")
+    return csv_path, summary_path
+
+
+def summary(rt: Any) -> dict[str, Any]:
+    """현황판용 요약: 브랜드별 노출/밀려남/미확인 수 + 새로 밀려난 키워드
+    (B4) + 검색량 비율(`data/exposure/<브랜드>.summary.json`이 있으면 얹는다).
+
+    dashboard.py는 이 함수 결과만 쓰고 이 모듈을 직접 고치지 않는다(설계 §5).
+    """
+    from v2r.store import keyword_exposure_store as store
+
+    out = store.summary(rt.conn)
+    out_dir = exposure_dir(rt)
+    for brand, entry in out.items():
+        p = out_dir / f"{brand}.summary.json"
+        if not p.exists():
+            continue
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        entry["exposed_volume_ratio"] = data.get("exposed_volume_ratio", 0.0)
+        entry["total_volume_p1"] = data.get("total_volume_p1", 0)
+        entry["exposed_volume_q1"] = data.get("exposed_volume_q1", 0)
+    return out
+
+
 __all__ = [
     "DEFAULT_TOP_N",
     "DEFAULT_DAILY_CAP",
@@ -558,4 +980,23 @@ __all__ = [
     "run_check",
     "summary",
     "write_report",
+    # B1~B4
+    "INTEGRATED_SEARCH_URL",
+    "DEFAULT_TOP_N_INTEGRATED",
+    "TOP5_RANK",
+    "KOREAN_STATUS",
+    "fetch_integrated_search_html",
+    "check_keyword_unified",
+    "integrated_search_url",
+    "known_brands",
+    "keyword_universe",
+    "next_cycle_batch",
+    "cycle_state_path",
+    "cycle_status",
+    "cycle_start",
+    "cycle_stop",
+    "cycle_tick",
+    "EXPOSURE_CSV_HEADERS",
+    "exposure_dir",
+    "write_exposure_csv",
 ]

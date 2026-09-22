@@ -35,12 +35,9 @@ entries:
     enabled: true
     command: 끊긴 작업 점검
 
-  # 브랜드별 키워드 노출 현황 (docs/reports/keyword-exposure-plan-2026-09-22.md §2)
-  - name: 키워드 노출 현황
-    time: "08:00"
-    days: daily
-    enabled: false   # 사용자 지시 2026-09-22 17:28: 노출 검사 일단 중지
-    command: 키워드 노출 현황
+  # 브랜드별 키워드 노출 현황: 08:00 1회 예약 대신 무한 순환기가 대체한다
+  # (docs/reports/keyword-program-plan-2026-09-22.md B2). 사이드카가 5초마다
+  # "노출 순환 시작" 상태를 보고 알아서 계속 돈다 — 예약 없음.
 
   - name: GPT 세션 점검
     time: "09:00"

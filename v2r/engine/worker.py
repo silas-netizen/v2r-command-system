@@ -2058,8 +2058,93 @@ def dispatch(rt: Runtime, job: Any, owner: str | None = None) -> dict:
         return {"ok": True, "report": monitor_mod.monitor_report(rt)}
     if task == "keyword_exposure":
         return _keyword_exposure(rt, spec)
+    if task == "exposure_cycle_start":
+        return _exposure_cycle_start(rt, spec)
+    if task == "exposure_cycle_stop":
+        return _exposure_cycle_stop(rt, spec)
+    if task == "exposure_cycle_status":
+        return _exposure_cycle_status(rt, spec)
+    if task == "keyword_discovery":
+        return _keyword_discovery(rt, spec)
+    if task == "keyword_discovery_status":
+        return _keyword_discovery_status(rt, spec)
 
     raise ValueError(f"처리기가 없는 작업: {task}")
+
+
+def _exposure_cycle_start(rt: Runtime, spec: TaskSpec) -> dict:
+    """`노출 순환 시작` — 사이드카 틱이 매번 조금씩 진행한다(B2)."""
+    from v2r.knowledge import keyword_exposure as ke_mod
+
+    brands = [spec.brand] if spec.brand else None
+    state = ke_mod.cycle_start(rt, brands=brands)
+    msg = f"노출 순환 시작: {', '.join(state.get('brands') or []) or '(브랜드 없음)'}"
+    return {"ok": True, "message": msg, "state": state}
+
+
+def _exposure_cycle_stop(rt: Runtime, spec: TaskSpec) -> dict:
+    """`노출 순환 중지`."""
+    from v2r.knowledge import keyword_exposure as ke_mod
+
+    ke_mod.cycle_stop(rt)
+    return {"ok": True, "message": "노출 순환을 중지했습니다"}
+
+
+def _exposure_cycle_status(rt: Runtime, spec: TaskSpec) -> dict:
+    """`노출 순환 상태`."""
+    from v2r.knowledge import keyword_exposure as ke_mod
+
+    state = ke_mod.cycle_status(rt)
+    if not state.get("enabled"):
+        return {"ok": True, "message": "노출 순환: 꺼짐", "state": state}
+    last = state.get("last_checked") or {}
+    msg = (
+        f"노출 순환: 켜짐 — 마지막 확인 {last.get('brand', '-')}/{last.get('keyword', '-')} "
+        f"({last.get('status', '-')}, {last.get('at', '-')})"
+    )
+    return {"ok": True, "message": msg, "state": state}
+
+
+def _keyword_discovery(rt: Runtime, spec: TaskSpec) -> dict:
+    """브랜드 키워드 발굴(꼬리 물기 BFS)을 돌리고 현황을 알린다."""
+    from v2r.knowledge import naver_keyword_tool as kt_mod
+
+    brand = (spec.brand or "").strip()
+    if not brand:
+        return {"ok": False, "error": "브랜드를 지정해 주세요 (예: 우아덤 키워드 발굴 1000개)"}
+    target = int(spec.count) or kt_mod.DEFAULT_TARGET
+    out = kt_mod.run_for_brand(rt, brand, target=target)
+    if not out.get("ok"):
+        return out
+    msg = (
+        f"{brand} 키워드 발굴: 누적 {out['collected']}개(이번 조회 {out['queries']}회)"
+        + (f" — {out['stopped_reason']}" if out.get("stopped_reason") else "")
+    )
+    try:
+        notify_all(rt.channels, msg)
+    except Exception:  # noqa: BLE001
+        pass
+    return {**out, "message": msg}
+
+
+def _keyword_discovery_status(rt: Runtime, spec: TaskSpec) -> dict:
+    """브랜드별 키워드 발굴 현황(개수·검색량 합·연관도 분포)."""
+    from v2r.knowledge import naver_keyword_tool as kt_mod
+    from v2r.store import keyword_discovery_store as kd_store
+
+    repo = Path(rt.settings.repo_root)
+    brands = [spec.brand] if spec.brand else list((rt.sources_cfg.get("brand_sheets") or {}).keys())
+    per_brand: dict[str, dict] = {}
+    for b in brands:
+        db_path = kt_mod.db_path_for_brand(b, repo / "data")
+        if not db_path.exists():
+            continue
+        conn = kd_store.open_db(db_path)
+        try:
+            per_brand[b] = kd_store.summary(conn)
+        finally:
+            conn.close()
+    return {"ok": True, "per_brand": per_brand}
 
 
 def _keyword_exposure(rt: Runtime, spec: TaskSpec) -> dict:

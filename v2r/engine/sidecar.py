@@ -59,6 +59,9 @@ LIGHT_TASKS = frozenset(
         "telegram_check",
         "maintenance",
         "keyword_exposure",
+        "exposure_cycle_start",
+        "exposure_cycle_stop",
+        "exposure_cycle_status",
     }
 )
 
@@ -217,6 +220,15 @@ def tick_once(rt: Any, owner: str | None = None) -> dict:
     except Exception as exc:  # noqa: BLE001
         log.exception("사이드카 가벼운 작업 실행 실패(계속 진행): %s", exc)
         out["done"] = []
+    try:
+        # 무한 순환 작업("long" 슬롯) — 큐에 안 들어가고 매 틱 조금씩 진행한다.
+        # 지금은 "노출 순환"(B2, keyword_exposure.cycle_tick) 하나뿐이다.
+        from v2r.knowledge import keyword_exposure as ke_mod
+
+        out["exposure_cycle"] = ke_mod.cycle_tick(rt)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("사이드카 노출 순환 실패(계속 진행): %s", exc)
+        out["exposure_cycle"] = {"error": str(exc)}
     write_heartbeat(rt)
     return out
 
