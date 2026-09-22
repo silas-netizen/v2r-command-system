@@ -58,6 +58,8 @@ MODELS: dict[str, str] = {
     # 2026-09-19 품질 시험: 본문도 잠시 Sonnet으로 내린다(되돌리려면 claude-opus-5).
     "brand_body": "claude-sonnet-5",
     "brand_comments": "claude-sonnet-5",
+    # 키워드-브랜드 연관도 재산정 (100개씩 묶음, 요금제 길 0원)
+    "keyword_relevance": "claude-haiku-4-5",
 }
 
 DEFAULT_MODEL = "claude-haiku-4-5"

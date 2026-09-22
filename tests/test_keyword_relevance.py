@@ -1,0 +1,305 @@
+"""키워드-브랜드 연관도 재산정(`v2r.knowledge.keyword_relevance`) 시험."""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+
+import pytest
+
+from v2r.knowledge import keyword_relevance as kr
+
+
+def _make_db(path, rows):
+    conn = sqlite3.connect(str(path))
+    conn.execute(
+        """
+        CREATE TABLE keywords (
+            keyword TEXT PRIMARY KEY,
+            pc INTEGER NOT NULL DEFAULT 0,
+            mobile INTEGER NOT NULL DEFAULT 0,
+            total INTEGER NOT NULL DEFAULT 0,
+            source_seed TEXT NOT NULL DEFAULT '',
+            depth INTEGER NOT NULL DEFAULT 0,
+            relevance INTEGER NOT NULL DEFAULT 0,
+            collected_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.executemany(
+        "INSERT INTO keywords (keyword, total, collected_at) VALUES (?, ?, '2026-09-23')",
+        rows,
+    )
+    conn.commit()
+    conn.close()
+
+
+class FakeRouter:
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.calls = 0
+
+    def complete(self, purpose, system, user, max_tokens=1200):
+        self.calls += 1
+        item = self._responses.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
+# --- 마이그레이션 ---------------------------------------------------
+
+
+def test_migrate_adds_columns_once(tmp_path):
+    db = tmp_path / "brand.sqlite"
+    _make_db(db, [("키워드1", 100)])
+    added = kr.migrate_path(db)
+    assert set(added) == set(kr.MIGRATION_COLUMNS)
+
+    added_again = kr.migrate_path(db)
+    assert added_again == []
+
+
+# --- 프롬프트/파싱 ---------------------------------------------------
+
+
+def test_build_user_prompt_numbers_keywords():
+    prompt = kr.build_user_prompt(["a", "b"])
+    assert prompt == "1. a\n2. b"
+
+
+def test_parse_response_ok():
+    keywords = ["감기약", "이비인후과"]
+    raw = json.dumps(
+        [
+            {"keyword": "감기약", "relevance": 0, "rationale": "직접 제품군"},
+            {"keyword": "이비인후과", "relevance": 3, "rationale": "무관"},
+        ],
+        ensure_ascii=False,
+    )
+    out = kr.parse_response(raw, keywords)
+    assert out[0] == {"keyword": "감기약", "relevance": 0, "rationale": "직접 제품군"}
+    # relevance=3이면 rationale은 강제로 빈 문자열
+    assert out[1]["rationale"] == ""
+
+
+def test_parse_response_count_mismatch():
+    raw = json.dumps([{"keyword": "a", "relevance": 0, "rationale": "x"}])
+    with pytest.raises(kr.RelevanceParseError):
+        kr.parse_response(raw, ["a", "b"])
+
+
+def test_parse_response_keyword_mismatch():
+    raw = json.dumps([{"keyword": "다른", "relevance": 0, "rationale": "x"}])
+    with pytest.raises(kr.RelevanceParseError):
+        kr.parse_response(raw, ["a"])
+
+
+def test_parse_response_bad_relevance_range():
+    raw = json.dumps([{"keyword": "a", "relevance": 9, "rationale": "x"}])
+    with pytest.raises(kr.RelevanceParseError):
+        kr.parse_response(raw, ["a"])
+
+
+def test_parse_response_not_json_array():
+    with pytest.raises(kr.RelevanceParseError):
+        kr.parse_response("이건 그냥 텍스트", ["a"])
+
+
+# --- score_batch 재시도 ------------------------------------------------
+
+
+def test_score_batch_retries_then_succeeds():
+    good = json.dumps([{"keyword": "a", "relevance": 1, "rationale": "근접"}], ensure_ascii=False)
+    router = FakeRouter(["엉망인 응답", good])
+    out = kr.score_batch(router, "브랜드", ["a"], "요약", retries=2)
+    assert out[0]["relevance"] == 1
+    assert router.calls == 2
+
+
+def test_score_batch_gives_up_after_retries():
+    router = FakeRouter(["나쁨1", "나쁨2", "나쁨3"])
+    with pytest.raises(kr.RelevanceParseError):
+        kr.score_batch(router, "브랜드", ["a"], "요약", retries=2)
+    assert router.calls == 3
+
+
+# --- score_brand / DB 반영 ----------------------------------------------
+
+
+def test_score_brand_writes_scores_and_progress(tmp_path):
+    db = tmp_path / "브랜드.sqlite"
+    _make_db(db, [("키워드1", 100), ("키워드2", 50)])
+
+    guides = tmp_path / "guides"
+    guides.mkdir()
+    (guides / "브랜드.md").write_text(
+        "# 브랜드 정리본\n- 브랜드/제품: 테스트 제품\n[역할]\n타깃 설명 문장\n[절대 규칙]\n",
+        encoding="utf-8",
+    )
+
+    response = json.dumps(
+        [
+            {"keyword": "키워드1", "relevance": 0, "rationale": "직접"},
+            {"keyword": "키워드2", "relevance": 2, "rationale": "확장"},
+        ],
+        ensure_ascii=False,
+    )
+    router = FakeRouter([response])
+    progress = tmp_path / "relevance_progress.json"
+
+    result = kr.score_brand(
+        router, "브랜드", db, guides, batch_size=100, progress_path=progress
+    )
+    assert result == {"scored": 2, "failed_batches": 0}
+
+    conn = sqlite3.connect(str(db))
+    rows = dict(conn.execute("SELECT keyword, relevance_llm FROM keywords").fetchall())
+    conn.close()
+    assert rows["키워드1"] == 0
+    assert rows["키워드2"] == 2
+
+    data = kr.load_progress(progress)
+    assert data["브랜드"]["status"] == "done"
+    assert data["브랜드"]["scored"] == 2
+
+
+def test_score_brand_skips_already_scored(tmp_path):
+    db = tmp_path / "브랜드.sqlite"
+    _make_db(db, [("키워드1", 100)])
+    kr.migrate_path(db)
+    conn = sqlite3.connect(str(db))
+    conn.execute(
+        "UPDATE keywords SET relevance_llm=1, scored_at='2026-09-23T00:00:00'"
+    )
+    conn.commit()
+    conn.close()
+
+    guides = tmp_path / "guides"
+    guides.mkdir()
+    (guides / "브랜드.md").write_text("- 브랜드/제품: 테스트", encoding="utf-8")
+
+    router = FakeRouter([])
+    result = kr.score_brand(router, "브랜드", db, guides, progress_path=None)
+    assert result == {"scored": 0, "failed_batches": 0}
+    assert router.calls == 0
+
+
+# --- primary_brand 중복 배정 --------------------------------------------
+
+
+def test_assign_primary_brand_picks_lower_relevance(tmp_path):
+    db_a = tmp_path / "A.sqlite"
+    db_b = tmp_path / "B.sqlite"
+    _make_db(db_a, [("공통키워드", 10), ("A전용", 5)])
+    _make_db(db_b, [("공통키워드", 10), ("B전용", 5)])
+    for db in (db_a, db_b):
+        kr.migrate_path(db)
+
+    conn_a = sqlite3.connect(str(db_a))
+    conn_a.execute("UPDATE keywords SET relevance_llm=2, scored_at='x' WHERE keyword='공통키워드'")
+    conn_a.execute("UPDATE keywords SET relevance_llm=0, scored_at='x' WHERE keyword='A전용'")
+    conn_a.commit()
+    conn_a.close()
+
+    conn_b = sqlite3.connect(str(db_b))
+    conn_b.execute("UPDATE keywords SET relevance_llm=0, scored_at='x' WHERE keyword='공통키워드'")
+    conn_b.execute("UPDATE keywords SET relevance_llm=1, scored_at='x' WHERE keyword='B전용'")
+    conn_b.commit()
+    conn_b.close()
+
+    counts = kr.assign_primary_brand({"A": db_a, "B": db_b})
+    assert counts["B"] == 2  # 공통키워드(B가 이김) + B전용
+    assert counts["A"] == 1  # A전용
+
+    conn_a = sqlite3.connect(str(db_a))
+    assert conn_a.execute(
+        "SELECT primary_brand FROM keywords WHERE keyword='공통키워드'"
+    ).fetchone()[0] == ""
+    conn_a.close()
+
+    conn_b = sqlite3.connect(str(db_b))
+    assert conn_b.execute(
+        "SELECT primary_brand FROM keywords WHERE keyword='공통키워드'"
+    ).fetchone()[0] == "B"
+    conn_b.close()
+
+
+# --- 현황 ---------------------------------------------------------------
+
+
+# --- Codex 교차 검증 ----------------------------------------------------
+
+
+def test_crosscheck_rows_flags_needs_review_and_picks_conservative():
+    claude_rows = [
+        {"keyword": "감기약", "relevance": 0, "rationale": "직접"},
+        {"keyword": "이비인후과", "relevance": 1, "rationale": "근접"},
+        {"keyword": "서울", "relevance": 0, "rationale": "직접(과다판정 의심)"},
+    ]
+    codex_rows = [
+        {"keyword": "감기약", "relevance": 0, "rationale": "직접"},
+        {"keyword": "이비인후과", "relevance": 2, "rationale": "확장"},
+        {"keyword": "서울", "relevance": 3, "rationale": ""},
+    ]
+    merged = kr.crosscheck_rows(claude_rows, codex_rows)
+    by_kw = {r["keyword"]: r for r in merged}
+
+    assert by_kw["감기약"]["needs_review"] is False
+    assert by_kw["감기약"]["final_relevance"] == 0
+
+    assert by_kw["이비인후과"]["needs_review"] is False  # gap=1 < NEEDS_REVIEW_GAP
+    assert by_kw["이비인후과"]["final_relevance"] == 1
+
+    assert by_kw["서울"]["needs_review"] is True  # gap=3
+    assert by_kw["서울"]["final_relevance"] == 3  # 보수적으로 큰(무관) 값 채택
+
+
+def test_agreement_rate():
+    merged = [
+        {"keyword": "a", "relevance": 0, "relevance_codex": 0},
+        {"keyword": "b", "relevance": 0, "relevance_codex": 1},
+        {"keyword": "c", "relevance": 0, "relevance_codex": 3},
+    ]
+    assert kr.agreement_rate(merged) == round(2 / 3, 4)
+
+
+def test_manuscript_eligible_requires_both_models_within_range():
+    assert kr.manuscript_eligible({"relevance": 2, "relevance_codex": 2}) is True
+    assert kr.manuscript_eligible({"relevance": 2, "relevance_codex": 3}) is False
+    assert kr.manuscript_eligible({"relevance": 3, "relevance_codex": 0}) is False
+    assert kr.manuscript_eligible({"relevance": 1, "relevance_codex": None}) is True
+
+
+def test_write_crosscheck_persists_final_scores(tmp_path):
+    db = tmp_path / "브랜드.sqlite"
+    _make_db(db, [("k1", 1)])
+    kr.migrate_path(db)
+    merged = [
+        {"keyword": "k1", "relevance": 0, "relevance_codex": 3, "needs_review": True, "final_relevance": 3}
+    ]
+    conn = sqlite3.connect(str(db))
+    kr.write_crosscheck(conn, merged)
+    row = conn.execute(
+        "SELECT relevance_llm, relevance_codex, needs_review FROM keywords WHERE keyword='k1'"
+    ).fetchone()
+    conn.close()
+    assert row == (3, 3, 1)
+
+
+def test_brand_status_distribution(tmp_path):
+    db = tmp_path / "브랜드.sqlite"
+    _make_db(db, [("k1", 1), ("k2", 1), ("k3", 1)])
+    kr.migrate_path(db)
+    conn = sqlite3.connect(str(db))
+    conn.execute("UPDATE keywords SET relevance_llm=0, scored_at='x' WHERE keyword='k1'")
+    conn.execute("UPDATE keywords SET relevance_llm=3, scored_at='x' WHERE keyword='k2'")
+    conn.commit()
+    conn.close()
+
+    status = kr.brand_status(db)
+    assert status["total"] == 3
+    assert status["unscored"] == 1
+    assert status["distribution"][0] == 1
+    assert status["distribution"][3] == 1
+    assert status["distribution"][1] == 0
