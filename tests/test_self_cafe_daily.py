@@ -379,6 +379,39 @@ def test_plan_is_always_immediate_and_rotates_accounts(tmp_path, monkeypatch):
     assert all(a != b for a, b in zip(used, used[1:]))  # 같은 계정 연속 금지
 
 
+def test_plan_ignores_xlsx_account_for_self_but_keeps_affiliate_account(tmp_path, monkeypatch):
+    """자사 카페 일상 글은 xlsx에 계정이 적혀 있어도 오늘 10개 중에서 새로 배정한다.
+
+    제휴 카페 행(workflows[i] == "affiliate")의 계정은 xlsx에 적힌 그대로 유지한다
+    (커밋 d21a19e — self_daily_mode 우회는 workflows[i] == "self"인 행만 건드린다).
+    """
+    rt = make_runtime(tmp_path)
+    rt.cafes_cfg = {
+        "self_owned": [{"name": "고요한 아침", "cafe_id": 1, "board": "반말일기"}],
+        "affiliate": [
+            {"name": "제휴카페", "cafe_id": 99, "board": "자유게시판", "revision_delay_hours": 1}
+        ],
+    }
+    pool = [_Acc(f"user{i:02d}") for i in range(30)]
+    monkeypatch.setattr(publish_mod, "load_accounts", lambda rt, prefer_cache=False: pool)
+    monkeypatch.setattr(publish_mod, "eligible", lambda *a, **k: list(pool))
+    monkeypatch.setattr(publish_mod, "_pool_for_cafe", lambda rt, spec, c, b, p: (list(p), False))
+    _patch_members(monkeypatch, {"고요한 아침": [a.login_id for a in pool]})
+
+    self_m = _m("고요한 아침", 0)
+    self_m.account = "xlsx박힌계정"  # xlsx에 적힌 계정 — 무시되어야 함
+    aff_m = _m("제휴카페", 1)
+    aff_m.account = "제휴전용계정"  # 제휴 카페는 xlsx 계정을 그대로 써야 함
+
+    spec = TaskSpec(task="publish_daily", count=2, per_cafe=True, dry_run=False)
+    slots = publish_mod.plan(rt, spec, [self_m, aff_m])
+
+    by_cafe = {s.cafe: s.account for s in slots}
+    assert by_cafe["고요한 아침"] != "xlsx박힌계정"
+    assert by_cafe["고요한 아침"] in {a.login_id for a in pool}
+    assert by_cafe["제휴카페"] == "제휴전용계정"
+
+
 def test_self_daily_accounts_are_random_ten():
     """계정 10개 고정은 LRU 순서가 아니라 **무작위**로 뽑는다 (규칙 §4)."""
     pool = [_Acc(f"user{i:02d}") for i in range(30)]
