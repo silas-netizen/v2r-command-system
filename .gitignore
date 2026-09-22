@@ -14,3 +14,4 @@ v2r_command_system.egg-info/
 !warehouse/
 warehouse/*
 !warehouse/guides/
+.pw-browsers/
