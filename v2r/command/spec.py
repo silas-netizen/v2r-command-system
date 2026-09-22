@@ -33,6 +33,8 @@ ALLOWED_TASKS: frozenset[str] = frozenset(
         "naver_keepalive",
         "web_keepalive",
         "plan_keepalive",
+        "slack_check",
+        "telegram_check",
         "request_photos",
         "wash_photos",
         "learn_guides",

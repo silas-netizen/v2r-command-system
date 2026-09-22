@@ -33,6 +33,10 @@ TASK_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("generate_daily", re.compile(r"일상\s*글.*(생성|만들어)")),
     ("collect_daily", re.compile(r"일상\s*글.*(수집|가져와)")),
     ("collect_new_photos", re.compile(r"새\s*(사진|이미지)\s*(수거|회수|가져오기|가져와)")),
+    # 채널 연결 점검(2026-09-22) — 다른 "점검" 패턴보다 앞에 둬야
+    # `web_keepalive` 등이 "슬랙"/"텔레그램" 낱말을 가로채지 않는다
+    ("slack_check", re.compile(r"슬랙\s*(점검|연결\s*확인|확인)")),
+    ("telegram_check", re.compile(r"텔레그램\s*(점검|연결\s*확인|확인)")),
     ("gpt_keepalive", re.compile(r"(gpt|지피티).*(유지|점검)", re.I)),
     ("naver_keepalive", re.compile(r"네이버.*(세션|로그인).*(유지|점검)")),
     # 요금제(Claude Code CLI) 로그인 점검. `클로드`가 든 문장을 web_keepalive가
@@ -497,6 +501,8 @@ TASK_LABELS: dict[str, str] = {
     "generate_photos": "사진 생성(GPT)",
     "approve_photos": "사진 승인",
     "reject_photos": "사진 반려",
+    "slack_check": "슬랙 연결 점검",
+    "telegram_check": "텔레그램 연결 점검",
     "gpt_keepalive": "GPT 세션 점검",
     "naver_keepalive": "네이버 세션 점검",
     "web_keepalive": "웹 세션 점검(Claude·Make)",

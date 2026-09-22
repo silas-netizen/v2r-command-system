@@ -1086,6 +1086,103 @@ def _collect_new_photos(rt: Runtime, spec: TaskSpec) -> dict:
     return stats
 
 
+def _channel_report_path(rt: Runtime, name: str) -> Any:
+    stamp = datetime.now(KST).strftime("%Y-%m-%d")
+    return rt.settings.repo_root.joinpath("docs", "reports", f"{name}-check-{stamp}.md")
+
+
+def _slack_check(rt: Runtime, spec: TaskSpec) -> dict:
+    """슬랙 연결 점검: auth.test·채널 확인·확인 메시지. 결과를 파일로 남긴다."""
+    del spec
+    slack = next((c for c in rt.channels if getattr(c, "name", "") == "slack"), None)
+    if slack is None:
+        message = "슬랙 채널이 비활성입니다(.env 의 SLACK_BOT_TOKEN 또는 webhook 확인 필요)"
+        notify_all(rt.channels, message)
+        return {"ok": False, "message": message}
+
+    out = slack.check_connection()
+    lines = [
+        "# 슬랙 연결 점검",
+        "",
+        f"- 확인 시각: {datetime.now(KST).strftime('%Y-%m-%d %H:%M')}",
+        f"- 봇 토큰 있음: {'예' if out.get('has_bot_token') else '아니오'}",
+        f"- webhook 있음: {'예' if out.get('has_webhook') else '아니오'}",
+    ]
+    if out.get("team"):
+        lines.append(f"- 워크스페이스: {out['team']}")
+    if out.get("bot_name"):
+        lines.append(f"- 봇 이름: {out['bot_name']}")
+    if out.get("note"):
+        lines.append(f"- 메모: {out['note']}")
+    if out.get("channels"):
+        lines.append("")
+        lines.append("## 채널별 결과")
+        for entry in out["channels"]:
+            status = "정상" if entry.get("found") and entry.get("message_sent") else "확인 필요"
+            lines.append(
+                f"- {entry.get('channel_id')} ({entry.get('name') or '?'}): {status}"
+                + (f" — {entry['note']}" if entry.get("note") else "")
+            )
+    lines.append("")
+    lines.append(f"## 종합: {'정상' if out.get('ok') else '확인 필요'}")
+
+    path = _channel_report_path(rt, "slack")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+    from v2r.channels import notify_document_all
+
+    sent = notify_document_all(rt.channels, path, "슬랙 연결 점검 결과")
+    out["path"] = str(path)
+    out["message"] = f"슬랙 점검 완료 ({'정상' if out.get('ok') else '확인 필요'}), 보고서 {sent}곳 전송"
+    if not sent:
+        notify_all(rt.channels, out["message"])
+    return out
+
+
+def _telegram_check(rt: Runtime, spec: TaskSpec) -> dict:
+    """텔레그램 연결 점검: getMe·확인 메시지. 결과를 파일로 남긴다."""
+    del spec
+    telegram = next((c for c in rt.channels if getattr(c, "name", "") == "telegram"), None)
+    if telegram is None:
+        message = "텔레그램 채널이 비활성입니다(.env 의 TELEGRAM_BOT_TOKEN·허용 chat_id 확인 필요)"
+        notify_all(rt.channels, message)
+        return {"ok": False, "message": message}
+
+    out = telegram.check_connection()
+    lines = [
+        "# 텔레그램 연결 점검",
+        "",
+        f"- 확인 시각: {datetime.now(KST).strftime('%Y-%m-%d %H:%M')}",
+        f"- 봇 토큰 있음: {'예' if out.get('has_token') else '아니오'}",
+    ]
+    if out.get("bot_name"):
+        lines.append(f"- 봇 이름: {out['bot_name']}")
+    if out.get("note"):
+        lines.append(f"- 메모: {out['note']}")
+    if out.get("chats"):
+        lines.append("")
+        lines.append("## 방별 결과")
+        for entry in out["chats"]:
+            status = "정상" if entry.get("message_sent") else "확인 필요"
+            lines.append(f"- {entry.get('chat_id')}: {status}")
+    lines.append("")
+    lines.append(f"## 종합: {'정상' if out.get('ok') else '확인 필요'}")
+
+    path = _channel_report_path(rt, "telegram")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+    from v2r.channels import notify_document_all
+
+    sent = notify_document_all(rt.channels, path, "텔레그램 연결 점검 결과")
+    out["path"] = str(path)
+    out["message"] = f"텔레그램 점검 완료 ({'정상' if out.get('ok') else '확인 필요'}), 보고서 {sent}곳 전송"
+    if not sent:
+        notify_all(rt.channels, out["message"])
+    return out
+
+
 #: 미처리(대기) 목록 파일 — 사람이 손으로 관리하고, 예약이 하루 5번 파일로 보낸다
 PENDING_REPORT_PATH = ("docs", "reports", "pending.md")
 
@@ -1897,6 +1994,10 @@ def dispatch(rt: Runtime, job: Any, owner: str | None = None) -> dict:
         return _web_keepalive(rt, spec)
     if task == "plan_keepalive":
         return _plan_keepalive(rt, spec)
+    if task == "slack_check":
+        return _slack_check(rt, spec)
+    if task == "telegram_check":
+        return _telegram_check(rt, spec)
     if task == "request_photos":
         return _request_photos(rt, spec)
     if task == "wash_photos":

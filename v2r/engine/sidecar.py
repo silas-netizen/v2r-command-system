@@ -55,6 +55,8 @@ LIGHT_TASKS = frozenset(
         "naver_keepalive",
         "web_keepalive",
         "plan_keepalive",
+        "slack_check",
+        "telegram_check",
         "maintenance",
         "keyword_exposure",
     }

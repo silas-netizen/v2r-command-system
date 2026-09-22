@@ -170,6 +170,144 @@ class SlackChannel:
             return sum(1 for cid in sorted(self.allowed_channel_ids) if self.send(cid, text))
         return 1 if self._send_webhook(text) else 0
 
+    # --- 파일 전송(새 업로드 방식) -----------------------------------
+    # 슬랙은 2024년 이후 files.upload를 없애고 3단계 업로드로 바꿨다:
+    # 1) files.getUploadURLExternal 로 업로드 URL·file_id 발급
+    # 2) 그 URL에 파일 바이트를 그대로 POST
+    # 3) files.completeUploadExternal 로 채널에 게시(초기 댓글 포함)
+    # 봇 토큰이 없으면(webhook 전용) 파일을 보낼 방법이 없어 0을 반환한다.
+    def _upload_file(self, chat_id: str, path: Any, caption: str, *, mimetype: str) -> bool:
+        if not self.bot_token:
+            return False
+        chat_id = str(chat_id)
+        if chat_id not in self.allowed_channel_ids:
+            log.warning("허용되지 않은 슬랙 채널 파일 전송 차단: %s", chat_id)
+            return False
+        file_path = Path(path)
+        if not file_path.is_file():
+            log.warning("보낼 파일이 없습니다: %s", file_path.name)
+            return False
+        try:
+            data = file_path.read_bytes()
+        except OSError as exc:
+            log.warning("파일 읽기 실패: %s", exc)
+            return False
+
+        step1 = self._api(
+            "files.getUploadURLExternal",
+            verb="GET",
+            params={"filename": file_path.name, "length": len(data)},
+        )
+        if step1 is None:
+            return False
+        upload_url = step1.get("upload_url")
+        file_id = step1.get("file_id")
+        if not upload_url or not file_id:
+            log.warning("슬랙 files.getUploadURLExternal 응답에 upload_url/file_id 없음")
+            return False
+
+        resp = self._request(
+            "upload",
+            url=upload_url,
+            files={"file": (file_path.name, data, mimetype)},
+            verb="POST",
+        )
+        if resp is None:
+            return False
+        try:
+            resp.raise_for_status()
+        except Exception as exc:
+            log.warning("슬랙 파일 업로드 실패: %s", exc)
+            return False
+
+        step3 = self._api(
+            "files.completeUploadExternal",
+            verb="POST",
+            payload={
+                "files": [{"id": file_id, "title": file_path.name}],
+                "channel_id": chat_id,
+                "initial_comment": (caption or "")[:1000],
+            },
+        )
+        return step3 is not None
+
+    def send_document(self, chat_id: str, path: Any, caption: str = "") -> bool:
+        """파일 한 개를 채널에 올린다(HTML·MD 등 원본 그대로)."""
+        return self._upload_file(chat_id, path, caption, mimetype="application/octet-stream")
+
+    def broadcast_document(self, path: Any, caption: str = "") -> int:
+        """허용된 모든 채널에 파일을 보낸다. 봇 토큰 없으면(webhook 전용) 0."""
+        if not self.bot_token:
+            return 0
+        return sum(
+            1
+            for chat_id in sorted(self.allowed_channel_ids)
+            if self.send_document(chat_id, path, caption)
+        )
+
+    def send_photo(self, chat_id: str, path: Any, caption: str = "") -> bool:
+        """사진 한 장을 채널에 올린다."""
+        return self._upload_file(chat_id, path, caption, mimetype="image/jpeg")
+
+    def broadcast_photo(self, path: Any, caption: str = "") -> int:
+        """허용된 모든 채널에 사진을 보낸다. 봇 토큰 없으면(webhook 전용) 0."""
+        if not self.bot_token:
+            return 0
+        return sum(
+            1
+            for chat_id in sorted(self.allowed_channel_ids)
+            if self.send_photo(chat_id, path, caption)
+        )
+
+
+    def check_connection(self) -> dict[str, Any]:
+        """연결 점검: auth.test → 허용 채널별 conversations.info → 확인 메시지 1건.
+
+        토큰 값은 절대 담지 않는다(안전 불변식 2).
+        """
+        result: dict[str, Any] = {
+            "ok": False,
+            "has_bot_token": bool(self.bot_token),
+            "has_webhook": bool(self.webhook_url),
+            "channels": [],
+        }
+        if not self.bot_token:
+            result["note"] = "봇 토큰 없음(webhook 전용, 파일 전송·수신 불가)"
+            if self.webhook_url:
+                result["webhook_ok"] = self._send_webhook("연결 확인")
+                result["ok"] = bool(result["webhook_ok"])
+            return result
+
+        auth = self._api("auth.test", verb="POST", payload={})
+        if auth is None:
+            result["note"] = "auth.test 실패(봇 토큰 확인 필요)"
+            return result
+        result["team"] = auth.get("team")
+        result["bot_name"] = auth.get("user")
+
+        for channel_id in sorted(self.allowed_channel_ids):
+            info = self._api(
+                "conversations.info", verb="GET", params={"channel": channel_id}
+            )
+            entry: dict[str, Any] = {"channel_id": channel_id}
+            if info is None:
+                entry["found"] = False
+                entry["note"] = "채널 정보를 못 읽음(앱 초대 여부·채널 ID 확인)"
+            else:
+                chan = info.get("channel") or {}
+                entry["found"] = True
+                entry["name"] = chan.get("name")
+                entry["is_private"] = bool(chan.get("is_private"))
+                entry["is_member"] = bool(chan.get("is_member"))
+                sent = self.send(channel_id, "연결 확인")
+                entry["message_sent"] = sent
+            result["channels"].append(entry)
+
+        result["ok"] = bool(result["channels"]) and all(
+            c.get("found") and c.get("message_sent") for c in result["channels"]
+        )
+        return result
+
 
 def _default_data_dir() -> Path:
     """설정의 data 폴더. 설정 로드 실패 시 저장소 기준 기본값."""

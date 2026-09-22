@@ -95,6 +95,29 @@ def test_telegram_error_log_hides_token(tmp_path, httpx_mock, caplog):
     assert "404" in text
 
 
+def test_telegram_check_connection(tmp_path, httpx_mock):
+    httpx_mock.add_response(
+        url=f"https://api.telegram.org/bot{TOKEN}/getMe",
+        json={"ok": True, "result": {"username": "v2r_bot"}},
+    )
+    httpx_mock.add_response(url=SEND_URL, json={"ok": True, "result": {}}, is_reusable=True)
+
+    channel = TelegramChannel(TOKEN, {"1234", "5678"}, data_dir=tmp_path)
+    out = channel.check_connection()
+
+    assert out["ok"] is True
+    assert out["bot_name"] == "v2r_bot"
+    assert {c["chat_id"] for c in out["chats"]} == {"1234", "5678"}
+    assert TOKEN not in json.dumps(out, ensure_ascii=False)
+
+
+def test_telegram_check_connection_no_token(tmp_path):
+    channel = TelegramChannel("", set(), data_dir=tmp_path)
+    out = channel.check_connection()
+    assert out["has_token"] is False
+    assert out["note"]
+
+
 def test_telegram_allowed_user_ids(tmp_path, httpx_mock):
     httpx_mock.add_response(
         url=UPDATES_URL,
@@ -130,6 +153,77 @@ def test_slack_poll_skips_bot_messages(tmp_path, httpx_mock):
     assert [c.text for c in commands] == ["상태 알려줘"]
     cursors = json.loads((tmp_path / "slack_cursor.json").read_text(encoding="utf-8"))
     assert cursors["C1"] == "200.0"
+
+
+def test_slack_broadcast_document_three_steps(tmp_path, httpx_mock):
+    """새 업로드 방식: getUploadURLExternal → 업로드 URL POST → completeUploadExternal."""
+    upload_url = "https://files.slack.com/upload/v1/abc123"
+    httpx_mock.add_response(
+        url="https://slack.com/api/files.getUploadURLExternal?filename=report.md&length=5",
+        json={"ok": True, "upload_url": upload_url, "file_id": "F123"},
+    )
+    httpx_mock.add_response(url=upload_url, text="ok")
+    httpx_mock.add_response(
+        url="https://slack.com/api/files.completeUploadExternal",
+        json={"ok": True, "files": [{"id": "F123"}]},
+    )
+
+    report = tmp_path / "report.md"
+    report.write_text("hello", encoding="utf-8")
+
+    channel = SlackChannel("xoxb-abc", {"C1"}, data_dir=tmp_path)
+    assert channel.broadcast_document(report, "테스트 보고서") == 1
+
+    complete_req = [
+        r for r in httpx_mock.get_requests() if "completeUploadExternal" in str(r.url)
+    ][0]
+    body = json.loads(complete_req.content)
+    assert body["channel_id"] == "C1"
+    assert body["files"] == [{"id": "F123", "title": "report.md"}]
+
+
+def test_slack_broadcast_document_no_bot_token_returns_zero(tmp_path):
+    """webhook 전용(봇 토큰 없음)이면 파일 전송이 불가하므로 0."""
+    channel = SlackChannel(
+        "", set(), webhook_url="https://hooks.slack.test/abc", data_dir=tmp_path
+    )
+    report = tmp_path / "report.md"
+    report.write_text("hi", encoding="utf-8")
+    assert channel.broadcast_document(report, "캡션") == 0
+    assert channel.broadcast_photo(report, "캡션") == 0
+
+
+def test_slack_check_connection(tmp_path, httpx_mock):
+    httpx_mock.add_response(
+        url="https://slack.com/api/auth.test",
+        json={"ok": True, "team": "V2R팀", "user": "v2r-bot"},
+    )
+    httpx_mock.add_response(
+        url="https://slack.com/api/conversations.info?channel=C1",
+        json={"ok": True, "channel": {"name": "general", "is_private": False, "is_member": True}},
+    )
+    httpx_mock.add_response(
+        url="https://slack.com/api/chat.postMessage", json={"ok": True, "result": {}}
+    )
+
+    channel = SlackChannel("xoxb-abc", {"C1"}, data_dir=tmp_path)
+    out = channel.check_connection()
+
+    assert out["ok"] is True
+    assert out["team"] == "V2R팀"
+    assert out["channels"][0]["found"] is True
+    assert out["channels"][0]["message_sent"] is True
+    # 토큰 값이 결과에 담기지 않는다
+    assert "xoxb-abc" not in json.dumps(out, ensure_ascii=False)
+
+
+def test_slack_check_connection_no_token(tmp_path):
+    channel = SlackChannel(
+        "", set(), webhook_url="https://hooks.slack.test/abc", data_dir=tmp_path
+    )
+    out = channel.check_connection()
+    assert out["has_bot_token"] is False
+    assert out["note"]
 
 
 def test_slack_webhook_only_mode(tmp_path, httpx_mock):

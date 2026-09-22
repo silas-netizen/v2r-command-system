@@ -43,6 +43,8 @@ def test_legacy_example_sentence():
         ("새 사진 수거", "collect_new_photos"),
         ("제휴 일상 글 10개 만들어줘", "generate_affiliate_daily"),
         ("gpt 세션 점검", "gpt_keepalive"),
+        ("슬랙 점검", "slack_check"),
+        ("텔레그램 점검", "telegram_check"),
         ("브랜드 우아덤 키워드 단호박 사진 2개 생성", "generate_photos"),
         ("브랜드 팥순이 키워드 단호박 사진 요청", "request_photos"),
         ("사진 세탁 30장", "wash_photos"),
@@ -82,7 +84,8 @@ def test_all_tasks_covered_by_tests():
     # + 정기 정비 1건(maintenance: 이벤트 정리·VACUUM·캐시, 2026-09-22)
     # + 새 모양 보고서 2건(daily_report·progress_report, 2026-09-22)
     # + 키워드 노출 현황 1건(keyword_exposure, 2026-09-22)
-    assert len(ALLOWED_TASKS) == 42
+    # + 채널 연결 점검 2건(slack_check·telegram_check, 2026-09-22)
+    assert len(ALLOWED_TASKS) == 44
 
 
 def test_wash_photos_count():

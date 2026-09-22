@@ -63,7 +63,7 @@ class _FakeChannel:
 def test_가벼운_작업_목록은_한곳에서만_정한다():
     assert "pending_report" in sidecar_mod.LIGHT_TASKS
     for task in ("status", "dashboard", "monitor_status", "schedule_list", "schedule_run",
-                 "gpt_keepalive"):
+                 "gpt_keepalive", "slack_check", "telegram_check"):
         assert sidecar_mod.is_light(task) and sidecar_mod.scope_for(task) == "light"
     for task in ("publish_daily", "publish_brand", "wash_photos", "reconcile"):
         assert not sidecar_mod.is_light(task) and sidecar_mod.scope_for(task) == "main"

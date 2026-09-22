@@ -232,6 +232,32 @@ class TelegramChannel:
         )
 
 
+    def check_connection(self) -> dict[str, Any]:
+        """연결 점검: getMe → 허용 chat_id별 확인 메시지 1건. 토큰 값은 담지 않는다."""
+        result: dict[str, Any] = {
+            "ok": False,
+            "has_token": bool(self.token),
+            "chats": [],
+        }
+        if not self.token:
+            result["note"] = "봇 토큰 없음"
+            return result
+        me = self._call("getMe", {})
+        if me is None:
+            result["note"] = "getMe 실패(봇 토큰 확인 필요)"
+            return result
+        info = me.get("result") or {}
+        result["bot_name"] = info.get("username")
+        if not self.allowed_chat_ids:
+            result["note"] = "허용 chat_id 없음(수신·점검 메시지 불가)"
+            return result
+        for chat_id in sorted(self.allowed_chat_ids):
+            sent = self.send(chat_id, "연결 확인")
+            result["chats"].append({"chat_id": chat_id, "message_sent": sent})
+        result["ok"] = bool(result["chats"]) and all(c["message_sent"] for c in result["chats"])
+        return result
+
+
 def _default_data_dir() -> Path:
     """설정의 data 폴더. 설정 로드 실패 시 저장소 기준 기본값."""
     try:
