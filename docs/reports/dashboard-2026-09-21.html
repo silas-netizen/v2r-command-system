@@ -1,0 +1,87 @@
+<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>V2R 현황판 2026-09-21</title>
+<style>
+:root{--bg:#f6f7f9;--card:#fff;--ink:#1c2430;--mute:#6b7683;--line:#e3e7ec;--ok:#1a9c5b;--warn:#d9890b;--bad:#d43f3f;--bar:#2f6fed;--bar2:#c9d6f5}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:"Malgun Gothic","Apple SD Gothic Neo",system-ui,sans-serif;padding:20px 16px 40px;font-size:14px}
+h1{font-size:20px;margin:0 0 4px}.sub{color:var(--mute);margin-bottom:18px}
+h2{font-size:15px;margin:26px 0 10px;padding-left:10px;border-left:4px solid var(--bar)}
+.grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(180px,1fr))}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px}
+.card .k{color:var(--mute);font-size:12px}.card .v{font-size:26px;font-weight:700;margin:4px 0 2px;font-variant-numeric:tabular-nums}.card .d{font-size:12px;color:var(--mute)}
+.ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}
+.pill{display:inline-block;padding:2px 9px;border-radius:999px;font-size:12px;font-weight:600;color:#fff;white-space:nowrap}
+.pill.ok{background:var(--ok)}.pill.warn{background:var(--warn)}.pill.bad{background:var(--bad)}.pill.off{background:#9aa4b0}
+table{width:100%;border-collapse:collapse;background:var(--card);border:1px solid var(--line);border-radius:10px;overflow:hidden}
+th,td{padding:9px 12px;border-bottom:1px solid var(--line);text-align:left;font-variant-numeric:tabular-nums}th{background:#f0f3f7;color:var(--mute);font-weight:600;font-size:12px}
+td.n,th.n{text-align:right}tr:last-child td{border-bottom:0}tr.sum td{font-weight:700;background:#fafbfc}
+.bar{display:flex;align-items:flex-end;gap:4px;height:120px;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:18px 12px 26px;position:relative}
+.bar div{flex:1;background:var(--bar);border-radius:3px 3px 0 0;position:relative;min-width:8px}
+.bar div span{position:absolute;bottom:-20px;left:0;right:0;text-align:center;font-size:10px;color:var(--mute)}
+.bar div b{position:absolute;top:-16px;left:0;right:0;text-align:center;font-size:10px;font-weight:600}
+.bar div.low{background:var(--bar2)}
+ul{margin:6px 0 0 18px;padding:0}li{margin:4px 0}
+.wrap{max-width:1100px;margin:0 auto}
+.tbl{overflow-x:auto}
+</style></head><body><div class="wrap">
+<h1>V2R 현황판 — 2026-09-21 (어제)</h1>
+<div class="sub">작성 2026-09-22 09:33 KST 실측 · 자사 카페 일상 글 · 브랜드 원고 · 로그인 · 비용</div>
+
+<h2>한눈에</h2>
+<div class="grid">
+<div class="card"><div class="k">발행 성공</div><div class="v ok">749</div><div class="d">목표 750 · 실패 1 · 제한 걸린 글 4(정정 중)</div></div>
+<div class="card"><div class="k">사용 계정</div><div class="v warn">12~20<span style="font-size:13px">/카페</span></div><div class="d">하루 10개 공용 규칙은 오늘 09:00부터</div></div>
+<div class="card"><div class="k">같은 게시판 연속</div><div class="v ok">0</div><div class="d">연속 금지 규칙 오늘부터(어제도 0)</div></div>
+<div class="card"><div class="k">V2R 로그인</div><div class="v ok">유지</div><div class="d">09-19 12:35 이후 재로그인 0회</div></div>
+<div class="card"><div class="k">원고 비용</div><div class="v ok">0원</div><div class="d">요금제 48회 · 유료 API 0건</div></div>
+<div class="card"><div class="k">실행기</div><div class="v ok">정상</div><div class="d">예약 5종 전부 발사 · 심장박동 정상</div></div>
+</div>
+
+<h2>발행 · 카페별</h2>
+<div class="tbl"><table><tr><th>카페</th><th class="n">성공</th><th class="n">실패</th><th class="n">제한 글</th><th class="n">계정 수</th><th class="n">게시판 수</th><th class="n">게시판 연속</th><th>상태</th></tr>
+<tr><td>고요한 아침</td><td class="n">150</td><td class="n">0</td><td class="n">0</td><td class="n">20</td><td class="n">1</td><td class="n">0</td><td><span class="pill ok">완료</span></td></tr>
+<tr><td>글로시 마이</td><td class="n">149</td><td class="n">0</td><td class="n">1</td><td class="n">19</td><td class="n">2</td><td class="n">0</td><td><span class="pill warn">제한 1</span></td></tr>
+<tr><td>송도포털</td><td class="n">149</td><td class="n">1</td><td class="n">1</td><td class="n">20</td><td class="n">2</td><td class="n">0</td><td><span class="pill warn">실패 1 · 제한 1</span></td></tr>
+<tr><td>러브 인썸</td><td class="n">150</td><td class="n">0</td><td class="n">1</td><td class="n">13</td><td class="n">2</td><td class="n">0</td><td><span class="pill warn">제한 1</span></td></tr>
+<tr><td>마이 웨딩 드림</td><td class="n">150</td><td class="n">0</td><td class="n">1</td><td class="n">12</td><td class="n">2</td><td class="n">0</td><td><span class="pill warn">제한 1</span></td></tr>
+<tr class="sum"><td>합계</td><td class="n">748</td><td class="n">1</td><td class="n">4</td><td></td><td></td><td class="n">0</td><td></td></tr>
+</table></div>
+<ul>
+<li><b>제한 글 4건</b>(18:36~18:38, peecics): 계정 하루 151번째 글에서 "ID/IP당 등록 제한"에 걸림. 어제 오후 추가 50건이 옛 코드로 계정 3개(125~155건씩)만 써서 발생. 실패로 정정 · 다른 계정 재발행 · 계정 하루 상한 100건 적용 중.</li>
+<li>경고 30 · 오류 34건은 전부 실행기 재시작 때 "리스 상실" 기록, 발행 손실 없음.</li>
+</ul>
+
+<h2>시간대별 발행 (건)</h2>
+<div class="bar">
+<div style="height:26%"><b>21</b><span>00</span></div><div style="height:82%"><b>66</b><span>01</span></div>
+<div class="low" style="height:2%"><span>02</span></div><div class="low" style="height:2%"><span>03</span></div><div class="low" style="height:2%"><span>04</span></div><div class="low" style="height:2%"><span>05</span></div><div class="low" style="height:2%"><span>06</span></div><div class="low" style="height:2%"><span>07</span></div>
+<div style="height:96%"><b>77</b><span>08</span></div><div style="height:97%"><b>78</b><span>09</span></div><div style="height:100%"><b>80</b><span>10</span></div><div style="height:92%"><b>74</b><span>11</span></div><div style="height:97%"><b>78</b><span>12</span></div>
+<div style="height:32%"><b>26</b><span>13</span></div><div style="height:21%"><b>17</b><span>14</span></div><div style="height:85%"><b>68</b><span>15</span></div><div style="height:74%"><b>59</b><span>16</span></div><div style="height:80%"><b>64</b><span>17</span></div><div style="height:51%"><b>41</b><span>18</span></div>
+<div class="low" style="height:2%"><span>19</span></div><div class="low" style="height:2%"><span>20</span></div><div class="low" style="height:2%"><span>21</span></div><div class="low" style="height:2%"><span>22</span></div><div class="low" style="height:2%"><span>23</span></div>
+</div>
+<ul><li>13~14시 급감은 실행기 교체 · 감시기 정리 시간. 00~01시 87건은 추가 50건분 새벽 발행.</li></ul>
+
+<h2>브랜드 원고 · LLM</h2>
+<div class="tbl"><table><tr><th>항목</th><th>값</th><th>상태</th></tr>
+<tr><td>브랜드 원고</td><td>6건 × 3판(v1 02:22 → v2 토큰 절약판 → <b>v3 03:23 최종</b>), 검증 전부 통과</td><td><span class="pill ok">확정</span></td></tr>
+<tr><td>GPT 교차 검증</td><td>체크리스트 방식, v3 평균 97점 (브랜드 글에만)</td><td><span class="pill ok">가동</span></td></tr>
+<tr><td>요금제 호출</td><td>48회 · 새 입력 23.3만 · 캐시 읽기 50.3만(68%) · 출력 19.6만</td><td><span class="pill ok">0원</span></td></tr>
+<tr><td>토큰 절약</td><td>새 입력 −55% · 시간 −34% (시스템 프롬프트 통일 · 지침 압축)</td><td><span class="pill ok">적용</span></td></tr>
+<tr><td>한도 알림</td><td>03:00 1건 → 오탐, 잠금 로직 수정</td><td><span class="pill ok">해결</span></td></tr>
+</table></div>
+
+<h2>로그인 · 세션 유지</h2>
+<div class="tbl"><table><tr><th>서비스</th><th>유지 방식</th><th>마지막 확인</th><th>상태</th></tr>
+<tr><td>V2R</td><td>API 세션 자동 갱신</td><td>상시</td><td><span class="pill ok">유지</span></td></tr>
+<tr><td>네이버</td><td>영속 프로필 · 하루 4회 방문</td><td>09-22 03:10</td><td><span class="pill ok">유지</span></td></tr>
+<tr><td>Claude 플랫폼</td><td>크롬 프로필 · 09:20 점검</td><td>09-21</td><td><span class="pill ok">유지</span></td></tr>
+<tr><td>Claude Code CLI(요금제)</td><td>자격증명 백업 · 복원</td><td>09-22 03:20 호출 성공</td><td><span class="pill ok">유지</span></td></tr>
+<tr><td>ChatGPT / Codex</td><td>앱 로그인</td><td>09-22 03:30 호출 성공</td><td><span class="pill ok">유지</span></td></tr>
+<tr><td>Make</td><td>1회 로그인 전</td><td>—</td><td><span class="pill off">대기</span></td></tr>
+</table></div>
+
+<h2>오늘(09-22) 진행 · 결정 대기</h2>
+<ul>
+<li>09:00:15 아침 일상 글 시작(계정 10개 공용, 게시판 연속 방지 6행 미룸). 10:03 중간 결과 파일.</li>
+<li>결정 대기: ① 기존 996건 '검색 노출 검사' 일괄 '사용' ② 웨딩 노트 · 헬씨 트리 합류 시점 ③ 09:00 수량 · 새벽 02:10 묶음 생성 ④ Make 로그인</li>
+</ul>
+</div></body></html>
