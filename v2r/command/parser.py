@@ -14,6 +14,9 @@ TASK_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("schedule_run", re.compile(r"예약\s*(?:지금\s*)?(?:실행|강제\s*실행|돌려)")),
     ("schedule_list", re.compile(r"예약\s*(목록|리스트|현황|확인|상태|표)")),
     ("monitor_status", re.compile(r"감시\s*(상태|현황|목록|확인)")),
+    # 키워드 노출 현황 (`키워드 노출 현황` / `우아덤 노출 현황`) — `상태|현황` 조회
+    # 패턴보다 앞에 둬야 "노출 현황"이 일반 status로 가로채이지 않는다
+    ("keyword_exposure", re.compile(r"(키워드\s*노출|노출\s*현황)")),
     ("pending_report", re.compile(r"미처리\s*(알림|목록|보고|리스트)")),
     # 새 모양 보고서(2026-09-22): 어제 기준 일일 보고 / 오늘 기준 중간 보고
     ("daily_report", re.compile(r"(일일|하루|어제)\s*(보고|보고서|현황판)")),
@@ -225,6 +228,7 @@ _NO_SLOT_TASKS = frozenset(
         "pending_report",
         "daily_report",
         "progress_report",
+        "keyword_exposure",
     }
 )
 
@@ -332,6 +336,7 @@ def parse_korean_command(text: str, now: datetime | None = None) -> TaskSpec | N
         "collect_daily",
         "collect_photos",
         "generate_photos",
+        "keyword_exposure",
     }:
         # `글` 없이 `N개`만 있어도 개수로 인정. 단 계정 수 표현은 먼저 제거한다.
         m = RE_ANY_COUNT.search(RE_ACCOUNT_COUNT.sub(" ", counting))
@@ -510,6 +515,7 @@ TASK_LABELS: dict[str, str] = {
     "schedule_list": "예약 목록",
     "schedule_run": "예약 지금 실행",
     "monitor_status": "감시 상태",
+    "keyword_exposure": "키워드 노출 현황",
     "pending_report": "미처리 목록 보내기",
     "daily_report": "일일 보고(어제 기준)",
     "progress_report": "중간 보고(오늘 기준)",

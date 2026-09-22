@@ -45,6 +45,7 @@ ALLOWED_TASKS: frozenset[str] = frozenset(
         "schedule_list",
         "schedule_run",
         "monitor_status",
+        "keyword_exposure",
         "pending_report",
         "daily_report",
         "progress_report",

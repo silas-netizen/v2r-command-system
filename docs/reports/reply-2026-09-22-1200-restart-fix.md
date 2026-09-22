@@ -1,4 +1,4 @@
-# 재시작 후 발행 미복구 — 자동 복구 수정 완료 (2026-09-22 12:00 KST, 실측)
+# 재시작 후 발행 미복구 — 자동 복구 수정 완료 (2026-09-22 11:55 KST, 실측)
 
 전문: [restart-resume-fix-2026-09-22.md](file:///D:/v2r%20%EC%9E%90%EB%8F%99%ED%99%94/v2r-command-system/docs/reports/restart-resume-fix-2026-09-22.md)
 

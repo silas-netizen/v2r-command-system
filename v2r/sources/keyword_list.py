@@ -94,11 +94,14 @@ def load_pushed_keywords(
     cfg: dict | None = None,
     xlsx_path: str | Path | None = None,
     limit: int = 0,
+    conn: Any = None,
 ) -> list[dict]:
-    """브랜드의 `밀려남` 키워드 목록.
+    """브랜드의 `밀려남` 키워드 목록 = 시트 `밀려남` ∪ 자동 검사 DB 최신 `pushed`.
 
-    반환: `[{"keyword": "...", "cafe": "..."}]` — 시트 순서 유지, 키워드 기준 중복 제거.
+    반환: `[{"keyword": "...", "cafe": "..."}]` — 시트 순서 우선, 키워드 기준 중복 제거.
     `xlsx_path`를 주면 네트워크를 쓰지 않고 로컬 엑셀을 읽는다.
+    `conn`(SQLite 연결)을 주면 `keyword_exposure` 표의 최신 자동 검사 결과도 합친다
+    (없으면 시트 값만, 기존과 동일하게 동작한다).
     """
     if xlsx_path:
         rows = rows_from_xlsx(xlsx_path)
@@ -122,8 +125,22 @@ def load_pushed_keywords(
             continue
         seen.add(key)
         out.append({"keyword": keyword, "cafe": _pick(row, _CAFE_HEADERS)})
-        if limit and len(out) >= limit:
-            break
+
+    if conn is not None:
+        try:
+            from v2r.store import keyword_exposure_store as _kestore
+
+            for item in _kestore.pushed_keywords(conn, brand):
+                key = _norm(item["keyword"])
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(item)
+        except Exception:
+            pass  # DB에 없거나 표가 아직 없어도 시트 값만으로 동작한다
+
+    if limit:
+        out = out[:limit]
     return out
 
 

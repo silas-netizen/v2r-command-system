@@ -140,7 +140,22 @@ CREATE TABLE IF NOT EXISTS republish_queue (
     PRIMARY KEY (source_key, row_number, content_hash)
 );
 
+-- 브랜드별 키워드 노출 현황 이력 (docs/reports/keyword-exposure-plan-2026-09-22.md §2)
+CREATE TABLE IF NOT EXISTS keyword_exposure (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    brand        TEXT NOT NULL,
+    keyword      TEXT NOT NULL,
+    cafe         TEXT,
+    article_url  TEXT,
+    rank         INTEGER,
+    status       TEXT NOT NULL,
+    t0_status    TEXT,
+    checked_at   TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_republish_status ON republish_queue(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_keyword_exposure_brand ON keyword_exposure(brand, keyword, checked_at);
+CREATE INDEX IF NOT EXISTS idx_keyword_exposure_checked ON keyword_exposure(checked_at);
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status, id);
 CREATE INDEX IF NOT EXISTS idx_jobs_scope ON jobs(status, lease_scope, id);
 CREATE INDEX IF NOT EXISTS idx_article_index_title ON article_index(title_norm);

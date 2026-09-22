@@ -56,6 +56,7 @@ LIGHT_TASKS = frozenset(
         "web_keepalive",
         "plan_keepalive",
         "maintenance",
+        "keyword_exposure",
     }
 )
 

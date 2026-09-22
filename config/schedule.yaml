@@ -26,6 +26,13 @@ entries:
     enabled: true
     command: 끊긴 작업 점검
 
+  # 브랜드별 키워드 노출 현황 (docs/reports/keyword-exposure-plan-2026-09-22.md §2)
+  - name: 키워드 노출 현황
+    time: "08:00"
+    days: daily
+    enabled: true
+    command: 키워드 노출 현황
+
   - name: GPT 세션 점검
     time: "09:00"
     days: daily
