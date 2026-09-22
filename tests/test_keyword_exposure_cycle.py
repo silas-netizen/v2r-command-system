@@ -509,3 +509,118 @@ def test_known_brands_시트파일_목록(tmp_path):
     (tmp_path / "data" / "brand_sheet_우아덤.xlsx").write_bytes(b"")
     (tmp_path / "data" / "brand_sheet_장으뜸.xlsx").write_bytes(b"")
     assert ke.known_brands(rt) == ["우아덤", "장으뜸"]
+
+
+# --------------------------------------------------------------------
+# 연결 3(2026-09-23): 순환 대상 = 시트 H열 ∪ DB 원고 대상(relevance 0~2).
+# 무관(3)은 DB에서 애초에 안 뽑히니 순환에서 자동 제외된다.
+# --------------------------------------------------------------------
+def _make_relevance_db(path, rows):
+    import sqlite3
+
+    con = sqlite3.connect(str(path))
+    con.execute(
+        "create table keywords (keyword text, total integer, relevance_llm integer, "
+        "relevance_codex integer, needs_review integer)"
+    )
+    con.executemany(
+        "insert into keywords (keyword, total, relevance_llm, relevance_codex, needs_review) "
+        "values (?, ?, ?, ?, ?)",
+        rows,
+    )
+    con.commit()
+    con.close()
+
+
+def test_relevance_eligible_keywords_무관_제외(tmp_path):
+    rt = make_runtime(tmp_path)
+    rt.settings.repo_root = tmp_path
+    db_path = tmp_path / "data" / "keywords" / "우아덤.sqlite"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    _make_relevance_db(
+        db_path,
+        [
+            ("직접키워드", 500, 0, 1, 0),
+            ("무관키워드", 300, 3, 3, 0),  # 무관(3) — 제외돼야 함
+            ("검토대기", 200, 1, 1, 1),  # needs_review — 제외돼야 함
+        ],
+    )
+    out = ke._relevance_eligible_keywords(rt, "우아덤")
+    kws = {i["keyword"] for i in out}
+    assert kws == {"직접키워드"}
+
+
+def test_keyword_universe_시트와_DB_합친다(tmp_path, monkeypatch):
+    rt = make_runtime(tmp_path)
+    rt.settings.repo_root = tmp_path
+    monkeypatch.setattr(ke, "target_keywords", lambda brand, cfg, xlsx_path=None, article_index=None: [
+        {"keyword": "시트키워드", "cafe": "c", "article_url": "", "t0_status": "", "candidate_title_norm": ""},
+    ])
+    db_path = tmp_path / "data" / "keywords" / "우아덤.sqlite"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    _make_relevance_db(db_path, [("DB키워드", 400, 2, 0, 0), ("무관", 100, 3, 3, 0)])
+
+    universe = ke.keyword_universe(rt, "우아덤")
+    kws = {i["keyword"] for i in universe}
+    assert "시트키워드" in kws
+    assert "DB키워드" in kws
+    assert "무관" not in kws
+
+
+# --------------------------------------------------------------------
+# 연결 1(2026-09-23): 순환 판정 → 시트 반영은 20건 또는 5분마다 묶어서 1번
+# --------------------------------------------------------------------
+def test_사이클_틱_20건_미만이면_바로_시트에_안_쓴다(tmp_path, monkeypatch):
+    rt = make_runtime(tmp_path)
+    rt.settings.repo_root = tmp_path
+    items = [
+        {"keyword": "키워드1", "cafe": "c", "article_url": OUR_URL, "t0_status": "", "candidate_title_norm": "", "volume": 10},
+    ]
+    monkeypatch.setattr(ke, "keyword_universe", lambda rt_, brand: items)
+    monkeypatch.setattr(ke, "cycle_start", ke.cycle_start)  # (실제 함수, 시트 반영 실패는 무시됨)
+    _patch_judge(monkeypatch, "exposed", rank=1, matched_url=OUR_URL)
+
+    calls = []
+    from v2r.sources import sheets_writer
+    monkeypatch.setattr(sheets_writer, "apply_exposure", lambda *a, **kw: calls.append(a) or {"written": 1})
+    monkeypatch.setattr(sheets_writer, "sync_keywords_to_sheet", lambda *a, **kw: {"skipped": True})
+
+    ke.cycle_start(rt, brands=["우아덤"])
+    ke.cycle_tick(rt, now_mono=1000.0)
+    assert calls == []  # 1건뿐이라 아직 안 흘려보낸다
+
+    ke.flush_sheet_batch_now(rt, "우아덤")
+    import time as _time
+    _time.sleep(0.2)  # 배경 스레드가 apply_exposure를 부를 시간
+    assert len(calls) == 1
+    brand_arg, rows_arg = calls[0][0], calls[0][1]
+    assert brand_arg == "우아덤"
+    assert rows_arg[0]["keyword"] == "키워드1"
+    assert rows_arg[0]["status"] == "노출완"
+
+
+def test_사이클_틱_20건_차면_자동으로_흘려보낸다(tmp_path, monkeypatch):
+    rt = make_runtime(tmp_path)
+    rt.settings.repo_root = tmp_path
+    items = [
+        {"keyword": f"키워드{i}", "cafe": "c", "article_url": OUR_URL, "t0_status": "", "candidate_title_norm": "", "volume": 10}
+        for i in range(1, 25)
+    ]
+    monkeypatch.setattr(ke, "keyword_universe", lambda rt_, brand: items)
+    _patch_judge(monkeypatch, "exposed", rank=1, matched_url=OUR_URL)
+
+    calls = []
+    from v2r.sources import sheets_writer
+    monkeypatch.setattr(sheets_writer, "apply_exposure", lambda *a, **kw: calls.append(a) or {"written": 1})
+    monkeypatch.setattr(sheets_writer, "sync_keywords_to_sheet", lambda *a, **kw: {"skipped": True})
+
+    ke.cycle_start(rt, brands=["우아덤"])
+    t = 0.0
+    for _ in range(20):
+        t += 10.0
+        ke.cycle_tick(rt, now_mono=t)
+
+    import time as _time
+    _time.sleep(0.2)
+    assert len(calls) == 1  # 20건 찼을 때 한 번만
+    assert len(calls[0][1]) == 20

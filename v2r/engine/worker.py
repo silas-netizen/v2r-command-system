@@ -2128,6 +2128,8 @@ def dispatch(rt: Runtime, job: Any, owner: str | None = None) -> dict:
         return _keyword_relevance_rescan(rt, spec)
     if task == "keyword_relevance_status":
         return _keyword_relevance_status(rt, spec)
+    if task == "sheet_sync_keywords":
+        return _sheet_sync_keywords(rt, spec)
 
     raise ValueError(f"처리기가 없는 작업: {task}")
 
@@ -2336,6 +2338,34 @@ def _keyword_relevance_status(rt: Runtime, spec: TaskSpec) -> dict:
             continue
         per_brand[b] = kr_mod.brand_status(db_path)
     return {"ok": True, "per_brand": per_brand}
+
+
+def _sheet_sync_keywords(rt: Runtime, spec: TaskSpec) -> dict:
+    """`시트 키워드 반영 <브랜드|전체>` — 연관도 재산정이 끝난 원고 대상 키워드를
+    브랜드 시트 두 번째 탭에 반영한다(`sheets_writer.sync_keywords_to_sheet`/`_all`).
+    """
+    from v2r.sources import sheets_writer
+
+    brand = (spec.brand or "").strip()
+    repo_root = rt.settings.repo_root
+    if brand:
+        out = sheets_writer.sync_keywords_to_sheet(brand, repo_root=repo_root)
+        per_brand = {brand: out}
+    else:
+        per_brand = sheets_writer.sync_keywords_all(repo_root=repo_root)
+
+    lines = []
+    for b, out in per_brand.items():
+        if out.get("skipped"):
+            lines.append(f"{b} 건너뜀: {out.get('reason', '')}")
+        else:
+            lines.append(f"{b} {out.get('appended', 0)}개 추가(대상 {out.get('picked', 0)}개)")
+    msg = "시트 키워드 반영: " + (" / ".join(lines) if lines else "대상 없음")
+    try:
+        notify_all(rt.channels, msg)
+    except Exception:  # noqa: BLE001
+        pass
+    return {"ok": True, "message": msg, "per_brand": per_brand}
 
 
 def _keyword_exposure(rt: Runtime, spec: TaskSpec) -> dict:

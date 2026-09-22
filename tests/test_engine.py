@@ -1220,3 +1220,42 @@ def test_모의실행에_댓글_역할표가_붙는다(tmp_path, monkeypatch):
     # 계정은 앞 3글자만 남는다
     assert rows["대댓글1"]["account"] == "aut…"
     rt.close()
+
+
+def test_sheet_sync_keywords_dispatch_brand(tmp_path, monkeypatch):
+    """`시트 키워드 반영 <브랜드>` — sheets_writer.sync_keywords_to_sheet 하나만 부른다
+    (연결 2, 2026-09-23)."""
+    rt = make_runtime(tmp_path)
+    from v2r.sources import sheets_writer
+
+    calls = []
+    monkeypatch.setattr(
+        sheets_writer,
+        "sync_keywords_to_sheet",
+        lambda brand, repo_root=".": calls.append(brand) or {"brand": brand, "picked": 3, "appended": 2},
+    )
+    spec = TaskSpec(task="sheet_sync_keywords", brand="우아덤")
+    out = worker._sheet_sync_keywords(rt, spec)
+    assert out["ok"] is True
+    assert calls == ["우아덤"]
+    assert out["per_brand"]["우아덤"]["appended"] == 2
+    rt.close()
+
+
+def test_sheet_sync_keywords_dispatch_all(tmp_path, monkeypatch):
+    """브랜드 없이(`전체`) 부르면 sync_keywords_all로 간다."""
+    rt = make_runtime(tmp_path)
+    from v2r.sources import sheets_writer
+
+    calls = []
+    monkeypatch.setattr(
+        sheets_writer,
+        "sync_keywords_all",
+        lambda repo_root=".": calls.append(repo_root) or {"우아덤": {"picked": 1, "appended": 1}},
+    )
+    spec = TaskSpec(task="sheet_sync_keywords", brand="")
+    out = worker._sheet_sync_keywords(rt, spec)
+    assert out["ok"] is True
+    assert len(calls) == 1
+    assert "우아덤" in out["per_brand"]
+    rt.close()

@@ -29,6 +29,9 @@ TASK_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     # "키워드 발굴"에 가로채이지 않는다("연관도"가 있으면 이쪽이 맞다)
     ("keyword_relevance_status", re.compile(r"키워드\s*연관도\s*현황")),
     ("keyword_relevance_rescan", re.compile(r"키워드\s*연관도\s*재산정")),
+    # 시트 키워드 반영 (연결 2, 2026-09-23) — `시트 키워드 반영 우아덤` / `시트 키워드 반영 전체`.
+    # 다른 "시트...동기화/갱신" 패턴보다 먼저 봐야 "반영"이 그쪽으로 안 가로채인다.
+    ("sheet_sync_keywords", re.compile(r"시트\s*키워드\s*반영")),
     # 예약 "키워드 발굴 전체 500개" — 브랜드 5개를 순차로 도는 일괄 발굴.
     # 특정 브랜드용 `keyword_discovery`(예: "우아덤 키워드 발굴 1000개")보다 먼저 본다.
     ("keyword_discovery_all", re.compile(r"키워드\s*발굴\s*전체")),
@@ -262,6 +265,8 @@ _NO_SLOT_TASKS = frozenset(
         "keyword_discovery_status",
         "keyword_discovery_all",
         "keyword_relevance_status",
+        "keyword_relevance_rescan",
+        "sheet_sync_keywords",
     }
 )
 
@@ -566,6 +571,7 @@ TASK_LABELS: dict[str, str] = {
     "exposure_cycle_start": "노출 순환 시작",
     "exposure_cycle_stop": "노출 순환 중지",
     "exposure_cycle_status": "노출 순환 상태",
+    "sheet_sync_keywords": "시트 키워드 반영",
     "pending_report": "미처리 목록 보내기",
     "daily_report": "일일 보고(어제 기준)",
     "progress_report": "중간 보고(오늘 기준)",

@@ -94,7 +94,8 @@ def test_all_tasks_covered_by_tests():
     # + 키워드 발굴 전체 1건(keyword_discovery_all, 2026-09-23 — 잠금·헤드리스 작업과 함께)
     # + 가상 PC 원고 내보내기 1건(vpc_export, 2026-09-23 — v2r/vpc 구분자 도입)
     # + 키워드 연관도 2건(keyword_relevance_rescan·keyword_relevance_status, 2026-09-23)
-    assert len(ALLOWED_TASKS) == 56
+    # + 시트 키워드 반영 1건(sheet_sync_keywords, 2026-09-23 — 노출 순환 연결 2)
+    assert len(ALLOWED_TASKS) == 57
 
 
 def test_wash_photos_count():
@@ -111,6 +112,19 @@ def test_keyword_relevance_rescan_brand_slot():
 def test_keyword_relevance_rescan_all_brands():
     spec = parse_korean_command("키워드 연관도 재산정 전체", now=NOW)
     assert spec.task == "keyword_relevance_rescan"
+    assert spec.brand == ""
+
+
+def test_sheet_sync_keywords_brand_slot():
+    spec = parse_korean_command("우아덤 시트 키워드 반영", now=NOW)
+    assert spec.task == "sheet_sync_keywords"
+    assert spec.brand == "우아덤"
+    assert spec.source == ""  # "시트"가 원본 이름 슬롯으로 잘못 잡히지 않는다
+
+
+def test_sheet_sync_keywords_all_brands():
+    spec = parse_korean_command("시트 키워드 반영 전체", now=NOW)
+    assert spec.task == "sheet_sync_keywords"
     assert spec.brand == ""
 
 

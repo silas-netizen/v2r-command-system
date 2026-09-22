@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -779,6 +780,45 @@ def _discovered_keywords_path(rt: Any, brand: str) -> Path:
     return Path(rt.settings.repo_root) / "data" / "keywords" / f"{brand}.csv"
 
 
+def _relevance_keywords_db_path(rt: Any, brand: str) -> Path:
+    return Path(rt.settings.repo_root) / "data" / "keywords" / f"{brand}.sqlite"
+
+
+def _relevance_eligible_keywords(rt: Any, brand: str) -> list[dict]:
+    """`data/keywords/<브랜드>.sqlite`에서 원고 대상(연관도 0~2, 검토 대기 아님)만.
+
+    `sheets_writer.sync_keywords_to_sheet`와 같은 조건이다(연결 3, 2026-09-23).
+    DB가 없거나(발굴/재산정 전) 읽는 중 문제가 있으면 조용히 빈 목록.
+    """
+    import sqlite3
+
+    db_path = _relevance_keywords_db_path(rt, brand)
+    if not db_path.exists():
+        return []
+    try:
+        con = sqlite3.connect(str(db_path))
+        try:
+            cols = {row[1] for row in con.execute("PRAGMA table_info(keywords)")}
+            required = {"relevance_llm", "relevance_codex", "needs_review"}
+            if not required.issubset(cols):
+                return []
+            rows = con.execute(
+                """
+                select keyword, total
+                from keywords
+                where relevance_llm between 0 and 2
+                  and relevance_codex between 0 and 2
+                  and (needs_review is null or needs_review = 0)
+                """
+            ).fetchall()
+        finally:
+            con.close()
+    except Exception as exc:  # pragma: no cover - 방어용(다른 일꾼이 동시에 쓰는 중일 수 있음)
+        log.warning("연관도 DB 읽기 실패(%s, %s): %s", brand, db_path, exc)
+        return []
+    return [{"keyword": kw, "cafe": "", "article_url": "", "t0_status": "", "candidate_title_norm": "", "volume": int(total or 0)} for kw, total in rows]
+
+
 def known_brands(rt: Any) -> list[str]:
     """`data/brand_sheet_<브랜드>.xlsx` 파일명에서 뽑은 브랜드 목록."""
     repo = Path(rt.settings.repo_root)
@@ -814,6 +854,17 @@ def keyword_universe(rt: Any, brand: str) -> list[dict]:
     out: dict[str, dict] = {}
     for t in targets:
         out[_norm(t["keyword"])] = {**t, "volume": 0}
+
+    # 2026-09-23 사용자 지시(연결 3) — DB 원고 대상(relevance_llm·relevance_codex
+    # 둘 다 0~2, needs_review 아님)도 순환 대상에 합친다. 무관(3)은 여기서 아예
+    # 안 뽑히므로 자연히 순환에서 제외된다. `keyword_relevance.py`는 다른 일꾼이
+    # 전량 재산정 중이라 이 모듈은 그 sqlite를 읽기만 한다(쓰지 않음).
+    for item in _relevance_eligible_keywords(rt, brand):
+        key = _norm(item["keyword"])
+        if key in out:
+            out[key]["volume"] = max(int(out[key].get("volume") or 0), int(item.get("volume") or 0))
+        else:
+            out[key] = item
 
     disc_path = _discovered_keywords_path(rt, brand)
     if disc_path.exists():
@@ -898,15 +949,28 @@ def _write_cycle_state(rt: Any, state: dict) -> None:
 def cycle_start(rt: Any, brands: list[str] | None = None) -> dict:
     """`노출 순환 시작`."""
     state = cycle_status(rt)
+    resolved_brands = brands or state.get("brands") or known_brands(rt)
     state.update(
         {
             "enabled": True,
-            "brands": brands or state.get("brands") or known_brands(rt),
+            "brands": resolved_brands,
             "started_at": now_iso(),
             "paused_until_mono": None,
         }
     )
     _write_cycle_state(rt, state)
+    # 연결 3(2026-09-23): 시작할 때 딱 한 번, 시트에 없는 키워드(H열 미존재)를
+    # sync_keywords_to_sheet가 넣게 한다. 실패해도 순환 시작은 막지 않는다(경고 1회).
+    try:
+        from v2r.sources import sheets_writer
+
+        for b in resolved_brands:
+            try:
+                sheets_writer.sync_keywords_to_sheet(b, repo_root=rt.settings.repo_root)
+            except Exception as exc:
+                log.warning("노출 순환 시작: 시트 키워드 반영 실패(%s): %s", b, exc)
+    except Exception as exc:  # pragma: no cover - 방어용
+        log.warning("노출 순환 시작: 시트 키워드 반영 건너뜀: %s", exc)
     return state
 
 
@@ -916,6 +980,99 @@ def cycle_stop(rt: Any) -> dict:
     state["enabled"] = False
     _write_cycle_state(rt, state)
     return state
+
+
+# =======================================================================
+# 연결 1(2026-09-23): 순환 판정 → 시트 반영 배칭
+#
+# 시트 쓰기(Google Sheets API/Playwright)는 느려서 판정마다 바로 부르면 순환
+# 속도가 막힌다. 판정 결과를 브랜드별로 모아뒀다가 **20건 또는 5분**(먼저
+# 차는 쪽) 마다 한 번씩, 별도 스레드에서 `sheets_writer.apply_exposure`를
+# 부른다. 실패해도 다음 판정(순환)은 그대로 계속되고, 경고는 1회만 남긴다.
+# =======================================================================
+
+SHEET_BATCH_SIZE = 20
+SHEET_BATCH_INTERVAL_SEC = 300
+
+_sheet_batch_lock = threading.Lock()
+#: brand -> [{keyword,status,final_url,edited_at,exposed_total,rank}, ...]
+_sheet_batch: dict[str, list[dict]] = {}
+_sheet_batch_last_flush: dict[str, float] = {}
+#: 브랜드별 시트 반영 실패를 경고 1회만 남기기 위한 표시
+_sheet_batch_warned: set[str] = set()
+
+
+def _sheet_row_from_result(item: dict, row: "ExposureRow") -> dict:
+    exposed_total = int(item.get("volume") or 0) if row.status == "exposed" else 0
+    top5 = row.status == "exposed" and row.rank is not None and row.rank <= TOP5_RANK
+    return {
+        "keyword": row.keyword,
+        "status": KOREAN_STATUS.get(row.status, row.status),
+        "final_url": integrated_search_url(row.search_query or row.keyword),
+        "edited_at": row.checked_at,
+        "exposed_total": exposed_total,
+        "rank": "예" if top5 else "",
+    }
+
+
+def _sheet_totals(rt: Any, brand: str) -> dict[str, Any] | None:
+    """`write_exposure_csv`가 이미 쓴 `<브랜드>.summary.json`에서 P1/Q1 합계를 읽는다."""
+    p = exposure_dir(rt) / f"{brand}.summary.json"
+    if not p.exists():
+        return None
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return {"P1": data.get("total_volume_p1", 0), "Q1": data.get("exposed_volume_q1", 0)}
+
+
+def _flush_sheet_batch_async(rt: Any, brand: str, rows: list[dict]) -> None:
+    def _run() -> None:
+        try:
+            from v2r.sources import sheets_writer
+
+            totals = _sheet_totals(rt, brand)
+            res = sheets_writer.apply_exposure(
+                brand, rows, totals=totals, repo_root=rt.settings.repo_root
+            )
+            if res.get("error"):
+                raise SourceError(res["error"])
+            _sheet_batch_warned.discard(brand)
+        except Exception as exc:
+            if brand not in _sheet_batch_warned:
+                log.warning("노출 순환: 시트 반영 실패(%s, 이후 같은 경고 생략): %s", brand, exc)
+                _sheet_batch_warned.add(brand)
+
+    threading.Thread(target=_run, daemon=True, name=f"exposure-sheet-flush-{brand}").start()
+
+
+def _enqueue_sheet_row(rt: Any, brand: str, item: dict, row: "ExposureRow") -> None:
+    """판정 결과를 배치에 쌓고, 20건 또는 5분이 찼으면 별도 스레드로 흘려보낸다."""
+    sheet_row = _sheet_row_from_result(item, row)
+    now_mono = time.monotonic()
+    to_flush: list[dict] | None = None
+    with _sheet_batch_lock:
+        pending = _sheet_batch.setdefault(brand, [])
+        pending.append(sheet_row)
+        last = _sheet_batch_last_flush.setdefault(brand, now_mono)
+        if len(pending) >= SHEET_BATCH_SIZE or (now_mono - last) >= SHEET_BATCH_INTERVAL_SEC:
+            to_flush = pending[:]
+            _sheet_batch[brand] = []
+            _sheet_batch_last_flush[brand] = now_mono
+    if to_flush:
+        _flush_sheet_batch_async(rt, brand, to_flush)
+
+
+def flush_sheet_batch_now(rt: Any, brand: str) -> None:
+    """대기 중인 배치를 즉시 흘려보낸다(순환 중지/테스트용)."""
+    with _sheet_batch_lock:
+        pending = _sheet_batch.get(brand) or []
+        if not pending:
+            return
+        _sheet_batch[brand] = []
+        _sheet_batch_last_flush[brand] = time.monotonic()
+    _flush_sheet_batch_async(rt, brand, pending)
 
 
 def cycle_tick(rt: Any, now_mono: float | None = None) -> dict | None:
@@ -978,6 +1135,7 @@ def cycle_tick(rt: Any, now_mono: float | None = None) -> dict | None:
         verdict["search_query"],
     )
     store.save(rt.conn, row.as_row())
+    _enqueue_sheet_row(rt, brand, item, row)
     state["last_checked"] = {
         "brand": brand,
         "keyword": item["keyword"],
@@ -1588,4 +1746,10 @@ __all__ = [
     "article_has_identifier",
     "confirm_our_article",
     "judge_keyword_exposure",
+    # 연결 1: 순환→시트 배칭 (2026-09-23)
+    "SHEET_BATCH_SIZE",
+    "SHEET_BATCH_INTERVAL_SEC",
+    "flush_sheet_batch_now",
+    # 연결 3: 연관도 DB 병합
+    "_relevance_eligible_keywords",
 ]

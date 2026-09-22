@@ -60,6 +60,7 @@ ALLOWED_TASKS: frozenset[str] = frozenset(
         "keyword_discovery_status",
         "keyword_relevance_rescan",
         "keyword_relevance_status",
+        "sheet_sync_keywords",
         "pending_report",
         "daily_report",
         "progress_report",
