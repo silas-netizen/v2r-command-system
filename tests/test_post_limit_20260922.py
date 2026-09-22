@@ -6,7 +6,7 @@
    목록에 글 번호가 보여도 그 글은 올라가지 않았다.
 2. 그런 건은 `failed`(사유 `제한`)로 남고 **재발행 대기 줄**에 들어간다.
 3. 한 계정이 하루 `ACCOUNT_DAILY_LIMIT`건을 채우면 그날은 더 쓰지 않는다.
-4. 현황판에 "제한 걸린 글" 수가 나온다.
+4. 현황판에 "제한 글" 수가 나온다(2026-09-22 새 모양부터 칸 이름 변경).
 """
 
 from __future__ import annotations
@@ -231,7 +231,8 @@ def test_현황판에_제한_걸린_글_열이_있다(tmp_path):
     assert len(rt.publications.list_limited(day)) == 1
 
     html = dashboard.render_html(rt)
-    assert "제한 걸린 글" in html
+    # 2026-09-22 새 모양부터는 표 칸 이름이 "제한 글"(카페별 표)이다
+    assert "제한 글" in html
     rt.close()
 
 

@@ -1050,7 +1050,16 @@ def build_dashboard(rt: Runtime) -> Path:
     return path
 
 
+#: 사람이 손으로 만든 1안 — 새 모양 자동 생성기가 **절대** 덮어쓰지 않는다.
+#: (2026-09-22: 자동 예약이 우연히 같은 날짜 파일명과 겹쳐 실수로 덮어쓴 사고가 있었다.
+#: 그 뒤로 이 이름은 영원히 피하고 `-auto` 꼬리표를 붙인다.)
+PROTECTED_STEMS = frozenset({"dashboard-2026-09-21"})
+
+
 def _write_pair(data: ReportData, out_dir: Path, stem: str) -> tuple[Path, Path]:
+    if stem in PROTECTED_STEMS:
+        log.warning("보호된 파일명과 겹쳐 '-auto' 꼬리표를 붙입니다: %s", stem)
+        stem = f"{stem}-auto"
     out_dir.mkdir(parents=True, exist_ok=True)
     html_path = out_dir / f"{stem}.html"
     md_path = out_dir / f"{stem}.md"
@@ -1065,7 +1074,10 @@ def build_daily_report(
     now: datetime | None = None,
     out_dir: str | Path | None = None,
 ) -> tuple[Path, Path]:
-    """어제 기준 일일 보고 → `docs/reports/dashboard-YYYY-MM-DD.html/.md`."""
+    """어제 기준 일일 보고 → `docs/reports/dashboard-YYYY-MM-DD.html/.md`.
+
+    단, 손으로 만든 1안과 이름이 겹치면(`PROTECTED_STEMS`) `-auto` 꼬리표를 붙인다.
+    """
     data = collect(rt, kind="daily", date=date, now=now)
     return _write_pair(data, _report_dir(rt, out_dir), f"dashboard-{data.date}")
 

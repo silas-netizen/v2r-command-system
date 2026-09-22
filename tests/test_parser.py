@@ -80,7 +80,8 @@ def test_all_tasks_covered_by_tests():
     # + 웹 세션 점검 1건(web_keepalive: Claude·Make, 2026-09-21)
     # + 요금제 세션 점검 1건(plan_keepalive: Claude Code CLI, 2026-09-21)
     # + 정기 정비 1건(maintenance: 이벤트 정리·VACUUM·캐시, 2026-09-22)
-    assert len(ALLOWED_TASKS) == 39
+    # + 새 모양 보고서 2건(daily_report·progress_report, 2026-09-22)
+    assert len(ALLOWED_TASKS) == 41
 
 
 def test_wash_photos_count():

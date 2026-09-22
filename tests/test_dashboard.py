@@ -165,22 +165,47 @@ def test_build_daily_report_files(tmp_path):
     rt = make_runtime(tmp_path)
     out = tmp_path / "reports"
     try:
+        date = "2026-09-23"  # 손으로 만든 1안(2026-09-21)과 안 겹치는 날짜
+        _seed_day(rt, date)
+        html_path, md_path = build_daily_report(rt, date=date, out_dir=out)
+    finally:
+        rt.close()
+    assert html_path.name == "dashboard-2026-09-23.html"
+    assert md_path.name == "dashboard-2026-09-23.md"
+    html = html_path.read_text(encoding="utf-8")
+    md = md_path.read_text(encoding="utf-8")
+    for title in SECTION_TITLES.values():
+        assert title in html and title in md, title
+    assert "2026-09-23" in html and "(어제)" in html
+    assert "| 고요한 아침 |" in md
+    assert "**합계**" in md
+    # 일일 보고에는 진행률 칸이 없다
+    assert "목표 대비 진행률" not in html
+
+
+def test_build_daily_report_never_overwrites_hand_made_1안(tmp_path):
+    """2026-09-21 은 손으로 만든 1안 — 자동 생성기는 반드시 '-auto' 꼬리표로 비켜 간다.
+
+    2026-09-22 사고: 예약이 같은 날짜 파일명과 겹쳐 1안을 실수로 덮어썼다.
+    """
+    rt = make_runtime(tmp_path)
+    out = tmp_path / "reports"
+    hand_made_html = out / "dashboard-2026-09-21.html"
+    hand_made_md = out / "dashboard-2026-09-21.md"
+    out.mkdir(parents=True, exist_ok=True)
+    hand_made_html.write_text("손으로 만든 1안 HTML", encoding="utf-8")
+    hand_made_md.write_text("손으로 만든 1안 MD", encoding="utf-8")
+    try:
         date = "2026-09-21"
         _seed_day(rt, date)
         html_path, md_path = build_daily_report(rt, date=date, out_dir=out)
     finally:
         rt.close()
-    assert html_path.name == "dashboard-2026-09-21.html"
-    assert md_path.name == "dashboard-2026-09-21.md"
-    html = html_path.read_text(encoding="utf-8")
-    md = md_path.read_text(encoding="utf-8")
-    for title in SECTION_TITLES.values():
-        assert title in html and title in md, title
-    assert "2026-09-21" in html and "(어제)" in html
-    assert "| 고요한 아침 |" in md
-    assert "**합계**" in md
-    # 일일 보고에는 진행률 칸이 없다
-    assert "목표 대비 진행률" not in html
+    assert html_path.name == "dashboard-2026-09-21-auto.html"
+    assert md_path.name == "dashboard-2026-09-21-auto.md"
+    # 1안은 그대로다
+    assert hand_made_html.read_text(encoding="utf-8") == "손으로 만든 1안 HTML"
+    assert hand_made_md.read_text(encoding="utf-8") == "손으로 만든 1안 MD"
 
 
 def test_daily_report_defaults_to_yesterday(tmp_path):
@@ -193,7 +218,12 @@ def test_daily_report_defaults_to_yesterday(tmp_path):
         html_path, _ = build_daily_report(rt, out_dir=out)
     finally:
         rt.close()
-    assert html_path.name == f"dashboard-{yesterday}.html"
+    # 손으로 만든 1안(2026-09-21)과 겹치는 날이면 '-auto' 꼬리표가 붙는다
+    from v2r.engine.dashboard import PROTECTED_STEMS
+
+    stem = f"dashboard-{yesterday}"
+    expect = f"{stem}-auto" if stem in PROTECTED_STEMS else stem
+    assert html_path.name == f"{expect}.html"
 
 
 def test_build_daily_report_empty_db(tmp_path):
