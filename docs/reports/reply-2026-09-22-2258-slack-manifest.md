@@ -1,4 +1,4 @@
-# 슬랙 앱 만들기 — 이 화면에서 (2026-09-22 22:58 KST, 실측)
+# 슬랙 앱 만들기 — 이 화면에서 (2026-09-22 23:08 KST, 실측)
 
 1. 화면 아래 쿠키 창은 **COOKIES SETTINGS → 필수만**(또는 그냥 닫기).
 2. 창에서 **From a manifest**(왼쪽 아래, "Upload JSON or YAML config") 선택 → **Continue**.
