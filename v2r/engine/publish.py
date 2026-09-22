@@ -369,6 +369,18 @@ def self_cafe_names(rt: Runtime, include_excluded: bool = False) -> list[str]:
     return out
 
 
+def affiliate_cafe_names(rt: Runtime) -> list[str]:
+    """제휴 카페(`affiliate`) 이름 목록 (config/cafes.yaml)."""
+    out: list[str] = []
+    for entry in (rt.cafes_cfg or {}).get("affiliate") or []:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("name") or "").strip()
+        if name and name not in out:
+            out.append(name)
+    return out
+
+
 def brand_source_keys(rt: Runtime) -> set[str]:
     """브랜드 원고 시트 이름 집합(= 일상 글이 아닌 `source_key`).
 
@@ -2588,6 +2600,7 @@ __all__ = [
     "declump_by_board",
     "last_board_by_cafe",
     "self_cafe_names",
+    "affiliate_cafe_names",
     "refresh_source",
     "resolve_board",
     "resolve_cafe",

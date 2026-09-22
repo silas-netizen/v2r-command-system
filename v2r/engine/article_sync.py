@@ -236,6 +236,61 @@ def sync_all_self_cafes(
     }
 
 
+def sync_all_cafes(
+    rt: Runtime,
+    scope: str = "all",
+    *,
+    with_bodies: bool = False,
+    heartbeat: Any = None,
+) -> dict:
+    """카페 글 목록 동기화 — `scope`로 자사/제휴/전체 선택.
+
+    브랜드 원고는 **제휴 카페**(씨씨앙·양평맘 등)에 올라간다. 키워드 노출 검사가
+    우리 글을 찾으려면 제휴 카페도 색인에 있어야 한다(`sync_all_self_cafes`는
+    자사 카페만 돈다). `scope`: ``"self"``(자사만, 기존 동작과 동일) /
+    ``"affiliate"``(제휴만) / ``"all"``(둘 다, 기본값).
+
+    돌려주는 값은 `sync_all_self_cafes`와 같은 모양에 `scope`를 더한 것.
+    """
+    from v2r.engine.publish import affiliate_cafe_names, self_cafe_names
+
+    if scope not in ("self", "affiliate", "all"):
+        raise ValueError(f"알 수 없는 scope: {scope}")
+
+    names: list[str] = []
+    if scope in ("self", "all"):
+        names.extend(self_cafe_names(rt, include_excluded=True))
+    if scope in ("affiliate", "all"):
+        names.extend(affiliate_cafe_names(rt))
+
+    results: list[dict] = []
+    errors: list[str] = []
+    warnings: list[str] = []
+    for cafe in names:
+        res = sync_cafe_index(rt, cafe, with_bodies=with_bodies, heartbeat=heartbeat)
+        errors.extend(res.get("errors") or [])
+        warnings.extend(res.get("warnings") or [])
+        results.append(res)
+
+    total_accounts = sum(r["accounts"] for r in results)
+    failed_accounts = len(warnings)
+    all_accounts_failed = total_accounts > 0 and failed_accounts >= total_accounts
+    ok = not errors and not all_accounts_failed
+
+    return {
+        "scope": scope,
+        "cafes": results,
+        "rows": sum(r["rows"] for r in results),
+        "new": sum(r["new"] for r in results),
+        "updated": sum(r["updated"] for r in results),
+        "bodies": sum(r["bodies"] for r in results),
+        "errors": errors,
+        "warnings": warnings,
+        "ok": ok,
+        "total": rt.article_index.count(),
+    }
+
+
 def format_sync_summary(out: dict) -> str:
     """`sync_all_self_cafes` 결과를 알림·결과용 한 줄 요약으로.
 
