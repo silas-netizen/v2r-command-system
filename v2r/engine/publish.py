@@ -1578,6 +1578,22 @@ def plan(rt: Runtime, spec: TaskSpec, manuscripts: list[Manuscript]) -> list[Slo
     comment_only = all_comment_accounts(rt)
     assigned: dict[int, str] = {}
     chosen_by_cafe: dict[str, list[str]] = {}
+    # 자사 카페 일상 글(카페별 발행·자동 계정)은 원본 xlsx에 적힌 계정을 **무시**하고
+    # 하루 10개 공용 계정으로 돌린다 (사용자 결정 2026-09-21/22). 2026-09-22 09:00 발행이
+    # xlsx의 계정 열(3개)로만 나간 원인이 이 우회였다.
+    self_daily_mode = (
+        getattr(spec, "per_cafe", False)
+        and not spec.account_count
+        and spec.account_mode != "manual"
+    )
+    if self_daily_mode:
+        overridden = 0
+        for i, m in enumerate(manuscripts):
+            if m.account and workflows[i] == "self":
+                m.account = ""
+                overridden += 1
+        if overridden:
+            plan_event(rt, "info", f"원본에 적힌 계정 {overridden}건 무시 → 오늘 계정 10개로 배정")
     need_assign = [i for i, m in enumerate(manuscripts) if not m.account]
     if need_assign:
         # 카페·게시판마다 쓸 수 있는 계정이 다르다 → (work_type, 카페, 게시판)으로 묶는다
