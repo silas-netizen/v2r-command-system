@@ -1,4 +1,4 @@
-# 등록 제한 글 4건 — 정정 결과 (2026-09-22 09:48 KST, 실측)
+# 등록 제한 글 4건 — 정정 결과 (2026-09-22 09:44 KST, 실측)
 
 전문: [limit-fail-fix-2026-09-22.md](file:///D:/v2r%20%EC%9E%90%EB%8F%99%ED%99%94/v2r-command-system/docs/reports/limit-fail-fix-2026-09-22.md)
 
