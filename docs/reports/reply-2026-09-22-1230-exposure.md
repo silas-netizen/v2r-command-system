@@ -1,4 +1,4 @@
-# 키워드 노출 검사 1차 구현 결과 (2026-09-22 12:30 KST, 실측)
+# 키워드 노출 검사 1차 구현 결과 (2026-09-22 12:15 KST, 실측)
 
 전문: [keyword-exposure-done-2026-09-22.md](file:///D:/v2r%20%EC%9E%90%EB%8F%99%ED%99%94/v2r-command-system/docs/reports/keyword-exposure-done-2026-09-22.md) · 첫 실행 결과 [exposure-2026-09-22.md](file:///D:/v2r%20%EC%9E%90%EB%8F%99%ED%99%94/v2r-command-system/docs/reports/exposure-2026-09-22.md)
 

@@ -1153,6 +1153,77 @@ def test_run_publish_은_카페별_간격으로_돈다(tmp_path, monkeypatch):
         assert all(2 * 60 <= b - a <= 5 * 60 for a, b in zip(mine, mine[1:]))
 
 
+# --------------------------------------------------------------------
+# 9-B. 카페별 계정 순번 시작점 분산 + 재시작 시 이어가기 (사용자 지시 2026-09-22)
+# --------------------------------------------------------------------
+def test_cafe_rotation_base_spreads_offsets(tmp_path):
+    """카페 순서(정규화 이름 정렬)마다 시작점을 2씩 벌린다 — 재시작 직후 동시 사용 방지."""
+    rt = make_runtime(tmp_path)
+    rt.cafes_cfg = {
+        "self_owned": [{"name": c, "cafe_id": i} for i, c in enumerate(FIVE_CAFES)]
+    }
+    order = sorted(FIVE_CAFES)
+    bases = [publish_mod._cafe_rotation_base(rt, c, 10) for c in order]
+    assert bases == [0, 2, 4, 6, 8]
+
+
+def test_account_rotation_start_fresh_run_uses_cafe_base(tmp_path):
+    rt = make_runtime(tmp_path)
+    rt.cafes_cfg = {
+        "self_owned": [{"name": c, "cafe_id": i} for i, c in enumerate(FIVE_CAFES)]
+    }
+    chosen = [f"user{i:02d}" for i in range(10)]
+    order = sorted(FIVE_CAFES)
+    starts = [publish_mod._account_rotation_start(rt, c, chosen) for c in order]
+    assert starts == [0, 2, 4, 6, 8]
+    # 재시작 직후 5개 카페가 동시에 도는 상황을 흉내 — 5곳 모두 다른 계정으로 시작
+    first_accounts = {publish_mod.rotate(chosen, s) for s in starts}
+    assert len(first_accounts) == 5
+
+
+def test_account_rotation_start_resumes_after_today_last_published(tmp_path):
+    """하루 중 재시작이면 그 카페 오늘 마지막 발행 계정 다음부터 잇는다."""
+    rt = make_runtime(tmp_path)
+    rt.cafes_cfg = {
+        "self_owned": [{"name": c, "cafe_id": i} for i, c in enumerate(FIVE_CAFES)]
+    }
+    chosen = [f"user{i:02d}" for i in range(10)]
+    rt.publications.mark(
+        "각색_전체_9", 1, "h1", "done", None, cafe="고요한 아침", account="user04"
+    )
+    start = publish_mod._account_rotation_start(rt, "고요한 아침", chosen)
+    assert start == 5  # user04 다음(인덱스 5)부터
+
+
+def test_account_rotation_start_falls_back_when_last_account_not_in_pool(tmp_path):
+    """오늘 마지막 발행 계정이 오늘의 10개 안에 없으면 카페 기준 시작점을 쓴다."""
+    rt = make_runtime(tmp_path)
+    rt.cafes_cfg = {
+        "self_owned": [{"name": c, "cafe_id": i} for i, c in enumerate(FIVE_CAFES)]
+    }
+    chosen = [f"user{i:02d}" for i in range(10)]
+    rt.publications.mark(
+        "각색_전체_9", 1, "h1", "done", None, cafe="고요한 아침", account="user99"
+    )
+    order = sorted(FIVE_CAFES)
+    expected_base = (order.index("고요한 아침") * 2) % 10
+    start = publish_mod._account_rotation_start(rt, "고요한 아침", chosen)
+    assert start == expected_base
+
+
+def test_account_rotation_start_only_computed_once_per_run(tmp_path):
+    """같은 실행 안에서는 같은 카페를 다시 물어도 이어서 세지 처음부터 다시 안 잰다."""
+    rt = make_runtime(tmp_path)
+    rt.cafes_cfg = {
+        "self_owned": [{"name": c, "cafe_id": i} for i, c in enumerate(FIVE_CAFES)]
+    }
+    chosen = [f"user{i:02d}" for i in range(10)]
+    first = publish_mod._account_rotation_start(rt, "고요한 아침", chosen)
+    rt.scratch["account_rotation_offset"][publish_mod._norm("고요한 아침")] = first + 3
+    again = publish_mod._account_rotation_start(rt, "고요한 아침", chosen)
+    assert again == first + 3
+
+
 def test_모의_실행_보고에_예상_소요가_나온다(tmp_path, monkeypatch):
     rt = make_runtime(tmp_path)
     rt.settings.repo_root = tmp_path

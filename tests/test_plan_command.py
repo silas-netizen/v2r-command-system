@@ -240,7 +240,7 @@ def _brand_runtime(tmp_path, monkeypatch, backend="plan"):
     rt._llm_ready = True
     monkeypatch.setattr(
         "v2r.sources.keyword_list.load_pushed_keywords",
-        lambda brand, cfg=None, xlsx_path=None, limit=0: [
+        lambda brand, cfg=None, xlsx_path=None, limit=0, conn=None: [
             {"keyword": KEYWORD, "cafe": "씨씨앙"}
         ],
     )

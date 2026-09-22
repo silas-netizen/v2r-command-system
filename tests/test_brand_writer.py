@@ -589,7 +589,7 @@ def test_worker_generate_brand(tmp_path, monkeypatch):
     rt._llm_ready = True
     monkeypatch.setattr(
         "v2r.sources.keyword_list.load_pushed_keywords",
-        lambda brand, cfg=None, xlsx_path=None, limit=0: [
+        lambda brand, cfg=None, xlsx_path=None, limit=0, conn=None: [
             {"keyword": KEYWORD, "cafe": "씨씨앙"}
         ],
     )
@@ -614,7 +614,7 @@ def test_worker_report_name_includes_manuscript_type(tmp_path, monkeypatch):
     rt._llm_ready = True
     monkeypatch.setattr(
         "v2r.sources.keyword_list.load_pushed_keywords",
-        lambda brand, cfg=None, xlsx_path=None, limit=0: [
+        lambda brand, cfg=None, xlsx_path=None, limit=0, conn=None: [
             {"keyword": KEYWORD, "cafe": "씨씨앙"},
             {"keyword": "이노시톨", "cafe": "씨씨앙"},
         ],
@@ -638,7 +638,7 @@ def test_worker_reports_not_ok_when_a_manuscript_is_unfinished(tmp_path, monkeyp
     rt._llm_ready = True
     monkeypatch.setattr(
         "v2r.sources.keyword_list.load_pushed_keywords",
-        lambda brand, cfg=None, xlsx_path=None, limit=0: [
+        lambda brand, cfg=None, xlsx_path=None, limit=0, conn=None: [
             {"keyword": KEYWORD, "cafe": "씨씨앙"}
         ],
     )
@@ -843,7 +843,7 @@ def test_worker_reply_has_estimated_cost(tmp_path, monkeypatch):
     rt._llm_ready = True
     monkeypatch.setattr(
         "v2r.sources.keyword_list.load_pushed_keywords",
-        lambda brand, cfg=None, xlsx_path=None, limit=0: [
+        lambda brand, cfg=None, xlsx_path=None, limit=0, conn=None: [
             {"keyword": KEYWORD, "cafe": "씨씨앙"}
         ],
     )

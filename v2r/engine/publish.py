@@ -1448,6 +1448,61 @@ def _daily_accounts_path(rt: Runtime) -> Path:
     return Path(rt.settings.data_dir) / "self_daily_accounts.json"
 
 
+def _cafe_rotation_base(rt: Runtime, cafe_name: str, account_count: int) -> int:
+    """카페별 순번 **시작점** — 재시작 직후 여러 카페가 같은 계정을 동시에 쓰지
+    않도록 카페 순서(정규화 이름 정렬)마다 2씩 벌려 둔다 (사용자 지시 2026-09-22).
+
+    예: 계정 10개, 자사 카페 5곳이면 0, 2, 4, 6, 8 — 계정 수로 나눈 나머지다.
+    """
+    if account_count <= 0:
+        return 0
+    names = sorted(self_cafe_names(rt), key=_norm)
+    try:
+        idx = names.index(cafe_name) if cafe_name in names else [
+            _norm(n) for n in names
+        ].index(_norm(cafe_name))
+    except ValueError:
+        idx = 0
+    return (idx * 2) % account_count
+
+
+def _last_published_account_today(rt: Runtime, cafe_name: str) -> str:
+    """이 카페에서 **오늘** 마지막으로 발행에 쓴 계정 (`publications` 표 기준).
+
+    재시작 직후에도 순번이 처음부터 다시 돌지 않도록, 있으면 그 계정 바로
+    다음부터 이어간다 (사용자 지시 2026-09-22). 없으면 빈 문자열.
+    """
+    try:
+        row = rt.conn.execute(
+            "SELECT account FROM publications"
+            " WHERE cafe = ? AND date(created_at) = date('now', 'localtime')"
+            " AND account IS NOT NULL AND account != ''"
+            " ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            (cafe_name,),
+        ).fetchone()
+    except Exception:  # noqa: BLE001 - DB 조회 실패는 그냥 기본 시작점을 쓴다
+        return ""
+    if not row:
+        return ""
+    return str(row["account"] or "")
+
+
+def _account_rotation_start(rt: Runtime, cafe_name: str, chosen: list[str]) -> int:
+    """이 실행에서 이 카페의 계정 순번 시작점 — 최초 1회만 계산하고 이후는
+    이어서 센다 (게시판마다 0부터 다시 세면 앞쪽 계정만 쓰게 된다).
+    """
+    offsets: dict[str, int] = rt.scratch.setdefault("account_rotation_offset", {})
+    key = _norm(cafe_name)
+    if key in offsets:
+        return offsets[key]
+    last = _last_published_account_today(rt, cafe_name)
+    if last and last in chosen:
+        start = (chosen.index(last) + 1) % len(chosen)
+    else:
+        start = _cafe_rotation_base(rt, cafe_name, len(chosen))
+    return start
+
+
 def daily_self_accounts(
     rt: Runtime,
     pool_all: list[Any],
@@ -1673,9 +1728,11 @@ def plan(rt: Runtime, spec: TaskSpec, manuscripts: list[Manuscript]) -> list[Slo
                     "info",
                     f"{cafe_name}/{board}: 계정 풀 {len(pool)}개 / {len(chosen)}개 사용",
                 )
-            # 순번은 카페 단위로 이어 간다 — 게시판마다 0부터 다시 세면 앞쪽 계정만 쓰게 된다
+            # 순번은 카페 단위로 이어 간다 — 게시판마다 0부터 다시 세면 앞쪽 계정만 쓰게 된다.
+            # 시작점은 카페마다 벌려 두고(재시작 직후 동시 사용 방지), 하루 중
+            # 재시작이면 그 카페 오늘 마지막 발행 계정 다음부터 잇는다 (2026-09-22).
             offsets: dict[str, int] = rt.scratch.setdefault("account_rotation_offset", {})
-            start = offsets.get(_norm(cafe_name), 0) if self_daily_pick else 0
+            start = _account_rotation_start(rt, cafe_name, chosen) if self_daily_pick else 0
             for position, i in enumerate(idxs):
                 assigned[i] = rotate(chosen, start + position)
             if self_daily_pick:
