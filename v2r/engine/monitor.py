@@ -75,7 +75,10 @@ DIAGNOSE_SYSTEM = (
 
 #: 감시 대상에서 빼는 작업(조회·중지처럼 순식간에 끝나는 것)
 SKIP_TASKS = frozenset(
-    {"stop", "status", "dashboard", "schedule_list", "monitor_status", "pending_report"}
+    {
+        "stop", "status", "dashboard", "schedule_list", "monitor_status",
+        "pending_report", "daily_report", "progress_report",
+    }
 )
 #: 실행기가 켜지기 이 시간보다 더 전에 멈춘 작업은 **과거**로 본다(초).
 #: 장애 2026-09-20: 켜자마자 어제 실패한 작업 59·62를 알리고 60을 다시 등록했다.

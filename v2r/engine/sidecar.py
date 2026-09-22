@@ -44,6 +44,8 @@ log = logging.getLogger(__name__)
 LIGHT_TASKS = frozenset(
     {
         "pending_report",
+        "daily_report",
+        "progress_report",
         "monitor_status",
         "schedule_list",
         "schedule_run",

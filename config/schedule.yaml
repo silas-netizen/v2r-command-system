@@ -98,6 +98,34 @@ entries:
     enabled: true
     command: 미처리 알림
 
+  # 새 모양 보고서(사용자 지시 2026-09-22). 전부 가벼운 작업이라 사이드카가 집어
+  # 가므로 발행 줄을 막지 않습니다.
+  # - 02:30 어제 기준 일일 보고  → docs/reports/dashboard-YYYY-MM-DD.html/.md
+  # - 12:00·15:00·18:00 오늘 기준 중간 보고 → docs/reports/progress-YYYY-MM-DD-HHMM.html/.md
+  - name: 일일 보고
+    time: "02:30"
+    days: daily
+    enabled: true
+    command: 일일 보고
+
+  - name: 중간 보고-1
+    time: "12:00"
+    days: daily
+    enabled: true
+    command: 중간 보고
+
+  - name: 중간 보고-2
+    time: "15:00"
+    days: daily
+    enabled: true
+    command: 중간 보고
+
+  - name: 중간 보고-3
+    time: "18:00"
+    days: daily
+    enabled: true
+    command: 중간 보고
+
   # 주 1회 정비 — 30일 지난 이벤트 정리 + DB VACUUM + 요금제 임시 파일 +
   # 브라우저 프로필 캐시(쿠키·로그인은 건드리지 않음). 가벼운 작업이라
   # 사이드카가 집어서 돌리므로 발행 줄을 막지 않습니다. (2026-09-22)

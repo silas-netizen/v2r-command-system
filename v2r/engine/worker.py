@@ -1765,6 +1765,52 @@ def _dashboard(rt: Runtime) -> dict:
     return {"ok": True, "path": str(path), "message": f"현황판을 갱신했습니다: {path}"}
 
 
+def _send_report_pair(rt: Runtime, html_path, md_path, caption: str) -> int:
+    """보고서 두 장을 미처리 보고와 **같은 길**(파일 전송)로 내보낸다."""
+    from v2r.channels import notify_document_all
+
+    sent = 0
+    for path, tag in ((md_path, "요약"), (html_path, "보기 좋은 판")):
+        try:
+            sent += notify_document_all(rt.channels, path, f"{caption} ({tag})")
+        except Exception as exc:  # 한쪽이 실패해도 나머지는 보낸다
+            log.warning("보고서 전송 실패(%s): %s", path, exc)
+    return sent
+
+
+def _daily_report(rt: Runtime) -> dict:
+    """어제 기준 일일 보고서(HTML·MD)를 만들어 보낸다 (예약 02:30)."""
+    from v2r.engine.dashboard import build_daily_report
+
+    html_path, md_path = build_daily_report(rt)
+    caption = f"일일 보고 {md_path.stem.replace('dashboard-', '')}"
+    sent = _send_report_pair(rt, html_path, md_path, caption)
+    return {
+        "ok": True,
+        "sent": sent,
+        "path": str(html_path),
+        "md_path": str(md_path),
+        "message": f"{caption} 생성 완료 ({sent}곳 전송): {html_path.name}",
+    }
+
+
+def _progress_report(rt: Runtime) -> dict:
+    """오늘 기준 중간 보고서(HTML·MD)를 만들어 보낸다 (예약 12:00·15:00·18:00)."""
+    from v2r.engine.dashboard import build_progress_report
+
+    html_path, md_path = build_progress_report(rt)
+    stamp = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
+    caption = f"중간 보고 {stamp}"
+    sent = _send_report_pair(rt, html_path, md_path, caption)
+    return {
+        "ok": True,
+        "sent": sent,
+        "path": str(html_path),
+        "md_path": str(md_path),
+        "message": f"{caption} 생성 완료 ({sent}곳 전송): {html_path.name}",
+    }
+
+
 def refresh_dashboard(rt: Runtime) -> None:
     """현황판 자동 갱신(최선 노력). 실패해도 작업 결과에는 영향을 주지 않는다."""
     try:
@@ -1884,6 +1930,10 @@ def dispatch(rt: Runtime, job: Any, owner: str | None = None) -> dict:
         return {"ok": bool(out.get("ok")), "message": out.get("message", "")}
     if task == "pending_report":
         return _pending_report(rt)
+    if task == "daily_report":
+        return _daily_report(rt)
+    if task == "progress_report":
+        return _progress_report(rt)
     if task == "monitor_status":
         from v2r.engine import monitor as monitor_mod
 

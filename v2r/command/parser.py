@@ -15,6 +15,9 @@ TASK_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("schedule_list", re.compile(r"예약\s*(목록|리스트|현황|확인|상태|표)")),
     ("monitor_status", re.compile(r"감시\s*(상태|현황|목록|확인)")),
     ("pending_report", re.compile(r"미처리\s*(알림|목록|보고|리스트)")),
+    # 새 모양 보고서(2026-09-22): 어제 기준 일일 보고 / 오늘 기준 중간 보고
+    ("daily_report", re.compile(r"(일일|하루|어제)\s*(보고|보고서|현황판)")),
+    ("progress_report", re.compile(r"(중간|진행)\s*(보고|보고서|현황판)")),
     ("inspect_failures", re.compile(r"(실패|미완성|불확실).*(점검|재시도|모아|확인)")),
     ("reconcile", re.compile(r"(끊긴|미완료).*(이어|재개|점검)")),
     ("sync_all_sources", re.compile(r"전체\s*(원본|시트).*(동기화|갱신)")),
@@ -220,6 +223,8 @@ _NO_SLOT_TASKS = frozenset(
         "schedule_run",
         "monitor_status",
         "pending_report",
+        "daily_report",
+        "progress_report",
     }
 )
 
@@ -506,6 +511,8 @@ TASK_LABELS: dict[str, str] = {
     "schedule_run": "예약 지금 실행",
     "monitor_status": "감시 상태",
     "pending_report": "미처리 목록 보내기",
+    "daily_report": "일일 보고(어제 기준)",
+    "progress_report": "중간 보고(오늘 기준)",
     "status": "상태 조회",
     "dashboard": "현황판 갱신",
     "catalog": "카탈로그 조회",
