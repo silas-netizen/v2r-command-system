@@ -659,6 +659,13 @@ def test_모든_허용작업에_처리기가_있다(tmp_path, monkeypatch):
         "v2r.warehouse.daily_generator.generate_affiliate_pool_via_gpt",
         lambda *a, **k: {"ok": True, "added": 0, "generated": 0, "cafes": [], "errors": []},
     )
+    # 키워드 노출 현황은 브랜드 시트 전 행(수천 개)을 훑고 네이버에 물어보는 무거운
+    # 작업이라 이 범용 커버리지 시험에서는 가짜로 막는다(실제 동작은
+    # tests/test_keyword_exposure.py에서 따로 확인한다).
+    monkeypatch.setattr(
+        "v2r.knowledge.keyword_exposure.run_check",
+        lambda rt_, brand, limit=0, **k: [],
+    )
 
     for index, task in enumerate(sorted(ALLOWED_TASKS)):
         spec = TaskSpec(
