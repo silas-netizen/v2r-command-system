@@ -164,6 +164,9 @@ class ExposureRow:
     status: str  # exposed | pushed | unpublished | unknown
     checked_at: str
     t0_status: str = ""
+    #: 실제로 검색창에 넣은 최종 검색어(자동완성 1번 또는 띄어쓰기 정규화 결과).
+    #: 2026-09-23 사용자 지시 — I열(통합검색 URL)이 이 검색어 기준이어야 한다.
+    search_query: str = ""
 
     def as_row(self) -> dict[str, Any]:
         return {
@@ -175,6 +178,7 @@ class ExposureRow:
             "status": self.status,
             "checked_at": self.checked_at,
             "t0_status": self.t0_status,
+            "search_query": self.search_query,
         }
 
 
@@ -580,7 +584,7 @@ KOREAN_STATUS = {
 def fetch_integrated_search_html(
     keyword: str, cookies: dict[str, str] | None = None, timeout: float = 10.0
 ) -> str:
-    """네이버 통합검색 결과 HTML을 가져온다. 실패 시 예외."""
+    """네이버 통합검색 결과 HTML을 가져온다(빠른 1차 조회, requests). 실패 시 예외."""
     url = INTEGRATED_SEARCH_URL.format(query=quote(keyword))
     headers = {
         "User-Agent": (
@@ -595,6 +599,116 @@ def fetch_integrated_search_html(
     return resp.text
 
 
+# =======================================================================
+# 2026-09-23 사용자 지시: 검색어 자동완성 정규화 + 첫 페이지 끝까지 스크롤(Playwright)
+# =======================================================================
+
+#: 네이버 자동완성 API
+AUTOCOMPLETE_URL = (
+    "https://ac.search.naver.com/nx/ac?q={query}&st=100&frm=nx&r_format=json"
+    "&r_enc=UTF-8&q_enc=UTF-8"
+)
+#: 최종 DOM 스크롤 시도 최대 횟수(더 내려도 높이가 안 느는지 확인하는 횟수 포함)
+MAX_SCROLL_ROUNDS = 20
+#: 스크롤 한 번 뒤 대기(초) — 동적 로딩(더보기 포함)이 붙을 시간
+SCROLL_WAIT_SECONDS = 0.4
+
+
+def naver_autocomplete_first(keyword: str, timeout: float = 5.0) -> str:
+    """네이버 자동완성 첫 항목(띄어쓰기 포함). 실패/빈 결과면 빈 문자열.
+
+    응답 모양: `{"items": [[["단어1", ...], ["단어2", ...], ...]]}` — 첫 그룹의
+    첫 항목 0번째 문자열이 자동완성 1순위다.
+    """
+    try:
+        url = AUTOCOMPLETE_URL.format(query=quote(keyword))
+        resp = httpx.get(url, timeout=timeout)
+        resp.raise_for_status()
+        data = resp.json()
+        groups = (data or {}).get("items") or []
+        first_group = groups[0] if groups else []
+        first_item = first_group[0] if first_group else []
+        suggestion = str(first_item[0]) if first_item else ""
+        return suggestion.strip()
+    except Exception as exc:
+        log.warning("자동완성 조회 실패(%s): %s", keyword, exc)
+        return ""
+
+
+def _spacing_fallback(keyword: str) -> str:
+    """자동완성이 없을 때 쓰는 띄어쓰기 정규화. `pykospacing`이 설치돼 있으면
+    그걸로 교정하고, 없으면(대부분의 환경) 원문 그대로 돌려준다 — 사용자 지시의
+    "실패 시 원문"에 해당한다.
+    """
+    try:
+        from pykospacing import Spacing  # type: ignore
+
+        spacing = Spacing()
+        out = spacing(keyword)
+        return out.strip() if out else keyword
+    except Exception:
+        return keyword
+
+
+def resolve_search_query(keyword: str) -> str:
+    """B1: 실제로 검색창에 넣을 최종 검색어 — 자동완성 1순위, 없으면 띄어쓰기
+    정규화(안 되면 원문)."""
+    keyword = str(keyword or "").strip()
+    if not keyword:
+        return keyword
+    suggestion = naver_autocomplete_first(keyword)
+    return suggestion or _spacing_fallback(keyword)
+
+
+def fetch_integrated_search_dom(
+    query: str,
+    cookies_path: str | Path | None = None,
+    max_rounds: int = MAX_SCROLL_ROUNDS,
+    headless: bool = True,
+) -> str:
+    """통검 첫 페이지를 열어 **끝까지 스크롤**(더보기 포함)한 뒤 최종 DOM을
+    돌려준다(Playwright, headless). 네이버 로그인 프로필 쿠키(`storage_state`
+    JSON)가 있으면 그대로 쓴다. 실패 시 예외.
+    """
+    from playwright.sync_api import sync_playwright
+
+    url = INTEGRATED_SEARCH_URL.format(query=quote(query))
+    storage_state = str(cookies_path) if cookies_path and Path(cookies_path).exists() else None
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=headless)
+        try:
+            context = browser.new_context(
+                storage_state=storage_state,
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1440, "height": 950},
+            )
+            page = context.new_page()
+            page.goto(url, timeout=15000, wait_until="domcontentloaded")
+            last_height = -1
+            for _ in range(max_rounds):
+                # "더보기"류 버튼이 있으면 눌러서 더 붙인다(있으면만, 없어도 무시)
+                for sel in ("a.api_more", "a.more", "button.api_more"):
+                    try:
+                        loc = page.locator(sel)
+                        if loc.count() and loc.first.is_visible():
+                            loc.first.click(timeout=1000)
+                    except Exception:
+                        pass
+                page.mouse.wheel(0, 20000)
+                page.wait_for_timeout(int(SCROLL_WAIT_SECONDS * 1000))
+                height = page.evaluate("document.body.scrollHeight")
+                if height == last_height:
+                    break
+                last_height = height
+            return page.content()
+        finally:
+            browser.close()
+
+
 def check_keyword_unified(
     brand: str,
     keyword: str,
@@ -602,37 +716,63 @@ def check_keyword_unified(
     article_url: str,
     t0_status: str = "",
     cookies: dict[str, str] | None = None,
+    cookies_path: str | Path | None = None,
     top_n: int = DEFAULT_TOP_N_INTEGRATED,
     now: str | None = None,
     candidate_title_norm: str = "",
     html: str | None = None,
+    search_query: str | None = None,
+    use_dom_fallback: bool = True,
 ) -> ExposureRow:
     """B1: 통합검색 기준 판정 — 있으면 `exposed`(노출완), 없으면 `pushed`(밀려남).
 
-    `html`을 직접 넘기면 네트워크를 타지 않는다(테스트/재사용용). 기존 카페탭
-    함수(`parse_cafe_search_rank`/`parse_cafe_search_title_rank`)를 그대로
-    재사용한다 — 둘 다 HTML 안의 cafe.naver.com 링크만 보므로 통검 결과에도
+    검색어는 `resolve_search_query`(자동완성 1순위 → 띄어쓰기 정규화 → 원문)로
+    정한 뒤 그 검색어로 조회한다. `html`을 직접 넘기면 네트워크/자동완성을 모두
+    타지 않는다(테스트/재사용용) — 이때 `search_query`도 같이 넘겨야 결과 행에
+    실린다.
+
+    requests로 받은 첫 HTML(`fetch_integrated_search_html`)에 우리 글이 안 보이면
+    — 동적으로 붙는 영역 때문일 수 있어 — Playwright로 첫 페이지를 끝까지 스크롤한
+    최종 DOM(`fetch_integrated_search_dom`)으로 한 번 더 확인한다
+    (`use_dom_fallback=False`면 건너뛴다 — 테스트/빠른 경로용).
+
+    기존 카페탭 함수(`parse_cafe_search_rank`/`parse_cafe_search_title_rank`)를
+    그대로 재사용한다 — 둘 다 HTML 안의 cafe.naver.com 링크만 보므로 통검 결과에도
     그대로 적용된다.
     """
     checked_at = now or now_iso()
     if not article_url and not candidate_title_norm:
-        return ExposureRow(brand, keyword, cafe, "", None, "unpublished", checked_at, t0_status)
-    try:
-        page = html if html is not None else fetch_integrated_search_html(keyword, cookies=cookies)
+        return ExposureRow(brand, keyword, cafe, "", None, "unpublished", checked_at, t0_status, "")
+
+    query = search_query if search_query is not None else (keyword if html is not None else resolve_search_query(keyword))
+
+    def _rank(page_html: str) -> int | None:
         if article_url:
-            rank = parse_cafe_search_rank(page, article_url, top_n=top_n)
+            return parse_cafe_search_rank(page_html, article_url, top_n=top_n)
+        return parse_cafe_search_title_rank(page_html, candidate_title_norm, top_n=top_n)
+
+    try:
+        if html is not None:
+            rank = _rank(html)
         else:
-            rank = parse_cafe_search_title_rank(page, candidate_title_norm, top_n=top_n)
+            page = fetch_integrated_search_html(query, cookies=cookies)
+            rank = _rank(page)
+            if rank is None and use_dom_fallback:
+                try:
+                    dom_html = fetch_integrated_search_dom(query, cookies_path=cookies_path)
+                    rank = _rank(dom_html)
+                except Exception as exc:  # pragma: no cover - 환경 의존(Playwright 미설치 등)
+                    log.warning("통검 DOM(끝까지 스크롤) 확인 실패(%s): %s", keyword, exc)
     except Exception as exc:
         log.warning("통검 확인 실패(%s): %s", keyword, exc)
-        return ExposureRow(brand, keyword, cafe, article_url, None, "unknown", checked_at, t0_status)
+        return ExposureRow(brand, keyword, cafe, article_url, None, "unknown", checked_at, t0_status, query)
     status = "exposed" if rank is not None else "pushed"
-    return ExposureRow(brand, keyword, cafe, article_url, rank, status, checked_at, t0_status)
+    return ExposureRow(brand, keyword, cafe, article_url, rank, status, checked_at, t0_status, query)
 
 
-def integrated_search_url(keyword: str) -> str:
-    """O열/보고서용 통합검색 URL(사람이 눌러볼 수 있게 인코딩 그대로)."""
-    return INTEGRATED_SEARCH_URL.format(query=quote(keyword))
+def integrated_search_url(query: str) -> str:
+    """O열/보고서용 통합검색 URL(최종 검색어 기준, 사람이 눌러볼 수 있게 인코딩 그대로)."""
+    return INTEGRATED_SEARCH_URL.format(query=quote(query))
 
 
 def _discovered_keywords_path(rt: Any, brand: str) -> Path:
@@ -816,18 +956,26 @@ def cycle_tick(rt: Any, now_mono: float | None = None) -> dict | None:
 
     item = batch[0]
     cookies_path = Path(rt.settings.repo_root) / "data" / "naver_cookies.json"
-    cookies = _cookie_dict(cookies_path)
 
     from v2r.store import keyword_exposure_store as store
 
-    row = check_keyword_unified(
+    verdict = judge_keyword_exposure(
+        rt,
+        brand,
+        item["keyword"],
+        cookies_path=cookies_path,
+        article_index=getattr(rt, "article_index", None),
+    )
+    row = ExposureRow(
         brand,
         item["keyword"],
         item.get("cafe", ""),
-        item.get("article_url", ""),
-        t0_status=item.get("t0_status", ""),
-        cookies=cookies,
-        candidate_title_norm=item.get("candidate_title_norm", ""),
+        verdict["matched_url"],
+        verdict["rank"],
+        verdict["status"],
+        now_iso(),
+        item.get("t0_status", ""),
+        verdict["search_query"],
     )
     store.save(rt.conn, row.as_row())
     state["last_checked"] = {
@@ -835,6 +983,8 @@ def cycle_tick(rt: Any, now_mono: float | None = None) -> dict | None:
         "keyword": item["keyword"],
         "status": row.status,
         "at": row.checked_at,
+        "candidates": verdict["candidates"],
+        "opened": verdict["opened"],
     }
     streak = int(state.get("_block_streak", 0))
     streak = streak + 1 if row.status == "unknown" else 0
@@ -850,7 +1000,10 @@ def cycle_tick(rt: Any, now_mono: float | None = None) -> dict | None:
     except Exception as exc:  # pragma: no cover - 방어용
         log.warning("노출 CSV 갱신 실패(%s): %s", brand, exc)
 
-    return {"brand": brand, "keyword": item["keyword"], "status": row.status, "rank": row.rank}
+    return {
+        "brand": brand, "keyword": item["keyword"], "status": row.status, "rank": row.rank,
+        "candidates": verdict["candidates"], "opened": verdict["opened"],
+    }
 
 
 #: B3: `data/exposure/<브랜드>.csv` 열 순서
@@ -910,7 +1063,7 @@ def write_exposure_csv(rt: Any, brand: str) -> tuple[Path, Path]:
                 r["article_url"] if r else item.get("article_url", ""),
                 KOREAN_STATUS.get(status, status),
                 keyword,
-                integrated_search_url(keyword),
+                integrated_search_url((r["search_query"] if (r and r["search_query"]) else keyword)),
                 r["checked_at"] if r else "",
                 vol,
                 exposed_vol,
@@ -968,6 +1121,285 @@ def summary(rt: Any) -> dict[str, Any]:
     return out
 
 
+# =======================================================================
+# 2026-09-23 사용자 지시 2차: "우리 글" 판별 — 카페 후보 → 댓글 식별어로 확정
+#
+# 1차 관문: 통검 최종 화면(스크롤 끝) 문서 중 우리 제휴·자사 카페(config/cafes.yaml)
+# 소속인 것만 후보로 삼는다(다른 카페·블로그는 아예 열지 않는다).
+# 2차 확정: 후보를 열어(네이버 프로필, headless, 3~6초 간격) 댓글(+본문)에
+# 브랜드 식별어(config/brands.yaml `identifiers`)가 있으면 우리 글로 확정한다.
+# article_index에 이미 있는 글이면 열지 않고 바로 확정한다. 확인 결과는
+# 24시간 캐시(같은 글 URL 재확인 생략).
+# =======================================================================
+
+CAFES_CONFIG_PATH = "config/cafes.yaml"
+BRANDS_CONFIG_PATH = "config/brands.yaml"
+#: 글 확인 결과 캐시(data/ 아래) — 같은 URL은 24시간 재확인 안 함
+ARTICLE_JUDGMENT_CACHE_FILE = "exposure_article_cache.json"
+ARTICLE_CACHE_TTL_SECONDS = 24 * 3600
+#: 후보 중 실제로 열어볼 최대 개수(전부 열면 느려지니 상한, 순위 위에서부터)
+MAX_CANDIDATES_TO_OPEN = 5
+
+#: 통검 결과 문서 링크(카페든 블로그든 안 가리고 화면 순서대로 센다)
+_RE_ANY_RESULT_LINK = re.compile(
+    r'<a[^>]+href="(?P<url>https?://[^"\']+)"[^>]*>(?P<title>.*?)</a>', re.I | re.S
+)
+#: 세지 않는 링크(검색 자체 내비게이션·광고 등)
+_RE_SKIP_HOST = re.compile(r"search\.naver\.com|naver\.com/(?:ad|adcenter)", re.I)
+
+
+def load_cafe_registry(rt: Any) -> list[dict]:
+    """`config/cafes.yaml`의 제휴+자사 카페 목록(이름·번호·별칭)."""
+    import yaml
+
+    path = Path(rt.settings.repo_root) / CAFES_CONFIG_PATH
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception as exc:
+        log.warning("카페 카탈로그 읽기 실패: %s", exc)
+        return []
+    out: list[dict] = []
+    for section in ("affiliate", "self_owned"):
+        for c in data.get(section) or []:
+            out.append(
+                {
+                    "name": c.get("name", ""),
+                    "cafe_id": c.get("cafe_id"),
+                    "aliases": [a for a in (list(c.get("aliases") or []) + [c.get("name", "")]) if a],
+                }
+            )
+    return out
+
+
+def is_our_cafe_url(url: str, registry: list[dict]) -> bool:
+    """이 카페 글 URL이 우리 제휴·자사 카페 소속인가(카페번호 또는 별칭 경로로 판단)."""
+    u = str(url or "")
+    if "cafe.naver.com" not in u:
+        return False
+    for c in registry:
+        cid = c.get("cafe_id")
+        if cid and re.search(rf"cafe\.naver\.com/(?:ca-fe/cafes/{cid}\b|{re.escape(str(cid))}/)", u, re.I):
+            return True
+        for alias in c.get("aliases") or []:
+            if alias and re.search(rf"cafe\.naver\.com/{re.escape(str(alias))}(?:/|$)", u, re.I):
+                return True
+    return False
+
+
+def extract_ordered_result_links(html: str) -> list[dict]:
+    """통검 최종 DOM에서 문서 링크를 화면(작성 순서) 순서대로(중복 제거)."""
+    seen: set[str] = set()
+    out: list[dict] = []
+    for m in _RE_ANY_RESULT_LINK.finditer(html or ""):
+        url = m.group("url")
+        if _RE_SKIP_HOST.search(url):
+            continue
+        norm = _norm_url(url)
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        out.append({"url": url, "title": _strip_tags(m.group("title"))})
+    return out
+
+
+def brand_identifiers(rt: Any, brand: str) -> list[str]:
+    """`config/brands.yaml`의 `identifiers`(없으면 브랜드명 자체 하나)."""
+    import yaml
+
+    path = Path(rt.settings.repo_root) / BRANDS_CONFIG_PATH
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception as exc:
+        log.warning("브랜드 설정 읽기 실패: %s", exc)
+        return [brand]
+    entry = (data.get("brands") or {}).get(brand) or {}
+    ids = [i for i in (entry.get("identifiers") or []) if i]
+    return ids or [brand]
+
+
+def _article_cache_path(rt: Any) -> Path:
+    return Path(rt.settings.data_dir) / ARTICLE_JUDGMENT_CACHE_FILE
+
+
+def _article_cache_load(rt: Any) -> dict:
+    p = _article_cache_path(rt)
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _article_cache_save(rt: Any, data: dict) -> None:
+    p = _article_cache_path(rt)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, p)
+
+
+def cached_verdict(rt: Any, url: str, now: str | None = None) -> bool | None:
+    """이 글 URL을 24시간 안에 이미 확인했으면 그 결과(참/거짓), 아니면 `None`."""
+    from datetime import datetime as _dt
+
+    data = _article_cache_load(rt)
+    entry = data.get(_norm_url(url))
+    if not entry:
+        return None
+    try:
+        at = _dt.fromisoformat(str(entry["at"]))
+        now_dt = _dt.fromisoformat(now) if now else _dt.now(at.tzinfo or KST)
+        if (now_dt - at).total_seconds() > ARTICLE_CACHE_TTL_SECONDS:
+            return None
+    except Exception:
+        return None
+    return bool(entry.get("ours"))
+
+
+def set_cached_verdict(rt: Any, url: str, ours: bool, now: str | None = None) -> None:
+    data = _article_cache_load(rt)
+    data[_norm_url(url)] = {"ours": bool(ours), "at": now or now_iso()}
+    _article_cache_save(rt, data)
+
+
+def fetch_article_text(
+    url: str, cookies_path: str | Path | None = None, headless: bool = True
+) -> str:
+    """글 상세(댓글 포함) 페이지 텍스트. Playwright(네이버 프로필, headless)로 연다.
+
+    카페 글은 본문·댓글이 `cafe_main` iframe 안에 있는 경우가 많아 그 프레임을
+    우선 읽고, 없으면 메인 프레임을 읽는다. 실패 시 예외.
+    """
+    from playwright.sync_api import sync_playwright
+
+    storage_state = str(cookies_path) if cookies_path and Path(cookies_path).exists() else None
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=headless)
+        try:
+            context = browser.new_context(storage_state=storage_state)
+            page = context.new_page()
+            page.goto(url, timeout=15000, wait_until="domcontentloaded")
+            page.wait_for_timeout(800)
+            frame = None
+            try:
+                frame = page.frame(name="cafe_main")
+            except Exception:
+                frame = None
+            target = frame or page.main_frame
+            return target.inner_text("body")
+        finally:
+            browser.close()
+
+
+def article_has_identifier(text: str, identifiers: list[str]) -> bool:
+    body = text or ""
+    return any(ident and ident in body for ident in identifiers)
+
+
+def confirm_our_article(
+    rt: Any,
+    brand: str,
+    url: str,
+    identifiers: list[str],
+    cookies_path: str | Path | None = None,
+    article_index: Any = None,
+    now: str | None = None,
+) -> bool:
+    """후보 글이 진짜 우리 글인지 확정한다.
+
+    순서: (1) `article_index`에 이미 있으면 열지 않고 바로 확정 →
+    (2) 24시간 캐시가 있으면 그대로 → (3) 직접 열어(Playwright) 댓글/본문에
+    브랜드 식별어가 있는지 확인하고 캐시에 남긴다.
+    """
+    if article_index is not None:
+        try:
+            aid = _article_id(url)
+            if aid and article_index.has_article_id(aid):
+                return True
+        except AttributeError:
+            pass
+        except Exception as exc:  # pragma: no cover - 방어용
+            log.warning("article_index 확인 실패(%s): %s", url, exc)
+
+    cached = cached_verdict(rt, url, now=now)
+    if cached is not None:
+        return cached
+
+    try:
+        text = fetch_article_text(url, cookies_path=cookies_path)
+        ours = article_has_identifier(text, identifiers)
+    except Exception as exc:
+        log.warning("글 열람 확인 실패(%s): %s", url, exc)
+        return False
+    set_cached_verdict(rt, url, ours, now=now)
+    return ours
+
+
+def judge_keyword_exposure(
+    rt: Any,
+    brand: str,
+    keyword: str,
+    cookies_path: str | Path | None = None,
+    dom_html: str | None = None,
+    cafe_registry: list[dict] | None = None,
+    identifiers: list[str] | None = None,
+    article_index: Any = None,
+    max_candidates: int = MAX_CANDIDATES_TO_OPEN,
+    sleep_fn: Any = time.sleep,
+    search_query: str | None = None,
+) -> dict:
+    """B1 2차 재설계 — 카페 후보(1차 관문) → 댓글 식별어(2차 확정)로 판정.
+
+    반환: `{search_query, candidates, opened, status(exposed|pushed|unknown),
+    rank, matched_url}`. `rank`는 통검 최종 화면에서 그 글이 위에서 몇 번째
+    "문서"인지(카페·블로그·VIEW 다 합쳐서 센다).
+    """
+    import random
+
+    query = (
+        search_query
+        if search_query is not None
+        else (keyword if dom_html is not None else resolve_search_query(keyword))
+    )
+    registry = cafe_registry if cafe_registry is not None else load_cafe_registry(rt)
+    idents = identifiers if identifiers is not None else brand_identifiers(rt, brand)
+
+    try:
+        html = dom_html if dom_html is not None else fetch_integrated_search_dom(query, cookies_path=cookies_path)
+    except Exception as exc:
+        log.warning("통검 DOM 확인 실패(%s): %s", keyword, exc)
+        return {
+            "search_query": query, "candidates": 0, "opened": 0,
+            "status": "unknown", "rank": None, "matched_url": "",
+        }
+
+    ordered = extract_ordered_result_links(html)
+    candidates = [
+        (i + 1, item) for i, item in enumerate(ordered) if is_our_cafe_url(item["url"], registry)
+    ]
+
+    opened = 0
+    to_open = candidates[:max_candidates]
+    for i, (rank, item) in enumerate(to_open):
+        ours = confirm_our_article(
+            rt, brand, item["url"], idents, cookies_path=cookies_path, article_index=article_index
+        )
+        opened += 1
+        if ours:
+            return {
+                "search_query": query, "candidates": len(candidates), "opened": opened,
+                "status": "exposed", "rank": rank, "matched_url": item["url"],
+            }
+        if i < len(to_open) - 1:
+            sleep_fn(random.uniform(MIN_DELAY_SEC, MAX_DELAY_SEC))
+
+    return {
+        "search_query": query, "candidates": len(candidates), "opened": opened,
+        "status": "pushed", "rank": None, "matched_url": "",
+    }
+
+
 __all__ = [
     "DEFAULT_TOP_N",
     "DEFAULT_DAILY_CAP",
@@ -999,4 +1431,25 @@ __all__ = [
     "EXPOSURE_CSV_HEADERS",
     "exposure_dir",
     "write_exposure_csv",
+    # 검색어 자동완성/끝까지 스크롤(2026-09-23)
+    "AUTOCOMPLETE_URL",
+    "naver_autocomplete_first",
+    "resolve_search_query",
+    "fetch_integrated_search_dom",
+    # 카페 후보 → 댓글 식별어 확정(2026-09-23 2차)
+    "CAFES_CONFIG_PATH",
+    "BRANDS_CONFIG_PATH",
+    "ARTICLE_JUDGMENT_CACHE_FILE",
+    "ARTICLE_CACHE_TTL_SECONDS",
+    "MAX_CANDIDATES_TO_OPEN",
+    "load_cafe_registry",
+    "is_our_cafe_url",
+    "extract_ordered_result_links",
+    "brand_identifiers",
+    "cached_verdict",
+    "set_cached_verdict",
+    "fetch_article_text",
+    "article_has_identifier",
+    "confirm_our_article",
+    "judge_keyword_exposure",
 ]

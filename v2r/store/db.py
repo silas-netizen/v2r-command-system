@@ -150,8 +150,26 @@ CREATE TABLE IF NOT EXISTS keyword_exposure (
     rank         INTEGER,
     status       TEXT NOT NULL,
     t0_status    TEXT,
-    checked_at   TEXT NOT NULL
+    checked_at   TEXT NOT NULL,
+    search_query TEXT
 );
+
+-- 브랜드 대량 원고 생성 대기열 (밀려남 키워드 → 원고, 2026-09-23)
+CREATE TABLE IF NOT EXISTS brand_queue (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    brand           TEXT NOT NULL,
+    keyword         TEXT NOT NULL,
+    mtype           TEXT NOT NULL DEFAULT '',
+    priority        REAL NOT NULL DEFAULT 0,
+    status          TEXT NOT NULL DEFAULT 'pending',
+    manuscript_path TEXT,
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL,
+    UNIQUE (brand, keyword, mtype)
+);
+
+CREATE INDEX IF NOT EXISTS idx_brand_queue_status ON brand_queue(brand, status, priority DESC);
 
 CREATE INDEX IF NOT EXISTS idx_republish_status ON republish_queue(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_keyword_exposure_brand ON keyword_exposure(brand, keyword, checked_at);
@@ -174,6 +192,8 @@ MIGRATIONS = (
     ("jobs", "lease_scope", "TEXT NOT NULL DEFAULT 'main'"),
     # 게시판 연속 방지(사용자 결정 2026-09-22 A안)가 "직전 글의 게시판"을 알아야 한다
     ("publications", "board", "TEXT"),
+    # 통검 자동완성 정규화 검색어(2026-09-23) — 실제로 검색창에 넣은 최종 검색어
+    ("keyword_exposure", "search_query", "TEXT"),
 )
 
 

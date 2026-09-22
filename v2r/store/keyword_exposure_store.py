@@ -11,8 +11,8 @@ def save(conn: sqlite3.Connection, row: dict[str, Any]) -> None:
     conn.execute(
         """
         INSERT INTO keyword_exposure
-            (brand, keyword, cafe, article_url, rank, status, t0_status, checked_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            (brand, keyword, cafe, article_url, rank, status, t0_status, checked_at, search_query)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             row.get("brand", ""),
@@ -23,6 +23,7 @@ def save(conn: sqlite3.Connection, row: dict[str, Any]) -> None:
             row.get("status", "unknown"),
             row.get("t0_status", ""),
             row.get("checked_at", ""),
+            row.get("search_query", ""),
         ),
     )
 
