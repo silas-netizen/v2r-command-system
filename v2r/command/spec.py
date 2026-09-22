@@ -24,6 +24,7 @@ ALLOWED_TASKS: frozenset[str] = frozenset(
         "bulk_generate",
         "bulk_generate_all",
         "bulk_generate_status",
+        "vpc_export",
         "generate_affiliate_daily",
         "generate_daily",
         "collect_daily",
@@ -57,6 +58,8 @@ ALLOWED_TASKS: frozenset[str] = frozenset(
         "keyword_discovery",
         "keyword_discovery_all",
         "keyword_discovery_status",
+        "keyword_relevance_rescan",
+        "keyword_relevance_status",
         "pending_report",
         "daily_report",
         "progress_report",
@@ -100,6 +103,9 @@ class TaskSpec(BaseModel):
     #: 모델을 부를 길. 빈 값 = 설정(`config/models.yaml`)의 차례대로.
     #: `plan` = 요금제(`요금제로`), `api` = 일반 API(`api로`), `batch` = 배치(미구현)
     llm_backend: str = ""
+    #: 대량 원고 구분자. `v2r`(우리 실행기 발행분) / `vpc`(가상 PC 처리분).
+    #: 빈 값 = 자동 배정(`brand_queue.refill`이 하루 상한까지는 v2r, 이후 vpc).
+    target: str = ""
     keyword: str = ""
     source: str = ""
     dry_run: bool = True
@@ -131,6 +137,14 @@ class TaskSpec(BaseModel):
         v = (v or "").strip().lower()
         if v and v not in {"plan", "batch", "api"}:
             raise ValueError(f"허용되지 않은 길: {v}")
+        return v
+
+    @field_validator("target")
+    @classmethod
+    def _check_target(cls, v: str) -> str:
+        v = (v or "").strip().lower()
+        if v and v not in {"v2r", "vpc"}:
+            raise ValueError(f"허용되지 않은 구분자: {v}")
         return v
 
     @field_validator("count", "account_count", "interval_min", "interval_max")

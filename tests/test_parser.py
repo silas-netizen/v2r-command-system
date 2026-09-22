@@ -65,6 +65,8 @@ def test_legacy_example_sentence():
         ("우아덤 원고 1개 만들어줘", "generate_brand"),
         ("정기 정비", "maintenance"),
         ("키워드 발굴 전체 500개", "keyword_discovery_all"),
+        ("장으뜸 키워드 연관도 재산정", "keyword_relevance_rescan"),
+        ("키워드 연관도 현황", "keyword_relevance_status"),
     ],
 )
 def test_each_task_pattern(text, task):
@@ -90,12 +92,26 @@ def test_all_tasks_covered_by_tests():
     # + 키워드 발굴 2건(keyword_discovery·keyword_discovery_status, 2026-09-22)
     # + 대량 원고 3건(bulk_generate·bulk_generate_all·bulk_generate_status, 다른 작업과 동시 진행)
     # + 키워드 발굴 전체 1건(keyword_discovery_all, 2026-09-23 — 잠금·헤드리스 작업과 함께)
-    assert len(ALLOWED_TASKS) == 53
+    # + 가상 PC 원고 내보내기 1건(vpc_export, 2026-09-23 — v2r/vpc 구분자 도입)
+    # + 키워드 연관도 2건(keyword_relevance_rescan·keyword_relevance_status, 2026-09-23)
+    assert len(ALLOWED_TASKS) == 56
 
 
 def test_wash_photos_count():
     spec = parse_korean_command("사진 세탁 30장", now=NOW)
     assert spec.count == 30
+
+
+def test_keyword_relevance_rescan_brand_slot():
+    spec = parse_korean_command("우아덤 키워드 연관도 재산정", now=NOW)
+    assert spec.task == "keyword_relevance_rescan"
+    assert spec.brand == "우아덤"
+
+
+def test_keyword_relevance_rescan_all_brands():
+    spec = parse_korean_command("키워드 연관도 재산정 전체", now=NOW)
+    assert spec.task == "keyword_relevance_rescan"
+    assert spec.brand == ""
 
 
 def test_wash_photos_per_original_and_brand():

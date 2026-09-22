@@ -164,12 +164,15 @@ CREATE TABLE IF NOT EXISTS brand_queue (
     status          TEXT NOT NULL DEFAULT 'pending',
     manuscript_path TEXT,
     attempts        INTEGER NOT NULL DEFAULT 0,
+    -- 구분자: v2r(우리 실행기 발행분) / vpc(가상 PC 처리분)
+    target          TEXT NOT NULL DEFAULT 'v2r',
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL,
     UNIQUE (brand, keyword, mtype)
 );
 
 CREATE INDEX IF NOT EXISTS idx_brand_queue_status ON brand_queue(brand, status, priority DESC);
+CREATE INDEX IF NOT EXISTS idx_brand_queue_target ON brand_queue(target, status);
 
 CREATE INDEX IF NOT EXISTS idx_republish_status ON republish_queue(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_keyword_exposure_brand ON keyword_exposure(brand, keyword, checked_at);
@@ -194,6 +197,8 @@ MIGRATIONS = (
     ("publications", "board", "TEXT"),
     # 통검 자동완성 정규화 검색어(2026-09-23) — 실제로 검색창에 넣은 최종 검색어
     ("keyword_exposure", "search_query", "TEXT"),
+    # 구분자: v2r(우리 실행기 발행분) / vpc(가상 PC 처리분) (2026-09-23)
+    ("brand_queue", "target", "TEXT NOT NULL DEFAULT 'v2r'"),
 )
 
 

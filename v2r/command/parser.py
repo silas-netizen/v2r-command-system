@@ -25,6 +25,10 @@ TASK_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     # 키워드 발굴 (`우아덤 키워드 발굴 1000개` / `키워드 발굴 현황`) — 노출 패턴 뒤,
     # 일반 status 패턴보다는 앞에 둔다
     ("keyword_discovery_status", re.compile(r"키워드\s*발굴\s*현황")),
+    # 키워드 연관도 재산정/현황 (2026-09-23) — 발굴 패턴보다 먼저 봐야
+    # "키워드 발굴"에 가로채이지 않는다("연관도"가 있으면 이쪽이 맞다)
+    ("keyword_relevance_status", re.compile(r"키워드\s*연관도\s*현황")),
+    ("keyword_relevance_rescan", re.compile(r"키워드\s*연관도\s*재산정")),
     # 예약 "키워드 발굴 전체 500개" — 브랜드 5개를 순차로 도는 일괄 발굴.
     # 특정 브랜드용 `keyword_discovery`(예: "우아덤 키워드 발굴 1000개")보다 먼저 본다.
     ("keyword_discovery_all", re.compile(r"키워드\s*발굴\s*전체")),
@@ -39,6 +43,9 @@ TASK_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("sync_sources", re.compile(r"(원본|시트).*(동기화|갱신)")),
     # 대량 원고 생성(밀려남 키워드 대기열, 2026-09-23) — `원고`라는 낱말이 있어
     # `generate_brand`보다 먼저 봐야 한다. `현황`이 먼저다(조회가 생성으로 안 잡히게).
+    # 가상 PC 내보내기는 대량 원고 계열 패턴들보다 먼저 봐야 "원고"라는 낱말에
+    # 가로채이지 않는다.
+    ("vpc_export", re.compile(r"가상\s*(?:pc|PC)\s*원고\s*내보내")),
     ("bulk_generate_status", re.compile(r"대량\s*원고\s*현황")),
     ("bulk_generate_all", re.compile(r"대량\s*원고\s*전체")),
     ("bulk_generate", re.compile(r"대량\s*원고")),
@@ -159,6 +166,8 @@ RE_COMBINED_MODE = re.compile(r"한\s*번에")
 RE_BACKEND_PLAN = re.compile(r"요금제(?:\s*길)?\s*(?:로|으로)|구독\s*(?:로|으로)")
 RE_BACKEND_API = re.compile(r"\bapi(?:\s*길)?\s*(?:로|으로)\b", re.I)
 RE_BACKEND_BATCH = re.compile(r"배치(?:\s*api)?(?:\s*길)?\s*(?:로|으로)", re.I)
+#: 대량 원고 구분자(사용자 지시 2026-09-23: v2r 발행분 / 가상 PC 처리분)
+RE_TARGET_VPC = re.compile(r"가상\s*(?:pc|PC)", re.I)
 RE_KEYWORD_SLOT = re.compile(r"키워드\s+(\S+)")
 #: 사진 생성 승인 문구 (`사진 생성 승인 우아덤 키워드 2장`)
 RE_PHOTO_APPROVE_GEN = re.compile(r"사진\s*생성\s*승인")
@@ -252,6 +261,7 @@ _NO_SLOT_TASKS = frozenset(
         "keyword_exposure",
         "keyword_discovery_status",
         "keyword_discovery_all",
+        "keyword_relevance_status",
     }
 )
 
@@ -459,6 +469,10 @@ def parse_korean_command(text: str, now: datetime | None = None) -> TaskSpec | N
     elif RE_BACKEND_API.search(raw):
         spec["llm_backend"] = "api"
 
+    # 대량 원고 구분자 (`가상pc` → vpc로 강제. 없으면 자동 배정)
+    if task in {"bulk_generate", "bulk_generate_all"} and RE_TARGET_VPC.search(raw):
+        spec["target"] = "vpc"
+
     # 게시판 / 시트
     m = RE_BOARD.search(raw)
     if m:
@@ -519,6 +533,7 @@ TASK_LABELS: dict[str, str] = {
     "bulk_generate": "대량 원고 생성",
     "bulk_generate_all": "대량 원고 전체 생성",
     "bulk_generate_status": "대량 원고 현황",
+    "vpc_export": "가상 PC 원고 내보내기",
     "generate_affiliate_daily": "제휴 일상 글 생성(GPT)",
     "generate_daily": "일상 글 생성",
     "collect_daily": "일상 글 수집",

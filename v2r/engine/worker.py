@@ -2124,6 +2124,10 @@ def dispatch(rt: Runtime, job: Any, owner: str | None = None) -> dict:
         return _keyword_discovery_all(rt, spec)
     if task == "keyword_discovery_status":
         return _keyword_discovery_status(rt, spec)
+    if task == "keyword_relevance_rescan":
+        return _keyword_relevance_rescan(rt, spec)
+    if task == "keyword_relevance_status":
+        return _keyword_relevance_status(rt, spec)
 
     raise ValueError(f"처리기가 없는 작업: {task}")
 
@@ -2248,6 +2252,89 @@ def _keyword_discovery_status(rt: Runtime, spec: TaskSpec) -> dict:
             per_brand[b] = kd_store.summary(conn)
         finally:
             conn.close()
+    return {"ok": True, "per_brand": per_brand}
+
+
+def _keyword_relevance_rescan(rt: Runtime, spec: TaskSpec) -> dict:
+    """`키워드 연관도 재산정 <브랜드|전체>` — 클로드 채점 + Codex 교차 검증까지 전량 실행.
+
+    브랜드가 없으면(`전체`) 발굴이 끝난(`progress.json` status=done) 브랜드를 전부 돈다.
+    발굴이 아직 `running`인 브랜드는 건너뛴다(발굴 프로세스와 DB 쓰기 충돌 방지).
+    """
+    from v2r.command.parser import BRAND_NAMES
+    from v2r.knowledge import keyword_relevance as kr_mod
+
+    repo = Path(rt.settings.repo_root)
+    data_dir = repo / "data" / "keywords"
+    guides_dir = repo / "warehouse" / "guides" / "정리본"
+    progress_path = data_dir / "relevance_progress.json"
+    discovery_progress = kr_mod.load_progress(data_dir / "progress.json")
+
+    brand = (spec.brand or "").strip()
+    if brand:
+        brands = [brand]
+    else:
+        brands = [
+            b for b in BRAND_NAMES if (discovery_progress.get(b) or {}).get("status") == "done"
+        ]
+    skipped = [
+        b for b in ([brand] if brand else BRAND_NAMES)
+        if b not in brands
+    ]
+
+    results: dict[str, dict] = {}
+    for b in brands:
+        db_path = data_dir / f"{b}.sqlite"
+        if not db_path.exists():
+            results[b] = {"ok": False, "error": "키워드 DB가 없습니다(발굴 먼저 필요)"}
+            continue
+        try:
+            out = kr_mod.score_and_crosscheck_brand(
+                rt.llm, b, db_path, guides_dir, progress_path=progress_path
+            )
+            results[b] = {"ok": True, **out}
+        except Exception as exc:  # noqa: BLE001 - 브랜드 하나 실패가 나머지를 막지 않는다
+            results[b] = {"ok": False, "error": f"{exc.__class__.__name__}: {exc}"}
+
+    # 중복 키워드 브랜드 배정(전량 끝난 브랜드 기준으로 다시 계산)
+    all_db_paths = {b: data_dir / f"{b}.sqlite" for b in BRAND_NAMES if (data_dir / f"{b}.sqlite").exists()}
+    try:
+        primary_counts = kr_mod.assign_primary_brand(all_db_paths)
+    except Exception as exc:  # noqa: BLE001
+        primary_counts = {}
+        log.warning("primary_brand 배정 실패: %s", exc)
+
+    lines = []
+    for b, out in results.items():
+        if out.get("ok"):
+            lines.append(f"{b} 채점 {out.get('scored', 0)}개/검증 {out.get('checked', 0)}개")
+        else:
+            lines.append(f"{b} 실패: {out.get('error')}")
+    if skipped:
+        lines.append(f"건너뜀(발굴 미완료): {', '.join(skipped)}")
+    msg = "키워드 연관도 재산정: " + " / ".join(lines)
+    try:
+        notify_all(rt.channels, msg)
+    except Exception:  # noqa: BLE001
+        pass
+    return {"ok": True, "message": msg, "per_brand": results, "skipped": skipped, "primary_brand": primary_counts}
+
+
+def _keyword_relevance_status(rt: Runtime, spec: TaskSpec) -> dict:
+    """`키워드 연관도 현황` — 브랜드별 0/1/2/3 분포·미산정 수."""
+    from v2r.command.parser import BRAND_NAMES
+    from v2r.knowledge import keyword_relevance as kr_mod
+
+    repo = Path(rt.settings.repo_root)
+    data_dir = repo / "data" / "keywords"
+    brand = (spec.brand or "").strip()
+    brands = [brand] if brand else [b for b in BRAND_NAMES if (data_dir / f"{b}.sqlite").exists()]
+    per_brand: dict[str, dict] = {}
+    for b in brands:
+        db_path = data_dir / f"{b}.sqlite"
+        if not db_path.exists():
+            continue
+        per_brand[b] = kr_mod.brand_status(db_path)
     return {"ok": True, "per_brand": per_brand}
 
 
