@@ -161,7 +161,11 @@ def build_system_prompt(brand: str, summary: str) -> str:
         "판단 기준(중요): 이비인후과·내과·피부과 같은 병원 진료과 이름, 지역명, 일반 생활어는"
         " 그 자체로는 형식적 채우기 키워드다. 이 검색자가 우리 브랜드 논리로 이어진다는 당위성이"
         " 억지스럽거나 두 문장 이상 설명을 짜내야 한다면 반드시 3으로 매긴다."
-        " 병원 진료과·지역명·일반 생활어는 브랜드 논리에 **직접** 연결되는 근거가 뚜렷할 때만 2 이하로 내린다.\n\n"
+        " 병원 진료과·지역명·일반 생활어는 브랜드 논리에 **직접** 연결되는 근거가 뚜렷할 때만 2 이하로 내린다.\n"
+        "질병명·증상명·의료행위(예: 대상포진, 독감, 매독, 헤르페스, 다낭성난소증후군, 예방접종,"
+        " 건강검진 같은 것)는 **우리 브랜드 제품이 그 질병/증상을 직접 다루거나 개선을 표방할 때만**"
+        " 0~2를 주고, 그렇지 않으면(브랜드 제품과 무관한 질병·증상이면) 반드시 3으로 매긴다."
+        " '건강 관리에 도움이 된다'처럼 막연히 관련짓지 않는다.\n\n"
         "각 키워드마다 rationale(이 검색자가 우리 논리로 이어지는 당위성 한 줄, 3이면 빈 문자열)을 함께 준다.\n"
         "출력은 오직 JSON 배열 하나. 형식:\n"
         '[{"keyword": "...", "relevance": 0, "rationale": "..."}, ...]\n'
@@ -294,6 +298,17 @@ def pending_keywords(conn: sqlite3.Connection, limit: int = 0) -> list[str]:
     return [row[0] for row in conn.execute(sql)]
 
 
+def pending_codex_rows(conn: sqlite3.Connection, limit: int = 0) -> list[tuple[str, int, str]]:
+    """클로드는 채점됐지만 아직 Codex 교차 검증이 안 된 (키워드, relevance, rationale)."""
+    sql = (
+        "SELECT keyword, relevance_llm, rationale FROM keywords"
+        " WHERE scored_at != '' AND relevance_codex IS NULL ORDER BY total DESC"
+    )
+    if limit:
+        sql += f" LIMIT {int(limit)}"
+    return conn.execute(sql).fetchall()
+
+
 def write_scores(conn: sqlite3.Connection, rows: list[dict[str, Any]]) -> None:
     stamp = _now_iso()
     conn.executemany(
@@ -351,6 +366,79 @@ def score_brand(
     if progress_path is not None:
         update_progress(progress_path, brand, status="done", scored=scored, failed_batches=failed_batches)
     return {"scored": scored, "failed_batches": failed_batches}
+
+
+def crosscheck_brand(
+    brand: str,
+    db_path: str | Path,
+    guides_dir: str | Path,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    limit: int = 0,
+    progress_path: str | Path | None = None,
+    codex_exe: str = "",
+) -> dict[str, int]:
+    """클로드 채점이 끝난 키워드 중 Codex 교차 검증이 안 된 것을 전부 처리한다."""
+    conn = sqlite3.connect(str(db_path))
+    migrate(conn)
+    summary = brand_summary(brand, guides_dir)
+    checked = 0
+    failed_batches = 0
+    try:
+        rows = pending_codex_rows(conn, limit=limit)
+        for start in range(0, len(rows), batch_size):
+            chunk = rows[start : start + batch_size]
+            claude_rows = [
+                {"keyword": kw, "relevance": int(rel), "rationale": ra or ""} for kw, rel, ra in chunk
+            ]
+            keywords = [r["keyword"] for r in claude_rows]
+            try:
+                codex_rows, _model = score_batch_codex(
+                    brand, keywords, summary, exe=codex_exe
+                )
+            except RelevanceParseError as exc:
+                failed_batches += 1
+                log.error("codex 묶음 포기(%s, %d개): %s", brand, len(chunk), exc)
+                continue
+            merged = crosscheck_rows(claude_rows, codex_rows)
+            write_crosscheck(conn, merged)
+            checked += len(merged)
+            if progress_path is not None:
+                update_progress(
+                    progress_path,
+                    brand,
+                    codex_checked=checked,
+                    codex_failed_batches=failed_batches,
+                    codex_status="running",
+                )
+    finally:
+        conn.close()
+    if progress_path is not None:
+        update_progress(progress_path, brand, codex_status="done", codex_checked=checked)
+    return {"checked": checked, "failed_batches": failed_batches}
+
+
+def score_and_crosscheck_brand(
+    router: Any,
+    brand: str,
+    db_path: str | Path,
+    guides_dir: str | Path,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    progress_path: str | Path | None = None,
+    codex_exe: str = "",
+) -> dict[str, int]:
+    """브랜드 전량을 클로드 채점 → Codex 교차 검증까지 한 번에 끝낸다(명령용 진입점)."""
+    claude_result = score_brand(
+        router, brand, db_path, guides_dir, batch_size=batch_size, progress_path=progress_path
+    )
+    codex_result = crosscheck_brand(
+        brand, db_path, guides_dir, batch_size=batch_size, progress_path=progress_path, codex_exe=codex_exe
+    )
+    return {
+        "scored": claude_result["scored"],
+        "score_failed_batches": claude_result["failed_batches"],
+        "checked": codex_result["checked"],
+        "codex_failed_batches": codex_result["failed_batches"],
+    }
 
 
 # --- 브랜드 간 중복 배정 -----------------------------------------------
@@ -616,4 +704,7 @@ __all__ = [
     "CODEX_DEFAULT_MODEL",
     "CODEX_FALLBACK_MODEL",
     "NEEDS_REVIEW_GAP",
+    "pending_codex_rows",
+    "crosscheck_brand",
+    "score_and_crosscheck_brand",
 ]

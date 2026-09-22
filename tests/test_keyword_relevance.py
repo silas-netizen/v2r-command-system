@@ -287,6 +287,38 @@ def test_write_crosscheck_persists_final_scores(tmp_path):
     assert row == (3, 3, 1)
 
 
+def test_crosscheck_brand_processes_already_scored_keywords(tmp_path, monkeypatch):
+    db = tmp_path / "브랜드.sqlite"
+    _make_db(db, [("k1", 10), ("k2", 5)])
+    kr.migrate_path(db)
+    conn = sqlite3.connect(str(db))
+    conn.execute("UPDATE keywords SET relevance_llm=0, rationale='직접', scored_at='x' WHERE keyword='k1'")
+    conn.execute("UPDATE keywords SET relevance_llm=1, rationale='근접', scored_at='x' WHERE keyword='k2'")
+    conn.commit()
+    conn.close()
+
+    guides = tmp_path / "guides"
+    guides.mkdir()
+    (guides / "브랜드.md").write_text("- 브랜드/제품: 테스트", encoding="utf-8")
+
+    def fake_score_batch_codex(brand, keywords, summary, exe=""):
+        return (
+            [{"keyword": kw, "relevance": 0, "rationale": "동의"} for kw in keywords],
+            "gpt-6-astra",
+        )
+
+    monkeypatch.setattr(kr, "score_batch_codex", fake_score_batch_codex)
+    result = kr.crosscheck_brand("브랜드", db, guides, batch_size=100)
+    assert result == {"checked": 2, "failed_batches": 0}
+
+    conn = sqlite3.connect(str(db))
+    row = conn.execute(
+        "SELECT relevance_codex FROM keywords WHERE keyword='k1'"
+    ).fetchone()
+    conn.close()
+    assert row[0] == 0
+
+
 def test_brand_status_distribution(tmp_path):
     db = tmp_path / "브랜드.sqlite"
     _make_db(db, [("k1", 1), ("k2", 1), ("k3", 1)])
