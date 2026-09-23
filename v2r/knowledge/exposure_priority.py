@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -372,34 +373,91 @@ def _try_refresh_lock(rt: Any, brand: str) -> bool:
 
 
 def _release_refresh_lock(rt: Any, brand: str) -> None:
+    _release_refresh_lock_by_root(rt.settings.repo_root, brand)
+
+
+def _release_refresh_lock_by_root(repo_root: str | Path, brand: str) -> None:
+    d = Path(repo_root) / "data" / "exposure_queue_refresh.lock" / brand
     try:
-        os.rmdir(_refresh_lock_dir(rt, brand))
+        os.rmdir(d)
     except OSError:
         pass
 
 
+def _open_refresh_runtime() -> Any:
+    """`_refresh_queue_in_background` 전용 — 별도 함수로 빼서 시험에서
+    (실제 프로덕션 설정 대신) 같은 임시 DB의 `rt`를 그대로 돌려주도록
+    바꿔치기할 수 있게 한다."""
+    from v2r.engine.context import Runtime
+
+    return Runtime.open()
+
+
+def _refresh_queue_in_background(repo_root: str | Path, brand: str, cfg: dict, now: datetime) -> None:
+    """백그라운드 스레드에서 실행 — 그 사이 호출한 작업자(와 다른 작업자들)는
+    기존(약간 오래된) 큐로 계속 선점을 진행한다(2026-09-24 6차, 코디네이터
+    지시). `rt.conn`을 다른 스레드와 공유하면 sqlite3 커넥션 동시 접근이
+    안전하지 않으므로, 이 스레드 전용의 새 `Runtime`(= 새 커넥션)을 연다."""
+    thread_rt = None
+    try:
+        thread_rt = _open_refresh_runtime()
+        _do_refresh_queue(thread_rt, brand, cfg, now)
+    except Exception as exc:  # pragma: no cover - 방어용(백그라운드라 예외를 삼킴)
+        log.warning("노출 큐 백그라운드 갱신 실패(%s): %s", brand, exc)
+    finally:
+        if thread_rt is not None:
+            try:
+                thread_rt.close()
+            except Exception:
+                pass
+        _release_refresh_lock_by_root(repo_root, brand)
+
+
 def maybe_refresh_queue(rt: Any, brand: str, cfg: dict, now: datetime) -> bool:
     """이 브랜드 큐가 TTL(`priority.queue_refresh_sec`, 기본
-    `universe_cache_sec`와 동일)보다 오래됐으면 갱신한다. 락을 못 잡으면(다른
-    작업자가 갱신 중) 아무것도 안 하고 `False`를 돌려준다 — 락을 기다리지
-    않는다(그 작업자가 곧 끝낼 것이므로, 이 호출자는 그냥 지금 있는 표
-    내용으로 선점을 시도하면 된다)."""
+    `universe_cache_sec`와 동일)보다 오래됐으면 갱신한다.
+
+    2026-09-24 6차(코디네이터 지시) — **이미 큐에 뭔가 있으면**(콜드 스타트가
+    아니면) 백그라운드 스레드에서 갱신하고 바로 돌아간다. 이전엔 락을 잡은
+    작업자가 갱신이 끝날 때까지(평균 13.5초, 최대 36.5초) 제자리에서
+    기다려 그 작업자만 그동안 아무 검사도 못 했다 — 이제는 갱신을 던져
+    놓고, 호출자도(그리고 락을 못 잡은 다른 작업자들도 원래부터 그랬듯)
+    갱신이 끝나기 전까지는 기존(약간 오래된) 큐로 계속 선점한다.
+
+    **큐가 아직 한 번도 채워진 적 없으면**(`last_refreshed_at == 0`, 콜드
+    스타트) 대체할 기존 큐가 없으므로 예외적으로 **동기** 갱신한다 — 안
+    그러면 첫 조회가 빈 배치를 돌려줘 그 브랜드는 영영 검사를 못 시작한다
+    (`tests/test_exposure_runner.py`의 콜드 스타트 시험들이 이 경로를 검증).
+
+    락을 못 잡으면(다른 작업자가 이미 갱신 중) 아무것도 안 하고 `False`."""
     from v2r.store import exposure_queue_store as qstore
 
     ttl = float(cfg.get("queue_refresh_sec", cfg.get("universe_cache_sec", 600)))
     now_epoch = time.time()
-    if now_epoch - qstore.last_refreshed_at(rt.conn, brand) < ttl:
+    last_refreshed = qstore.last_refreshed_at(rt.conn, brand)
+    if now_epoch - last_refreshed < ttl:
         return False
+    cold_start = last_refreshed <= 0.0
     if not _try_refresh_lock(rt, brand):
         return False
-    try:
-        # 락을 잡는 사이 다른 프로세스가 이미 갱신했을 수 있으니 다시 확인.
-        if now_epoch - qstore.last_refreshed_at(rt.conn, brand) < ttl:
-            return False
-        _do_refresh_queue(rt, brand, cfg, now)
-        return True
-    finally:
+    # 락을 잡는 사이 다른 프로세스가 이미 갱신했을 수 있으니 다시 확인.
+    if now_epoch - qstore.last_refreshed_at(rt.conn, brand) < ttl:
         _release_refresh_lock(rt, brand)
+        return False
+    if cold_start:
+        try:
+            _do_refresh_queue(rt, brand, cfg, now)
+            return True
+        finally:
+            _release_refresh_lock(rt, brand)
+
+    threading.Thread(
+        target=_refresh_queue_in_background,
+        args=(rt.settings.repo_root, brand, cfg, now),
+        daemon=True,
+        name=f"exposure-queue-refresh-{brand}",
+    ).start()
+    return False
 
 
 #: 발행 시각이 이 창(±시간) 안이면 "최근 발행"으로 본다

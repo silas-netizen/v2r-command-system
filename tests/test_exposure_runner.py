@@ -432,10 +432,30 @@ def test_universe_캐시_TTL안에는_한번만_조회(tmp_path, monkeypatch):
 def test_universe_캐시_TTL지나면_다시_조회(tmp_path, monkeypatch):
     """프로세스 메모리 캐시가 TTL 지나 만료되면 다시 조회해야 한다 — 4차에서
     추가된 파일 캐시(작업자 프로세스 간 공유)는 이 시험의 관심사가 아니므로
-    비활성화해(항상 미스로) 순수 프로세스 캐시 동작만 본다."""
+    비활성화해(항상 미스로) 순수 프로세스 캐시 동작만 본다.
+
+    2026-09-24 6차 — 큐가 이미 한 번 채워진 뒤(콜드 스타트 아님) TTL이
+    지나 갱신할 때는 백그라운드 스레드로 넘어간다(코디네이터 지시 —
+    갱신하는 동안 호출자를 막지 않기 위해). 시험에서는 `threading.Thread`를
+    "바로 그 자리에서 실행"하는 가짜로 바꿔 동기적으로 검증한다."""
+
+    class _SyncThread:
+        def __init__(self, target=None, args=(), kwargs=None, daemon=None, name=None):
+            self._target = target
+            self._args = args
+            self._kwargs = kwargs or {}
+
+        def start(self):
+            self._target(*self._args, **self._kwargs)
+
     exposure_priority.invalidate_universe_cache(None)
     monkeypatch.setattr(exposure_priority, "_read_universe_file_cache", lambda rt_, brand, ttl: None)
+    monkeypatch.setattr(exposure_priority.threading, "Thread", _SyncThread)
     rt = make_runtime(tmp_path)
+    monkeypatch.setattr(exposure_priority, "_open_refresh_runtime", lambda: rt)
+    # 가짜 스레드가 끝나며 rt.close()를 부르면 시험이 이어서 쓰는 rt.conn이
+    # 닫혀 버리니, 이 시험 안에서는 close를 무시한다.
+    monkeypatch.setattr(rt, "close", lambda: None)
     calls = {"n": 0}
 
     def fake_universe(rt_, brand):
@@ -450,6 +470,7 @@ def test_universe_캐시_TTL지나면_다시_조회(tmp_path, monkeypatch):
     assert calls["n"] == 1
 
     # 기본 TTL(600초, 4차에서 120→600으로 상향) + 여유 지남 — 다시 조회해야 한다
+    # (백그라운드 스레드가 가짜 동기 스레드라 이 호출 안에서 바로 끝난다)
     monkeypatch.setattr(exposure_priority.time, "time", lambda: 1_000_000.0 + 650.0)
     exposure_priority.next_priority_batch(rt, "테스트브랜드", n=1, now=now0)
     assert calls["n"] == 2
