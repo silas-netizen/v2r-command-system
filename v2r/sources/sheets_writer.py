@@ -25,6 +25,7 @@ import csv
 import io
 import logging
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -146,6 +147,95 @@ def _parse_cell(cell: str) -> tuple[str, int]:
 # --------------------------------------------------------------------------
 
 
+def _dismiss_modal(page: Any) -> str:
+    """떠 있는 알림 모달(예: '지정한 범위가 시트 크기를 초과합니다')을 닫고 그 문구를 돌려준다."""
+    try:
+        dl = page.locator(".modal-dialog")
+        for i in range(dl.count()):
+            if dl.nth(i).is_visible():
+                text = dl.nth(i).inner_text()[:120].replace("\n", " | ")
+                dl.nth(i).locator("button, [role=button]").first.click()
+                page.wait_for_timeout(300)
+                return text
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
+def _nav_to(page: Any, cell: str) -> str:
+    """이름 상자로 `cell`에 이동하고, 이동 뒤 이름 상자 값을 돌려준다(모달이 뜨면 닫는다)."""
+    page.click("#t-name-box")
+    page.keyboard.press("Control+A")
+    page.keyboard.type(cell)
+    page.keyboard.press("Enter")
+    page.wait_for_timeout(400)
+    if _dismiss_modal(page):
+        return ""
+    try:
+        return str(page.input_value("#t-name-box") or "").strip().upper()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _grid_row_count(page: Any, hi_hint: int = 1000) -> int:
+    """격자의 마지막 행 번호를 이름 상자 이동 시도로 이진 탐색한다(모달이 뜨면 범위 밖).
+
+    사고 2026-09-23: Ctrl+End 로 어림하다가(이름 상자에 초점이 있어 1행으로 읽힘) 팥순이
+    탭 2~3024행에 빈 행 3,023개를 끼워 넣었다. 이제 어림하지 않고 정확히 잰다.
+    """
+    lo, hi = 1, max(2, int(hi_hint))
+    while _nav_to(page, f"A{hi}") == f"A{hi}":
+        lo = hi
+        hi *= 2
+        if hi > 5_000_000:
+            return lo
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if _nav_to(page, f"A{mid}") == f"A{mid}":
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+
+def _ensure_grid_rows(page: Any, last_row: int, max_loops: int = 12) -> None:
+    """시트 격자가 `last_row`행까지 없으면 마지막 행 아래에 행을 끼워 넣어 늘린다.
+
+    익명 편집 화면에는 API가 없으므로 UI로 한다: 마지막 N행을 이름 상자로 선택 →
+    Shift+F10 컨텍스트 메뉴 → "아래에 행 N개 삽입"(선택 행 수만큼 늘어난다).
+    현재 격자 크기는 모르므로 Ctrl+End(데이터 끝)를 하한으로 잡고, 목표 셀 이동이
+    모달 없이 성공할 때까지 반복한다. 이미 충분하면 아무것도 하지 않는다.
+    """
+    probe = f"A{last_row}"
+    if _nav_to(page, probe) == probe:
+        return
+    current = _grid_row_count(page, last_row)
+    for _ in range(max_loops):
+        n = max(1, min(current, 1000, last_row - current))
+        sel = f"{current - n + 1}:{current}"
+        if _nav_to(page, sel) != sel.upper():
+            raise SheetsWriteError(f"행 늘리기 실패: {sel} 선택이 안 됨")
+        page.keyboard.press("Shift+F10")
+        page.wait_for_timeout(700)
+        items = page.locator("[role=menuitem]:visible")
+        clicked = False
+        for i in range(items.count()):
+            text = items.nth(i).inner_text().strip()
+            if "아래에" in text and "행" in text and "삽입" in text:
+                items.nth(i).click()
+                clicked = True
+                break
+        if not clicked:
+            page.keyboard.press("Escape")
+            raise SheetsWriteError("행 늘리기 실패: '아래에 행 N개 삽입' 메뉴가 없음")
+        page.wait_for_timeout(1500)
+        current += n
+        log.info("시트 행 늘림: +%d행 → %d행", n, current)
+        if current >= last_row and _nav_to(page, probe) == probe:
+            return
+    raise SheetsWriteError(f"행 늘리기 실패: {last_row}행까지 늘리지 못함(현재 {current})")
+
+
 def _write_tsv_at(spreadsheet_id: str, gid: str | int, cell: str, tsv: str) -> None:
     """`cell`에서 시작해 `tsv`(탭=열 구분, 개행=행 구분)를 붙여넣는다."""
     from playwright.sync_api import sync_playwright
@@ -161,20 +251,20 @@ def _write_tsv_at(spreadsheet_id: str, gid: str | int, cell: str, tsv: str) -> N
             page.wait_for_selector("#t-name-box", timeout=45000)
             page.wait_for_timeout(1000)  # 그리드 초기화 여유
 
+            # 붙여넣을 마지막 행이 시트 격자 밖이면 먼저 행을 늘린다 — 사고 2026-09-23:
+            # 팥순이(3,654행)·코숨핏(449행) 탭은 격자가 데이터 크기로 잘려 있어 A3655/A450
+            # 이동이 "지정한 범위가 시트 크기를 초과합니다" 모달로 막혔고, 그 상태로 붙여넣기가
+            # A1(기본 선택)에 떨어져 헤더가 덮였다.
+            col_letter, row1 = _parse_cell(cell)
+            n_lines = tsv.count("\n") + 1 if tsv else 1
+            _ensure_grid_rows(page, row1 + n_lines - 1)
+
             # 이름 상자에 셀 주소 입력 → Enter로 이동. 이동이 실제로 됐는지 이름 상자
-            # 값을 다시 읽어 확인한다 — 사고 2026-09-23: 이동이 씹힌 채 붙여넣기가
-            # A1(기본 선택)에 떨어져 장으뜸 A1에 P1 합계, 팥순이 A1에 통검 URL이 덮였다.
+            # 값을 다시 읽어 확인한다(이동이 씹히면 붙여넣기가 A1에 떨어진다).
             landed = False
+            now_at = ""
             for _nav in range(3):
-                page.click("#t-name-box")
-                page.keyboard.press("Control+A")
-                page.keyboard.type(cell)
-                page.keyboard.press("Enter")
-                page.wait_for_timeout(400)
-                try:
-                    now_at = str(page.input_value("#t-name-box") or "").strip().upper()
-                except Exception:
-                    now_at = ""
+                now_at = _nav_to(page, cell)
                 if now_at == cell.upper():
                     landed = True
                     break
