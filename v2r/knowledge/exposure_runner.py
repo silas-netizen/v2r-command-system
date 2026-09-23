@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import logging
 import os
@@ -236,9 +237,22 @@ def _to_epoch(iso: str) -> float:
 # 작업자 루프
 # =======================================================================
 
-def judge_once(rt: Any, context: Any, brand: str, item: dict, cfg: dict) -> "ExposureRow":  # noqa: F821
+def judge_once(
+    rt: Any, context: Any, brand: str, item: dict, cfg: dict, executor: "concurrent.futures.ThreadPoolExecutor | None" = None
+) -> "ExposureRow":  # noqa: F821
     """키워드 하나 조기 종료 스크롤 → 기존 판정 함수. DB/시트에는 아직 안 쓴다
-    (2차 확인 대기 로직이 `process_one`에서 저장 여부를 결정한다)."""
+    (2차 확인 대기 로직이 `process_one`에서 저장 여부를 결정한다).
+
+    2026-09-24 실측 중 발견한 버그 — `judge_keyword_exposure`(카드 후보 확정
+    단계, `confirm_our_article_detail`)는 후보 글을 열 때 **자기 것만의**
+    `with sync_playwright()`를 새로 연다(`fetch_article_html`/`fetch_article_text`).
+    이 함수를 상주 브라우저를 쥔 스레드(메인 스레드, `run_worker`가 이미
+    `with sync_playwright()` 안에 있음)에서 그대로 부르면 Playwright sync API가
+    같은 스레드 안의 중첩 호출을 막아 "Playwright Sync API inside the asyncio
+    loop" 예외를 던진다 — 모든 후보 확인이 조용히 실패해 노출완이 전부
+    밀려남으로 오판정되는 심각한 결함이었다(30분 실측, 103건 전부 pushed,
+    unknown 0). 판정 함수 자체(`judge_keyword_exposure`)는 그대로 두고, 그
+    호출만 별도 스레드(`executor`)로 옮겨 스레드 충돌을 피한다."""
     from v2r.knowledge.keyword_exposure import ExposureRow, judge_keyword_exposure, now_iso, resolve_search_query
 
     keyword = item["keyword"]
@@ -256,15 +270,16 @@ def judge_once(rt: Any, context: Any, brand: str, item: dict, cfg: dict) -> "Exp
         log.warning("페이지 로드 실패(%s): %s", keyword, exc)
         return ExposureRow(brand, keyword, item.get("cafe", ""), "", None, "unknown", now_iso(), item.get("t0_status", ""), query)
 
-    verdict = judge_keyword_exposure(
-        rt,
-        brand,
-        keyword,
+    judge_kwargs = dict(
         cookies_path=cookies_path,
         dom_html=html,
         search_query=query,
         article_index=getattr(rt, "article_index", None),
     )
+    if executor is not None:
+        verdict = executor.submit(judge_keyword_exposure, rt, brand, keyword, **judge_kwargs).result()
+    else:
+        verdict = judge_keyword_exposure(rt, brand, keyword, **judge_kwargs)
     return ExposureRow(
         brand,
         keyword,
@@ -303,7 +318,9 @@ def _latest_status(conn: Any, brand: str, keyword: str) -> str:
     return str(row["status"]) if row else ""
 
 
-def process_one(rt: Any, context: Any, brand: str, item: dict, cfg: dict) -> dict:
+def process_one(
+    rt: Any, context: Any, brand: str, item: dict, cfg: dict, executor: "concurrent.futures.ThreadPoolExecutor | None" = None
+) -> dict:
     """키워드 하나 검사 + 노출완→밀려남 2단계 확인(아래 참고) + DB/시트 반영.
 
     2026-09-24 코디네이터 지시(비만도 계산기 23:31 일시 변동 사례) — 직전
@@ -319,7 +336,7 @@ def process_one(rt: Any, context: Any, brand: str, item: dict, cfg: dict) -> dic
     prev_status = _latest_status(rt.conn, brand, keyword)
     pending = get_pending(rt.settings.repo_root, brand, keyword)
 
-    row = judge_once(rt, context, brand, item, cfg)
+    row = judge_once(rt, context, brand, item, cfg, executor=executor)
 
     if row.status == "pushed" and (prev_status == "exposed" or pending is not None):
         if pending is None:
@@ -435,6 +452,12 @@ def run_worker(worker_id: int, brands: list[str] | None = None, max_iterations: 
     unknown_streak = 0
     brand_idx = 0
     iterations = 0
+    # 후보 글 상세 확인(judge_keyword_exposure 내부)은 자기만의 sync_playwright()를
+    # 새로 연다 — 이 스레드(메인, 상주 브라우저 보유)에서 그대로 부르면 중첩
+    # 호출로 실패한다(judge_once 문서 참고). 전담 스레드 1개로 격리한다.
+    confirm_executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix=f"exposure-confirm-{worker_id}"
+    )
     with sync_playwright() as pw:
         browser = launch_chromium(pw, headless=True)
         context = browser.new_context(
@@ -472,7 +495,7 @@ def run_worker(worker_id: int, brands: list[str] | None = None, max_iterations: 
                         time.sleep(2.0)
                         continue
                     item = batch[0]
-                result = process_one(rt, context, brand, item, cfg)
+                result = process_one(rt, context, brand, item, cfg, executor=confirm_executor)
                 update_worker_state(rt.settings.repo_root, worker_id, processed_delta=1, last_keyword=item["keyword"])
                 unknown_streak = unknown_streak + 1 if result["status"] == "unknown" else 0
                 if unknown_streak >= block_streak_limit:
@@ -493,6 +516,7 @@ def run_worker(worker_id: int, brands: list[str] | None = None, max_iterations: 
             context.close()
             browser.close()
             rt.close()
+    confirm_executor.shutdown(wait=True)
 
 
 def main(argv: list[str] | None = None) -> int:

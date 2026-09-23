@@ -642,6 +642,84 @@ def naver_autocomplete_first(keyword: str, timeout: float = 5.0) -> str:
         return ""
 
 
+def parse_autocomplete_items(data: Any) -> list[str]:
+    """자동완성 응답(`{"items": [[["단어", ...], ...], ...]}`) → 후보 전체 목록(순서 유지·중복 제거)."""
+    out: list[str] = []
+    seen: set[str] = set()
+    groups = (data or {}).get("items") if isinstance(data, dict) else None
+    for group in groups or []:
+        if not isinstance(group, list):
+            continue
+        for item in group:
+            text = ""
+            if isinstance(item, list) and item:
+                text = str(item[0])
+            elif isinstance(item, str):
+                text = item
+            text = text.strip()
+            if text and text not in seen:
+                seen.add(text)
+                out.append(text)
+    return out
+
+
+def naver_autocomplete_all(keyword: str, timeout: float = 5.0) -> list[str]:
+    """네이버 자동완성 후보 전체(시드 다양화용, 2026-09-24). 실패 시 빈 목록."""
+    try:
+        url = AUTOCOMPLETE_URL.format(query=quote(keyword))
+        resp = httpx.get(url, timeout=timeout)
+        resp.raise_for_status()
+        return parse_autocomplete_items(resp.json())
+    except Exception as exc:
+        log.warning("자동완성 전체 조회 실패(%s): %s", keyword, exc)
+        return []
+
+
+#: 통검 하단 "함께 많이 찾는"(예전 이름 "연관 검색어") 항목 링크 — 실측(2026-09-24):
+#: 항목은 `?where=nexearch&sm=tab_clk.ndT&query=<URL인코딩 검색어>` 링크로 렌더된다
+#: (텍스트는 말줄임 처리되므로 링크의 query 값을 쓴다). 렌더는 JS라 httpx HTML에는
+#: 없고 `fetch_integrated_search_dom`(헤드리스)의 최종 DOM에만 있다.
+_RE_RELATED_LINK = re.compile(r'sm=tab_clk\.ndT[^"\']*?query=([^&"\'#]+)')
+
+
+def parse_related_searches(html: str) -> list[str]:
+    """통검 최종 DOM에서 하단 연관 검색어("함께 많이 찾는") 목록(순서 유지·중복 제거)."""
+    from urllib.parse import unquote
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in _RE_RELATED_LINK.findall(html or ""):
+        text = unquote(raw.replace("+", " ")).strip()
+        if text and text not in seen:
+            seen.add(text)
+            out.append(text)
+    return out
+
+
+def naver_related_searches(keyword: str, headless: bool = True, max_rounds: int = 3) -> list[str]:
+    """통검 하단 연관 검색어(기존 `fetch_integrated_search_dom` 재사용, 헤드리스만). 실패 시 빈 목록.
+
+    호출 스레드가 이미 Playwright sync 루프를 돌리고 있을 수 있어(키워드 도구 페이지를
+    연 워커) 별도 스레드에서 연다 — 실측(2026-09-24): 같은 스레드에서는
+    "Sync API inside the asyncio loop" 오류로 전부 실패했다.
+    """
+    box: dict[str, Any] = {}
+
+    def _run() -> None:
+        try:
+            box["html"] = fetch_integrated_search_dom(keyword, headless=headless, max_rounds=max_rounds)
+        except Exception as exc:  # noqa: BLE001
+            box["err"] = exc
+
+    t = threading.Thread(target=_run, name="related-searches", daemon=True)
+    t.start()
+    t.join(timeout=120)
+    if t.is_alive() or "err" in box or "html" not in box:
+        log.warning("연관 검색어 조회 실패(%s): %s", keyword, box.get("err") or "시간 초과")
+        return []
+    return parse_related_searches(box["html"])
+
+
 def _spacing_fallback(keyword: str) -> str:
     """자동완성이 없을 때 쓰는 띄어쓰기 정규화. `pykospacing`이 설치돼 있으면
     그걸로 교정하고, 없으면(대부분의 환경) 원문 그대로 돌려준다 — 사용자 지시의
@@ -791,38 +869,48 @@ def _relevance_keywords_db_path(rt: Any, brand: str) -> Path:
 
 
 def _relevance_eligible_keywords(rt: Any, brand: str) -> list[dict]:
-    """`data/keywords/<브랜드>.sqlite`에서 원고 대상(연관도 0~2, 검토 대기 아님)만.
+    """`data/keywords/<브랜드>.sqlite`에서 원고 대상(`is_manuscript_target`)만.
 
-    `sheets_writer.sync_keywords_to_sheet`와 같은 조건이다(연결 3, 2026-09-23).
+    `sheets_writer.sync_keywords_to_sheet`와 같은 조건이다(연결 3, 2026-09-23;
+    2026-09-24부터 0에서 3(당위성 포함), 4(무관)만 제외 — 사용자 지시).
     DB가 없거나(발굴/재산정 전) 읽는 중 문제가 있으면 조용히 빈 목록.
     """
     import sqlite3
+
+    from v2r.knowledge import keyword_relevance as kr_mod
 
     db_path = _relevance_keywords_db_path(rt, brand)
     if not db_path.exists():
         return []
     try:
         con = sqlite3.connect(str(db_path))
+        con.row_factory = sqlite3.Row
         try:
             cols = {row[1] for row in con.execute("PRAGMA table_info(keywords)")}
             required = {"relevance_llm", "relevance_codex", "needs_review"}
             if not required.issubset(cols):
                 return []
             rows = con.execute(
-                """
-                select keyword, total
-                from keywords
-                where relevance_llm between 0 and 2
-                  and relevance_codex between 0 and 2
-                  and (needs_review is null or needs_review = 0)
-                """
+                "select keyword, total, relevance_llm, relevance_codex, needs_review"
+                " from keywords where relevance_llm is not null"
             ).fetchall()
         finally:
             con.close()
     except Exception as exc:  # pragma: no cover - 방어용(다른 일꾼이 동시에 쓰는 중일 수 있음)
         log.warning("연관도 DB 읽기 실패(%s, %s): %s", brand, db_path, exc)
         return []
-    return [{"keyword": kw, "cafe": "", "article_url": "", "t0_status": "", "candidate_title_norm": "", "volume": int(total or 0)} for kw, total in rows]
+    return [
+        {
+            "keyword": r["keyword"],
+            "cafe": "",
+            "article_url": "",
+            "t0_status": "",
+            "candidate_title_norm": "",
+            "volume": int(r["total"] or 0),
+        }
+        for r in rows
+        if kr_mod.is_manuscript_target(r)
+    ]
 
 
 def known_brands(rt: Any) -> list[str]:

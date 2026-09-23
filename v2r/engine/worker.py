@@ -2141,6 +2141,8 @@ def dispatch(rt: Runtime, job: Any, owner: str | None = None) -> dict:
         return _keyword_discovery_status(rt, spec)
     if task == "keyword_relevance_rescan":
         return _keyword_relevance_rescan(rt, spec)
+    if task == "keyword_relevance_rescore_legacy":
+        return _keyword_relevance_rescore_legacy(rt, spec)
     if task == "keyword_relevance_status":
         return _keyword_relevance_status(rt, spec)
     if task == "sheet_sync_keywords":
@@ -2396,6 +2398,53 @@ def _keyword_relevance_rescan(rt: Runtime, spec: TaskSpec) -> dict:
     except Exception:  # noqa: BLE001
         pass
     return {"ok": True, "message": msg, "per_brand": results, "skipped": skipped, "primary_brand": primary_counts}
+
+
+def _keyword_relevance_rescore_legacy(rt: Runtime, spec: TaskSpec) -> dict:
+    """`키워드 연관도 재채점 <브랜드|전체>` — 구 척도 3(무관)이던 키워드만
+
+    새 척도(0에서 4, 3=당위성/4=무관)로 다시 채점한다(사용자 지시 2026-09-24).
+    브랜드가 없으면 발굴이 끝난 브랜드 전부를 돈다. 실제 대량 실행(5개 브랜드
+    약 3만 7천개)은 이 명령을 브랜드별로 명시적으로 호출해야 한다 — 이 함수
+    자체가 "전체"를 자동으로 한꺼번에 돌리진 않게 브랜드별로 순차 처리한다.
+    """
+    from v2r.command.parser import BRAND_NAMES
+    from v2r.knowledge import keyword_relevance as kr_mod
+
+    repo = Path(rt.settings.repo_root)
+    data_dir = repo / "data" / "keywords"
+    guides_dir = repo / "warehouse" / "guides" / "정리본"
+    progress_path = data_dir / "relevance_rescore_progress.json"
+
+    brand = (spec.brand or "").strip()
+    brands = [brand] if brand else [b for b in BRAND_NAMES if (data_dir / f"{b}.sqlite").exists()]
+
+    results: dict[str, dict] = {}
+    for b in brands:
+        db_path = data_dir / f"{b}.sqlite"
+        if not db_path.exists():
+            results[b] = {"ok": False, "error": "키워드 DB가 없습니다(발굴 먼저 필요)"}
+            continue
+        try:
+            out = kr_mod.rescore_legacy_unrelated_brand(
+                rt.llm, b, db_path, guides_dir, progress_path=progress_path
+            )
+            results[b] = {"ok": True, **out}
+        except Exception as exc:  # noqa: BLE001
+            results[b] = {"ok": False, "error": f"{exc.__class__.__name__}: {exc}"}
+
+    lines = []
+    for b, out in results.items():
+        if out.get("ok"):
+            lines.append(f"{b} 재채점 {out.get('scored', 0)}개/검증 {out.get('checked', 0)}개")
+        else:
+            lines.append(f"{b} 실패: {out.get('error')}")
+    msg = "키워드 연관도 재채점(당위성/무관 분리): " + " / ".join(lines)
+    try:
+        notify_all(rt.channels, msg)
+    except Exception:  # noqa: BLE001
+        pass
+    return {"ok": True, "message": msg, "per_brand": results}
 
 
 def _keyword_relevance_status(rt: Runtime, spec: TaskSpec) -> dict:

@@ -5,8 +5,12 @@
 `data/keywords/<브랜드>.sqlite`의 발굴분(노출 확인된 것만 — 확인은 `keyword_exposure`
 표에 들어간 것으로 판단한다. 미확인 발굴 키워드는 여기서 걸러진다).
 
-우선순위 = 검색량(`total`) 내림차순, 같은 검색량이면 연관도(`relevance`, 작을수록
-가까움) 오름차순. 시트에서만 온 키워드처럼 검색량을 모르면 맨 뒤로 보낸다.
+우선순위(2026-09-24 개정, 사용자 지시): 1순위로 연관도 등급 그룹 — 0에서 2(직접/
+근접/확장)를 먼저, 3(당위성)은 그 뒤(4/무관은 `keyword_relevance.is_manuscript_target`
+으로 아예 걸러 대기열에 넣지 않는다). 같은 그룹 안에서는 검색량(`total`) 내림차순.
+아직 LLM 연관도 재산정 전(`relevance_llm`이 없음)인 항목은 옛 낱말겹침 `relevance`
+열로 대체 판정하고, 그마저 없으면 맨 뒤 그룹으로 보낸다. 시트에서만 온 키워드처럼
+검색량을 모르면 그 그룹 안에서 맨 뒤로 보낸다.
 
 팥순이는 질문형·후기형을 번갈아 채운다 (사용자 지시: 팥순이만 두 유형 다 씀).
 나머지 브랜드는 질문형만 채운다.
@@ -20,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from v2r.config import load_yaml
+from v2r.knowledge import keyword_relevance as kr_mod
 from v2r.store.db import now_iso
 
 #: 팥순이만 질문형·후기형을 번갈아 채운다
@@ -34,22 +39,68 @@ def _norm(value: str) -> str:
     return re.sub(r"\s+", "", str(value or ""))
 
 
-def _volume_map(brand: str, data_dir: Path) -> dict[str, tuple[float, float]]:
-    """`data/keywords/<브랜드>.sqlite`에서 키워드 → (검색량, 연관도)."""
+#: 대기열 우선순위 그룹: 0-2(직접/근접/확장) 먼저, 3(당위성) 다음, 미산정/무관은 맨 뒤.
+_GROUP_SCORED = 0
+_GROUP_BRIDGE = 1
+_GROUP_UNKNOWN = 2
+
+
+def _priority_group(relevance_llm: float | None) -> int:
+    if relevance_llm is None:
+        return _GROUP_UNKNOWN
+    if relevance_llm <= kr_mod.MANUSCRIPT_MAX_RELEVANCE - 1:  # 0,1,2
+        return _GROUP_SCORED
+    if relevance_llm == kr_mod.RELEVANCE_BRIDGE:  # 3
+        return _GROUP_BRIDGE
+    return _GROUP_UNKNOWN
+
+
+def _volume_map(brand: str, data_dir: Path) -> dict[str, tuple[float, int, float]]:
+    """`data/keywords/<브랜드>.sqlite`에서 키워드 → (검색량, 우선순위그룹, 연관도).
+
+    연관도는 `relevance_llm`(새 척도, 0에서 4)을 우선 쓰고, 아직 재산정 전이면
+    옛 낱말겹침 `relevance` 열로 대체한다. `is_manuscript_target`이 False인
+    항목(4=무관 또는 needs_review)은 아예 목록에서 뺀다(호출측에서 걸러진다 —
+    `refill`에서 이 맵에 없는 키워드는 원래 관대하게 통과시켰으므로, 여기서는
+    "존재하되 무관으로 확인된 것"만 제외한다).
+    """
     path = Path(data_dir) / "keywords" / f"{brand}.sqlite"
-    out: dict[str, tuple[float, float]] = {}
+    out: dict[str, tuple[float, int, float]] = {}
     if not path.exists():
         return out
     try:
         conn = sqlite3.connect(str(path))
+        conn.row_factory = sqlite3.Row
         try:
-            rows = conn.execute("SELECT keyword, total, relevance FROM keywords").fetchall()
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(keywords)")}
+            has_llm_cols = {"relevance_llm", "relevance_codex", "needs_review"}.issubset(cols)
+            if has_llm_cols:
+                rows = conn.execute(
+                    "SELECT keyword, total, relevance, relevance_llm, relevance_codex, needs_review"
+                    " FROM keywords"
+                ).fetchall()
+            else:
+                rows = conn.execute("SELECT keyword, total, relevance FROM keywords").fetchall()
         finally:
             conn.close()
     except Exception:
         return out
-    for kw, total, relevance in rows:
-        out[_norm(kw)] = (float(total or 0), float(relevance if relevance is not None else 99))
+    for row in rows:
+        kw = row["keyword"]
+        total = float(row["total"] or 0)
+        if has_llm_cols and row["relevance_llm"] is not None:
+            if not kr_mod.is_manuscript_target(row):
+                continue  # 4(무관) 또는 needs_review — 대기열 대상 아님
+            rel = float(row["relevance_llm"])
+            group = _priority_group(rel)
+        else:
+            # 아직 LLM 재산정 전 — 옛 낱말겹침 `relevance`(0-4 스케일과 다른
+            # 범위)로는 새 0-2/3 그룹을 매길 수 없으므로 그룹을 나누지 않고
+            # (전부 미산정 그룹) 검색량으로만 정렬한다(기존 동작 유지).
+            legacy = row["relevance"]
+            rel = float(legacy) if legacy is not None else 99.0
+            group = _GROUP_UNKNOWN
+        out[_norm(kw)] = (total, group, rel)
     return out
 
 
@@ -121,16 +172,20 @@ def refill(rt: Any, brand: str, n: int, target: str = "") -> int:
     }
     vol = _volume_map(brand, rt.settings.data_dir)
 
-    scored: list[tuple[float, float, dict]] = []
+    scored: list[tuple[int, float, float, dict]] = []
     for item in pool:
         key = _norm(item["keyword"])
-        total, relevance = vol.get(key, (-1.0, 999.0))
-        scored.append((total, relevance, item))
-    # 검색량 내림차순, 같으면 연관도(작을수록 가까움) 오름차순
-    scored.sort(key=lambda t: (-t[0], t[1]))
+        entry = vol.get(key)
+        if entry is None:
+            total, group, relevance = -1.0, _GROUP_UNKNOWN, 999.0
+        else:
+            total, group, relevance = entry
+        scored.append((group, total, relevance, item))
+    # 1순위: 연관도 그룹(0-2 먼저, 3 다음, 미산정/무관 맨 뒤). 그룹 안에서는 검색량 내림차순.
+    scored.sort(key=lambda t: (t[0], -t[1]))
 
     candidates = []
-    for total, relevance, item in scored:
+    for group, total, relevance, item in scored:
         key = _norm(item["keyword"])
         candidates.append((key, item, total, relevance))
 

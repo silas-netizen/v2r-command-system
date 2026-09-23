@@ -28,6 +28,9 @@ TASK_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     # 키워드 연관도 재산정/현황 (2026-09-23) — 발굴 패턴보다 먼저 봐야
     # "키워드 발굴"에 가로채이지 않는다("연관도"가 있으면 이쪽이 맞다)
     ("keyword_relevance_status", re.compile(r"키워드\s*연관도\s*현황")),
+    # 구 척도(0-3, 3=무관) 재채점 → 새 척도(3=당위성/4=무관) 분리(2026-09-24).
+    # "재산정"보다 먼저 봐야 "재채점"이 일반 재산정으로 가로채이지 않는다.
+    ("keyword_relevance_rescore_legacy", re.compile(r"키워드\s*연관도\s*재채점")),
     ("keyword_relevance_rescan", re.compile(r"키워드\s*연관도\s*재산정")),
     # 키워드 채우기(원고 대상 1만 개까지 순환, 2026-09-24) — 현황/중지를 시작보다 먼저 봐야
     # "시작"이 없어도 "채우기"만으로 가로채이지 않는다
@@ -271,6 +274,7 @@ _NO_SLOT_TASKS = frozenset(
         "keyword_discovery_all",
         "keyword_relevance_status",
         "keyword_relevance_rescan",
+        "keyword_relevance_rescore_legacy",
         "sheet_sync_keywords",
         "keyword_fill_status",
         "keyword_fill_stop",

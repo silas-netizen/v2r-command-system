@@ -138,6 +138,30 @@ def test_body_prompt_carries_brand_rules():
     assert build is not None
 
 
+def test_body_prompt_adds_bridge_block_for_relevance_3():
+    # 2026-09-24 사용자 지시: relevance=3(당위성)이면 user 프롬프트에 당위성 논리
+    # 블록을 넣는다. system(브랜드 공용)은 그대로여야 한다.
+    system, user = bw.build_body_prompt(
+        "우아덤",
+        KEYWORD,
+        "씨씨앙",
+        relevance=3,
+        bridge_rationale="독감으로 몸살을 앓으면 면역이 떨어져 여성 건강 관리가 중요해진다",
+    )
+    assert "【당위성 논리】" in user
+    assert "독감으로 몸살을 앓으면" in user
+    assert "억지 연결 금지" in user
+    baseline_system, _ = bw.build_body_prompt("우아덤", KEYWORD, "씨씨앙")
+    assert system == baseline_system  # system은 relevance와 무관하게 그대로
+
+
+def test_body_prompt_no_bridge_block_when_relevance_not_3():
+    _, user = bw.build_body_prompt(
+        "우아덤", KEYWORD, "씨씨앙", relevance=0, bridge_rationale="쓰지 않아야 함"
+    )
+    assert "당위성" not in user
+
+
 def test_body_prompt_patsooni_review_type():
     system, user = bw.build_body_prompt("팥순이", "곤약젤리", manuscript_type="후기형")
     assert "300자" in system

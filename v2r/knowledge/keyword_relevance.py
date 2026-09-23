@@ -13,7 +13,20 @@ system 프롬프트로, 키워드 묶음(최대 100개)을 user 프롬프트로 
   (기존 `relevance`—낱말겹침 값—은 손대지 않는다).
 - 여러 브랜드에 겹치는 키워드는 relevance_llm이 더 낮은(가까운) 브랜드에
   `primary_brand`를 표시한다.
-- 원고 대상 = relevance_llm 0~2. 3(무관)은 제외.
+- 원고 대상 = relevance_llm 0에서 3(2026-09-24부터: 0 직접/1 근접/2 확장/3 당위성).
+  4(무관)만 제외한다. 척도가 0-3(무관 포함) → 0-4(당위성/무관 분리)로 넓어졌다
+  (사용자 지시 2026-09-24, docs/reports/relevance-split-2026-09-24.md).
+
+원고 대상 판정은 반드시 `is_manuscript_target(row)`를 통해서만 한다(하드코딩 금지).
+`row`는 최소 `relevance_llm`(또는 `relevance`)·`relevance_codex`·`needs_review` 키를
+가진 dict 또는 sqlite3.Row다. 다른 모듈(sheets_writer.py, brand_queue.py,
+exposure_priority.py, keyword_exposure.py)은 이 함수를 import해서 쓴다.
+keyword_fill_loop.py는 이번 변경 대상이 아니다(다른 작업자가 시드 다양화 작업
+중) — 그 파일 담당자가 나중에 `_relevance_eligible_keywords` 류 로직을
+`is_manuscript_target`로 갈아끼우면 된다: 시그니처는
+`is_manuscript_target(row: Mapping[str, Any]) -> bool`이고, sqlite Row/딕셔너리
+어느 쪽이든 `row["relevance_llm"]`, `row["relevance_codex"]`, `row["needs_review"]`
+키(또는 속성)로 값을 얻을 수 있으면 된다.
 """
 
 from __future__ import annotations
@@ -37,11 +50,17 @@ CODEX_DEFAULT_TIMEOUT = 300
 #: 두 모델 점수 차이가 이 값 이상이면 재검토 표시
 NEEDS_REVIEW_GAP = 2
 
-#: 라벨 (M/N열 반영용 — 본문 분류)
-RELEVANCE_LABELS: dict[int, str] = {0: "직접", 1: "근접", 2: "확장", 3: "무관"}
+#: 라벨 (M/N열 반영용 — 본문 분류). 2026-09-24: 0-3(무관 포함) → 0-4로 확장,
+#: 3(당위성)과 4(무관)을 분리했다(사용자 지시).
+RELEVANCE_LABELS: dict[int, str] = {0: "직접", 1: "근접", 2: "확장", 3: "당위성", 4: "무관"}
 
-#: 원고 대상 상한 (이 값 이하만 원고 후보, 3은 제외)
-MANUSCRIPT_MAX_RELEVANCE = 2
+#: 원고 대상 상한 (이 값 이하만 원고 후보, 4(무관)만 제외)
+MANUSCRIPT_MAX_RELEVANCE = 3
+
+#: 당위성 등급(3) — bridge 필드가 채워져야 하는 등급
+RELEVANCE_BRIDGE = 3
+#: 무관 등급(4) — rationale이 비어야 하는 등급
+RELEVANCE_UNRELATED = 4
 
 #: 한 번에 모델에 넣는 키워드 수
 DEFAULT_BATCH_SIZE = 100
@@ -60,6 +79,8 @@ MIGRATION_COLUMNS: dict[str, str] = {
     "relevance_codex": "INTEGER",
     "needs_review": "INTEGER NOT NULL DEFAULT 0",
     "codex_checked_at": "TEXT NOT NULL DEFAULT ''",
+    #: relevance==3(당위성)일 때의 연결 논리 한 줄 (사용자 지시 2026-09-24)
+    "bridge_rationale": "TEXT NOT NULL DEFAULT ''",
 }
 
 
@@ -167,22 +188,39 @@ def build_system_prompt(brand: str, summary: str) -> str:
         f"너는 {brand} 브랜드의 키워드 담당자다. 아래는 이 브랜드의 제품·타깃·핵심 논리 요약이다.\n\n"
         f"{summary}\n\n"
         "이제 사용자가 보내는 키워드 목록 각각에 대해, 이 검색어를 친 사람이"
-        " 우리 브랜드 논리로 자연스럽게 이어지는지 판단해 relevance(0~3)를 매긴다.\n"
+        " 우리 브랜드 논리로 자연스럽게 이어지는지 판단해 relevance(0에서 4)를 매긴다.\n"
         "- 0 = 직접: 브랜드/제품/증상을 바로 가리키는 핵심어\n"
         "- 1 = 근접: 같은 타깃·같은 문제의식이지만 브랜드를 직접 가리키진 않음\n"
         "- 2 = 확장: 관련은 있으나 거리가 있음(주변 정보 탐색 수준)\n"
-        "- 3 = 무관: 브랜드 논리로 이어지지 않는 일반어(예: 진료과 이름, 무관한 질병)\n\n"
+        "- 3 = 당위성: 브랜드 논리로 자연스럽게 '이어 붙일 수 있는' 키워드. 직접·근접·확장만큼"
+        " 밀접하진 않지만, 한 문장짜리 다리(bridge)를 놓으면 억지스럽지 않게 브랜드로 연결된다."
+        " 원고(콘텐츠) 대상에 포함한다.\n"
+        "- 4 = 무관: 브랜드 논리로 이어지지 않는 일반어. 다리를 놓으려면 억지스럽거나 두 문장 이상"
+        " 설명을 짜내야 한다. 원고 대상에서 제외한다.\n\n"
+        "3(당위성)과 4(무관)의 경계가 이번 척도의 핵심이다. 예시(우아덤 기준, 산부인과 여성 건강"
+        " 브랜드):\n"
+        "  - 3(당위성)으로 매기는 예: 대상포진, 독감, 위고비, 근처피부과, 사마귀"
+        " — 면역·호르몬·피부 컨디션 등 브랜드 논리와 한 문장으로 이어 붙일 다리가 있다"
+        "(예: '독감으로 몸살을 앓으면 면역이 떨어져 여성 건강 관리가 더 중요해진다').\n"
+        "  - 4(무관)로 매기는 예: 피부과, 안과, 치과, 마운자로, 독감예방접종"
+        " — 진료과 이름이거나 비만·안과·치과처럼 브랜드 타깃·논리와 맞닿는 지점이 없어,"
+        " 다리를 놓으려면 근거 없이 우기는 것이 된다.\n"
+        "브랜드마다 이 경계가 다르다: 위 예시는 우아덤 기준이고, 다른 브랜드는 위 요약의 제품·"
+        "타깃·핵심 논리에 맞춰 판단한다(예시를 다른 브랜드에 그대로 옮기지 않는다).\n\n"
         "판단 기준(중요): 이비인후과·내과·피부과 같은 병원 진료과 이름, 지역명, 일반 생활어는"
-        " 그 자체로는 형식적 채우기 키워드다. 이 검색자가 우리 브랜드 논리로 이어진다는 당위성이"
-        " 억지스럽거나 두 문장 이상 설명을 짜내야 한다면 반드시 3으로 매긴다."
+        " 그 자체로는 형식적 채우기 키워드다. 브랜드 논리로 이어진다는 당위성이"
+        " 두 문장 이상 설명을 짜내야 할 만큼 억지스럽다면 4로 매긴다."
         " 병원 진료과·지역명·일반 생활어는 브랜드 논리에 **직접** 연결되는 근거가 뚜렷할 때만 2 이하로 내린다.\n"
         "질병명·증상명·의료행위(예: 대상포진, 독감, 매독, 헤르페스, 다낭성난소증후군, 예방접종,"
-        " 건강검진 같은 것)는 **우리 브랜드 제품이 그 질병/증상을 직접 다루거나 개선을 표방할 때만**"
-        " 0~2를 주고, 그렇지 않으면(브랜드 제품과 무관한 질병·증상이면) 반드시 3으로 매긴다."
+        " 건강검진 같은 것)는 **우리 브랜드 제품이 그 질병/증상을 직접 다루거나 개선을 표방할 때** 0~2를,"
+        " 직접 다루진 않지만 한 문장 다리로 자연스럽게 이어지면 3을,"
+        " 그렇지도 않으면(브랜드 제품과 무관한 질병·증상이면) 4를 매긴다."
         " '건강 관리에 도움이 된다'처럼 막연히 관련짓지 않는다.\n\n"
-        "각 키워드마다 rationale(이 검색자가 우리 논리로 이어지는 당위성 한 줄, 3이면 빈 문자열)을 함께 준다.\n"
+        "각 키워드마다 rationale(이 검색자가 우리 논리로 이어지는 당위성 한 줄, 4면 빈 문자열)을 함께 준다.\n"
+        "relevance가 3(당위성)인 항목은 반드시 bridge(브랜드로 자연스럽게 이어 붙이는 한 문장 논리)도"
+        " 함께 준다. 3이 아니면 bridge는 빈 문자열로 둔다.\n"
         "출력은 오직 JSON 배열 하나. 형식:\n"
-        '[{"keyword": "...", "relevance": 0, "rationale": "..."}, ...]\n'
+        '[{"keyword": "...", "relevance": 0, "rationale": "...", "bridge": "..."}, ...]\n'
         "입력 키워드 수와 출력 배열 길이가 반드시 같아야 하고, keyword 값은 입력 그대로여야 한다."
         " JSON 밖의 다른 텍스트는 쓰지 않는다."
     )
@@ -234,9 +272,14 @@ def parse_response(raw_text: str, keywords: list[str]) -> list[dict[str, Any]]:
         if rel not in RELEVANCE_LABELS:
             raise RelevanceParseError(f"{idx}번째 relevance 범위 밖: {rel}")
         rationale = str(item.get("rationale", "") or "").strip()
-        if rel == 3:
+        bridge = str(item.get("bridge", "") or "").strip()
+        if rel == RELEVANCE_UNRELATED:
             rationale = ""
-        out.append({"keyword": kw, "relevance": rel, "rationale": rationale})
+        if rel != RELEVANCE_BRIDGE:
+            bridge = ""
+        out.append(
+            {"keyword": kw, "relevance": rel, "rationale": rationale, "bridge_rationale": bridge}
+        )
     return out
 
 
@@ -312,10 +355,12 @@ def pending_keywords(conn: sqlite3.Connection, limit: int = 0) -> list[str]:
     return [row[0] for row in conn.execute(sql)]
 
 
-def pending_codex_rows(conn: sqlite3.Connection, limit: int = 0) -> list[tuple[str, int, str]]:
-    """클로드는 채점됐지만 아직 Codex 교차 검증이 안 된 (키워드, relevance, rationale)."""
+def pending_codex_rows(
+    conn: sqlite3.Connection, limit: int = 0
+) -> list[tuple[str, int, str, str]]:
+    """클로드는 채점됐지만 아직 Codex 교차 검증이 안 된 (키워드, relevance, rationale, bridge_rationale)."""
     sql = (
-        "SELECT keyword, relevance_llm, rationale FROM keywords"
+        "SELECT keyword, relevance_llm, rationale, bridge_rationale FROM keywords"
         " WHERE scored_at != '' AND relevance_codex IS NULL ORDER BY total DESC"
     )
     if limit:
@@ -326,8 +371,12 @@ def pending_codex_rows(conn: sqlite3.Connection, limit: int = 0) -> list[tuple[s
 def write_scores(conn: sqlite3.Connection, rows: list[dict[str, Any]]) -> None:
     stamp = _now_iso()
     conn.executemany(
-        "UPDATE keywords SET relevance_llm = ?, rationale = ?, scored_at = ? WHERE keyword = ?",
-        [(r["relevance"], r["rationale"], stamp, r["keyword"]) for r in rows],
+        "UPDATE keywords SET relevance_llm = ?, rationale = ?, bridge_rationale = ?,"
+        " scored_at = ? WHERE keyword = ?",
+        [
+            (r["relevance"], r["rationale"], r.get("bridge_rationale", ""), stamp, r["keyword"])
+            for r in rows
+        ],
     )
     conn.commit()
 
@@ -402,7 +451,13 @@ def crosscheck_brand(
         for start in range(0, len(rows), batch_size):
             chunk = rows[start : start + batch_size]
             claude_rows = [
-                {"keyword": kw, "relevance": int(rel), "rationale": ra or ""} for kw, rel, ra in chunk
+                {
+                    "keyword": kw,
+                    "relevance": int(rel),
+                    "rationale": ra or "",
+                    "bridge_rationale": br or "",
+                }
+                for kw, rel, ra, br in chunk
             ]
             keywords = [r["keyword"] for r in claude_rows]
             try:
@@ -453,6 +508,76 @@ def score_and_crosscheck_brand(
         "checked": codex_result["checked"],
         "codex_failed_batches": codex_result["failed_batches"],
     }
+
+
+# --- 구 척도(0-3) 재채점: 3(무관) → 3(당위성)/4(무관) 분리 ------------------
+
+
+def pending_legacy_unrelated_rows(conn: sqlite3.Connection, limit: int = 0) -> list[str]:
+    """구 척도(0-3, 3=무관)로 채점된 뒤 아직 새 척도로 재채점되지 않은 키워드.
+
+    판정: relevance_llm == 3(구 무관)이고 relevance_codex도 3 이하(구 척도에는 4가
+    없었으므로)이며, 아직 bridge_rationale/재채점 흔적이 없는 것(needs_review로
+    걸려있던 것도 포함해 전부 다시 본다). 검색량(total) 내림차순.
+    """
+    sql = (
+        "SELECT keyword FROM keywords"
+        " WHERE relevance_llm = 3"
+        " AND (relevance_codex IS NULL OR relevance_codex <= 3)"
+        " ORDER BY total DESC"
+    )
+    if limit:
+        sql += f" LIMIT {int(limit)}"
+    return [row[0] for row in conn.execute(sql)]
+
+
+def rescore_legacy_unrelated_brand(
+    router: Any,
+    brand: str,
+    db_path: str | Path,
+    guides_dir: str | Path,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    limit: int = 0,
+    progress_path: str | Path | None = None,
+    codex_exe: str = "",
+) -> dict[str, int]:
+    """구 척도 3(무관)이던 키워드만 새 프롬프트로 재채점해 3(당위성)/4(무관)로 나눈다.
+
+    `score_and_crosscheck_brand`와 같은 패턴(클로드 100개 배치 → Codex 교차검증)을
+    쓰되, 대상을 `pending_legacy_unrelated_rows`로 좁힌다. 대량(5개 브랜드
+    약 3만 7천개) 실행은 이 함수를 부르는 CLI에서 브랜드별로 명시적으로
+    실행해야 한다(이 모듈은 자동으로 전량을 돌리지 않는다).
+
+    돌려주는 값은 `score_and_crosscheck_brand`와 같은 형태.
+    """
+    conn = sqlite3.connect(str(db_path))
+    added = migrate(conn)
+    if added:
+        log.info("마이그레이션 %s: %s", db_path, added)
+    try:
+        targets = pending_legacy_unrelated_rows(conn, limit=limit)
+        if not targets:
+            return {"scored": 0, "score_failed_batches": 0, "checked": 0, "codex_failed_batches": 0}
+        # 재채점 대상만 다시 미채점 상태로 되돌려 score_brand/crosscheck_brand의
+        # 기존 pending 로직을 그대로 재사용한다.
+        conn.executemany(
+            "UPDATE keywords SET scored_at = '', relevance_codex = NULL,"
+            " needs_review = 0, codex_checked_at = '' WHERE keyword = ?",
+            [(kw,) for kw in targets],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    return score_and_crosscheck_brand(
+        router,
+        brand,
+        db_path,
+        guides_dir,
+        batch_size=batch_size,
+        progress_path=progress_path,
+        codex_exe=codex_exe,
+    )
 
 
 # --- 브랜드 간 중복 배정 -----------------------------------------------
@@ -508,7 +633,7 @@ def brand_status(db_path: str | Path) -> dict[str, Any]:
     conn = sqlite3.connect(str(db_path))
     try:
         migrate(conn)
-        dist = dict.fromkeys(range(4), 0)
+        dist = dict.fromkeys(range(5), 0)
         for rel, cnt in conn.execute(
             "SELECT relevance_llm, COUNT(*) FROM keywords WHERE relevance_llm IS NOT NULL GROUP BY relevance_llm"
         ):
@@ -653,12 +778,13 @@ def write_crosscheck(conn: sqlite3.Connection, merged: list[dict[str, Any]]) -> 
     stamp = _now_iso()
     conn.executemany(
         "UPDATE keywords SET relevance_llm = ?, relevance_codex = ?, needs_review = ?,"
-        " codex_checked_at = ? WHERE keyword = ?",
+        " bridge_rationale = ?, codex_checked_at = ? WHERE keyword = ?",
         [
             (
                 r["final_relevance"],
                 r["relevance_codex"],
                 1 if r["needs_review"] else 0,
+                r.get("bridge_rationale", ""),
                 stamp,
                 r["keyword"],
             )
@@ -678,13 +804,52 @@ def agreement_rate(merged: list[dict[str, Any]]) -> float:
 
 
 def manuscript_eligible(row: dict[str, Any]) -> bool:
-    """원고 대상인가: 클로드·codex 둘 다 0~2 (사용자 지시 2026-09-23 §3)."""
+    """원고 대상인가: 클로드·codex 둘 다 0~2 (사용자 지시 2026-09-23 §3, 구 버전).
+
+    2026-09-24부터는 `is_manuscript_target`을 쓴다. 이 함수는 옛 호출부 호환용으로
+    남겨둔다.
+    """
     claude_rel = row.get("relevance")
     codex_rel = row.get("relevance_codex")
     if claude_rel is None or claude_rel > MANUSCRIPT_MAX_RELEVANCE:
         return False
     if codex_rel is not None and codex_rel > MANUSCRIPT_MAX_RELEVANCE:
         return False
+    return True
+
+
+def is_manuscript_target(row: Any) -> bool:
+    """원고(콘텐츠) 대상인가: relevance_llm·relevance_codex가 둘 다 0에서 3이고,
+    needs_review가 아니면 True (사용자 지시 2026-09-24).
+
+    `row`는 dict 또는 sqlite3.Row(둘 다 매핑처럼 `row["key"]`로 접근 가능)다.
+    `relevance_llm`이 없으면 `relevance` 키도 함께 본다(스코어링 직후의 임시
+    dict — DB 열 이름과 다를 수 있음).
+    이것이 sheets_writer.py/brand_queue.py/exposure_priority.py/
+    keyword_exposure.py가 공통으로 써야 하는 원고 대상 판정 함수다.
+    """
+
+    def _get(key: str) -> Any:
+        try:
+            val = row[key]
+        except (KeyError, IndexError):
+            return None
+        return val
+
+    llm_rel = _get("relevance_llm")
+    if llm_rel is None:
+        llm_rel = _get("relevance")
+    if llm_rel is None or int(llm_rel) > MANUSCRIPT_MAX_RELEVANCE:
+        return False
+
+    codex_rel = _get("relevance_codex")
+    if codex_rel is not None and int(codex_rel) > MANUSCRIPT_MAX_RELEVANCE:
+        return False
+
+    needs_review = _get("needs_review")
+    if needs_review:
+        return False
+
     return True
 
 
@@ -715,6 +880,11 @@ __all__ = [
     "write_crosscheck",
     "agreement_rate",
     "manuscript_eligible",
+    "is_manuscript_target",
+    "RELEVANCE_BRIDGE",
+    "RELEVANCE_UNRELATED",
+    "pending_legacy_unrelated_rows",
+    "rescore_legacy_unrelated_brand",
     "CODEX_DEFAULT_MODEL",
     "CODEX_FALLBACK_MODEL",
     "NEEDS_REVIEW_GAP",

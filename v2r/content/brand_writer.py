@@ -1952,6 +1952,8 @@ def build_body_prompt(
     manuscript_type: str = "",
     examples: list[str] | None = None,
     reference_brief: str = "",
+    relevance: int | None = None,
+    bridge_rationale: str = "",
 ) -> tuple[str, str]:
     """본문 생성용 `(공용 system, 이번 할 일 user)` 프롬프트.
 
@@ -1959,12 +1961,22 @@ def build_body_prompt(
     "본문을 써라"와 출력 형식, 키워드·카페는 user로 간다. `reference_brief`(통검
     1등 글 형식 요약, 2026-09-23 지시)도 키워드마다 달라지므로 user에만 넣는다
     — system(브랜드 공용, 캐시 대상)은 건드리지 않는다.
+
+    `relevance`가 3(당위성, `keyword_relevance.RELEVANCE_BRIDGE`)이면
+    `bridge_rationale`(연관도 재산정 때 모델이 낸 연결 논리 한 줄)을 user에
+    별도 블록으로 넣는다(사용자 지시 2026-09-24). system은 건드리지 않는다.
     """
     rule = rule_for(brand, manuscript_type)
     system = build_shared_system(brand, manuscript_type, guide_text, examples)
     lines = [BRAND_BODY_TASK, "", *_body_dynamic_block(rule, keyword, cafe)]
     if reference_brief:
         lines += ["", "【참고 형식(통검 1등 글)】", reference_brief]
+    if relevance == 3 and bridge_rationale:
+        lines += [
+            "",
+            "【당위성 논리】 " + bridge_rationale
+            + " — 이 논리로 자연스럽게 브랜드로 이어라(억지 연결 금지)",
+        ]
     user = "\n".join(lines)
     return system, user
 

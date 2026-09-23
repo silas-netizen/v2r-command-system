@@ -177,7 +177,7 @@ def test_노출완에서_밀려남_첫관측은_보류만_DB안바뀜(tmp_path, 
     brand, keyword = "테스트브랜드", "비만도계산기"
     store.save(rt.conn, _fake_row(brand, keyword, "exposed").as_row())
 
-    monkeypatch.setattr(exposure_runner, "judge_once", lambda rt_, ctx, b, item, cfg: _fake_row(b, item["keyword"], "pushed"))
+    monkeypatch.setattr(exposure_runner, "judge_once", lambda rt_, ctx, b, item, cfg, **kw: _fake_row(b, item["keyword"], "pushed"))
     item = {"keyword": keyword, "cafe": "마이카페", "t0_status": "", "volume": 0}
 
     result = exposure_runner.process_one(rt, object(), brand, item, {})
@@ -194,7 +194,7 @@ def test_재확인에서도_밀려남이면_확정(tmp_path, monkeypatch):
     store.save(rt.conn, _fake_row(brand, keyword, "exposed").as_row())
     item = {"keyword": keyword, "cafe": "마이카페", "t0_status": "", "volume": 0}
 
-    monkeypatch.setattr(exposure_runner, "judge_once", lambda rt_, ctx, b, i, cfg: _fake_row(b, i["keyword"], "pushed"))
+    monkeypatch.setattr(exposure_runner, "judge_once", lambda rt_, ctx, b, i, cfg, **kw: _fake_row(b, i["keyword"], "pushed"))
     exposure_runner.process_one(rt, object(), brand, item, {})  # 1차: 보류
 
     result = exposure_runner.process_one(rt, object(), brand, item, {})  # 2차: 또 밀려남
@@ -210,10 +210,10 @@ def test_재확인에서_다시_노출완이면_일시변동으로_취소(tmp_pa
     store.save(rt.conn, _fake_row(brand, keyword, "exposed").as_row())
     item = {"keyword": keyword, "cafe": "마이카페", "t0_status": "", "volume": 0}
 
-    monkeypatch.setattr(exposure_runner, "judge_once", lambda rt_, ctx, b, i, cfg: _fake_row(b, i["keyword"], "pushed"))
+    monkeypatch.setattr(exposure_runner, "judge_once", lambda rt_, ctx, b, i, cfg, **kw: _fake_row(b, i["keyword"], "pushed"))
     exposure_runner.process_one(rt, object(), brand, item, {})  # 1차: 보류
 
-    monkeypatch.setattr(exposure_runner, "judge_once", lambda rt_, ctx, b, i, cfg: _fake_row(b, i["keyword"], "exposed"))
+    monkeypatch.setattr(exposure_runner, "judge_once", lambda rt_, ctx, b, i, cfg, **kw: _fake_row(b, i["keyword"], "exposed"))
     result = exposure_runner.process_one(rt, object(), brand, item, {})  # 2차: 다시 노출완
     assert result.get("false_alarm_cleared") is True
     assert exposure_runner._latest_status(rt.conn, brand, keyword) == "exposed"
