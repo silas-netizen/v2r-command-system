@@ -468,3 +468,36 @@ def test_build_exposure_column_updates_J는_항상_정규화():
         existing_i="x", integrated_search_url_fn=None, keyword="kw",
     )
     assert updates["J"] == "2026-09-23 23:18:27"
+
+
+def test_last_data_row_ignores_trailing_blank_rows():
+    from v2r.sources.sheets_writer import _last_data_row
+
+    table = [["카페", "url"], ["", "", "", "", "", "", "", "k1"], [""] * 12, ["", ""], []]
+    assert _last_data_row(table) == 2
+    assert _last_data_row([["h"]]) == 1
+    assert _last_data_row([]) == 0
+
+
+def test_append_rows_starts_after_last_data_row_not_grid_end(monkeypatch):
+    from v2r.sources import sheets_writer as sw
+
+    table = [["카페"] + [""] * 7 + ["키워드"]] + [[""] * 7 + ["k%d" % i] for i in range(3)] + [[""] * 12] * 50
+    monkeypatch.setattr(sw, "_read_export_csv", lambda *a, **k: table)
+    calls = []
+
+    def fake_write(sid, gid, cell, rows, repo_root):
+        calls.append(cell)
+        return {"written": len(rows), "mode": "sheets"}
+
+    monkeypatch.setattr(sw, "_write_verified", fake_write)
+    monkeypatch.setattr(sw, "copy_row_format", lambda *a, **k: {"ok": True}, raising=False)
+    sw.append_rows("sid", "노출 현황", [["", "", "", "", "", "", "", "new"]], gid="1", copy_format=False)
+    assert calls == ["A5"]
+
+
+def test_norm_cell_date_without_leading_zero():
+    from v2r.sources.sheets_writer import _norm_cell
+
+    assert _norm_cell("2026-09-24 0:31:50") == _norm_cell("2026-09-24 00:31:50")
+    assert _norm_cell("2026-09-23 8:39:17") == "2026-09-23 08:39:17"

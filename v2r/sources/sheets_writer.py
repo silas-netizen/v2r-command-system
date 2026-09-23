@@ -466,11 +466,27 @@ def _verify(
     return True
 
 
+def _last_data_row(table: list[list[str]]) -> int:
+    """값이 하나라도 있는 마지막 행 번호(1-based). 비어 있으면 0, 헤더만 있으면 1."""
+    last = 0
+    for i, row in enumerate(table, 1):
+        if any(str(c).strip() for c in row):
+            last = i
+    return last
+
+
+_DATE_RE = re.compile(r"^(\d{4})-(\d{1,2})-(\d{1,2})[ T](\d{1,2}):(\d{2}):(\d{2})")
+
+
 def _norm_cell(value: Any) -> str:
     """검증용 정규화 — 시트가 숫자를 자동 서식(천 단위 콤마, 12345.0)해서 돌려주거나
     앞뒤 공백·개행 종류가 달라지는 것을 같은 값으로 본다 (사고 2026-09-23: P1/Q1 합계와
     검색량 열이 이 차이로 1,000회 넘게 "검증 불일치"로 찍혔다)."""
     s = str(value if value is not None else "").strip().replace("\r\n", "\n")
+    m = _DATE_RE.match(s)
+    if m:  # 시트가 날짜를 "2026-09-24 0:31:50"처럼 앞 0 없이 돌려준다 (2026-09-24)
+        y, mo, d, h, mi, se = m.groups()
+        return f"{y}-{int(mo):02d}-{int(d):02d} {int(h):02d}:{mi}:{se}"
     t = s.replace(",", "")
     try:
         f = float(t)
@@ -598,7 +614,10 @@ def append_rows(
     if not value_rows:
         return {"written": 0, "mode": "sheets"}
 
-    start_row1 = len(table) + 1
+    # 2026-09-24 사고: export CSV는 서식·데이터 확인만 있는 빈 행도 돌려주므로 len(table)은
+    # 격자 끝이지 데이터 끝이 아니다 — 우아덤 탭에서 4,947행 뒤 빈 행 8,979개를 건너뛰어
+    # 13,926행부터 붙였다. 마지막 '값이 있는 행' 다음에 붙인다.
+    start_row1 = _last_data_row(table) + 1
     written = 0
     errors: list[str] = []
     # 2026-09-23 실측: 1,000행을 한 번에 붙여넣으면 690행쯤에서 잘려 검증이 늘 실패했다
