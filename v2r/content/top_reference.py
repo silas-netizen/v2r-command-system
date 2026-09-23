@@ -480,6 +480,132 @@ def format_brief(ref: dict) -> str:
     return brief
 
 
+#: 2026-09-24 사용자 지시 — 자동 주입 대신 "차이 점수" 사전 알림으로 바꾼다.
+#: 5개 사례(더 완전 가까운 키워드) 조사 결과 형식이 "크게 다른" 사례가 없어
+#: 우리 형식은 유지하고, 대신 매 키워드 생성 전에 1위 글과 얼마나 다른지
+#: 계산해 임계(8항목 중 4개 이상 불일치)를 넘으면 생성 전에 사용자 확인
+#: 대기(hold)로 돌린다. 보고서: docs/reports/top-reference-cases-2026-09-24.md
+OUR_FORMAT = {
+    # 우리 브랜드 원고(질문형/후기형 두 유형만 씀 — brand_writer MTYPE_ROLE)
+    "title_type": {"질문형", "후기형"},
+    "opening": {"질문", "상황 서술"},
+    "closing_type": {"정리", "요청"},
+    # 단락 3~6개, 단락당 대략 150~500자를 정상 범위로 본다(대대댓글2 구조 기준 어림)
+    "paragraphs_min": 3,
+    "paragraphs_max": 6,
+    "para_len_min": 100,
+    "para_len_max": 600,
+    "has_list": False,
+    "has_subhead": False,
+    "images": 0,
+}
+
+#: 8개 비교 항목 이름(보고서·알림에 그대로 쓴다)
+FORMAT_GAP_ITEMS = (
+    "제목 유형",
+    "도입 방식",
+    "단락 수",
+    "단락 길이",
+    "마무리 방식",
+    "목록 사용",
+    "소제목 사용",
+    "사진 수",
+)
+
+#: 8항목 중 이 이상 불일치면 "크게 다름"으로 보고 사전 알림 + hold (사용자 지시)
+GAP_ALERT_THRESHOLD = 4
+
+
+def format_gap(ref: dict) -> list[str]:
+    """1위 글(`ref`)이 `OUR_FORMAT`과 다른 항목 이름 목록(형식만, 소재는 안 본다)."""
+    if not ref or ref.get("error"):
+        return []
+    gaps: list[str] = []
+    if ref.get("title_type") not in OUR_FORMAT["title_type"]:
+        gaps.append("제목 유형")
+    if ref.get("opening") not in OUR_FORMAT["opening"]:
+        gaps.append("도입 방식")
+    paragraphs = int(ref.get("paragraphs") or 0)
+    if not (OUR_FORMAT["paragraphs_min"] <= paragraphs <= OUR_FORMAT["paragraphs_max"]):
+        gaps.append("단락 수")
+    para_len = (int(ref.get("length") or 0) / paragraphs) if paragraphs else 0
+    if not (OUR_FORMAT["para_len_min"] <= para_len <= OUR_FORMAT["para_len_max"]):
+        gaps.append("단락 길이")
+    if ref.get("closing_type") not in OUR_FORMAT["closing_type"]:
+        gaps.append("마무리 방식")
+    if bool(ref.get("has_list")) != OUR_FORMAT["has_list"]:
+        gaps.append("목록 사용")
+    if bool(ref.get("has_subhead")) != OUR_FORMAT["has_subhead"]:
+        gaps.append("소제목 사용")
+    if int(ref.get("images") or 0) != OUR_FORMAT["images"]:
+        gaps.append("사진 수")
+    return gaps
+
+
+def _alerts_report_path(repo_root: str | Path) -> Path:
+    from datetime import date
+
+    return Path(repo_root) / "docs" / "reports" / f"top-reference-alerts-{date.today().isoformat()}.md"
+
+
+def _append_alert(repo_root: str | Path, brand: str, keyword: str, ref: dict, gaps: list[str]) -> None:
+    p = _alerts_report_path(repo_root)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    is_new = not p.exists()
+    with p.open("a", encoding="utf-8") as f:
+        if is_new:
+            f.write(f"# 통검 카페 1위 형식 차이 알림 ({p.stem.rsplit('-', 1)[-1]})\n\n")
+            f.write("사용자 확인 대기(hold)로 넘어간 키워드 목록. 형식만 비교(소재는 안 봄).\n\n")
+            f.write("| 브랜드 | 키워드 | 불일치 항목 | 1위 글 URL |\n|---|---|---|---|\n")
+        f.write(f"| {brand} | {keyword} | {', '.join(gaps)} | {ref.get('url', '')} |\n")
+
+
+def evaluate_alert(rt: Any, brand: str, keyword: str) -> dict:
+    """원고 생성 직전 호출. 차이 점수를 계산해 임계 이상이면 알림을 남기고 hold=True.
+
+    `top_reference.mode`가 `"alert"`일 때만 쓴다(기본은 이전처럼 `reference_for`로
+    brief를 프롬프트에 얹는 흐름). 실패해도 예외를 올리지 않고 hold=False로
+    돌아가 원고 생성을 막지 않는다.
+    """
+    result = {"hold": False, "gaps": [], "url": ""}
+    try:
+        if not _volume_gate(rt, brand, keyword):
+            return result
+    except Exception:
+        return result
+
+    repo_root = rt.settings.repo_root
+    cached = _load_cache(repo_root, keyword)
+    if cached is not None:
+        ref = cached
+    else:
+        cookies_path = Path(repo_root) / "data" / "naver_cookies.json"
+        try:
+            ref = fetch_top_article(keyword, cookies_path=cookies_path, headless=True) or {
+                "error": "빈 결과", "fetched_at": now_iso()
+            }
+        except Exception as exc:
+            log.warning("형식 알림: 수집 실패(%s/%s): %s", brand, keyword, exc)
+            ref = {"error": str(exc), "fetched_at": now_iso()}
+        try:
+            _save_cache(repo_root, keyword, ref)
+        except Exception as exc:
+            log.warning("형식 알림: 캐시 저장 실패(%s): %s", keyword, exc)
+
+    if ref.get("error"):
+        return result
+    result["url"] = ref.get("url", "")
+    gaps = format_gap(ref)
+    result["gaps"] = gaps
+    if len(gaps) >= GAP_ALERT_THRESHOLD:
+        result["hold"] = True
+        try:
+            _append_alert(repo_root, brand, keyword, ref, gaps)
+        except Exception as exc:
+            log.warning("형식 알림: 보고서 기록 실패(%s/%s): %s", brand, keyword, exc)
+    return result
+
+
 def _volume_gate(rt: Any, brand: str, keyword: str) -> bool:
     """검색량이 브랜드 pool 상위 top_pct% 이상이거나 min_volume 이상인지."""
     from v2r.content.brand_queue import _norm, _volume_map
@@ -489,7 +615,8 @@ def _volume_gate(rt: Any, brand: str, keyword: str) -> bool:
     min_volume = float(cfg.get("min_volume", 100) or 100)
 
     vol_map = _volume_map(brand, Path(rt.settings.data_dir))
-    total, _relevance = vol_map.get(_norm(keyword), (0.0, 99.0))
+    entry = vol_map.get(_norm(keyword), (0.0, 0, 99.0))
+    total = entry[0]
     if total >= min_volume:
         return True
     if not vol_map:

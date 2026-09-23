@@ -347,3 +347,118 @@ def test_save_cache_then_load_roundtrip_has_current_version(tmp_path):
     loaded = tr._load_cache(tmp_path, "새키워드")
     assert loaded is not None
     assert loaded["version"] == tr.CACHE_VERSION
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-24 — format_brief는 소재/내용 없이 형식만 (사용자 지시: 단순 소재
+# 카피 제외) / format_gap·evaluate_alert (사전 알림 + hold)
+# ---------------------------------------------------------------------------
+
+
+def test_format_brief_has_no_content_only_format_labels():
+    ref = {
+        "source": "cafe",
+        "title_type": "후기형",
+        "length": 1200,
+        "paragraphs": 4,
+        "images": 0,
+        "opening": "상황 서술",
+        "closing_type": "정리",
+        "has_list": False,
+        "has_subhead": False,
+    }
+    brief = tr.format_brief(ref)
+    # 형식 라벨(제목 유형/본문 길이/단락/사진/도입/마무리/목록)만 있고 소재·상품명·
+    # 본문 문장은 절대 없어야 한다 — 값은 전부 분류 라벨이나 숫자뿐이다.
+    for label in ("제목 유형", "본문 길이", "단락", "사진", "도입 방식", "마무리 방식", "목록/소제목"):
+        assert label in brief
+
+
+def test_format_gap_empty_when_matches_our_format():
+    ref = {
+        "title_type": "질문형",
+        "opening": "질문",
+        "paragraphs": 4,
+        "length": 4 * 300,
+        "closing_type": "정리",
+        "has_list": False,
+        "has_subhead": False,
+        "images": 0,
+    }
+    assert tr.format_gap(ref) == []
+
+
+def test_format_gap_flags_each_mismatched_item():
+    ref = {
+        "title_type": "정보형",  # 다름
+        "opening": "결론 먼저",  # 다름
+        "paragraphs": 12,  # 다름 (3~6 범위 밖)
+        "length": 12 * 900,  # 단락당 900자 -> 다름 (100~600 범위 밖)
+        "closing_type": "질문",  # 다름
+        "has_list": True,  # 다름
+        "has_subhead": True,  # 다름
+        "images": 3,  # 다름
+    }
+    gaps = tr.format_gap(ref)
+    assert len(gaps) == 8
+    assert gaps == list(tr.FORMAT_GAP_ITEMS)
+
+
+def test_format_gap_empty_for_error_or_none():
+    assert tr.format_gap(None) == []
+    assert tr.format_gap({"error": "실패"}) == []
+
+
+def test_evaluate_alert_below_volume_no_hold(tmp_path):
+    rt = _rt(tmp_path)
+    _make_keywords_db(
+        tmp_path,
+        "우아덤",
+        [("높은키워드1", 90, 1), ("높은키워드2", 80, 1), ("높은키워드3", 70, 1), ("낮은키워드", 1, 1)],
+    )
+    result = tr.evaluate_alert(rt, "우아덤", "낮은키워드")
+    assert result == {"hold": False, "gaps": [], "url": ""}
+
+
+def test_evaluate_alert_holds_and_writes_report_on_big_gap(tmp_path, monkeypatch):
+    rt = _rt(tmp_path)
+    _make_keywords_db(tmp_path, "우아덤", [("높은키워드", 500, 1)])
+    ref = {
+        "url": "https://cafe.naver.com/x/1",
+        "title_type": "정보형",
+        "opening": "결론 먼저",
+        "paragraphs": 12,
+        "length": 12 * 900,
+        "closing_type": "질문",
+        "has_list": True,
+        "has_subhead": True,
+        "images": 3,
+    }
+    monkeypatch.setattr(tr, "fetch_top_article", lambda *a, **k: ref)
+    result = tr.evaluate_alert(rt, "우아덤", "높은키워드")
+    assert result["hold"] is True
+    assert len(result["gaps"]) >= tr.GAP_ALERT_THRESHOLD
+    report = tr._alerts_report_path(tmp_path)
+    assert report.exists()
+    text = report.read_text(encoding="utf-8")
+    assert "우아덤" in text and "높은키워드" in text and ref["url"] in text
+
+
+def test_evaluate_alert_no_hold_when_gap_small(tmp_path, monkeypatch):
+    rt = _rt(tmp_path)
+    _make_keywords_db(tmp_path, "우아덤", [("높은키워드", 500, 1)])
+    ref = {
+        "url": "https://cafe.naver.com/x/2",
+        "title_type": "질문형",
+        "opening": "질문",
+        "paragraphs": 4,
+        "length": 4 * 300,
+        "closing_type": "정리",
+        "has_list": False,
+        "has_subhead": False,
+        "images": 0,
+    }
+    monkeypatch.setattr(tr, "fetch_top_article", lambda *a, **k: ref)
+    result = tr.evaluate_alert(rt, "우아덤", "높은키워드")
+    assert result["hold"] is False
+    assert not tr._alerts_report_path(tmp_path).exists()

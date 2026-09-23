@@ -122,9 +122,22 @@ def generate_for_brand(rt: Any, brand: str, n: int, target: str = "") -> dict:
             try:
                 from v2r.content import top_reference
 
-                reference_brief = top_reference.reference_for(
-                    rt, brand, row["keyword"], meta=reference_meta
-                )
+                if str((top_reference._cfg() or {}).get("mode", "")) == "alert":
+                    # 2026-09-24 지시: 자동 주입 대신 차이 점수 사전 알림.
+                    # 임계 이상 다르면 이 키워드는 hold로 돌리고 원고를
+                    # 만들지 않는다(사용자 확인 대기).
+                    alert = top_reference.evaluate_alert(rt, brand, row["keyword"])
+                    if alert.get("hold"):
+                        brand_queue.mark(rt, row["id"], "hold", attempts=int(row["attempts"] or 0))
+                        log.info(
+                            "형식 알림: hold(%s/%s) 불일치=%s url=%s",
+                            brand, row["keyword"], alert.get("gaps"), alert.get("url"),
+                        )
+                        continue
+                else:
+                    reference_brief = top_reference.reference_for(
+                        rt, brand, row["keyword"], meta=reference_meta
+                    )
             except Exception as exc:  # 참고 형식은 덤 — 실패해도 원고 생성은 막지 않는다
                 log.warning("참고 형식 조회 실패(%s/%s): %s", brand, row["keyword"], exc)
             relevance_llm, bridge_rationale = brand_queue.bridge_info(
