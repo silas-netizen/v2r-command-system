@@ -2347,7 +2347,11 @@ def _sheet_sync_keywords(rt: Runtime, spec: TaskSpec) -> dict:
     from v2r.sources import sheets_writer
 
     brand = (spec.brand or "").strip()
-    repo_root = rt.settings.repo_root
+    # `config/brands.yaml`은 `repo_root`가 아니라 항상 "진짜" 설정 폴더
+    # (`config_dir`)의 부모 밑에서 찾는다. `repo_root`는 산출물(보고서 등) 쓰기
+    # 경로용으로 시험 중 가짜 폴더로 바뀔 수 있어(2026-09-23) `config/` 하위가
+    # 없을 수 있다.
+    repo_root = rt.settings.config_dir.parent
     if brand:
         out = sheets_writer.sync_keywords_to_sheet(brand, repo_root=repo_root)
         per_brand = {brand: out}

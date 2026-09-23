@@ -141,6 +141,13 @@ def test_예전_DB에도_줄_칸이_생긴다(tmp_path):
 # --------------------------------------------------------------------
 def test_틱이_예약과_감시와_수신과_가벼운_작업을_모두_돌린다(tmp_path, monkeypatch):
     rt = make_runtime(tmp_path)
+    # `pending_report`(미처리 알림)가 실제로 "성공"하려면 미처리 목록 파일이
+    # 있어야 한다(2026-09-23, `repo_root`가 시험용 가짜 폴더로 격리되면서
+    # 파일이 없어 "실패"로 잘못 나오던 것을 고정 — 이 시험의 목적은 파일
+    # 내용이 아니라 가벼운 작업이 같은 틱에서 바로 실행되는지 확인하는 것).
+    reports_dir = rt.settings.repo_root / "docs" / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    (reports_dir / "pending.md").write_text("# 미처리 목록\n\n(없음)\n", encoding="utf-8")
     channel = _FakeChannel(["미처리 알림"])
     rt._channels = [channel]
     seen: list[str] = []

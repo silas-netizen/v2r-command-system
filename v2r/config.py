@@ -89,7 +89,12 @@ def _build_settings() -> Settings:
     root = Path(os.getenv("V2R_REPO_ROOT") or REPO_ROOT)
     data_dir = Path(os.getenv("V2R_DATA_DIR") or (root / "data"))
     warehouse_dir = Path(os.getenv("V2R_WAREHOUSE_DIR") or (root / "warehouse"))
-    config_dir = root / "config"
+    #: `config/*.yaml`은 시험 중에도 항상 "진짜" 저장소 설정을 읽는다.
+    #: `V2R_REPO_ROOT`는 `docs/reports`·`data` 같은 산출물 경로만 시험용 가짜
+    #: 폴더로 돌리기 위한 것이지, 읽기 전용인 설정 파일까지 가짜 빈 폴더로
+    #: 돌리면 "실제 설정값과 같은지" 확인하는 시험이 전부 빈 설정을 보게 된다
+    #: (2026-09-23, 시험 전수 실행에서 발견).
+    config_dir = REPO_ROOT / "config"
 
     settings = Settings(
         v2r_email=os.getenv("V2R_EMAIL", ""),

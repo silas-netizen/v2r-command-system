@@ -219,7 +219,12 @@ def test_extract_ordered_result_links_화면_순서대로_중복제거():
 
 def test_brand_identifiers_설정에서_읽는다(tmp_path):
     rt = make_runtime(tmp_path)
-    rt.settings.repo_root = tmp_path  # config/brands.yaml 없음 → 브랜드명 폴백
+    # `config/brands.yaml`은 이제 `repo_root`가 아니라 `config_dir`(항상 진짜
+    # 저장소 설정)에서 읽는다(2026-09-23, 시험이 `repo_root`를 가짜로 돌려도
+    # 설정 확인 시험이 빈 설정을 보지 않게 분리). 여기서는 "설정 파일이
+    # 없을 때 브랜드명으로 대체" 동작을 확인해야 하므로 `config_dir` 자체를
+    # 빈 폴더로 돌린다.
+    rt.settings.config_dir = tmp_path / "config"  # brands.yaml 없음 → 브랜드명 폴백
     assert ke.brand_identifiers(rt, "우아덤") == ["우아덤"]
 
 

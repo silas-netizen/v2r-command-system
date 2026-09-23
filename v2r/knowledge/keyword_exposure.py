@@ -1310,7 +1310,7 @@ def load_cafe_registry(rt: Any) -> list[dict]:
     """`config/cafes.yaml`의 제휴+자사 카페 목록(이름·번호·별칭)."""
     import yaml
 
-    path = Path(rt.settings.repo_root) / CAFES_CONFIG_PATH
+    path = Path(rt.settings.config_dir.parent) / CAFES_CONFIG_PATH
     try:
         data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     except Exception as exc:
@@ -1474,7 +1474,7 @@ def brand_identifiers(rt: Any, brand: str) -> list[str]:
     """`config/brands.yaml`의 `identifiers`(없으면 브랜드명 자체 하나)."""
     import yaml
 
-    path = Path(rt.settings.repo_root) / BRANDS_CONFIG_PATH
+    path = Path(rt.settings.config_dir.parent) / BRANDS_CONFIG_PATH
     try:
         data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     except Exception as exc:

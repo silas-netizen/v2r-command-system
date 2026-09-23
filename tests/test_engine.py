@@ -666,6 +666,16 @@ def test_모든_허용작업에_처리기가_있다(tmp_path, monkeypatch):
         "v2r.knowledge.keyword_exposure.run_check",
         lambda rt_, brand, limit=0, **k: [],
     )
+    # 시트 키워드 반영(2026-09-23 추가)은 헤드리스 브라우저로 진짜 구글 시트를
+    # 편집한다 — 이 범용 커버리지 시험에서는 가짜로 막는다.
+    monkeypatch.setattr(
+        "v2r.sources.sheets_writer.sync_keywords_all",
+        lambda **k: {},
+    )
+    monkeypatch.setattr(
+        "v2r.sources.sheets_writer.sync_keywords_to_sheet",
+        lambda brand, **k: {"skipped": True, "reason": "test"},
+    )
 
     for index, task in enumerate(sorted(ALLOWED_TASKS)):
         spec = TaskSpec(

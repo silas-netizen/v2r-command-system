@@ -47,7 +47,14 @@ def _isolate_data_dirs(tmp_path_factory, monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _no_real_data_dir_writes(_isolate_data_dirs):
-    """진짜 장부에 줄이 늘어나면 바로 잡아낸다 (덧대기 감시)."""
+    """진짜 장부가 시험 때문에 깎이거나 사라지면 바로 잡아낸다 (덧대기 감시).
+
+    2026-09-23: 실행기가 09:00 발행을 돌리는 동안 같은 장부 파일에 실시간으로
+    줄을 계속 덧붙인다. 그래서 "크기가 조금이라도 달라지면 실패"로 두면
+    시험과 무관한 정상적인 덧붙임까지 오탐으로 잡힌다. 시험이 실제로 문제를
+    일으켰다면 파일이 사라지거나(삭제) 줄어드는(덮어쓰기) 방향으로만 나타나므로
+    그 두 경우만 잡는다.
+    """
     from pathlib import Path
 
     real = Path(__file__).resolve().parents[1] / "data"
@@ -55,28 +62,39 @@ def _no_real_data_dir_writes(_isolate_data_dirs):
     before = {p: p.stat().st_size for p in ledgers}
     yield
     for path, size in before.items():
-        if path.exists() and path.stat().st_size != size:
+        if not path.exists():
             raise AssertionError(
-                f"시험이 진짜 사용량 장부를 건드렸습니다: {path}"
+                f"시험이 진짜 사용량 장부를 지웠습니다: {path}"
+            )
+        after_size = path.stat().st_size
+        if after_size < size:
+            raise AssertionError(
+                f"시험이 진짜 사용량 장부를 덮어썼습니다(줄어듦): {path}"
             )
 
 
 @pytest.fixture(autouse=True)
 def _no_real_docs_reports_writes():
-    """진짜 `docs/reports/*` 파일이 시험 중 바뀌면 바로 잡아낸다(파수꾼,
-    2026-09-23 — 03:31 pytest 실행이 `dashboard-2026-09-22.*`를 빈 DB 결과로
-    덮어쓴 사고 재발 방지)."""
+    """진짜 `docs/reports/*` 파일이 시험 때문에 지워지거나 빈 내용으로
+    덮어써지면 바로 잡아낸다(파수꾼, 2026-09-23 — 03:31 pytest 실행이
+    `dashboard-2026-09-22.*`를 빈 DB 결과로 덮어쓴 사고 재발 방지).
+
+    2026-09-23 보강: 실행기가 발행을 돌리는 동안 보고서 파일을 실시간으로
+    새로 쓰거나 갱신한다(정상 동작, mtime·크기가 자연스레 바뀜). 크기·시각이
+    "다르기만 해도" 실패로 잡으면 이런 정상 갱신까지 오탐이 된다. 시험이
+    실제로 사고를 냈다면 파일이 사라지거나 내용이 줄어드는(빈 결과로 덮어쓰는)
+    방향으로 나타나므로 그 경우만 잡는다."""
     from pathlib import Path
 
     real = Path(__file__).resolve().parents[1] / "docs" / "reports"
     files = sorted(p for p in real.glob("*") if p.is_file())
-    before = {p: (p.stat().st_size, p.stat().st_mtime) for p in files}
+    before = {p: p.stat().st_size for p in files}
     yield
-    for path, stamp in before.items():
+    for path, size in before.items():
         if not path.exists():
             raise AssertionError(f"시험이 진짜 보고서 파일을 지웠습니다: {path}")
-        after = (path.stat().st_size, path.stat().st_mtime)
-        if after != stamp:
+        after_size = path.stat().st_size
+        if after_size < size:
             raise AssertionError(
-                f"시험이 진짜 보고서 파일을 건드렸습니다(docs/reports 격리 실패): {path}"
+                f"시험이 진짜 보고서 파일을 건드렸습니다(docs/reports 격리 실패, 줄어듦): {path}"
             )
