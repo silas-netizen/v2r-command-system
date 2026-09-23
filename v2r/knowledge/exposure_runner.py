@@ -668,76 +668,90 @@ def complete_inflight(
 # =======================================================================
 
 
+class _BrandQueueState:
+    __slots__ = ("items", "expires_at", "consumed", "claim_failed", "stale_skipped")
+
+    def __init__(self) -> None:
+        self.items: list[dict] = []
+        self.expires_at: float = 0.0
+        self.consumed = 0
+        self.claim_failed = 0
+        self.stale_skipped = 0
+
+
 class WorkerQueue:
-    """브랜드 하나의 우선순위 배치를 메모리에 들고 하나씩 내준다."""
+    """브랜드별 우선순위 배치를 메모리에 들고 하나씩 내준다.
+
+    2026-09-24 4차(실측 8) — 작업자가 매 반복마다 브랜드를 바꿔 도는데(중복
+    재검사 방지를 위해 브랜드 고정을 되돌린 ab32ce5), 이전 구현은 브랜드
+    하나짜리 큐 한 개만 들고 있어 브랜드가 바뀔 때마다(사실상 매번) 배치를
+    통째로 버리고 새로 조회했다 — 로그 실측으로 확인(`타이밍 큐소비`가
+    항상 "소비=1 ... 남은채로재조회=9"). 브랜드별로 큐를 따로 둬서, 5개
+    브랜드를 순환해도 각 브랜드의 배치(기본 10개)가 실제로 다 소비될 때까지
+    유지되게 고쳤다."""
 
     def __init__(self, batch_size: int = 10, ttl_sec: float = 120.0):
         self.batch_size = max(1, int(batch_size))
         self.ttl_sec = float(ttl_sec)
-        self.items: list[dict] = []
-        self.brand: str | None = None
-        self.expires_at: float = 0.0
-        # 2026-09-24 지시 — 배치가 실제로 몇 개나 소비되는지(claim_inflight
-        # 충돌로 대부분 버려져 재조회가 잦은 건 아닌지) 로그로 확인한다.
-        self._consumed = 0
-        self._claim_failed = 0
-        # 2026-09-24 3차 — 캐시(정렬 목록)가 이미 다른 작업자가 검사한 후보를
-        # 들고 있어 뽑혔지만, 검사 직전 DB 단건 확인(`is_due_now`)에서 걸린 수.
-        self._stale_skipped = 0
+        self._by_brand: dict[str, _BrandQueueState] = {}
 
-    def _needs_refill(self, brand: str, now: float) -> bool:
-        return brand != self.brand or now >= self.expires_at or not self.items
+    def _state(self, brand: str) -> _BrandQueueState:
+        return self._by_brand.setdefault(brand, _BrandQueueState())
+
+    def _needs_refill(self, state: _BrandQueueState, now: float) -> bool:
+        return now >= state.expires_at or not state.items
 
     def refill_if_needed(self, rt: Any, brand: str, now: float | None = None) -> None:
         now = now if now is not None else time.time()
-        if not self._needs_refill(brand, now):
+        state = self._state(brand)
+        if not self._needs_refill(state, now):
             return
         from v2r.knowledge import exposure_priority
 
-        if self.brand is not None:
+        if state.expires_at > 0:
             log.info(
                 "타이밍 큐소비 브랜드=%s 소비=%s 선점실패=%s 직전확인제외=%s 남은채로재조회=%s",
-                self.brand, self._consumed, self._claim_failed, self._stale_skipped, len(self.items),
+                brand, state.consumed, state.claim_failed, state.stale_skipped, len(state.items),
             )
         # next_priority_batch 자체는 이미 선점 중인(claim_inflight) 항목을
         # 걸러 주지만(2026-09-24 2차), 이 배치를 받은 뒤에도 다른 작업자가
         # 그 사이 선점할 수 있으므로 take()에서 다시 한 번 확인한다.
         t0 = time.perf_counter()
-        self.items = list(exposure_priority.next_priority_batch(rt, brand, n=self.batch_size))
+        state.items = list(exposure_priority.next_priority_batch(rt, brand, n=self.batch_size))
         log.info(
             "타이밍 큐조회 브랜드=%s round_trip=%.2fs 배치=%s",
-            brand, time.perf_counter() - t0, len(self.items),
+            brand, time.perf_counter() - t0, len(state.items),
         )
-        self.brand = brand
-        self.expires_at = now + self.ttl_sec
-        self._consumed = 0
-        self._claim_failed = 0
-        self._stale_skipped = 0
+        state.expires_at = now + self.ttl_sec
+        state.consumed = 0
+        state.claim_failed = 0
+        state.stale_skipped = 0
 
     def take(self, rt: Any, brand: str, worker_id: int, now: float | None = None) -> dict | None:
-        """큐에서 `claim_inflight`로 선점에 성공하고, 검사 직전 DB 단건 확인
-        (`exposure_priority.is_due_now`, 2026-09-24 3차)까지 통과하는 첫
-        항목을 꺼내 돌려준다.
+        """이 브랜드 큐에서 `claim_inflight`로 선점에 성공하고, 검사 직전 DB
+        단건 확인(`exposure_priority.is_due_now`, 2026-09-24 3차)까지 통과하는
+        첫 항목을 꺼내 돌려준다.
 
         선점 실패한 항목(다른 작업자가 방금 집음)이나, 선점엔 성공했지만
         직전 확인에서 "이미 다른 작업자가 방금 검사했다"고 나온 항목은
         버리고 다음 항목을 시도한다(후자는 선점을 도로 풀어 다른 작업자가
-        헛수고로 붙잡고 있지 않게 한다). 큐가 다 비면 새로 조회하지 않고
-        `None`을 돌려준다 — 호출자가 잠시 쉬었다 다음 틱에 다시 부르면 그때
-        TTL·빈 큐 조건으로 재조회된다."""
+        헛수고로 붙잡고 있지 않게 한다). 이 브랜드 큐가 다 비면 새로 조회하지
+        않고 `None`을 돌려준다 — 호출자가 다른 브랜드로 넘어갔다가 다음에
+        이 브랜드로 돌아오면 그때 TTL·빈 큐 조건으로 재조회된다."""
         from v2r.knowledge import exposure_priority
 
         self.refill_if_needed(rt, brand, now)
-        while self.items:
-            candidate = self.items.pop(0)
+        state = self._state(brand)
+        while state.items:
+            candidate = state.items.pop(0)
             if not claim_inflight(rt.settings.repo_root, brand, candidate["keyword"], worker_id):
-                self._claim_failed += 1
+                state.claim_failed += 1
                 continue
             if not exposure_priority.is_due_now(rt, brand, candidate):
                 release_inflight(rt.settings.repo_root, brand, candidate["keyword"])
-                self._stale_skipped += 1
+                state.stale_skipped += 1
                 continue
-            self._consumed += 1
+            state.consumed += 1
             return candidate
         return None
 

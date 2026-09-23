@@ -405,7 +405,11 @@ def test_universe_캐시_TTL안에는_한번만_조회(tmp_path, monkeypatch):
 
 
 def test_universe_캐시_TTL지나면_다시_조회(tmp_path, monkeypatch):
+    """프로세스 메모리 캐시가 TTL 지나 만료되면 다시 조회해야 한다 — 4차에서
+    추가된 파일 캐시(작업자 프로세스 간 공유)는 이 시험의 관심사가 아니므로
+    비활성화해(항상 미스로) 순수 프로세스 캐시 동작만 본다."""
     exposure_priority.invalidate_universe_cache(None)
+    monkeypatch.setattr(exposure_priority, "_read_universe_file_cache", lambda rt_, brand, ttl: None)
     rt = make_runtime(tmp_path)
     calls = {"n": 0}
 
@@ -420,8 +424,8 @@ def test_universe_캐시_TTL지나면_다시_조회(tmp_path, monkeypatch):
     exposure_priority.next_priority_batch(rt, "테스트브랜드", n=1, now=now0)
     assert calls["n"] == 1
 
-    # 기본 TTL(120초) + 여유 지남 — 다시 조회해야 한다
-    monkeypatch.setattr(exposure_priority.time, "time", lambda: 1_000_000.0 + 200.0)
+    # 기본 TTL(600초, 4차에서 120→600으로 상향) + 여유 지남 — 다시 조회해야 한다
+    monkeypatch.setattr(exposure_priority.time, "time", lambda: 1_000_000.0 + 650.0)
     exposure_priority.next_priority_batch(rt, "테스트브랜드", n=1, now=now0)
     assert calls["n"] == 2
 
@@ -511,6 +515,7 @@ def test_is_due_now_직전확인(tmp_path, monkeypatch):
 
 def test_invalidate_universe_cache_비우면_다시조회(tmp_path, monkeypatch):
     exposure_priority.invalidate_universe_cache(None)
+    monkeypatch.setattr(exposure_priority, "_read_universe_file_cache", lambda rt_, brand, ttl: None)
     rt = make_runtime(tmp_path)
     calls = {"n": 0}
 
@@ -643,7 +648,7 @@ def test_worker_queue_직전확인에서_걸리면_다음후보(tmp_path, monkey
     wq = exposure_runner.WorkerQueue(batch_size=2, ttl_sec=120.0)
     item = wq.take(rt, "테스트브랜드", worker_id=0)
     assert item["keyword"] == "새것"
-    assert wq._stale_skipped == 1
+    assert wq._state("테스트브랜드").stale_skipped == 1
     # 직전 확인에서 걸린 "방금검사됨"은 선점이 다시 풀려 다른 작업자가 집을 수 있다
     assert exposure_runner.is_inflight(rt.settings.repo_root, "테스트브랜드", "방금검사됨") is False
 
@@ -686,3 +691,74 @@ def test_process_one_주기지난_재검사는_duplicate_False(tmp_path, monkeyp
     monkeypatch.setattr(exposure_runner, "judge_once", lambda rt_, ctx, b, i, cfg, **kw: _fake_row(b, i["keyword"], "pushed"))
     result = exposure_runner.process_one(rt, object(), brand, item, {})
     assert result["duplicate"] is False
+
+
+# =======================================================================
+# 2026-09-24 4차 — 브랜드 순환 중에도 배치가 실제로 소비되는지(실측 8:
+# "소비=1 ... 남은채로재조회=9"가 매번 나오던 결함), universe 파일 캐시
+# =======================================================================
+
+
+def test_worker_queue_브랜드순환해도_배치가_유지됨(tmp_path, monkeypatch):
+    """5개 브랜드를 매 반복 바꿔 가며 take()해도, 각 브랜드 배치(10개)가
+    실제로 다 소비될 때까지 재조회하지 않아야 한다(2026-09-24 4차 —
+    이전엔 브랜드가 바뀔 때마다 큐를 통째로 버려 사실상 매번 재조회했다)."""
+    rt = make_runtime(tmp_path)
+    calls: dict[str, int] = {}
+
+    def fake_batch(rt_, brand, n, now=None):
+        calls[brand] = calls.get(brand, 0) + 1
+        return [{"keyword": f"{brand}-{calls[brand]}-{i}", "cafe": "마이카페", "volume": 0} for i in range(n)]
+
+    monkeypatch.setattr(exposure_priority, "next_priority_batch", fake_batch)
+
+    wq = exposure_runner.WorkerQueue(batch_size=10, ttl_sec=600.0)
+    brands = ["브랜드A", "브랜드B", "브랜드C", "브랜드D", "브랜드E"]
+    # 브랜드를 매번 바꿔 가며 각 브랜드당 10개씩(배치 크기만큼) 소비한다
+    for _round in range(10):
+        for b in brands:
+            item = wq.take(rt, b, worker_id=0)
+            assert item is not None
+            exposure_runner.release_inflight(rt.settings.repo_root, b, item["keyword"])
+
+    # 브랜드마다 배치(10개)가 정확히 한 번씩만 조회됐어야 한다(10라운드×10개=100건을
+    # 배치 1번으로 다 소비) — 이전 결함이면 브랜드당 10회(라운드마다) 조회됐을 것.
+    assert calls == {b: 1 for b in brands}
+
+
+def test_universe_bundle_파일캐시로_프로세스간_공유(tmp_path, monkeypatch):
+    """2026-09-24 4차 — 작업자 프로세스 A가 만든 universe 파일 캐시
+    (`data/exposure_universe_cache/<브랜드>.json`)를, 프로세스 메모리 캐시가
+    없는(A와는 다른 프로세스라고 흉내낸) 다른 호출도 네트워크 없이 재사용해야
+    한다."""
+    rt = make_runtime(tmp_path)
+    calls = {"n": 0}
+
+    def fake_universe(rt_, brand):
+        calls["n"] += 1
+        return [{"keyword": "키워드", "cafe": "마이카페", "volume": 0}]
+
+    monkeypatch.setattr(ke, "keyword_universe", fake_universe)
+    exposure_priority.invalidate_universe_cache(None)
+
+    # 1차: 실제로 읽고 파일 캐시에 씀
+    bundle1 = exposure_priority._universe_bundle(
+        rt, "테스트브랜드", {"universe_cache_sec": 600, "universe_file_cache_sec": 600}, datetime.now(timezone.utc)
+    )
+    assert calls["n"] == 1
+    cache_file = exposure_priority._universe_file_cache_path(rt, "테스트브랜드")
+    assert cache_file.exists()
+
+    # 2차: 프로세스 메모리 캐시를 비워(다른 프로세스인 것처럼) 다시 불러도
+    # 파일 캐시가 있으면 keyword_universe를 다시 안 부른다
+    exposure_priority.invalidate_universe_cache(rt, "테스트브랜드")
+    bundle2 = exposure_priority._universe_bundle(
+        rt, "테스트브랜드", {"universe_cache_sec": 600, "universe_file_cache_sec": 600}, datetime.now(timezone.utc)
+    )
+    assert calls["n"] == 1, "파일 캐시가 있으면 네트워크(keyword_universe)를 다시 안 불러야 한다"
+    assert bundle2["universe"] == bundle1["universe"]
+
+
+def test_universe_cache_sec_기본값_600(tmp_path):
+    cfg = exposure_priority.load_config(tmp_path)
+    assert cfg["priority"]["universe_cache_sec"] == 600

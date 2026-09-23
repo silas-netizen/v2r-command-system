@@ -36,8 +36,18 @@ priority:
   # 2026-09-24 큐 캐시(exposure-speed-2026-09-24.md 6절) — keyword_universe(시트
   # CSV·키워드DB 전량 읽기)+최근 발행 집합 및 정렬된 후보 목록을 이 초만큼
   # 브랜드별로 캐시한다.
-  universe_cache_sec: 120
+  # 4차(실측 8, 6-5·6-6절) — 작업자가 매번 브랜드를 바꿔 돌아, 120초로는
+  # 같은 브랜드로 돌아오기 전에 거의 매번 캐시가 만료됐다(로그로 확정).
+  # 정확성(중복 재검사 방지)은 이제 next_priority_batch의 DB 직전 확인이
+  # 캐시와 무관하게 지키므로 600초(10분)로 늘려도 안전하다.
+  universe_cache_sec: 600
+  # 4차 — universe 번들을 작업자 프로세스 간에도 공유하는 파일 캐시 TTL(초).
+  # data/exposure_universe_cache/<브랜드>.json, mtime 기준.
+  universe_file_cache_sec: 600
   # 한 번에 뽑아 작업자 메모리 큐에 쌓아 둘 후보 수(매번 n=1로 조회하던 것을 배치로).
+  # 4차 — WorkerQueue가 이제 브랜드별로 큐를 따로 두므로(이전엔 브랜드가
+  # 바뀔 때마다 큐를 통째로 버려 사실상 매번 재조회했다) 이 배치가 실제로
+  # 다 소비된다.
   batch_size: 10
   # 2026-09-24 2차(6-2절) — universe 캐시 후에도 개선이 없어 last_checked(DB
   # 전체 이력 쿼리)도 이 초만큼 캐시한다. 러너가 검사 결과를 저장한 직후

@@ -19,7 +19,9 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -44,7 +46,20 @@ _DEFAULT_PRIORITY = {
     # `store.latest_by_keyword`(DB 조회 1건)는 가벼워서 캐시하지 않고 매번
     # 새로 읽는다 — 그래서 방금 이 작업자가 저장한 검사 결과는 캐시와 무관하게
     # 항상 바로 반영된다.
-    "universe_cache_sec": 120,
+    #
+    # 2026-09-24 4차(실측 8, 6-5·6-6절) — 120초였을 때 실측해 보니 작업자가
+    # 매번 브랜드를 바꿔(5개 순환) 같은 브랜드로 돌아오기까지 평균 150초 이상
+    # 걸려 TTL 안에 캐시가 거의 재사용되지 못했다(원인 (a), 로그 실측으로
+    # 확정 — 4차 절 참고). 정확성(중복 재검사 방지)은 이제 `next_priority_batch`
+    # 의 후보별 DB 직전 확인과 `is_due_now`가 캐시와 무관하게 항상 지키므로,
+    # 이 캐시는 "정렬 순서·최근 발행 집합의 신선도"에만 영향을 준다 — 600초
+    # (10분)로 늘려도 안전하다.
+    "universe_cache_sec": 600,
+    # 4차 — universe 번들(시트 CSV 포함)을 작업자 프로세스 간에도 공유하는
+    # 파일 캐시 TTL(초). 기본은 universe_cache_sec과 같지만 따로 조정 가능.
+    # `data/exposure_universe_cache/<브랜드>.json`에 저장되며, 어느 작업자든
+    # 이 파일이 신선하면(mtime 기준) 네트워크 없이 읽는다.
+    "universe_file_cache_sec": 600,
     # 러너가 한 번에 뽑아 작업자 메모리 큐에 쌓아 둘 후보 수(1건씩 매번
     # 조회하던 것을 배치로 바꿈 — exposure_runner.WorkerQueue 참고).
     "batch_size": 10,
@@ -83,23 +98,94 @@ def invalidate_universe_cache(rt: Any, brand: str | None = None) -> None:
     _UNIVERSE_CACHE.pop(key, None)
 
 
+#: 2026-09-24 4차 — universe 번들을 작업자 프로세스 간에도 공유하는 파일 캐시.
+#: `data/exposure_universe_cache/<브랜드>.json`, mtime 기준으로 신선도 판단.
+_UNIVERSE_FILE_CACHE_DIR = "data/exposure_universe_cache"
+
+#: (repo_root, brand) -> {"source": "process_cache"|"file_cache"|"live",
+#:                          "fetch_sec": float} — 직전 `_universe_bundle` 호출
+#: 진단 정보(로그용, 함수 시그니처는 안 바꾸려고 곁가지 딕셔너리로 둠).
+_UNIVERSE_BUNDLE_META: dict[tuple[str, str], dict[str, Any]] = {}
+
+
+def _universe_file_cache_path(rt: Any, brand: str) -> Path:
+    return Path(rt.settings.repo_root) / _UNIVERSE_FILE_CACHE_DIR / f"{brand}.json"
+
+
+def _read_universe_file_cache(rt: Any, brand: str, ttl: float) -> dict[str, Any] | None:
+    p = _universe_file_cache_path(rt, brand)
+    try:
+        if not p.exists():
+            return None
+        age = time.time() - p.stat().st_mtime
+        if age > ttl:
+            return None
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return {
+            "universe": data.get("universe") or [],
+            "cafes": set(data.get("cafes") or []),
+            "recent_norm": set(data.get("recent_norm") or []),
+            "vol_threshold": float(data.get("vol_threshold") or 0.0),
+        }
+    except Exception as exc:  # pragma: no cover - 방어용
+        log.warning("universe 파일 캐시 읽기 실패(%s): %s", brand, exc)
+        return None
+
+
+def _write_universe_file_cache(rt: Any, brand: str, bundle: dict[str, Any]) -> None:
+    p = _universe_file_cache_path(rt, brand)
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "universe": bundle["universe"],
+            "cafes": sorted(bundle["cafes"]),
+            "recent_norm": sorted(bundle["recent_norm"]),
+            "vol_threshold": bundle["vol_threshold"],
+        }
+        # 여러 작업자 프로세스가 동시에 쓸 수 있으니 pid로 고유한 임시 이름을
+        # 쓰고 os.replace로 원자적으로 바꾼다(exposure_runner의 상태 파일
+        # 쓰기와 같은 패턴 — 이름 충돌로 크래시하던 d9849f2 교훈).
+        tmp = p.with_suffix(f".{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, p)
+    except Exception as exc:  # pragma: no cover - 방어용
+        log.warning("universe 파일 캐시 쓰기 실패(%s): %s", brand, exc)
+
+
 def _universe_bundle(rt: Any, brand: str, cfg: dict, now: datetime) -> dict[str, Any]:
     """`keyword_universe` + 최근 발행 집합 + 검색량 임계값을 TTL 캐시에서 꺼낸다.
 
-    같은 브랜드를 여러 작업자 프로세스가 부르더라도 캐시는 프로세스별
-    메모리라 서로 섞이지 않는다 — 작업자 간 중복 선점 방지는 이미
-    `exposure_runner.claim_inflight`(파일 기반)가 맡고 있으므로, 여기서
-    같은 번들을 여러 작업자가 동시에 읽어도(같은 순서로 정렬돼도) 실제로
-    같은 키워드를 두 번 검사하는 일은 claim_inflight가 막는다.
+    2026-09-24 4차 — 캐시를 2단으로 뒀다: (1) 프로세스 메모리(`_UNIVERSE_CACHE`,
+    이 프로세스 안에서는 공짜), (2) 작업자 프로세스 간 공유 파일
+    (`data/exposure_universe_cache/<브랜드>.json`, mtime 기준) — 한 작업자가
+    이미 받아 둔 시트 CSV를 다른 작업자들이 네트워크 없이 재사용한다(실측
+    8에서 5개 작업자가 독립적으로 같은 시트를 반복 요청하던 걸 줄임). 그래도
+    둘 다 없으면 실제로 `keyword_universe`(시트 CSV)를 읽는다. 어느 경로든
+    이 함수를 부른 브랜드에 대해 `_UNIVERSE_BUNDLE_META`에 소스·소요 시간을
+    남겨 `next_priority_batch`가 로그에 찍는다.
+
+    같은 브랜드를 여러 작업자 프로세스가 부르더라도 실제로 같은 키워드를
+    두 번 검사하는 일은 (이 캐시가 아니라) `exposure_runner.claim_inflight`·
+    `next_priority_batch`의 후보별 DB 직전 확인이 막는다 — 이 캐시가 얼마나
+    낡아도(최대 파일 TTL) 정확성에는 영향이 없다.
     """
     from v2r.knowledge.keyword_exposure import keyword_universe
 
-    ttl = float(cfg.get("universe_cache_sec", 120))
+    ttl = float(cfg.get("universe_cache_sec", 600))
+    file_ttl = float(cfg.get("universe_file_cache_sec", ttl))
     key = _cache_key(rt, brand)
     cached = _UNIVERSE_CACHE.get(key)
     now_epoch = time.time()
     if cached is not None and cached[0] > now_epoch:
+        _UNIVERSE_BUNDLE_META[key] = {"source": "process_cache", "fetch_sec": 0.0}
         return cached[1]
+
+    t0 = time.perf_counter()
+    file_bundle = _read_universe_file_cache(rt, brand, file_ttl)
+    if file_bundle is not None:
+        _UNIVERSE_CACHE[key] = (now_epoch + ttl, file_bundle)
+        _UNIVERSE_BUNDLE_META[key] = {"source": "file_cache", "fetch_sec": time.perf_counter() - t0}
+        return file_bundle
 
     universe = keyword_universe(rt, brand)
     cafes = {i.get("cafe") for i in universe if i.get("cafe")}
@@ -109,6 +195,8 @@ def _universe_bundle(rt: Any, brand: str, cfg: dict, now: datetime) -> dict[str,
     vol_threshold = _volume_threshold(universe, float(cfg.get("top_volume_percentile", 0.7)))
     bundle = {"universe": universe, "cafes": cafes, "recent_norm": recent_norm, "vol_threshold": vol_threshold}
     _UNIVERSE_CACHE[key] = (now_epoch + ttl, bundle)
+    _write_universe_file_cache(rt, brand, bundle)
+    _UNIVERSE_BUNDLE_META[key] = {"source": "live", "fetch_sec": time.perf_counter() - t0}
     return bundle
 
 
@@ -134,6 +222,10 @@ _LAST_CHECKED_CACHE: dict[tuple[str, str], tuple[float, dict[str, dict]]] = {}
 
 #: (repo_root, brand) -> (expires_at_epoch, [(tier, item), ...] 정렬됨)
 _SORTED_CACHE: dict[tuple[str, str], tuple[float, list[tuple[int, dict]]]] = {}
+
+#: (repo_root, brand) -> {"hit": bool, "recompute_sec": float} — 직전
+#: `_sorted_candidates` 호출 진단(로그용).
+_SORTED_CACHE_META: dict[tuple[str, str], dict[str, Any]] = {}
 
 
 def _last_checked_map(rt: Any, brand: str, cfg: dict) -> dict[str, dict]:
@@ -188,13 +280,15 @@ def _sorted_candidates(rt: Any, brand: str, cfg: dict, now: datetime) -> list[tu
     반환값은 `(tier, item)` 튜플의 정렬된 리스트 — 등급이 낮을수록,
     같은 등급 안에서는 오래된/검색량 높은 순으로 이미 정렬돼 있다.
     99등급(주기 전)은 여기서 이미 제외돼 있다."""
-    ttl = float(cfg.get("universe_cache_sec", 120))
+    ttl = float(cfg.get("universe_cache_sec", 600))
     key = _cache_key(rt, brand)
     now_epoch = time.time()
     cached = _SORTED_CACHE.get(key)
     if cached is not None and cached[0] > now_epoch:
+        _SORTED_CACHE_META[key] = {"hit": True, "recompute_sec": 0.0}
         return cached[1]
 
+    t0 = time.perf_counter()
     bundle = _universe_bundle(rt, brand, cfg, now)
     universe = bundle["universe"]
     last_checked = _last_checked_map(rt, brand, cfg)
@@ -212,6 +306,7 @@ def _sorted_candidates(rt: Any, brand: str, cfg: dict, now: datetime) -> list[tu
     scored.sort(key=lambda t: (t[0], t[1]))
     result = [(t[0], t[2]) for t in scored]
     _SORTED_CACHE[key] = (now_epoch + ttl, result)
+    _SORTED_CACHE_META[key] = {"hit": False, "recompute_sec": time.perf_counter() - t0}
     return result
 
 
@@ -449,11 +544,18 @@ def next_priority_batch(rt: Any, brand: str, n: int, now: datetime | None = None
 
     now = now or datetime.now(timezone.utc)
     cfg = load_config(rt.settings.repo_root).get("priority", dict(_DEFAULT_PRIORITY))
+    key = _cache_key(rt, brand)
 
     t0 = time.perf_counter()
     candidates = _sorted_candidates(rt, brand, cfg, now)
     t1 = time.perf_counter()
+    sorted_meta = _SORTED_CACHE_META.get(key, {})
+    universe_meta = _UNIVERSE_BUNDLE_META.get(key, {})
     if not candidates:
+        log.info(
+            "타이밍 우선순위조회 브랜드=%s 정렬캐시=%.3fs(정렬hit=%s) universe=%s(%.3fs) 후보없음",
+            brand, t1 - t0, sorted_meta.get("hit"), universe_meta.get("source"), universe_meta.get("fetch_sec", 0.0),
+        )
         return []
 
     bundle = _universe_bundle(rt, brand, cfg, now)
@@ -463,6 +565,7 @@ def next_priority_batch(rt: Any, brand: str, n: int, now: datetime | None = None
     out: list[dict] = []
     skipped_due, skipped_inflight = 0, 0
     db_checks = 0
+    db_check_sec, inflight_sec = 0.0, 0.0
     for _tier, item in candidates:
         keyword = item["keyword"]
         # 2026-09-24 3차 — 캐시(정렬·last_checked)는 작업자 프로세스별 메모리라
@@ -470,7 +573,9 @@ def next_priority_batch(rt: Any, brand: str, n: int, now: datetime | None = None
         # 고정 시 67%)가 났다. 그래서 배치에 넣을 후보마다 DB 단건 조회로
         # 캐시와 무관하게 항상 최신 상태를 확인한다(인덱스로 밀리초 단위,
         # 전체 순회가 아니라 앞에서부터 스캔하는 몇 건만이라 비용이 작다).
+        _tdb0 = time.perf_counter()
         last_row = store.latest_for_keyword(rt.conn, brand, keyword)
+        db_check_sec += time.perf_counter() - _tdb0
         db_checks += 1
         last_checked = (
             {_norm(keyword): {"checked_at": str(last_row["checked_at"] or ""), "status": str(last_row["status"] or "")}}
@@ -484,7 +589,10 @@ def next_priority_batch(rt: Any, brand: str, n: int, now: datetime | None = None
         # `is_inflight`는 진행 중(claim) 표시뿐 아니라 방금 완료된 표시
         # (`complete_inflight`, TTL 동안 유지)도 함께 걸러낸다 — 다른 작업자의
         # 오래된 정렬 캐시가 아직 이 키워드를 들고 있어도 배치에 다시 안 담긴다.
-        if is_inflight(rt.settings.repo_root, brand, keyword):
+        _tin0 = time.perf_counter()
+        blocked = is_inflight(rt.settings.repo_root, brand, keyword)
+        inflight_sec += time.perf_counter() - _tin0
+        if blocked:
             skipped_inflight += 1
             continue
         out.append(item)
@@ -492,8 +600,11 @@ def next_priority_batch(rt: Any, brand: str, n: int, now: datetime | None = None
             break
     t2 = time.perf_counter()
     log.info(
-        "타이밍 우선순위조회 브랜드=%s 정렬캐시=%.3fs 필터=%.3fs DB직전확인=%s 후보=%s 주기전제외=%s 선점제외=%s",
-        brand, t1 - t0, t2 - t1, db_checks, len(out), skipped_due, skipped_inflight,
+        "타이밍 우선순위조회 브랜드=%s round_trip=%.3fs 정렬=%.3fs(hit=%s 재계산=%.3fs) "
+        "universe=%s(%.3fs) DB직전확인=%.3fs(%s건) 선점확인=%.3fs 후보=%s 주기전제외=%s 선점제외=%s",
+        brand, t2 - t0, t1 - t0, sorted_meta.get("hit"), sorted_meta.get("recompute_sec", 0.0),
+        universe_meta.get("source"), universe_meta.get("fetch_sec", 0.0),
+        db_check_sec, db_checks, inflight_sec, len(out), skipped_due, skipped_inflight,
     )
     return out
 
