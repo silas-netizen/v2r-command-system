@@ -29,6 +29,7 @@ import logging
 import os
 import random
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -108,6 +109,27 @@ def fetch_integrated_search_dom_resident(
         page.close()
 
 
+def _atomic_write_json(path: Path, data: dict) -> None:
+    """여러 작업자 프로세스가 같은 파일에 동시에 쓸 수 있어 임시 파일명을
+    프로세스별로 고유하게 만든다(2026-09-24 발견 — 고정된 `.json.tmp` 이름을
+    공유해서 작업자 5개 중 1개가 "다른 프로세스가 파일을 사용 중" PermissionError로
+    죽었다). `os.replace` 자체는 원자적이지만, Windows에서 마침 다른 프로세스가
+    같은 임시 파일을 쓰는 찰나와 겹치면 잠깐 실패할 수 있어 짧게 재시도한다."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    last_exc: Exception | None = None
+    for _ in range(5):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError as exc:  # pragma: no cover - Windows 파일 잠금 경합
+            last_exc = exc
+            time.sleep(0.05)
+    if last_exc is not None:
+        raise last_exc
+
+
 # =======================================================================
 # 작업자 상태 파일
 # =======================================================================
@@ -129,9 +151,7 @@ def _load_state(repo_root: str | Path) -> dict:
 def _write_state(repo_root: str | Path, state: dict) -> None:
     p = state_path(repo_root)
     p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(tmp, p)
+    _atomic_write_json(p, state)
 
 
 def update_worker_state(
@@ -400,9 +420,7 @@ def _load_pending_all(repo_root: str | Path) -> dict:
 def _write_pending_all(repo_root: str | Path, data: dict) -> None:
     p = pending_confirm_path(repo_root)
     p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(tmp, p)
+    _atomic_write_json(p, data)
 
 
 def _pending_key(brand: str, keyword: str) -> str:
@@ -504,9 +522,7 @@ def _load_inflight(repo_root: str | Path) -> dict:
 def _write_inflight(repo_root: str | Path, data: dict) -> None:
     p = inflight_path(repo_root)
     p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(tmp, p)
+    _atomic_write_json(p, data)
 
 
 def _inflight_key(brand: str, keyword: str) -> str:
