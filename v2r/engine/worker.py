@@ -569,6 +569,8 @@ def generate_and_crosscheck_one(
     closings: list[str],
     mode: str = "",
     reference_brief: str = "",
+    relevance: int | None = None,
+    bridge_rationale: str = "",
 ) -> tuple[Any, dict]:
     """원고 한 건 생성 + GPT 교차 검증 (본문·댓글 만들기와 검증 호출이 여기 한 곳뿐이다).
 
@@ -593,6 +595,8 @@ def generate_and_crosscheck_one(
         examples=examples,
         recent_openings=recent_openings,
         reference_brief=reference_brief,
+        relevance=relevance,
+        bridge_rationale=bridge_rationale,
     )
     stats["reference_used"] = bool(reference_brief)
     reply2 = next(

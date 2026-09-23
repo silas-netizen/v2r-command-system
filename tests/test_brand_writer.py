@@ -171,6 +171,51 @@ def test_body_prompt_patsooni_review_type():
     assert "곤약젤리" in user
 
 
+def test_combined_prompt_adds_bridge_block_for_relevance_3():
+    # build_body_prompt와 같은 배선 규칙(사용자 지시 2026-09-24)이 combined 모드에도 있어야 한다.
+    system, user = bw.build_combined_prompt(
+        "우아덤",
+        KEYWORD,
+        "씨씨앙",
+        relevance=3,
+        bridge_rationale="독감으로 몸살을 앓으면 면역이 떨어져 여성 건강 관리가 중요해진다",
+    )
+    assert "【당위성 논리】" in user
+    assert "독감으로 몸살을 앓으면" in user
+    baseline_system, _ = bw.build_combined_prompt("우아덤", KEYWORD, "씨씨앙")
+    assert system == baseline_system
+
+
+def test_combined_prompt_no_bridge_block_when_relevance_not_3():
+    _, user = bw.build_combined_prompt(
+        "우아덤", KEYWORD, "씨씨앙", relevance=1, bridge_rationale="쓰지 않아야 함"
+    )
+    assert "당위성" not in user
+
+
+def test_generate_manuscript_passes_relevance_to_body_prompt():
+    # generate_manuscript(단건 경로)가 relevance/bridge_rationale을 build_body_prompt까지
+    # 그대로 넘기는지 확인한다(배선 없으면 프롬프트에 당위성 블록이 빠진다).
+    llm = FakeLLM()
+
+    class Rt:
+        pass
+
+    rt = Rt()
+    rt.llm = llm
+    bw.generate_manuscript(
+        rt,
+        "우아덤",
+        KEYWORD,
+        "씨씨앙",
+        relevance=3,
+        bridge_rationale="독감 몸살로 면역이 떨어지면 여성 건강 관리가 중요해진다",
+    )
+    body_call = next(c for c in llm.calls if c[0] == "brand_body")
+    assert "【당위성 논리】" in body_call[2]
+    assert "독감 몸살로" in body_call[2]
+
+
 def test_comments_prompt_has_12_labels_and_limits():
     system, user = bw.build_comments_prompt("우아덤", KEYWORD, "제목", BODY)
     for label in bw.COMMENT_LABELS:

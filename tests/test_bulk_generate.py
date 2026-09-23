@@ -94,6 +94,72 @@ def test_refill_orders_by_volume_then_relevance(tmp_path, monkeypatch):
     rt.close()
 
 
+def test_bridge_info_reads_relevance_and_rationale(tmp_path):
+    import sqlite3
+
+    kdir = tmp_path / "data" / "keywords"
+    kdir.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(kdir / "우아덤.sqlite"))
+    conn.execute(
+        "CREATE TABLE keywords (keyword TEXT, total INT, relevance INT,"
+        " relevance_llm INT, relevance_codex INT, needs_review INT,"
+        " bridge_rationale TEXT DEFAULT '')"
+    )
+    conn.execute(
+        "INSERT INTO keywords VALUES ('독감',100,0,3,3,0,'독감 몸살로 면역이 떨어지면 관리가 중요해진다')"
+    )
+    conn.execute("INSERT INTO keywords VALUES ('비타민C',100,0,0,0,0,'')")
+    conn.commit()
+    conn.close()
+
+    rel, rationale = brand_queue.bridge_info("우아덤", "독감", tmp_path / "data")
+    assert rel == 3
+    assert "면역이 떨어지면" in rationale
+
+    rel2, rationale2 = brand_queue.bridge_info("우아덤", "비타민C", tmp_path / "data")
+    assert rel2 == 0
+    assert rationale2 == ""
+
+    # 없는 키워드/브랜드는 배선 없던 시절과 같이 (None, "")
+    assert brand_queue.bridge_info("우아덤", "없는키워드", tmp_path / "data") == (None, "")
+    assert brand_queue.bridge_info("없는브랜드", "독감", tmp_path / "data") == (None, "")
+
+
+def test_bulk_generate_passes_bridge_rationale_to_prompt(tmp_path, monkeypatch):
+    # bulk_generate → worker.generate_and_crosscheck_one → brand_writer.generate_manuscript
+    # → build_body_prompt 까지 relevance_llm/bridge_rationale이 실제로 전달되는지 확인.
+    import sqlite3
+
+    rt = make_runtime(tmp_path)
+    rt.settings.repo_root = tmp_path
+    llm = FakeLLM()
+    rt._llm = llm
+    rt._llm_ready = True
+    _patch_pool(monkeypatch, [{"keyword": KEYWORD, "cafe": "씨씨앙"}])
+
+    kdir = tmp_path / "data" / "keywords"
+    kdir.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(kdir / "우아덤.sqlite"))
+    conn.execute(
+        "CREATE TABLE keywords (keyword TEXT, total INT, relevance INT,"
+        " relevance_llm INT, relevance_codex INT, needs_review INT,"
+        " bridge_rationale TEXT DEFAULT '')"
+    )
+    conn.execute(
+        f"INSERT INTO keywords VALUES (?,100,0,3,3,0,?)",
+        (KEYWORD, "독감 몸살로 면역이 떨어지면 여성 건강 관리가 중요해진다"),
+    )
+    conn.commit()
+    conn.close()
+
+    out = bulk_generate.generate_for_brand(rt, "우아덤", 1)
+    assert out["ok"] is True and out["generated"] == 1
+    body_call = next(c for c in llm.calls if c[0] == "brand_body")
+    assert "【당위성 논리】" in body_call[2]
+    assert "독감 몸살로" in body_call[2]
+    rt.close()
+
+
 def test_bulk_generate_for_brand_saves_to_queue_folder(tmp_path, monkeypatch):
     rt = make_runtime(tmp_path)
     rt.settings.repo_root = tmp_path

@@ -2113,13 +2113,25 @@ def build_combined_prompt(
     manuscript_type: str = "",
     examples: list[str] | None = None,
     reference_brief: str = "",
+    relevance: int | None = None,
+    bridge_rationale: str = "",
 ) -> tuple[str, str]:
-    """본문 + 댓글 12개를 **한 번에** 받는 `(공용 system, 이번 할 일 user)` 프롬프트."""
+    """본문 + 댓글 12개를 **한 번에** 받는 `(공용 system, 이번 할 일 user)` 프롬프트.
+
+    `relevance`/`bridge_rationale`은 `build_body_prompt`와 같은 규칙(연관도 3=당위성일
+    때만 【당위성 논리】 블록 추가, 사용자 지시 2026-09-24)을 따른다.
+    """
     rule = rule_for(brand, manuscript_type)
     system = build_shared_system(brand, manuscript_type, guide_text, examples)
     combined_lines = [BRAND_COMBINED_TASK, "", *_body_dynamic_block(rule, keyword, cafe)]
     if reference_brief:
         combined_lines += ["", "【참고 형식(통검 1등 글)】", reference_brief]
+    if relevance == 3 and bridge_rationale:
+        combined_lines += [
+            "",
+            "【당위성 논리】 " + bridge_rationale
+            + " — 이 논리로 자연스럽게 브랜드로 이어라(억지 연결 금지)",
+        ]
     user = "\n".join(
         combined_lines
     )
@@ -2868,8 +2880,14 @@ def generate_manuscript(
     examples: list[str] | None = None,
     recent_openings: list[str] | None = None,
     reference_brief: str = "",
+    relevance: int | None = None,
+    bridge_rationale: str = "",
 ) -> Manuscript:
     """키워드 한 개로 제목·본문·댓글 12개를 만든다.
+
+    `relevance`/`bridge_rationale`을 주면(연관도 3=당위성일 때만) 본문 프롬프트에
+    `build_body_prompt`가 【당위성 논리】 블록을 넣는다(사용자 지시 2026-09-24).
+    값이 없으면 기존 동작 그대로다.
 
     검증에 걸리면 **무엇이 어떻게 어긋났는지 짚어서 될 때까지 다시 시킨다**
     (사용자 지시 2026-09-19). 안전장치로 본문·댓글 각각 `max_attempts`번까지만
@@ -2900,11 +2918,12 @@ def generate_manuscript(
     if mode == "combined":
         return _generate_combined(
             llm, rule, brand, keyword, cafe, guide_text, stats, cap, before, examples,
-            reference_brief,
+            reference_brief, relevance, bridge_rationale,
         )
 
     body_sys, body_user = build_body_prompt(
-        brand, keyword, cafe, guide_text, rule.manuscript_type, examples, reference_brief
+        brand, keyword, cafe, guide_text, rule.manuscript_type, examples, reference_brief,
+        relevance, bridge_rationale,
     )
     draft: Manuscript | None = None
     body_bad: list[str] = []
@@ -3250,13 +3269,16 @@ def _generate_combined(
     before: dict,
     examples: list[str] | None = None,
     reference_brief: str = "",
+    relevance: int | None = None,
+    bridge_rationale: str = "",
 ) -> Manuscript:
     """본문 + 댓글 12개를 한 번에 받는 방식 (`mode="combined"`).
 
     본문이 어긋나면 통째로 다시, 댓글만 어긋나면 **걸린 자리만** 다시 받는다.
     """
     sys_p, user_p = build_combined_prompt(
-        brand, keyword, cafe, guide_text, rule.manuscript_type, examples, reference_brief
+        brand, keyword, cafe, guide_text, rule.manuscript_type, examples, reference_brief,
+        relevance, bridge_rationale,
     )
     draft: Manuscript | None = None
     bad_all: list[str] = []

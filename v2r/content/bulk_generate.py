@@ -127,6 +127,9 @@ def generate_for_brand(rt: Any, brand: str, n: int, target: str = "") -> dict:
                 )
             except Exception as exc:  # 참고 형식은 덤 — 실패해도 원고 생성은 막지 않는다
                 log.warning("참고 형식 조회 실패(%s/%s): %s", brand, row["keyword"], exc)
+            relevance_llm, bridge_rationale = brand_queue.bridge_info(
+                brand, row["keyword"], rt.settings.data_dir
+            )
             try:
                 m, stats = _worker.generate_and_crosscheck_one(
                     rt,
@@ -139,6 +142,8 @@ def generate_for_brand(rt: Any, brand: str, n: int, target: str = "") -> dict:
                     recent_openings,
                     closings,
                     reference_brief=reference_brief,
+                    relevance=relevance_llm,
+                    bridge_rationale=bridge_rationale,
                 )
             except Exception as exc:
                 from v2r.llm.plan_backend import PlanLimit

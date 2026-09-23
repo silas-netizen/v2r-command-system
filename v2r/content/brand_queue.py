@@ -104,6 +104,38 @@ def _volume_map(brand: str, data_dir: Path) -> dict[str, tuple[float, int, float
     return out
 
 
+def bridge_info(brand: str, keyword: str, data_dir: Path) -> tuple[int | None, str]:
+    """`data/keywords/<브랜드>.sqlite`에서 키워드의 `relevance_llm`·`bridge_rationale`.
+
+    원고 생성 배선(사용자 지시 2026-09-24, `docs/reports/relevance-split-2026-09-24.md`
+    8절 3항)이 `build_body_prompt`의 【당위성 논리】 블록까지 값을 넘기는 데 쓴다.
+    표/열이 없거나 그 키워드가 없으면 `(None, "")` — 호출측은 기존 동작 그대로 간다.
+    """
+    path = Path(data_dir) / "keywords" / f"{brand}.sqlite"
+    if not path.exists():
+        return None, ""
+    try:
+        conn = sqlite3.connect(str(path))
+        conn.row_factory = sqlite3.Row
+        try:
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(keywords)")}
+            if "relevance_llm" not in cols:
+                return None, ""
+            has_rationale = "bridge_rationale" in cols
+            sql = "SELECT relevance_llm" + (", bridge_rationale" if has_rationale else "")
+            sql += " FROM keywords WHERE keyword = ?"
+            row = conn.execute(sql, (keyword,)).fetchone()
+        finally:
+            conn.close()
+    except Exception:
+        return None, ""
+    if row is None or row["relevance_llm"] is None:
+        return None, ""
+    rel = int(row["relevance_llm"])
+    rationale = str(row["bridge_rationale"] or "") if has_rationale else ""
+    return rel, rationale
+
+
 def _mtypes_for(brand: str, n: int) -> list[str]:
     if brand in ALTERNATING_BRANDS:
         return [ALT_MTYPES[i % 2] for i in range(n)]
@@ -306,5 +338,6 @@ __all__ = [
     "counts_by_target",
     "ready_count",
     "ready_rows_for_export",
+    "bridge_info",
     "ALTERNATING_BRANDS",
 ]
