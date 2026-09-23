@@ -161,12 +161,26 @@ def _write_tsv_at(spreadsheet_id: str, gid: str | int, cell: str, tsv: str) -> N
             page.wait_for_selector("#t-name-box", timeout=45000)
             page.wait_for_timeout(1000)  # 그리드 초기화 여유
 
-            # 이름 상자에 셀 주소 입력 → Enter로 이동
-            page.click("#t-name-box")
-            page.keyboard.press("Control+A")
-            page.keyboard.type(cell)
-            page.keyboard.press("Enter")
-            page.wait_for_timeout(300)
+            # 이름 상자에 셀 주소 입력 → Enter로 이동. 이동이 실제로 됐는지 이름 상자
+            # 값을 다시 읽어 확인한다 — 사고 2026-09-23: 이동이 씹힌 채 붙여넣기가
+            # A1(기본 선택)에 떨어져 장으뜸 A1에 P1 합계, 팥순이 A1에 통검 URL이 덮였다.
+            landed = False
+            for _nav in range(3):
+                page.click("#t-name-box")
+                page.keyboard.press("Control+A")
+                page.keyboard.type(cell)
+                page.keyboard.press("Enter")
+                page.wait_for_timeout(400)
+                try:
+                    now_at = str(page.input_value("#t-name-box") or "").strip().upper()
+                except Exception:
+                    now_at = ""
+                if now_at == cell.upper():
+                    landed = True
+                    break
+                page.wait_for_timeout(600)
+            if not landed:
+                raise SheetsWriteError(f"셀 이동 실패({cell}): 이름 상자가 {now_at!r}에 머묾")
 
             if tsv == "":
                 # 빈 문자열은 paste 이벤트로 지워지지 않는다(클립보드에 아무 것도
