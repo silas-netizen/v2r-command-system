@@ -1,0 +1,30 @@
+# 노출 확인 러너 설정 — docs/reports/exposure-speed-plan-2026-09-23.md 설계.
+# exposure_runner.py / exposure_priority.py가 읽는다.
+
+# 작업자(브라우저 상주 프로세스) 수. 2로 시작해 실측 후 올린다.
+workers: 2
+
+# 작업자별 요청 간격(초) — 무작위 범위
+delay_min_sec: 6
+delay_max_sec: 10
+
+# 스크롤 조기 종료
+max_scroll_rounds: 20       # 카페 카드가 하나도 없을 때의 상한(기존 값 유지)
+scroll_wait_sec: 0.4
+early_exit_same_height_rounds: 2   # 카페 카드 로드 후 문서 높이가 이만큼 연속 동일하면 중단
+
+# 미확인(차단 의심) 연속 n건 → 그 작업자 휴식(분)
+worker_block_streak_limit: 3
+worker_rest_minutes: 15
+
+# 전체 작업자가 동시에 휴식 상태 → 순환 전체 정지(분)
+global_block_rest_minutes: 30
+
+# 우선순위 등급별 재검사 주기(시간) — exposure_priority.py
+priority:
+  # 1순위: 한 번도 검사 안 한 키워드 — 주기 없음(늘 최우선)
+  recent_publish_hours: [4, 24, 72]     # 2순위: 발행 후 이 시각 근방이면 우선
+  exposed_recheck_hours: 24             # 3순위: 노출완 → 이 시간 지나면 재검사
+  pushed_recheck_hours: 48              # 4순위: 밀려남(검색량 상위 30%) → 이 시간 지나면
+  pushed_low_recheck_hours: 168         # 5순위: 밀려남(하위) → 이 시간 지나면(7일)
+  top_volume_percentile: 0.7            # 검색량 상위 30% 기준(0.7 = 70번째 백분위 이상)

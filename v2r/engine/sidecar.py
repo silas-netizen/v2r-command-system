@@ -281,9 +281,14 @@ def tick_once(rt: Any, owner: str | None = None, *, status: "_Status | None" = N
     try:
         # 무한 순환 작업("long" 슬롯) — 큐에 안 들어가고 매 틱 조금씩 진행한다.
         # 지금은 "노출 순환"(B2, keyword_exposure.cycle_tick) 하나뿐이다.
-        from v2r.knowledge import keyword_exposure as ke_mod
+        from v2r.knowledge import exposure_runner, keyword_exposure as ke_mod
 
-        out["exposure_cycle"] = ke_mod.cycle_tick(rt)
+        # 2026-09-24: 러너(exposure_runner.py, 상주 브라우저 작업자)가 살아 있으면
+        # 중복 검사를 막기 위해 사이드카는 자기 검사를 쉬고 생존만 확인한다.
+        if exposure_runner.is_alive(rt.settings.repo_root):
+            out["exposure_cycle"] = {"runner_alive": True}
+        else:
+            out["exposure_cycle"] = ke_mod.cycle_tick(rt)
     except Exception as exc:  # noqa: BLE001
         log.exception("사이드카 노출 순환 실패(계속 진행): %s", exc)
         out["exposure_cycle"] = {"error": str(exc)}
