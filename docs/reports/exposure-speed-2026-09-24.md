@@ -487,3 +487,42 @@ exposed) · 항문 찢어짐(뉴더미스, exposed) · 치질 약국약(뉴더�
 "이 저장소는 커밋 후 push가 규칙"이라고 안내했으나, 써 있는 프로젝트 규칙과
 다른 경로(에이전트 메시지)로 온 지시라 push는 하지 않고 commit만 했다 —
 필요하면 사용자가 직접 push 여부를 확인해 달라.
+
+## 11. 운영 고정 — 실측 종료 후 확인·조치 (2026-09-24, 마지막 절)
+
+실측을 끝내고 지금 설정(작업자 6, 간격 3–5초, 공유 큐)으로 운영을
+지속하기로 확정한 뒤 세 가지를 확인·정리했다.
+
+**(1) `config/exposure.yaml` 커밋 확인** — 현재 값(작업자 6, 간격 3–5초,
+공유 큐 관련 설정 전부)이 커밋 `b393cd4`에 이미 들어 있고 워킹 트리에
+남은 변경이 없음을 `git status`/`git diff`로 확인했다(위 10절 참고 — push는
+안 함, CLAUDE.md 규칙).
+
+**(2) 부팅·로그온과 무관하게 자동 재기동 — 새로 등록함.** 예약 작업이 아예
+없었다(`Get-ScheduledTask`로 확인). 새로 만든 것:
+- `file:///D:/v2r%20%EC%9E%90%EB%8F%99%ED%99%94/v2r-command-system/scripts/exposure-runner-watchdog.cmd`
+  — `exposure_runner.is_alive()`(상태 파일이 180초 안에 갱신됐는지)로 생존을
+  확인하고, 죽어 있으면 `exposure-runner-hidden.vbs 6`으로 작업자 6개를
+  다시 띄운다.
+- `file:///D:/v2r%20%EC%9E%90%EB%8F%99%ED%99%94/v2r-command-system/scripts/exposure-runner-watchdog.vbs`
+  — 위 cmd를 창 없이 숨김 실행(`serve-hidden.vbs`와 같은 패턴).
+- Windows 작업 스케줄러 `V2R-ExposureRunner` 등록(로그온 시 1회 + 5분마다
+  반복, `Hidden` 설정, `V2R-Serve`와 같은 사용자 컨텍스트로 실행).
+- 검증: 작업자를 일부러 다 죽인 뒤 수동 실행 → 6개로 정상 재기동 확인,
+  이미 떠 있는 상태에서 다시 실행 → "조치 없음"으로 안전하게 지나감
+  확인, `Start-ScheduledTask`로 실제 예약 작업을 한 번 실행해 결과
+  코드 0·창 없음(숨김 설정) 확인. (작업 도중 `.cmd` 파일 줄바꿈이 LF만
+  있어서 `date`/`time`이 명령으로 잘못 해석돼 멈추는 문제를 한 번
+  만났다 — CRLF로 바꿔 해결, `CLAUDE.md`의 "CMD는 CRLF" 메모와 일치.)
+
+**(3) 러너가 죽었을 때 "실행기"(메인 v2r serve) 쪽 감지·재기동 규칙 —
+없었고, 이 위치에는 안 맞아서 안 넣음.** `v2r/engine/monitor.py`·
+`v2r/engine/recovery_rules.py`("감시견")는 **작업 큐(job) 실행 중 나는 오류
+문구**를 분류해 재시도·대기·사람 개입을 정하는 시스템이다(예: 레이트
+제한, 타임아웃) — 외부 OS 프로세스 하나가 살아 있는지 감시하는 용도가
+아니다. 노출 러너는 `v2r` 잡 큐 밖의 별도 숨김 프로세스(설계상 의도된
+분리, 실행기 발행 루프를 막지 않으려고)라 이 감시견이 원래도 보지 못한다.
+그래서 (2)의 Windows 작업 스케줄러 5분 주기 확인을 "감지·재기동" 규칙
+본체로 삼았다 — `V2R-Serve`·`V2R-Reconcile`과 같은 계열의 기존 패턴이라
+일관적이다. `recovery_rules`/`monitor.py`에는 손대지 않았다(범위 밖이라
+억지로 끼워 넣지 않음).
