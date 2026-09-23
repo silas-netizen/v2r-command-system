@@ -13,6 +13,28 @@ entries:
   # 같은 네이버 프로필(data/browser-profile-naver)을 여는 다른 작업(노출 순환기,
   # 예약 "네이버 세션 점검")과는 naver_session의 프로세스 간 파일 잠금
   # (data/locks/naver-profile.lock)으로 자동으로 순서를 맞춘다.
+  # 2026-09-24 사용자 지시 "키워드는 추가해, 이제부터 알아서 1만개 달성": 확정된 원고 대상
+  # (클로드·GPT 둘 다 0에서 3)을 6시간마다 시트에 자동 추가(승인 없이). 중복은 정규화 대조로 차단.
+  - name: 시트 키워드 반영(자동)
+    time: "05:30"
+    days: daily
+    enabled: true
+    command: 시트 키워드 반영 전체
+  - name: 시트 키워드 반영(자동, 낮)
+    time: "11:30"
+    days: daily
+    enabled: true
+    command: 시트 키워드 반영 전체
+  - name: 시트 키워드 반영(자동, 저녁)
+    time: "17:30"
+    days: daily
+    enabled: true
+    command: 시트 키워드 반영 전체
+  - name: 시트 키워드 반영(자동, 밤)
+    time: "23:30"
+    days: daily
+    enabled: true
+    command: 시트 키워드 반영 전체
   - name: 키워드 발굴 전체
     time: "01:00"
     days: daily
