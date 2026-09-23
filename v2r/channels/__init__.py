@@ -84,6 +84,38 @@ def clear_critical(category: str) -> bool:
     return bool(state)
 
 
+_PUSH_CACHE: dict[str, Any] = {"at": 0.0, "names": None}
+
+
+def push_channels(channels: list[Channel]) -> list[Channel]:
+    """푸시(보고·경고)를 실제로 보낼 채널만 고른다.
+
+    사용자 지시 2026-09-23 "푸시는 텔레는 일단 중지, 슬랙만": config/notify.yaml 의
+    `push_channels` 목록(채널 이름)에 든 채널로만 보낸다. 항목이 없으면 전부.
+    명령 수신·명령에 대한 직접 답장(reply_to_origin)은 이 필터와 무관하다.
+    파일은 60초마다 다시 읽어 실행기 재시작 없이 바꿀 수 있다.
+    """
+    now = _time.monotonic()
+    if _PUSH_CACHE["names"] is None or now - _PUSH_CACHE["at"] > 60:
+        names = None
+        try:
+            import yaml
+            from pathlib import Path
+
+            cfg_path = Path(__file__).resolve().parents[2] / "config" / "notify.yaml"
+            data = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+            raw = data.get("push_channels")
+            if isinstance(raw, list):
+                names = {str(x).strip().lower() for x in raw if str(x).strip()}
+        except Exception as exc:  # noqa: BLE001
+            log.debug("push_channels 읽기 실패: %s", exc)
+        _PUSH_CACHE.update(at=now, names=names if names is not None else set())
+    names = _PUSH_CACHE["names"]
+    if not names:
+        return list(channels or [])
+    return [c for c in channels or [] if str(getattr(c, "name", "")).lower() in names]
+
+
 def build_channels(settings: Any | None = None) -> list[Channel]:
     """설정에서 활성 채널 목록을 만든다. 비활성 채널은 제외."""
     if settings is None:
@@ -180,7 +212,7 @@ def notify_all(
     out_text = f"{_icon_prefix(level, tag)}{out_text}"
 
     sent = 0
-    for channel in channels or []:
+    for channel in push_channels(channels):
         try:
             sent += int(channel.broadcast(sanitize(out_text)) or 0)
         except Exception as exc:  # 알림 실패로 본 작업이 죽지 않게
@@ -191,7 +223,7 @@ def notify_all(
 def notify_document_all(channels: list[Channel], path: Any, caption: str = "") -> int:
     """모든 채널에 파일 한 개를 보낸다. 파일을 못 보내는 채널은 건너뛴다."""
     sent = 0
-    for channel in channels or []:
+    for channel in push_channels(channels):
         fn = getattr(channel, "broadcast_document", None)
         if not callable(fn):
             continue
@@ -205,7 +237,7 @@ def notify_document_all(channels: list[Channel], path: Any, caption: str = "") -
 def notify_photo_all(channels: list[Channel], path: Any, caption: str = "") -> int:
     """모든 채널에 사진 한 장을 보낸다. 사진을 못 보내는 채널은 건너뛴다."""
     sent = 0
-    for channel in channels or []:
+    for channel in push_channels(channels):
         fn = getattr(channel, "broadcast_photo", None)
         if not callable(fn):
             continue

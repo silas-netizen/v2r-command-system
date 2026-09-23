@@ -1699,6 +1699,12 @@ def _run_publish(
         }
     # 계획 단계 이벤트(카페별 계정 풀 N개 / 오늘 10개 중 M개 사용, 권한 조회 경고)
     publish_mod.flush_plan_events(rt, job_id)
+    if spec.task == "publish_daily" and not spec.dry_run and slots:
+        # 사용자 지시 2026-09-23: 일상 글 **시작할 때** 카페·건수·계정 현황판을 슬랙으로.
+        try:
+            notify_all(rt.channels, _daily_start_board(rt, job_id, spec, slots), level="always", tag="publish")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("시작 현황판 전송 실패: %s", exc)
     paced = bool(getattr(spec, "per_cafe", False))
     # 각색 xlsx의 행 순서(카페가 행마다 번갈아 옴)를 그대로 지킨다 — 라운드로빈으로
     # 다시 섞지 않는다 (사용자 절대 규칙, 규칙 §2)
@@ -2651,6 +2657,29 @@ def reply_to_origin(out: dict) -> bool:
     extra = result.get("report") or result.get("message") or ""
     _reply(channel, chat_id, f"{text}\n{extra}".strip())
     return True
+
+
+def _daily_start_board(rt: Runtime, job_id: int, spec: Any, slots: list) -> str:
+    """일상 글 시작 현황판 한 장: 카페별 건수·게시판 수·계정, 오늘 계정 목록."""
+    from collections import Counter, defaultdict
+
+    by_cafe: Counter = Counter()
+    boards: dict[str, set] = defaultdict(set)
+    accts: dict[str, set] = defaultdict(set)
+    for sl in slots:
+        by_cafe[sl.cafe] += 1
+        boards[sl.cafe].add(sl.board)
+        accts[sl.cafe].add(sl.account)
+    all_accts = sorted({a for s_ in accts.values() for a in s_})
+    now = datetime.now(KST).strftime("%m-%d %H:%M")
+    lines = [
+        f"일상 글 시작 현황판 ({now}, 작업 {job_id})",
+        f"총 {len(slots)}건 · 카페 {len(by_cafe)}곳 · 계정 {len(all_accts)}개 · 간격 {spec.interval_min}~{spec.interval_max}분",
+    ]
+    for cafe, n in sorted(by_cafe.items(), key=lambda kv: (-kv[1], kv[0])):
+        lines.append(f"• {cafe}: {n}건 · 게시판 {len(boards[cafe])}개 · 계정 {len(accts[cafe])}개")
+    lines.append("오늘 계정: " + ", ".join(all_accts))
+    return "\n".join(lines)
 
 
 def poll_channels(rt: Runtime) -> int:
