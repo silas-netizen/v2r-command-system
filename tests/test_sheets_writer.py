@@ -501,3 +501,168 @@ def test_norm_cell_date_without_leading_zero():
 
     assert _norm_cell("2026-09-24 0:31:50") == _norm_cell("2026-09-24 00:31:50")
     assert _norm_cell("2026-09-23 8:39:17") == "2026-09-23 08:39:17"
+
+
+# --------------------------------------------------------------------------
+# 2026-09-24: 공백·대소문자 차이로 같은 키워드가 새 행으로 중복 추가되던 사고
+# (5개 브랜드 시트에서 811개 중복 발생) 재발 방지 시험
+# --------------------------------------------------------------------------
+
+
+def test_update_by_key_matches_ignoring_space_and_case(monkeypatch, tmp_path):
+    """H열에 "수면 테이프"(공백 포함)가 있는데 "수면테이프"로 조회해도 같은 키로 본다."""
+    table = [
+        ["A", "B", "C", "D", "E", "F", "G", "H", "I"],
+        ["", "", "", "", "", "", "미확인", "수면 테이프", "url1"],
+    ]
+
+    def fake_read(sid, gid, timeout=15.0):
+        return table
+
+    written = {}
+
+    def fake_write_verified(sid, gid, cell, rows, repo_root="."):
+        written[cell] = rows[0][0]
+        return {"written": 1, "mode": "sheets", "cell": cell}
+
+    monkeypatch.setattr(sw, "_read_export_csv", fake_read)
+    monkeypatch.setattr(sw, "_write_verified", fake_write_verified)
+
+    result = sw.update_by_key(
+        "sid", "탭", "수면테이프", {"G": "확인"}, key_column="H", repo_root=tmp_path
+    )
+    assert result["mode"] == "sheets"
+    assert result["row"] == 2
+    assert written["G2"] == "확인"
+
+
+def test_update_by_key_updates_all_rows_when_multiple_normalize_the_same(monkeypatch, tmp_path):
+    """이미 시트에 정규화 중복 행이 남아 있으면(예: 다른 원인으로 재발) 첫 행만이 아니라
+    전부 갱신해야 한 행만 갱신하고 다른 행은 낡은 값으로 남는 일이 없다."""
+    table = [
+        ["A", "B", "C", "D", "E", "F", "G", "H", "I"],
+        ["", "", "", "", "", "", "미확인", "수면테이프", "url1"],
+        ["", "", "", "", "", "", "미확인", "수면 테이프", "url2"],
+    ]
+
+    def fake_read(sid, gid, timeout=15.0):
+        return table
+
+    written = []
+
+    def fake_write_verified(sid, gid, cell, rows, repo_root="."):
+        written.append(cell)
+        return {"written": 1, "mode": "sheets", "cell": cell}
+
+    monkeypatch.setattr(sw, "_read_export_csv", fake_read)
+    monkeypatch.setattr(sw, "_write_verified", fake_write_verified)
+
+    result = sw.update_by_key(
+        "sid", "탭", "수면 테이프", {"G": "확인"}, key_column="H", repo_root=tmp_path
+    )
+    assert result["rows"] == [2, 3]
+    assert set(written) == {"G2", "G3"}
+
+
+def test_update_rows_treats_space_case_variants_as_same_key(monkeypatch, tmp_path):
+    """update_rows: 기존 "수면 테이프" 행을 "수면테이프" 키로 넣으면 새 행 추가가 아니라
+    그 행을 갱신해야 한다."""
+    table = [["키워드", "값"], ["수면 테이프", "old"]]
+    monkeypatch.setattr(sw, "_read_export_csv", lambda sid, gid, timeout=15.0: table)
+
+    updated = {}
+    appended = {}
+
+    def fake_write_verified(sid, gid, cell, rows, repo_root="."):
+        updated[cell] = rows[0]
+        return {"written": 1, "mode": "sheets", "cell": cell}
+
+    def fake_append_rows(sid, sheet, rows, *, header=None, gid=0, repo_root="."):
+        appended["rows"] = rows
+        return {"written": len(rows), "mode": "sheets"}
+
+    monkeypatch.setattr(sw, "_write_verified", fake_write_verified)
+    monkeypatch.setattr(sw, "append_rows", fake_append_rows)
+
+    result = sw.update_rows(
+        "sid", "탭", [{"키워드": "수면테이프", "값": "new"}], key_column="키워드", repo_root=tmp_path
+    )
+    assert result["written"] == 1
+    assert updated["A2"] == ["수면테이프", "new"]
+    assert "rows" not in appended  # 새 행으로 추가되지 않았다
+
+
+def test_update_rows_dedupes_normalized_duplicates_within_append_batch(monkeypatch, tmp_path):
+    """새로 넣을 목록 안에 공백·대소문자만 다른 중복이 있으면 하나만 append한다."""
+    table = [["키워드", "값"]]
+    monkeypatch.setattr(sw, "_read_export_csv", lambda sid, gid, timeout=15.0: table)
+    monkeypatch.setattr(
+        sw, "_write_verified",
+        lambda sid, gid, cell, rows, repo_root=".": {"written": 1, "mode": "sheets", "cell": cell},
+    )
+    captured = {}
+
+    def fake_append_rows(sid, sheet, rows, *, header=None, gid=0, repo_root="."):
+        captured["rows"] = rows
+        return {"written": len(rows), "mode": "sheets"}
+
+    monkeypatch.setattr(sw, "append_rows", fake_append_rows)
+
+    sw.update_rows(
+        "sid", "탭",
+        [
+            {"키워드": "수면테이프", "값": "a"},
+            {"키워드": "수면 테이프", "값": "b"},
+            {"키워드": "Sleep Tape", "값": "c"},
+        ],
+        key_column="키워드", repo_root=tmp_path,
+    )
+    assert len(captured["rows"]) == 2
+    assert [r[0] for r in captured["rows"]] == ["수면테이프", "Sleep Tape"]
+
+
+def test_sync_keywords_to_sheet_dedupes_space_case_variants(tmp_path, monkeypatch):
+    """이미 시트에 "수면 테이프"가 있으면 DB의 "수면테이프"는 다시 안 붙이고,
+    새로 붙일 후보 안에 정규화 중복이 있어도 하나만 남긴다."""
+    import sqlite3
+
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    (cfg / "brands.yaml").write_text(
+        "brands:\n  테스트브랜드:\n    spreadsheet_id: sid1\n", encoding="utf-8"
+    )
+    kw_dir = tmp_path / "data" / "keywords"
+    kw_dir.mkdir(parents=True)
+    con = sqlite3.connect(str(kw_dir / "테스트브랜드.sqlite"))
+    con.execute(
+        "create table keywords (keyword text, total integer, rationale text, "
+        "relevance_llm integer, relevance_codex integer, needs_review integer)"
+    )
+    con.executemany(
+        "insert into keywords values (?, ?, ?, ?, ?, ?)",
+        [
+            ("수면테이프", 100, "", 0, 0, 0),  # 시트에 이미 "수면 테이프"로 있음 -> 제외
+            ("코숨 편해요", 90, "", 0, 0, 0),
+            ("코숨편해요", 80, "", 0, 0, 0),  # 위와 정규화 중복 -> 하나만
+        ],
+    )
+    con.commit()
+    con.close()
+
+    header_row = ["A", "B", "C", "D", "E", "F", "G", "H"]
+    existing_row = ["", "", "", "", "", "", "", "수면 테이프"]
+    monkeypatch.setattr(sw, "_second_tab_gid", lambda sid: 999)
+    monkeypatch.setattr(
+        sw, "_read_export_csv", lambda sid, gid, timeout=15.0: [header_row, existing_row]
+    )
+    captured = {}
+
+    def fake_append_rows(sid, sheet, rows, *, header=None, gid=0, repo_root="."):
+        captured["rows"] = rows
+        return {"written": len(rows), "mode": "sheets"}
+
+    monkeypatch.setattr(sw, "append_rows", fake_append_rows)
+
+    res = sw.sync_keywords_to_sheet("테스트브랜드", repo_root=tmp_path)
+    assert res["appended"] == 1
+    assert [r["키워드"] for r in captured["rows"]] == ["코숨 편해요"]

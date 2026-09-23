@@ -33,6 +33,7 @@ from typing import Any
 import httpx
 
 from v2r.knowledge import keyword_relevance as _kr_mod
+from v2r.sources.keyword_list import _norm
 
 log = logging.getLogger(__name__)
 
@@ -561,19 +562,35 @@ def update_rows(
         key_idx = hdr.index(key_column)
     except ValueError:
         return {"written": 0, "mode": "csv_only", "error": f"열 없음: {key_column}"}
-    existing_keys = {row[key_idx]: i + 1 for i, row in enumerate(table) if i > 0}  # 1-based data row
+    # 2026-09-24: 공백·대소문자 차이로 같은 키워드가 새 행으로 붙던 사고(811개 중복)
+    # 방지 — 키 대조는 항상 `_norm`(keyword_exposure._norm과 동일 규칙) 정규화로 한다.
+    existing_keys: dict[str, int] = {}
+    for i, row in enumerate(table):
+        if i == 0:
+            continue
+        norm_key = _norm(row[key_idx]) if key_idx < len(row) else ""
+        if norm_key:
+            existing_keys.setdefault(norm_key, i + 1)  # 1-based data row, 첫 일치만
 
     written = 0
     to_append: list[list[str]] = []
+    seen_new: set[str] = set()  # append 목록 안 정규화 중복 제거
     for row in rows:
         key = str(row.get(key_column, ""))
+        norm_key = _norm(key)
         values = [str(row.get(h, "")) for h in hdr]
-        if key in existing_keys:
-            row1 = existing_keys[key] + 1  # +1: 헤더 포함 1-based
+        if norm_key in existing_keys:
+            # existing_keys[norm_key]는 이미 헤더를 포함한 1-based 시트 행 번호다
+            # (예: 헤더=1행, 첫 데이터 행=2행) — 여기서 다시 +1 하면 한 행 밀려
+            # 써지는 버그였다(2026-09-24 시험에서 발견, 정규화 중복 수정과 함께 고침).
+            row1 = existing_keys[norm_key]
             res = _write_verified(spreadsheet_id, gid, _cell_ref(row1, "A"), [values], repo_root)
             if res.get("mode") == "sheets":
                 written += 1
-        else:
+        elif norm_key and norm_key not in seen_new:
+            seen_new.add(norm_key)
+            to_append.append(values)
+        elif not norm_key:
             to_append.append(values)
     if to_append:
         res = append_rows(spreadsheet_id, sheet, to_append, header=hdr, gid=gid, repo_root=repo_root)
@@ -667,24 +684,34 @@ def update_by_key(
     except Exception as exc:
         return {"written": 0, "mode": "csv_only", "error": str(exc)}
     key_col0 = ord(key_column.upper()) - ord("A")
-    row1 = None
-    for i, row in enumerate(table):
-        if key_col0 < len(row) and row[key_col0] == key_value:
-            row1 = i + 1
-            break
-    if row1 is None:
+    # 2026-09-24: 공백·대소문자 차이(예 "수면테이프"/"수면 테이프")를 같은 키로 보도록
+    # `_norm` 정규화로 대조한다. 여러 행이 일치하면(정규화 중복이 이미 시트에 있는 경우)
+    # 전부 갱신한다(한 행만 갱신하면 나머지는 계속 안 맞는 값으로 남는다).
+    norm_target = _norm(key_value)
+    row1s = [
+        i + 1
+        for i, row in enumerate(table)
+        if key_col0 < len(row) and _norm(row[key_col0]) == norm_target and norm_target
+    ]
+    if not row1s:
         return {"written": 0, "mode": "csv_only", "error": f"키를 찾지 못함: {key_value}"}
 
     written = 0
     errors: list[str] = []
-    for col_letter, value in updates.items():
-        cell = _cell_ref(row1, col_letter.upper())
-        res = _write_verified(spreadsheet_id, gid, cell, [[str(value)]], repo_root)
-        if res.get("mode") == "sheets":
-            written += 1
-        elif res.get("error"):
-            errors.append(f"{cell}: {res['error']}")
-    out = {"written": written, "mode": "sheets" if written == len(updates) else "csv_only", "row": row1}
+    for row1 in row1s:
+        for col_letter, value in updates.items():
+            cell = _cell_ref(row1, col_letter.upper())
+            res = _write_verified(spreadsheet_id, gid, cell, [[str(value)]], repo_root)
+            if res.get("mode") == "sheets":
+                written += 1
+            elif res.get("error"):
+                errors.append(f"{cell}: {res['error']}")
+    out = {
+        "written": written,
+        "mode": "sheets" if written == len(updates) * len(row1s) else "csv_only",
+        "row": row1s[0],
+        "rows": row1s,
+    }
     if errors:
         out["error"] = "; ".join(errors)
     return out
@@ -949,12 +976,18 @@ def sync_keywords_to_sheet(
         "노출 상태", "키워드", "통합검색", "최종 편집 일시", "키워드 검색량",
         "노출된 검색량", "비고", "본문 분류", "1~5순위 진입",
     ]
-    existing = {r[7].strip() for r in table[1:] if len(r) > 7 and r[7].strip()}
+    # 2026-09-24: 공백·대소문자 차이로 같은 키워드가 중복 행으로 붙던 사고 방지 —
+    # 이미 있는지 판정은 항상 `_norm` 정규화로 하고, append 목록 안에서도 정규화
+    # 중복을 제거한다.
+    existing = {_norm(r[7]) for r in table[1:] if len(r) > 7 and r[7].strip()}
 
     out_rows: list[dict[str, Any]] = []
+    seen_new: set[str] = set()
     for kw, total, rationale, rel_llm, bridge_rationale in rows:
-        if kw in existing:
+        norm_kw = _norm(kw)
+        if not norm_kw or norm_kw in existing or norm_kw in seen_new:
             continue
+        seen_new.add(norm_kw)
         d = {h: "" for h in header}
         d["노출 상태"] = "미확인"
         d["키워드"] = kw
@@ -1040,7 +1073,7 @@ def apply_exposure(
         return {"brand": brand, "written": 0, "rows": len(rows), "error": f"시트 읽기 실패: {exc}"}
     # I(통합검색, 인덱스 8)이 이미 있는지만 본다 — B~F(인덱스 1~5, E=비밀번호 포함)는
     # 이 딕셔너리에 담기지만 아래에서 절대 인덱스로 꺼내 쓰지 않는다(로그·기록 없음).
-    by_keyword_i = {r[7]: (r[8] if len(r) > 8 else "") for r in table[1:] if len(r) > 7 and r[7]}
+    by_keyword_i = {_norm(r[7]): (r[8] if len(r) > 8 else "") for r in table[1:] if len(r) > 7 and r[7]}
 
     written = 0
     errors: list[str] = []
@@ -1056,7 +1089,7 @@ def apply_exposure(
             checked_at_kst=row.get("edited_at", ""),
             cafe=row.get("cafe") or None,
             volume=row.get("volume"),
-            existing_i=by_keyword_i.get(str(kw), ""),
+            existing_i=by_keyword_i.get(_norm(kw), ""),
             integrated_search_url_fn=lambda k: row.get("final_url") or "",
             keyword=str(kw),
         )
