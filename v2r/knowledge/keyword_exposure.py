@@ -35,6 +35,7 @@ from urllib.parse import quote
 
 import httpx
 
+from v2r.knowledge import serp
 from v2r.sources.keyword_list import (
     EXPOSURE_SHEET,
     _brand_spreadsheet_id,
@@ -168,6 +169,10 @@ class ExposureRow:
     #: 실제로 검색창에 넣은 최종 검색어(자동완성 1번 또는 띄어쓰기 정규화 결과).
     #: 2026-09-23 사용자 지시 — I열(통합검색 URL)이 이 검색어 기준이어야 한다.
     search_query: str = ""
+    #: 예전 방식 순위(광고·내비 포함 전체 링크 순번) — 참고용(2026-09-23 정정,
+    #: `rank`는 이제 일반 결과만 센다). `judge_keyword_exposure`를 거치지 않은
+    #: 예전 경로(`check_keyword_unified`)에서는 늘 `None`이다.
+    rank_overall: int | None = None
 
     def as_row(self) -> dict[str, Any]:
         return {
@@ -180,6 +185,7 @@ class ExposureRow:
             "checked_at": self.checked_at,
             "t0_status": self.t0_status,
             "search_query": self.search_query,
+            "rank_overall": self.rank_overall,
         }
 
 
@@ -1003,14 +1009,17 @@ _sheet_batch_warned: set[str] = set()
 
 
 def _sheet_row_from_result(item: dict, row: "ExposureRow") -> dict:
-    exposed_total = int(item.get("volume") or 0) if row.status == "exposed" else 0
+    """`sheets_writer.apply_exposure`에 줄 배치 행 — A·G·J·K·L만 바꾸는 최종
+    규칙(2026-09-23)에 맞춘다. `cafe`는 노출완일 때만 채운다(밀려남이면 A를
+    아예 안 바꾸도록 `apply_exposure`가 빈 값을 걸러낸다)."""
     top5 = row.status == "exposed" and row.rank is not None and row.rank <= TOP5_RANK
     return {
         "keyword": row.keyword,
         "status": KOREAN_STATUS.get(row.status, row.status),
         "final_url": integrated_search_url(row.search_query or row.keyword),
         "edited_at": row.checked_at,
-        "exposed_total": exposed_total,
+        "cafe": row.cafe if row.status == "exposed" else "",
+        "volume": int(item.get("volume") or 0) if item.get("volume") is not None else None,
         "rank": "예" if top5 else "",
     }
 
@@ -1144,6 +1153,7 @@ def cycle_tick(rt: Any, now_mono: float | None = None) -> dict | None:
         now_iso(),
         item.get("t0_status", ""),
         verdict["search_query"],
+        verdict.get("rank_overall"),
     )
     store.save(rt.conn, row.as_row())
     _enqueue_sheet_row(rt, brand, item, row)
@@ -1588,6 +1598,119 @@ def fetch_article_text(
             browser.close()
 
 
+# ---------------------------------------------------------------------------
+# 2026-09-23 사용자 확정 — 식별어는 **댓글2 계열**(댓글2 → 대댓글2 → 대대댓글2 →
+# 대대대댓글2, `config/brands.yaml` comment_profiles의 라벨)에만 심는다. 댓글
+# 트리에서 "몇 번째 최상위 댓글"과 "그 밑 답글이냐"를 실측 DOM 클래스로 가른다.
+#
+# 실측 근거(2026-09-23, `data/exposure_audit/팥순이/_hankki_article_raw.html`,
+# 헤드리스로 카페 글 상세를 열어 `cafe_main` 프레임 원본 HTML을 그대로 저장해 확인):
+#   <li id="<댓글id>" class="CommentItem">              ← 최상위 댓글(댓글N)
+#   <li id="<댓글id>" class="CommentItem CommentItem--reply">  ← 그 바로 위 최상위
+#       댓글에 달린 답글(대댓글N/대대댓글N/대대대댓글N — Naver 카페 UI 자체는 답글을
+#       한 단계로만 펼쳐 보여주지만, DOM 순서상 같은 최상위 댓글 밑에 연달아 나온다.
+#       그래서 "몇 번째 최상위 댓글 다음이냐"로 댓글N 계열을 가른다)
+#   본문 텍스트는 그 `<li>` 안 `class="comment_text_view"` 문단(<p>) 하나.
+# 실측 결과: `한끼통살`/`비만도 계산기` 둘 다 식별어가 **두 번째 최상위 댓글**
+# (top_index=2, 정확히 "댓글2")의 본문 자체에서 나왔다 — 사용자 규칙과 일치.
+# ---------------------------------------------------------------------------
+
+_RE_COMMENT_LI = re.compile(
+    r'<li[^>]*\bid="(\d+)"[^>]*\bclass="(CommentItem(?: CommentItem--reply)?)"', re.I
+)
+_RE_COMMENT_TEXT_P = re.compile(r'class="comment_text_view"[^>]*>(.*?)</p>', re.S | re.I)
+_RE_HTML_TAG = re.compile(r"<[^>]+>")
+
+
+def extract_comment_tree(article_html: str) -> list[dict]:
+    """글 상세 **원본 HTML**(`fetch_article_html`)에서 댓글을 화면 순서대로,
+    "몇 번째 최상위 댓글 계열이냐"(`top_index`, 1부터)와 답글 여부(`is_reply`)를
+    같이 뽑는다. `CommentItem`류 마커가 없는 화면(옛 마크업 등)이면 빈 목록 —
+    호출 쪽은 그러면 위치 구분 없이 `extract_comments`(댓글 전체)로 넘어간다.
+    """
+    items = list(_RE_COMMENT_LI.finditer(article_html or ""))
+    if not items:
+        return []
+    out: list[dict] = []
+    top_index = 0
+    for i, m in enumerate(items):
+        comment_id, cls = m.group(1), m.group(2)
+        is_reply = "reply" in cls
+        if not is_reply:
+            top_index += 1
+        start = m.end()
+        end = items[i + 1].start() if i + 1 < len(items) else min(len(article_html), start + 4000)
+        block = article_html[start:end]
+        tm = _RE_COMMENT_TEXT_P.search(block)
+        text = _RE_HTML_TAG.sub("", tm.group(1)).strip() if tm else ""
+        out.append({"comment_id": comment_id, "top_index": top_index, "is_reply": is_reply, "text": text})
+    return out
+
+
+def find_identifier_in_reply2_series(
+    tree: list[dict], identifiers: list[str]
+) -> dict | None:
+    """댓글 트리에서 **댓글2 계열**(top_index == 2, 대댓글2/대대댓글2/대대대댓글2
+    포함)에서만 식별어를 찾는다. 찾으면 `{comment_id, top_index, is_reply,
+    ident, out_of_position: False}`, 댓글2 계열 밖에서만 나오면
+    `{..., out_of_position: True}`(보고용, 확정에는 안 씀), 아예 없으면 `None`.
+    """
+    norm_idents = [(ident, _norm_identifier_text(ident)) for ident in identifiers if ident]
+    out_of_position_hit: dict | None = None
+    for item in tree:
+        norm_text = _norm_identifier_text(item["text"])
+        for ident, norm_ident in norm_idents:
+            if norm_ident and norm_ident in norm_text:
+                if item["top_index"] == 2:
+                    return {
+                        "comment_id": item["comment_id"], "top_index": item["top_index"],
+                        "is_reply": item["is_reply"], "ident": ident, "out_of_position": False,
+                    }
+                if out_of_position_hit is None:
+                    out_of_position_hit = {
+                        "comment_id": item["comment_id"], "top_index": item["top_index"],
+                        "is_reply": item["is_reply"], "ident": ident, "out_of_position": True,
+                    }
+    return out_of_position_hit
+
+
+def fetch_article_html(
+    url: str, cookies_path: str | Path | None = None, headless: bool = True
+) -> str:
+    """글 상세(댓글 포함) **원본 HTML**(innerText가 아니라). `extract_comment_tree`용
+    — `fetch_article_text`와 프레임 대기 로직은 같고 반환만 `frame.content()`."""
+    from playwright.sync_api import sync_playwright
+
+    storage_state = str(cookies_path) if cookies_path and Path(cookies_path).exists() else None
+    with sync_playwright() as pw:
+        browser = launch_chromium(pw, headless=headless)
+        try:
+            context = browser.new_context(storage_state=storage_state)
+            page = context.new_page()
+            page.goto(url, timeout=15000, wait_until="domcontentloaded")
+            frame = None
+            for _ in range(5):
+                try:
+                    frame = page.frame(name="cafe_main")
+                except Exception:
+                    frame = None
+                if frame is not None:
+                    break
+                page.wait_for_timeout(500)
+            if frame is not None:
+                try:
+                    frame.wait_for_load_state("networkidle", timeout=8000)
+                except Exception:
+                    pass
+                frame.wait_for_timeout(1200)
+            else:
+                page.wait_for_timeout(1500)
+            target = frame or page.main_frame
+            return target.content()
+        finally:
+            browser.close()
+
+
 def article_has_identifier(text: str, identifiers: list[str]) -> bool:
     body = text or ""
     return any(ident and ident in body for ident in identifiers)
@@ -1638,6 +1761,66 @@ def find_identifier_in_comments(
     return None
 
 
+def confirm_our_article_detail(
+    rt: Any,
+    brand: str,
+    url: str,
+    identifiers: list[str],
+    cookies_path: str | Path | None = None,
+    article_index: Any = None,
+    now: str | None = None,
+) -> dict:
+    """`confirm_our_article`의 상세판 — 위치(댓글2 계열인지)까지 돌려준다.
+
+    반환: `{ours: bool, via: "article_index"|"cache"|"tree"|"flat_comments"|"error",
+    hit: find_identifier_in_reply2_series 결과 또는 None}`.
+
+    순서: (1) `article_index`에 이미 있으면 열지 않고 바로 확정(위치 확인 불필요 —
+    우리가 이미 발행 기록으로 아는 글) → (2) 24시간 캐시 → (3) 직접 열어 **원본
+    HTML**로 댓글 트리를 뽑아 **댓글2 계열에서만** 식별어를 찾는다(2026-09-23
+    사용자 확정 규칙). `CommentItem` 마커가 없는 화면(옛 마크업)이면 위치 구분
+    없이 댓글 전체(`extract_comments`)로 대신 확인한다(`find_identifier_in_comments`).
+    """
+    if article_index is not None:
+        try:
+            aid = _article_id(url)
+            if aid and article_index.has_article_id(aid):
+                return {"ours": True, "via": "article_index", "hit": None}
+        except AttributeError:
+            pass
+        except Exception as exc:  # pragma: no cover - 방어용
+            log.warning("article_index 확인 실패(%s): %s", url, exc)
+
+    cached = cached_verdict(rt, url, now=now)
+    if cached is not None:
+        return {"ours": cached, "via": "cache", "hit": None}
+
+    try:
+        html = fetch_article_html(url, cookies_path=cookies_path)
+        tree = extract_comment_tree(html)
+        if tree:
+            hit = find_identifier_in_reply2_series(tree, identifiers)
+            ours = bool(hit) and not hit.get("out_of_position")
+            via = "tree"
+        else:
+            # 옛 마크업 등 트리 파싱이 안 되는 화면 — 위치 구분 없이(댓글 전체) 확인.
+            text = fetch_article_text(url, cookies_path=cookies_path)
+            comments = extract_comments(text)
+            flat_hit = find_identifier_in_comments(comments, identifiers)
+            hit = (
+                {"comment_id": "", "top_index": flat_hit[0], "is_reply": None,
+                 "ident": flat_hit[1], "out_of_position": None}
+                if flat_hit else None
+            )
+            ours = flat_hit is not None
+            via = "flat_comments"
+    except Exception as exc:
+        log.warning("글 열람 확인 실패(%s): %s", url, exc)
+        return {"ours": False, "via": "error", "hit": None}
+    set_cached_verdict(rt, url, ours, now=now)
+    return {"ours": ours, "via": via, "hit": hit}
+
+
 def confirm_our_article(
     rt: Any,
     brand: str,
@@ -1647,37 +1830,12 @@ def confirm_our_article(
     article_index: Any = None,
     now: str | None = None,
 ) -> bool:
-    """후보 글이 진짜 우리 글인지 확정한다.
-
-    순서: (1) `article_index`에 이미 있으면 열지 않고 바로 확정 →
-    (2) 24시간 캐시가 있으면 그대로 → (3) 직접 열어(Playwright) 댓글/본문에
-    브랜드 식별어가 있는지 확인하고 캐시에 남긴다.
-    """
-    if article_index is not None:
-        try:
-            aid = _article_id(url)
-            if aid and article_index.has_article_id(aid):
-                return True
-        except AttributeError:
-            pass
-        except Exception as exc:  # pragma: no cover - 방어용
-            log.warning("article_index 확인 실패(%s): %s", url, exc)
-
-    cached = cached_verdict(rt, url, now=now)
-    if cached is not None:
-        return cached
-
-    try:
-        text = fetch_article_text(url, cookies_path=cookies_path)
-        # 2026-09-23 재지시: 식별어는 본문이 아니라 **댓글에서만** 찾는다(실제
-        # 원고 기획상 식별어는 댓글2/대댓글2/대대댓글2 계열에만 심는다).
-        comments = extract_comments(text)
-        ours = find_identifier_in_comments(comments, identifiers) is not None
-    except Exception as exc:
-        log.warning("글 열람 확인 실패(%s): %s", url, exc)
-        return False
-    set_cached_verdict(rt, url, ours, now=now)
-    return ours
+    """후보 글이 진짜 우리 글인지 확정한다(참/거짓만 — 위치까지 필요하면
+    `confirm_our_article_detail`)."""
+    return confirm_our_article_detail(
+        rt, brand, url, identifiers, cookies_path=cookies_path,
+        article_index=article_index, now=now,
+    )["ours"]
 
 
 def judge_keyword_exposure(
@@ -1696,8 +1854,25 @@ def judge_keyword_exposure(
     """B1 2차 재설계 — 카페 후보(1차 관문) → 댓글 식별어(2차 확정)로 판정.
 
     반환: `{search_query, candidates, opened, status(exposed|pushed|unknown),
-    rank, matched_url}`. `rank`는 통검 최종 화면에서 그 글이 위에서 몇 번째
-    "문서"인지(카페·블로그·VIEW 다 합쳐서 센다).
+    rank, rank_overall, matched_url, matched_as, identifier_position,
+    sub_link_hits}`.
+    `rank`는 **일반 결과만**(광고·쇼핑·뉴스·내비·도움말·`ader.naver.com`
+    캐러셀 제외, 카페·블로그·포스트·지식iN 중 진짜 글만) 셌을 때 몇 번째인지 —
+    `v2r/knowledge/serp.py`의 `extract_serp` 재사용(2026-09-23 정정, `top_reference.py`
+    가 먼저 검증한 추출기). `rank_overall`은 예전 방식(통검 화면의 **모든**
+    `<a href>`를 순서대로 센 것, 광고·내비도 포함) — 참고용으로 남겨 둔다.
+
+    2026-09-23 사용자 정정(카페 카드 구조) — 카페 결과 한 "카드"는 ① 대표 글
+    (큰 제목 링크, 그 밑 댓글 미리보기는 대표 글에 딸린 일부일 뿐 별도 글이
+    아니다) ② 서브 링크(같은 카페의 **다른** 글 제목 링크, 댓글 미리보기 없음)
+    로 이뤄진다. 우리 글이 **서브 링크로만** 보이면 밀려남이다(`serp.py`의
+    `extract_cafe_cards` 재사용). `matched_as`는 "representative"|"sub".
+
+    2026-09-23 사용자 확정(댓글 위치) — 식별어는 **댓글2 계열**(댓글2·대댓글2·
+    대대댓글2·대대대댓글2)에만 심는다. 대표 글이어도 식별어가 그 계열 밖에서만
+    나오면 확정하지 않는다(`confirm_our_article_detail`이 판정). `identifier_position`
+    에 `{top_index, is_reply, out_of_position}`을 남긴다(위치 이탈이면
+    `out_of_position=True`로 보고에 표시).
     """
     import random
 
@@ -1716,35 +1891,57 @@ def judge_keyword_exposure(
         log.warning("통검 DOM 확인 실패(%s): %s", keyword, exc)
         return {
             "search_query": query, "candidates": 0, "opened": 0,
-            "status": "unknown", "rank": None, "matched_url": "",
+            "status": "unknown", "rank": None, "rank_overall": None, "matched_url": "",
+            "matched_as": "", "identifier_position": None, "sub_link_hits": [],
         }
 
     ordered = extract_ordered_result_links(html)
-    candidates = [
-        (i + 1, item)
-        for i, item in enumerate(ordered)
-        if looks_like_cafe_article_url(item["url"])
-        and is_our_cafe_candidate(rt, item["url"], registry, cookies=cookies)
-    ]
+    # 카드 파싱이 되는 화면이면 대표 글만 후보로 삼고, 서브 링크는 따로 기록만
+    # 한다(위 docstring 참고). 카드 마커가 없으면(옛 마크업) 예전처럼 모든
+    # 카페 글 링크를 대표로 본다 — 판정이 아예 안 되는 것보다는 낫다.
+    cards = serp.extract_cafe_cards(html)
+    sub_norm: set[str] = set()
+    sub_link_hits: list[dict] = []
+    if cards:
+        for card in cards:
+            for sub_url in card["sub_urls"]:
+                if looks_like_cafe_article_url(sub_url) and is_our_cafe_candidate(rt, sub_url, registry, cookies=cookies):
+                    sub_norm.add(_norm_url(sub_url))
+                    sub_link_hits.append({"url": sub_url, "representative_url": card["representative_url"]})
+
+    candidates = []
+    for i, item in enumerate(ordered):
+        if not looks_like_cafe_article_url(item["url"]):
+            continue
+        if not is_our_cafe_candidate(rt, item["url"], registry, cookies=cookies):
+            continue
+        if cards and _norm_url(item["url"]) in sub_norm:
+            continue  # 서브 링크는 후보에서 뺀다(대표 글로만 판단)
+        candidates.append((i + 1, item))
 
     opened = 0
     to_open = candidates[:max_candidates]
-    for i, (rank, item) in enumerate(to_open):
-        ours = confirm_our_article(
+    for i, (rank_overall, item) in enumerate(to_open):
+        detail = confirm_our_article_detail(
             rt, brand, item["url"], idents, cookies_path=cookies_path, article_index=article_index
         )
         opened += 1
-        if ours:
+        if detail["ours"]:
+            general_rank = serp.general_result_rank(html, item["url"])
+            hit = detail.get("hit")
             return {
                 "search_query": query, "candidates": len(candidates), "opened": opened,
-                "status": "exposed", "rank": rank, "matched_url": item["url"],
+                "status": "exposed", "rank": general_rank, "rank_overall": rank_overall,
+                "matched_url": item["url"], "matched_as": "representative",
+                "identifier_position": hit, "sub_link_hits": sub_link_hits,
             }
         if i < len(to_open) - 1:
             sleep_fn(random.uniform(MIN_DELAY_SEC, MAX_DELAY_SEC))
 
     return {
         "search_query": query, "candidates": len(candidates), "opened": opened,
-        "status": "pushed", "rank": None, "matched_url": "",
+        "status": "pushed", "rank": None, "rank_overall": None, "matched_url": "",
+        "matched_as": "", "identifier_position": None, "sub_link_hits": sub_link_hits,
     }
 
 
@@ -1806,6 +2003,10 @@ __all__ = [
     "extract_comments",
     "find_identifier_in_comments",
     "confirm_our_article",
+    "confirm_our_article_detail",
+    "extract_comment_tree",
+    "find_identifier_in_reply2_series",
+    "fetch_article_html",
     "judge_keyword_exposure",
     # 연결 1: 순환→시트 배칭 (2026-09-23)
     "SHEET_BATCH_SIZE",

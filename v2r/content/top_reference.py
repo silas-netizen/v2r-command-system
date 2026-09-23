@@ -28,21 +28,14 @@ from v2r.store.db import now_iso
 
 log = logging.getLogger(__name__)
 
-#: 광고/파워링크/쇼핑/뉴스 등 "일반 글"이 아닌 것으로 보는 URL/텍스트 표시
-_EXCLUDE_HOST_HINTS = ("shopping.naver.com", "ad.naver.com", "adcr.naver.com", "news.naver.com")
-_EXCLUDE_TEXT_HINTS = ("파워링크", "광고", "네이버쇼핑", "브랜드검색")
+#: 2026-09-23(교차 검증 후속) — SERP 추출기는 `v2r/knowledge/serp.py`로 옮겼다
+#: (`keyword_exposure.py`도 같이 쓴다). 여기서는 이름만 그대로 다시 노출한다.
+from v2r.knowledge import serp as _serp
 
-#: 일반 글로 인정하는 링크 패턴 — 카페 > 블로그 > 포스트 > 지식iN 순으로 우선한다.
-#: 실제 글(숫자 게시글 ID)만 잡는다 — "내 블로그" 같은 내비게이션/메뉴 링크는
-#: 게시글 ID가 없어 여기서 자연히 걸러진다(2026-09-23 실측에서 확인한 오탐).
-_RESULT_LINK_PATTERNS = [
-    ("cafe", re.compile(r"https?://(?:m\.)?cafe\.naver\.com/(?:ca-fe/cafes/\d+/articles/\d+|[^/\s\"'<>]+/\d+)", re.I)),
-    ("blog", re.compile(r"https?://(?:m\.)?blog\.naver\.com/(?:PostView\.naver\?[^\s\"'<>]*|[^/\s\"'<>]+/\d{6,})", re.I)),
-    ("post", re.compile(r"https?://(?:m\.)?post\.naver\.com/viewer/postView\.naver\?[^\s\"'<>]+", re.I)),
-    ("jisik", re.compile(r"https?://(?:m\.)?kin\.naver\.com/(?:qna/detail\.naver\?[^\s\"'<>]+|[^/\s\"'<>]+/\d+)", re.I)),
-]
-#: 내비게이션/메뉴류로 걸러낼 URL 조각
-_EXCLUDE_URL_HINTS = ("MyBlog.naver", "BlogHome.naver", "gnb_", "/PostList.naver", "/ns/home")
+_EXCLUDE_HOST_HINTS = _serp.EXCLUDE_HOST_HINTS
+_EXCLUDE_TEXT_HINTS = _serp.EXCLUDE_TEXT_HINTS
+_RESULT_LINK_PATTERNS = _serp.RESULT_LINK_PATTERNS
+_EXCLUDE_URL_HINTS = _serp.EXCLUDE_URL_HINTS
 
 # ---------------------------------------------------------------------------
 # 2026-09-23 추가 지시 — 우리가 고른 글이 통검에서 실제 몇 번째인지 기록 +
@@ -66,78 +59,12 @@ def _norm_serp_url(url: str) -> str:
 #: 배지 링크를 "카페 결과"로 잘못 세는 바람에 `rank_in_source`가 항상 실제보다
 #: 1 컸다). 느슨한 도메인 매칭 대신 글 번호가 있는 `_RESULT_LINK_PATTERNS`(진짜
 #: 글만 잡는 패턴)를 그대로 재사용해 이 오탐을 없앤다.
-_SERP_STRICT_SECTIONS = [
-    ("카페", "cafe"),
-    ("블로그", "blog"),
-    ("포스트", "post"),
-    ("지식iN", "jisik"),
-]
-_SERP_STRICT_PATTERN_BY_SOURCE = dict(_RESULT_LINK_PATTERNS)
+_SERP_STRICT_SECTIONS = _serp.STRICT_SECTIONS
+_SERP_STRICT_PATTERN_BY_SOURCE = _serp.STRICT_PATTERN_BY_SOURCE
+_SERP_LOOSE_SECTIONS = _serp.LOOSE_SECTIONS
 
-#: 광고/쇼핑/뉴스는 "진짜 글 번호" 개념이 없어 도메인 기반으로 그대로 훑는다.
-_SERP_LOOSE_SECTIONS = [
-    (re.compile(r"https?://(?:ader|adcr)\.naver\.com/[^\s\"'<>]+", re.I), "파워링크/광고", "ad", True),
-    (re.compile(r"https?://shopping\.naver\.com/[^\s\"'<>]+", re.I), "쇼핑", "shopping", False),
-    (re.compile(r"https?://(?:m\.)?news\.naver\.com/[^\s\"'<>]+", re.I), "뉴스", "news", False),
-]
-
-
-def extract_serp(dom_html: str, max_n: int = 15) -> list[dict]:
-    """통검 최종 DOM에서 화면 순서대로 결과 링크를 뽑는다(상위 `max_n`개, 중복 제거).
-
-    반환: `[{rank, section, source, title, url, is_ad}]`. 카페·블로그·포스트·
-    지식iN은 **진짜 글(글 번호가 있는 URL)만** 센다 — 카페 이름 배지 같은
-    비-글 링크는 여기서 아예 후보에 들지 않는다.
-    """
-    if not dom_html:
-        return []
-    matches: list[tuple[int, str, str, str, bool]] = []  # (start, url, section, source, is_ad)
-    for section, source in _SERP_STRICT_SECTIONS:
-        pattern = _SERP_STRICT_PATTERN_BY_SOURCE[source]
-        for m in pattern.finditer(dom_html):
-            url = m.group(0)
-            if any(h in url for h in _EXCLUDE_HOST_HINTS) or any(h in url for h in _EXCLUDE_URL_HINTS):
-                continue
-            matches.append((m.start(), url, section, source, False))
-    for pattern, section, source, is_ad in _SERP_LOOSE_SECTIONS:
-        for m in pattern.finditer(dom_html):
-            url = m.group(0)
-            if any(h in url for h in _EXCLUDE_URL_HINTS):
-                continue
-            path = urlparse(url).path
-            if not is_ad and section != "쇼핑" and path in ("", "/"):
-                continue  # 상단 메뉴 바로가기(실제 결과가 아니다)
-            matches.append((m.start(), url, section, source, is_ad))
-    matches.sort(key=lambda t: t[0])
-
-    seen: set[str] = set()
-    out: list[dict] = []
-    for start, url, section, source, is_ad in matches:
-        norm = _norm_serp_url(url)
-        if is_ad:
-            # 파워링크 광고 한 칸에 썸네일/제목/설명 등 여러 클릭 영역이 있어 URL이
-            # 조금씩 다르다 — 리다이렉트 토큰 앞 16자로 "같은 광고 칸"인지 본다.
-            token = re.search(r"/v1/([^?&\s\"']{16})", url)
-            norm = f"ad:{token.group(1)}" if token else norm
-        if norm in seen:
-            continue
-        seen.add(norm)
-        window_start = max(0, start - 40)
-        window = dom_html[window_start:window_start + 400]
-        title = _strip_tags(window)[:60].strip()
-        out.append(
-            {
-                "rank": len(out) + 1,
-                "section": section,
-                "source": source,
-                "title": title,
-                "url": url,
-                "is_ad": is_ad,
-            }
-        )
-        if len(out) >= max_n:
-            break
-    return out
+#: 하위 호환 — 기존 호출부(`top_reference.py` 안, 시험)는 그대로 `extract_serp`를 쓴다.
+extract_serp = _serp.extract_serp
 
 
 def _requests_crosscheck(keyword_query: str, cookies: dict | None = None, sources: list[str] | None = None) -> dict:

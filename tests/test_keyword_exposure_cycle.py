@@ -22,7 +22,7 @@ OUR_URL = "https://cafe.naver.com/mycafe/555"
 SAMPLE_UNIFIED_TOP2 = f"""
 <html><body>
 <div class="api_subject_bx">
-  <a href="https://blog.naver.com/someone/1">블로그 글</a>
+  <a href="https://blog.naver.com/someone/123456">블로그 글</a>
   <a href="{OUR_URL}">우리 카페 글</a>
   <a href="https://cafe.naver.com/othercafe/2">다른 카페 글</a>
 </div>
@@ -248,7 +248,10 @@ def test_confirm_our_article_캐시_24시간_재사용(tmp_path, monkeypatch):
     rt = make_runtime(tmp_path)
     rt.settings.repo_root = tmp_path
     calls = []
-    monkeypatch.setattr(ke, "fetch_article_text", lambda url, cookies_path=None: calls.append(url) or "우아덤 후기입니다")
+    # 2026-09-23 재지시: 식별어는 댓글에서만 찾는다 — "답글쓰기" 마커로 끝나는
+    # 댓글 블록 형태로 fixture를 맞춘다(extract_comments가 쓰는 실제 UI 패턴).
+    comment_page = "댓글 1\n작성자\n\n우아덤 후기입니다\n\n2026.09.10. 10:00\n답글쓰기\n댓글을 입력하세요"
+    monkeypatch.setattr(ke, "fetch_article_text", lambda url, cookies_path=None: calls.append(url) or comment_page)
 
     first = ke.confirm_our_article(rt, "우아덤", OUR_URL, IDENTS)
     assert first is True
@@ -271,14 +274,20 @@ def test_judge_keyword_exposure_후보중_확정되면_노출완(tmp_path, monke
     rt.settings.repo_root = tmp_path
     monkeypatch.setattr(ke, "load_cafe_registry", lambda rt_: REGISTRY)
     monkeypatch.setattr(ke, "brand_identifiers", lambda rt_, brand: IDENTS)
-    monkeypatch.setattr(ke, "confirm_our_article", lambda rt_, brand, url, idents, **kw: url == OUR_URL)
+    monkeypatch.setattr(
+        ke, "confirm_our_article_detail",
+        lambda rt_, brand, url, idents, **kw: {"ours": url == OUR_URL, "via": "tree", "hit": None},
+    )
 
     out = ke.judge_keyword_exposure(
         rt, "우아덤", "비건세제", dom_html=SAMPLE_UNIFIED_TOP2, search_query="비건세제",
         sleep_fn=lambda s: None,
     )
     assert out["status"] == "exposed"
+    # 2026-09-23 정정: rank는 이제 일반 결과(광고·내비 제외, v2r/knowledge/serp.py)만
+    # 세서 블로그(1) 다음의 카페 글(2) — rank_overall은 옛 방식(전체 링크 순번)이다.
     assert out["rank"] == 2  # 블로그(1) 다음의 카페 글(2)
+    assert out["rank_overall"] == 2  # 이 고정 fixture는 광고/내비 링크가 없어 우연히 같다
     assert out["candidates"] == 1  # 다른카페는 등록 카페가 아니라 후보 아님
     assert out["opened"] == 1
     assert out["matched_url"] == OUR_URL
@@ -297,8 +306,8 @@ def test_judge_keyword_exposure_카페홈_링크는_후보에서_제외(tmp_path
     monkeypatch.setattr(ke, "brand_identifiers", lambda rt_, brand: IDENTS)
     opened_urls = []
     monkeypatch.setattr(
-        ke, "confirm_our_article",
-        lambda rt_, brand, url, idents, **kw: opened_urls.append(url) or (url == OUR_URL),
+        ke, "confirm_our_article_detail",
+        lambda rt_, brand, url, idents, **kw: opened_urls.append(url) or {"ours": url == OUR_URL, "via": "tree", "hit": None},
     )
     out = ke.judge_keyword_exposure(
         rt, "우아덤", "비건세제", dom_html=html, search_query="비건세제", sleep_fn=lambda s: None,
@@ -312,7 +321,10 @@ def test_judge_keyword_exposure_후보있어도_식별어없으면_밀려남(tmp
     rt.settings.repo_root = tmp_path
     monkeypatch.setattr(ke, "load_cafe_registry", lambda rt_: REGISTRY)
     monkeypatch.setattr(ke, "brand_identifiers", lambda rt_, brand: IDENTS)
-    monkeypatch.setattr(ke, "confirm_our_article", lambda rt_, brand, url, idents, **kw: False)
+    monkeypatch.setattr(
+        ke, "confirm_our_article_detail",
+        lambda rt_, brand, url, idents, **kw: {"ours": False, "via": "tree", "hit": None},
+    )
 
     out = ke.judge_keyword_exposure(
         rt, "우아덤", "비건세제", dom_html=SAMPLE_UNIFIED_TOP2, search_query="비건세제",
@@ -329,7 +341,10 @@ def test_judge_keyword_exposure_후보없으면_열지않고_밀려남(tmp_path,
     monkeypatch.setattr(ke, "load_cafe_registry", lambda rt_: REGISTRY)
     monkeypatch.setattr(ke, "brand_identifiers", lambda rt_, brand: IDENTS)
     opened = []
-    monkeypatch.setattr(ke, "confirm_our_article", lambda rt_, brand, url, idents, **kw: opened.append(url) or False)
+    monkeypatch.setattr(
+        ke, "confirm_our_article_detail",
+        lambda rt_, brand, url, idents, **kw: opened.append(url) or {"ours": False, "via": "tree", "hit": None},
+    )
 
     out = ke.judge_keyword_exposure(
         rt, "우아덤", "비건세제", dom_html=SAMPLE_UNIFIED_NOT_FOUND, search_query="비건세제",
@@ -629,3 +644,81 @@ def test_사이클_틱_20건_차면_자동으로_흘려보낸다(tmp_path, monke
     _time.sleep(0.2)
     assert len(calls) == 1  # 20건 찼을 때 한 번만
     assert len(calls[0][1]) == 20
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-23 후속 — 카페 카드 대표/서브, 댓글2 계열 위치 (교차 검증 중 정정)
+# ---------------------------------------------------------------------------
+
+from v2r.knowledge import serp as _serp  # noqa: E402
+
+
+_CARD_HTML = """
+<div>
+  <a data-heatmap-target="articleSourceJSX_title" href="https://cafe.naver.com/cantsb">카페이름</a>
+  <a class="fds-ugc-ellipsis3" href="https://cafe.naver.com/cantsb/100?art=x">대표 글 제목</a>
+  <a class="fds-reply-box" href="https://cafe.naver.com/cantsb/100?art=x">댓글 미리보기1</a>
+  <a class="fds-reply-box" href="https://cafe.naver.com/cantsb/100?art=x">댓글 미리보기2</a>
+  <span class="VertDivider"></span>
+  <a data-heatmap-target=".series" href="https://cafe.naver.com/cantsb/200?art=y">관련 글(서브)</a>
+</div>
+"""
+
+
+def test_extract_cafe_cards_대표와_서브를_가른다():
+    cards = _serp.extract_cafe_cards(_CARD_HTML)
+    assert len(cards) == 1
+    card = cards[0]
+    assert "cantsb/100" in card["representative_url"]
+    assert len(card["sub_urls"]) == 1
+    assert "cantsb/200" in card["sub_urls"][0]
+
+
+def test_extract_cafe_cards_마커없으면_빈목록():
+    assert _serp.extract_cafe_cards("<html><body>그냥 글</body></html>") == []
+
+
+_COMMENT_TREE_HTML = (
+    '<li id="1" class="CommentItem">A</li>'
+    '<div class="comment_text_view"><p>첫 댓글 아무 말</p></div>'
+    '<li id="2" class="CommentItem CommentItem--reply">B</li>'
+    '<div class="comment_text_view"><p>첫 댓글 답글 아무 말</p></div>'
+    '<li id="3" class="CommentItem">C</li>'
+    '<div class="comment_text_view"><p>팥순추출물 드셔보세요</p></div>'
+    '<li id="4" class="CommentItem CommentItem--reply">D</li>'
+    '<div class="comment_text_view"><p>저도 먹어요 좋아요</p></div>'
+)
+
+
+def test_extract_comment_tree_top_index와_is_reply():
+    tree = ke.extract_comment_tree(_COMMENT_TREE_HTML)
+    assert [t["top_index"] for t in tree] == [1, 1, 2, 2]
+    assert [t["is_reply"] for t in tree] == [False, True, False, True]
+    assert tree[2]["text"] == "팥순추출물 드셔보세요"
+
+
+def test_find_identifier_in_reply2_series_댓글2에서_찾으면_확정():
+    tree = ke.extract_comment_tree(_COMMENT_TREE_HTML)
+    hit = ke.find_identifier_in_reply2_series(tree, ["팥순추출물"])
+    assert hit is not None
+    assert hit["top_index"] == 2
+    assert hit["out_of_position"] is False
+
+
+def test_find_identifier_in_reply2_series_댓글1에만_있으면_위치이탈():
+    html = (
+        '<li id="1" class="CommentItem">A</li>'
+        '<div class="comment_text_view"><p>팥순추출물 언급</p></div>'
+        '<li id="2" class="CommentItem">B</li>'
+        '<div class="comment_text_view"><p>그냥 딴 얘기</p></div>'
+    )
+    tree = ke.extract_comment_tree(html)
+    hit = ke.find_identifier_in_reply2_series(tree, ["팥순추출물"])
+    assert hit is not None
+    assert hit["out_of_position"] is True
+    assert hit["top_index"] == 1
+
+
+def test_find_identifier_in_reply2_series_없으면_None():
+    tree = ke.extract_comment_tree(_COMMENT_TREE_HTML)
+    assert ke.find_identifier_in_reply2_series(tree, ["없는식별어"]) is None

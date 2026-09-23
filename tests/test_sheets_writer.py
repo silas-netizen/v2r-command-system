@@ -279,12 +279,21 @@ def test_sync_keywords_to_sheet_picks_only_target_rows(tmp_path, monkeypatch):
 
 
 def test_apply_exposure_maps_columns_and_writes_totals(tmp_path, monkeypatch):
+    """2026-09-23 사용자 최종 지시 — A·G·J·K·L만 바꾸고 B~F(E=비밀번호 포함)는
+    절대 안 건드린다. I는 비어 있을 때만 채운다."""
     cfg = tmp_path / "config"
     cfg.mkdir()
     (cfg / "brands.yaml").write_text(
         "brands:\n  테스트브랜드:\n    spreadsheet_id: sid1\n", encoding="utf-8"
     )
     monkeypatch.setattr(sw, "_second_tab_gid", lambda sid: 999)
+    # 시트 export 흉내 — A~L, kw1은 I가 이미 채워짐, kw2는 비어 있음.
+    header = ["카페", "url", "발행시간", "작성자", "비번", "발행URL", "노출 상태", "키워드", "통합검색", "최종편집", "검색량", "노출량"]
+    monkeypatch.setattr(sw, "_read_export_csv", lambda sid, gid: [
+        header,
+        ["", "", "", "", "", "", "미확인", "kw1", "https://already", "", "", ""],
+        ["", "", "", "", "", "", "미확인", "kw2", "", "", "", ""],
+    ])
 
     calls = []
 
@@ -304,15 +313,69 @@ def test_apply_exposure_maps_columns_and_writes_totals(tmp_path, monkeypatch):
     res = sw.apply_exposure(
         "테스트브랜드",
         [
-            {"keyword": "kw1", "status": "노출", "final_url": "https://x", "rank": 2},
-            {"keyword": "kw2", "exposed_total": "1,234"},
+            {"keyword": "kw1", "status": "노출완", "final_url": "https://x", "edited_at": "2026-09-23 12:00:00", "cafe": "씨씨앙", "volume": 100},
+            {"keyword": "kw2", "status": "밀려남", "final_url": "https://y", "edited_at": "2026-09-23 12:01:00", "volume": 50},
         ],
         totals={"P1": 10, "Q1": 20},
         repo_root=tmp_path,
     )
-    assert res["written"] == 4  # kw1: 3개(G,I,O) + kw2: 1개(L)
     assert calls[0][0] == "kw1"
-    assert calls[0][1] == {"G": "노출", "I": "https://x", "O": 2}
-    assert calls[1][1] == {"L": "1,234"}
+    # kw1: 노출완 + 카페 있음 + I 이미 있음(안 건드림) + 검색량 있음
+    assert calls[0][1] == {"G": "노출완", "J": "2026-09-23 12:00:00", "A": "씨씨앙", "K": "100", "L": "100"}
+    # kw2: 밀려남 + 카페 없음(A 안 건드림) + I 비어 있어서 채움 + L=0
+    assert calls[1][0] == "kw2"
+    assert calls[1][1] == {"G": "밀려남", "J": "2026-09-23 12:01:00", "I": "https://y", "K": "50", "L": "0"}
+    # B~F, H, E는 어떤 updates 딕셔너리에도 등장하지 않는다.
+    for _, updates in calls:
+        assert set(updates) <= {"A", "G", "I", "J", "K", "L"}
     assert ("P1", 10) in cell_calls
     assert ("Q1", 20) in cell_calls
+
+
+def test_build_exposure_column_updates_노출완_카페_있음():
+    updates = sw.build_exposure_column_updates(
+        status="exposed", checked_at_kst="2026-09-23 10:00:00", cafe="양평맘", volume=200,
+        existing_i="", integrated_search_url_fn=lambda k: f"https://s/{k}", keyword="kw",
+    )
+    assert updates == {
+        "G": "노출완", "J": "2026-09-23 10:00:00", "A": "양평맘",
+        "I": "https://s/kw", "K": "200", "L": "200",
+    }
+
+
+def test_build_exposure_column_updates_밀려남_카페_안바뀜():
+    updates = sw.build_exposure_column_updates(
+        status="pushed", checked_at_kst="2026-09-23 10:00:00", cafe=None, volume=80,
+        existing_i="https://이미있음", integrated_search_url_fn=lambda k: "무시됨", keyword="kw",
+    )
+    assert "A" not in updates  # 밀려남이면 카페(A)를 바꾸지 않는다
+    assert "I" not in updates  # 이미 있으면 I도 안 바꾼다
+    assert updates["G"] == "밀려남"
+    assert updates["K"] == "80"
+    assert updates["L"] == "0"
+
+
+def test_normalize_kst_timestamp_iso_to_kst():
+    # +09:00 오프셋 ISO는 그대로 같은 시각이므로 T만 빠지고 그대로.
+    assert sw.normalize_kst_timestamp("2026-09-23T23:18:27+09:00") == "2026-09-23 23:18:27"
+
+
+def test_normalize_kst_timestamp_다른_시간대는_KST로_변환():
+    # UTC 23:18:27 -> KST(+9) 익일 08:18:27
+    assert sw.normalize_kst_timestamp("2026-09-23T23:18:27+00:00") == "2026-09-24 08:18:27"
+
+
+def test_normalize_kst_timestamp_이미_공백형식이면_그대로():
+    assert sw.normalize_kst_timestamp("2026-09-23 23:18:27") == "2026-09-23 23:18:27"
+
+
+def test_normalize_kst_timestamp_빈값_그대로():
+    assert sw.normalize_kst_timestamp("") == ""
+
+
+def test_build_exposure_column_updates_J는_항상_정규화():
+    updates = sw.build_exposure_column_updates(
+        status="pushed", checked_at_kst="2026-09-23T23:18:27+09:00", cafe=None, volume=None,
+        existing_i="x", integrated_search_url_fn=None, keyword="kw",
+    )
+    assert updates["J"] == "2026-09-23 23:18:27"

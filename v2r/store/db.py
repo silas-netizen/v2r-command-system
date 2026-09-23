@@ -153,7 +153,8 @@ CREATE TABLE IF NOT EXISTS keyword_exposure (
     status       TEXT NOT NULL,
     t0_status    TEXT,
     checked_at   TEXT NOT NULL,
-    search_query TEXT
+    search_query TEXT,
+    rank_overall INTEGER
 );
 
 -- 브랜드 대량 원고 생성 대기열 (밀려남 키워드 → 원고, 2026-09-23)
@@ -201,6 +202,9 @@ MIGRATIONS = (
     ("keyword_exposure", "search_query", "TEXT"),
     # 구분자: v2r(우리 실행기 발행분) / vpc(가상 PC 처리분) (2026-09-23)
     ("brand_queue", "target", "TEXT NOT NULL DEFAULT 'v2r'"),
+    # 노출 rank 정정(2026-09-23 교차검증 후속) — 예전 rank(광고·내비 포함 전체
+    # 링크 순번)는 rank_overall로 남기고, rank는 일반 결과만(v2r/knowledge/serp.py)로 바꾼다.
+    ("keyword_exposure", "rank_overall", "INTEGER"),
 )
 
 

@@ -533,6 +533,76 @@ def update_by_key(
     return out
 
 
+def normalize_kst_timestamp(raw: str) -> str:
+    """J(최종 편집 일시)에 쓸 시각을 항상 KST `YYYY-MM-DD HH:MM:SS`로 맞춘다.
+
+    2026-09-23 사용자 지적 — 노출 순환(`keyword_exposure.cycle_tick`)이 DB의
+    `checked_at`(ISO 8601, `now_iso()`가 만드는 `...+09:00` 꼴)을 그대로 J에
+    써서 "2026-09-23T23:18:27+09:00" 같은 값이 들어갔다. `apply_exposure`가
+    J를 쓸 때마다(어느 호출부에서 왔든) 이 함수를 거치게 해 형식을 고정한다.
+    이미 `YYYY-MM-DD HH:MM:SS`(공백 구분) 형식이면 그대로 두고, ISO(`T`·시간대
+    포함)면 KST로 변환해 같은 형식으로 바꾼다. 못 알아보는 형식은 원문 그대로
+    (억지로 지우지 않는다).
+    """
+    from datetime import datetime
+
+    from v2r.store.db import KST
+
+    raw = str(raw or "").strip()
+    if not raw:
+        return raw
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{1,2}:\d{2}:\d{2}", raw):
+        return raw  # 이미 원하는 형식(옛 데이터의 한 자리 시각도 그대로 둔다)
+    try:
+        dt = datetime.fromisoformat(raw)
+    except Exception:
+        return raw
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(KST)
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def build_exposure_column_updates(
+    *,
+    status: str,
+    checked_at_kst: str,
+    cafe: str | None = None,
+    volume: int | None = None,
+    existing_i: str = "",
+    integrated_search_url_fn: Any = None,
+    keyword: str = "",
+) -> dict[str, str]:
+    """노출 검사 결과로 바꿀 열만(2026-09-23 사용자 최종 지시) — **A·G·J·K·L만**.
+
+    B~F열(url·발행시간·작성자·비밀번호·발행URL)은 숨김 열이라 절대 건드리지
+    않는다(읽지도 쓰지도 않음 — 특히 E 비밀번호는 이 함수도, 이 함수를 부르는
+    쪽도 어디서도 다루지 않는다). H(키워드)도 불변. I(통합검색)는 시트에 이미
+    값이 있으면(`existing_i`) 그대로 두고, 비어 있을 때만 채운다.
+
+    - A(카페): `cafe`가 있을 때만(노출완으로 확정된 우리 글의 카페) — 밀려남
+      (`cafe=None`)이면 이 열은 아예 updates에 안 넣는다(기존 값 유지).
+    - G(노출 상태): 노출완/밀려남/미확인.
+    - J(최종 편집 일시): 이번 검사 시각(KST).
+    - K(키워드 검색량): `volume`이 있을 때만.
+    - L(노출된 검색량): 노출완이면 K와 같은 값, 밀려남이면 0(미확인이면 안 건드림).
+    """
+    status_label = EXPOSURE_STATUS_LABEL.get(status, status)
+    updates: dict[str, str] = {"G": status_label, "J": normalize_kst_timestamp(checked_at_kst)}
+    if cafe:
+        updates["A"] = cafe
+    if not existing_i and integrated_search_url_fn:
+        i_val = integrated_search_url_fn(keyword)
+        if i_val:
+            updates["I"] = i_val
+    if volume is not None:
+        updates["K"] = str(volume)
+        if status_label == "노출완":
+            updates["L"] = str(volume)
+        elif status_label == "밀려남":
+            updates["L"] = "0"
+    return updates
+
+
 def set_cell(
     spreadsheet_id: str,
     sheet: str,
@@ -557,6 +627,11 @@ DEFAULT_KEYWORDS_DIR = "data/keywords"
 
 #: 시트 두 번째 탭(노출 현황류) 이름 — 명령 로그·보고서 표기용
 EXPOSURE_TAB_NAME = "노출 현황"
+
+#: G열(노출 상태) 표기 — 코드 -> 한국어(keyword_exposure.KOREAN_STATUS와 동일 값)
+EXPOSURE_STATUS_LABEL = {"exposed": "노출완", "pushed": "밀려남", "unpublished": "미확인", "unknown": "미확인"}
+#: 반대로 한국어 라벨이 그대로 들어와도 받아주기 위한 역매핑
+KOREAN_STATUS_TO_CODE = {v: k for k, v in EXPOSURE_STATUS_LABEL.items()}
 
 #: `relevance_llm` 값 -> 본문 분류 라벨(0=가장 직접적, 값이 커질수록 느슨해진다는
 #: 기존 연관도 재산정 스케일 전제. `data/keywords/<브랜드>.sqlite`를 만드는
@@ -770,33 +845,34 @@ def apply_exposure(
 ) -> dict[str, Any]:
     """노출 확인 결과를 브랜드 시트 두 번째 탭에 반영한다.
 
-    `rows`는 각 항목이 최소 `keyword`(H열 매칭 키)를 담고, 나머지는
-    다음 중 있는 것만 반영한다:
-      - `status`      -> G(노출 상태)
-      - `final_url`   -> I(통합검색/최종 검색어 URL)
-      - `edited_at`   -> J(최종 편집 일시)
-      - `exposed_total` -> L(노출된 검색량)
-      - `rank`        -> O(1~5순위 진입)
+    2026-09-23 사용자 최종 지시(스크린샷 확인 후 정정) — B~F열은 숨김 열이라
+    **건드리지 않는다**(읽지도 로그에 남기지도 않는다 — 특히 E 비밀번호). 바꾸는
+    열은 **A(우리 글이 확정된 카페, 노출완일 때만)·G(노출 상태)·J(검사 시각)·
+    K(키워드 검색량)·L(노출된 검색량)** 뿐이고, I(통합검색)는 비어 있을 때만
+    채운다. H(키워드)는 불변. `rows`의 각 항목: `keyword`(H열 매칭 키, 필수),
+    `status`(exposed|pushed|unknown 또는 한국어 라벨), `edited_at`(이번 검사
+    시각), `volume`(키워드 검색량), `cafe`(노출완으로 확정된 카페명 — 밀려남이면
+    빈 채로 둬서 A를 안 바꾼다), `final_url`(I가 비어 있을 때 채울 통합검색 URL).
+
+    쓰기는 `update_by_key`로 열마다 따로 쓴다(한 번에 A~L 전체를 붙여넣는
+    대신) — B~F를 아예 읽지 않아도 되고(이름 상자로 A, G, J:K:L 몇 칸만
+    옮겨 다니면 되니 왕복이 적다), E가 붙여넣기 버퍼에 실릴 일 자체가 없어
+    더 안전하다(보고서 "시트 갱신 규칙" 절 비교 참고).
 
     `totals`(선택)는 `{"P1": ..., "Q1": ...}` 형태로 시트 1행 합계 셀에 쓴다.
-
-    호출부: `v2r/knowledge/keyword_exposure.py`(다른 일꾼 담당, 이 함수는
-    아직 어디서도 호출되지 않는다) — 노출 확인 주기가 끝나고 브랜드별 결과를
-    모은 다음 `sheets_writer.apply_exposure(brand, rows, totals=...)`를
-    호출하도록 그쪽에서 연결해야 한다. 자세한 위치는 보고서 참고.
     """
     sid = get_spreadsheet_id(brand, repo_root, config_path)
     if not sid:
         return {"brand": brand, "skipped": True, "reason": "config/brands.yaml에 spreadsheet_id 없음"}
     gid = _second_tab_gid(sid)
 
-    col_map = {
-        "status": "G",
-        "final_url": "I",
-        "edited_at": "J",
-        "exposed_total": "L",
-        "rank": "O",
-    }
+    try:
+        table = _read_export_csv(sid, gid)
+    except Exception as exc:
+        return {"brand": brand, "written": 0, "rows": len(rows), "error": f"시트 읽기 실패: {exc}"}
+    # I(통합검색, 인덱스 8)이 이미 있는지만 본다 — B~F(인덱스 1~5, E=비밀번호 포함)는
+    # 이 딕셔너리에 담기지만 아래에서 절대 인덱스로 꺼내 쓰지 않는다(로그·기록 없음).
+    by_keyword_i = {r[7]: (r[8] if len(r) > 8 else "") for r in table[1:] if len(r) > 7 and r[7]}
 
     written = 0
     errors: list[str] = []
@@ -804,9 +880,18 @@ def apply_exposure(
         kw = row.get("keyword")
         if not kw:
             continue
-        updates = {col_map[k]: v for k, v in row.items() if k in col_map and v is not None}
-        if not updates:
-            continue
+        status = row.get("status", "")
+        if status in KOREAN_STATUS_TO_CODE:
+            status = KOREAN_STATUS_TO_CODE[status]
+        updates = build_exposure_column_updates(
+            status=status,
+            checked_at_kst=row.get("edited_at", ""),
+            cafe=row.get("cafe") or None,
+            volume=row.get("volume"),
+            existing_i=by_keyword_i.get(str(kw), ""),
+            integrated_search_url_fn=lambda k: row.get("final_url") or "",
+            keyword=str(kw),
+        )
         res = update_by_key(sid, EXPOSURE_TAB_NAME, str(kw), updates, key_column="H", gid=gid, repo_root=repo_root)
         written += res.get("written", 0)
         if res.get("error"):
@@ -839,6 +924,9 @@ __all__ = [
     "update_rows",
     "append_rows",
     "update_by_key",
+    "build_exposure_column_updates",
+    "normalize_kst_timestamp",
+    "EXPOSURE_STATUS_LABEL",
     "set_cell",
     "get_spreadsheet_id",
     "list_configured_brands",
