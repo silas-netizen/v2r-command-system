@@ -310,6 +310,12 @@ def _finalize_row(rt: Any, brand: str, item: dict, row: Any) -> None:
     from v2r.store import keyword_exposure_store as store
 
     store.save(rt.conn, row.as_row())
+    # `next_priority_batch`의 last_checked(DB)는 캐시하지 않고 매번 새로 읽으므로
+    # 이 저장은 다음 조회에 바로 반영된다(같은 키워드 연속 재선택 방지, 단위
+    # 시험 `test_next_priority_batch_같은_키워드_연속_두번_안뽑힘` 참고).
+    # universe 캐시(시트·발굴 CSV, `exposure_priority.invalidate_universe_cache`)는
+    # 검사 결과와 무관해 여기서 비우지 않는다 — 매 건 저장마다 비우면 배치
+    # 캐시 효과가 사라진다.
     _enqueue_sheet_row(rt, brand, item, row)
     try:
         write_exposure_csv(rt, brand)
@@ -546,6 +552,58 @@ def release_inflight(repo_root: str | Path, brand: str, keyword: str) -> None:
     _with_inflight_lock(repo_root, _do)
 
 
+# =======================================================================
+# 작업자 메모리 큐 — n=1로 매번 우선순위 조회하던 것을 배치로 바꾼다
+# (docs/reports/exposure-speed-2026-09-24.md 6절). 한 번에 여러 개 뽑아
+# 작업자 메모리에 두고 하나씩 소비하며, `claim_inflight`로 선점 실패한
+# 항목은 건너뛴다. 큐가 비거나(선점 실패로 다 걸러진 경우 포함) TTL이
+# 지나면 `exposure_priority.next_priority_batch`를 다시 부른다.
+# =======================================================================
+
+
+class WorkerQueue:
+    """브랜드 하나의 우선순위 배치를 메모리에 들고 하나씩 내준다."""
+
+    def __init__(self, batch_size: int = 10, ttl_sec: float = 120.0):
+        self.batch_size = max(1, int(batch_size))
+        self.ttl_sec = float(ttl_sec)
+        self.items: list[dict] = []
+        self.brand: str | None = None
+        self.expires_at: float = 0.0
+
+    def _needs_refill(self, brand: str, now: float) -> bool:
+        return brand != self.brand or now >= self.expires_at or not self.items
+
+    def refill_if_needed(self, rt: Any, brand: str, now: float | None = None) -> None:
+        now = now if now is not None else time.time()
+        if not self._needs_refill(brand, now):
+            return
+        from v2r.knowledge import exposure_priority
+
+        t0 = time.perf_counter()
+        self.items = list(exposure_priority.next_priority_batch(rt, brand, n=self.batch_size))
+        log.info(
+            "타이밍 우선순위조회 브랜드=%s sheet_read=%.2fs 배치=%s",
+            brand, time.perf_counter() - t0, len(self.items),
+        )
+        self.brand = brand
+        self.expires_at = now + self.ttl_sec
+
+    def take(self, rt: Any, brand: str, worker_id: int, now: float | None = None) -> dict | None:
+        """큐에서 `claim_inflight`로 선점에 성공하는 첫 항목을 꺼내 돌려준다.
+
+        선점 실패한 항목(다른 작업자가 방금 집음)은 버리고 다음 항목을
+        시도한다. 큐가 (선점 실패로) 다 비면 새로 조회하지 않고 `None`을
+        돌려준다 — 호출자가 잠시 쉬었다 다음 틱에 다시 부르면 그때
+        TTL·빈 큐 조건으로 재조회된다."""
+        self.refill_if_needed(rt, brand, now)
+        while self.items:
+            candidate = self.items.pop(0)
+            if claim_inflight(rt.settings.repo_root, brand, candidate["keyword"], worker_id):
+                return candidate
+        return None
+
+
 def run_worker(worker_id: int, brands: list[str] | None = None, max_iterations: int | None = None) -> None:
     """작업자 1개 메인 루프 — 브라우저 1개 상주, 브랜드를 돌며 우선순위 큐에서 계속 뽑는다."""
     from playwright.sync_api import sync_playwright
@@ -572,6 +630,12 @@ def run_worker(worker_id: int, brands: list[str] | None = None, max_iterations: 
     storage_state = str(cookies_path) if cookies_path.exists() else None
 
     update_worker_state(rt.settings.repo_root, worker_id, processed_delta=0)
+
+    priority_cfg = cfg.get("priority", {}) if isinstance(cfg.get("priority"), dict) else {}
+    worker_queue = WorkerQueue(
+        batch_size=int(priority_cfg.get("batch_size", 10)),
+        ttl_sec=float(priority_cfg.get("universe_cache_sec", 120)),
+    )
 
     unknown_streak = 0
     brand_idx = 0
@@ -619,15 +683,9 @@ def run_worker(worker_id: int, brands: list[str] | None = None, max_iterations: 
                 if item is None:
                     brand = brand_list[brand_idx % len(brand_list)]
                     brand_idx += 1
-                    # n=1로는 이미 진행 중인 후보 하나뿐일 때 고를 게 없으니
-                    # 넉넉히 받아 첫 번째로 안 잡힌 후보를 고른다.
-                    _sheet_t0 = time.perf_counter()
-                    batch = exposure_priority.next_priority_batch(rt, brand, n=5)
-                    log.info("타이밍 우선순위조회 브랜드=%s sheet_read=%.2fs", brand, time.perf_counter() - _sheet_t0)
-                    for candidate in batch:
-                        if claim_inflight(rt.settings.repo_root, brand, candidate["keyword"], worker_id):
-                            item = candidate
-                            break
+                    # 배치를 메모리 큐에 두고 하나씩 소비한다(매번 n=1로 조회하던
+                    # 것을 바꿈 — 조회 자체도 브랜드별 TTL 캐시를 쓴다).
+                    item = worker_queue.take(rt, brand, worker_id)
                     if item is None:
                         time.sleep(2.0)
                         continue
@@ -695,6 +753,7 @@ __all__ = [
     "is_inflight",
     "claim_inflight",
     "release_inflight",
+    "WorkerQueue",
     "run_worker",
     "main",
 ]

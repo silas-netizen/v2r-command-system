@@ -369,3 +369,185 @@ def test_claim_inflight_만료되면_다시_잡을수있음(tmp_path):
 def test_claim_inflight_다른_키워드는_서로_안막음(tmp_path):
     assert exposure_runner.claim_inflight(tmp_path, "브랜드", "키워드A", worker_id=0) is True
     assert exposure_runner.claim_inflight(tmp_path, "브랜드", "키워드B", worker_id=1) is True
+
+
+# =======================================================================
+# universe 캐시(TTL) — exposure-queue-cache-2026-09-24.md
+# =======================================================================
+
+
+def _universe_fixture():
+    return [
+        {"keyword": "더마팩토리", "cafe": "마이카페", "article_url": "", "t0_status": "", "candidate_title_norm": "", "volume": 50},
+        {"keyword": "착상혈", "cafe": "마이카페", "article_url": "", "t0_status": "", "candidate_title_norm": "", "volume": 30},
+    ]
+
+
+def test_universe_캐시_TTL안에는_한번만_조회(tmp_path, monkeypatch):
+    exposure_priority.invalidate_universe_cache(None)
+    rt = make_runtime(tmp_path)
+    calls = {"n": 0}
+
+    def fake_universe(rt_, brand):
+        calls["n"] += 1
+        return _universe_fixture()
+
+    monkeypatch.setattr(ke, "keyword_universe", fake_universe)
+
+    exposure_priority.next_priority_batch(rt, "테스트브랜드", n=1)
+    exposure_priority.next_priority_batch(rt, "테스트브랜드", n=1)
+    exposure_priority.queue_counts(rt, "테스트브랜드")
+    assert calls["n"] == 1, "TTL 안이면 keyword_universe는 한 번만 불려야 한다"
+
+
+def test_universe_캐시_TTL지나면_다시_조회(tmp_path, monkeypatch):
+    exposure_priority.invalidate_universe_cache(None)
+    rt = make_runtime(tmp_path)
+    calls = {"n": 0}
+
+    def fake_universe(rt_, brand):
+        calls["n"] += 1
+        return _universe_fixture()
+
+    monkeypatch.setattr(ke, "keyword_universe", fake_universe)
+
+    now0 = datetime(2026, 9, 24, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(exposure_priority.time, "time", lambda: 1_000_000.0)
+    exposure_priority.next_priority_batch(rt, "테스트브랜드", n=1, now=now0)
+    assert calls["n"] == 1
+
+    # 기본 TTL(120초) + 여유 지남 — 다시 조회해야 한다
+    monkeypatch.setattr(exposure_priority.time, "time", lambda: 1_000_000.0 + 200.0)
+    exposure_priority.next_priority_batch(rt, "테스트브랜드", n=1, now=now0)
+    assert calls["n"] == 2
+
+
+def test_universe_캐시_브랜드마다_따로(tmp_path, monkeypatch):
+    exposure_priority.invalidate_universe_cache(None)
+    rt = make_runtime(tmp_path)
+    calls = []
+
+    def fake_universe(rt_, brand):
+        calls.append(brand)
+        return _universe_fixture()
+
+    monkeypatch.setattr(ke, "keyword_universe", fake_universe)
+
+    exposure_priority.next_priority_batch(rt, "브랜드A", n=1)
+    exposure_priority.next_priority_batch(rt, "브랜드B", n=1)
+    exposure_priority.next_priority_batch(rt, "브랜드A", n=1)
+    assert calls == ["브랜드A", "브랜드B"], "브랜드별로 캐시가 따로 유지돼야 한다"
+
+
+def test_universe_캐시_last_checked는_캐시와_무관하게_즉시반영(tmp_path, monkeypatch):
+    """universe(시트) 캐시가 TTL 안이어도, 방금 저장한 검사 결과(last_checked,
+    DB)는 캐시하지 않으므로 같은 키워드가 바로 다시 뽑히지 않아야 한다."""
+    exposure_priority.invalidate_universe_cache(None)
+    rt = make_runtime(tmp_path)
+    monkeypatch.setattr(ke, "keyword_universe", lambda rt_, brand: _universe_fixture())
+
+    picked = exposure_priority.next_priority_batch(rt, "테스트브랜드", n=1)
+    assert len(picked) == 1
+    first_keyword = picked[0]["keyword"]
+
+    row = ke.ExposureRow("테스트브랜드", first_keyword, "마이카페", "", None, "pushed", now_iso())
+    store.save(rt.conn, row.as_row())
+
+    picked2 = exposure_priority.next_priority_batch(rt, "테스트브랜드", n=1)
+    assert len(picked2) == 1
+    assert picked2[0]["keyword"] != first_keyword
+
+
+def test_invalidate_universe_cache_비우면_다시조회(tmp_path, monkeypatch):
+    exposure_priority.invalidate_universe_cache(None)
+    rt = make_runtime(tmp_path)
+    calls = {"n": 0}
+
+    def fake_universe(rt_, brand):
+        calls["n"] += 1
+        return _universe_fixture()
+
+    monkeypatch.setattr(ke, "keyword_universe", fake_universe)
+
+    exposure_priority.next_priority_batch(rt, "테스트브랜드", n=1)
+    exposure_priority.invalidate_universe_cache(rt, "테스트브랜드")
+    exposure_priority.next_priority_batch(rt, "테스트브랜드", n=1)
+    assert calls["n"] == 2
+
+
+# =======================================================================
+# WorkerQueue — n=1 매번 조회를 배치로 바꿈
+# =======================================================================
+
+
+def test_worker_queue_배치를_하나씩_소비(tmp_path, monkeypatch):
+    rt = make_runtime(tmp_path)
+    batch = [{"keyword": f"키워드{i}", "cafe": "마이카페"} for i in range(3)]
+    calls = {"n": 0}
+
+    def fake_batch(rt_, brand, n, now=None):
+        calls["n"] += 1
+        return list(batch)
+
+    monkeypatch.setattr(exposure_priority, "next_priority_batch", fake_batch)
+
+    wq = exposure_runner.WorkerQueue(batch_size=3, ttl_sec=120.0)
+    seen = []
+    for _ in range(3):
+        item = wq.take(rt, "테스트브랜드", worker_id=0)
+        assert item is not None
+        seen.append(item["keyword"])
+        exposure_runner.release_inflight(rt.settings.repo_root, "테스트브랜드", item["keyword"])
+
+    assert seen == ["키워드0", "키워드1", "키워드2"]
+    assert calls["n"] == 1, "큐가 남아 있는 동안은 다시 조회하지 않아야 한다"
+
+
+def test_worker_queue_비면_다시조회(tmp_path, monkeypatch):
+    rt = make_runtime(tmp_path)
+    calls = {"n": 0}
+
+    def fake_batch(rt_, brand, n, now=None):
+        calls["n"] += 1
+        return [{"keyword": f"배치{calls['n']}", "cafe": "마이카페"}]
+
+    monkeypatch.setattr(exposure_priority, "next_priority_batch", fake_batch)
+
+    wq = exposure_runner.WorkerQueue(batch_size=1, ttl_sec=120.0)
+    item1 = wq.take(rt, "테스트브랜드", worker_id=0)
+    exposure_runner.release_inflight(rt.settings.repo_root, "테스트브랜드", item1["keyword"])
+    item2 = wq.take(rt, "테스트브랜드", worker_id=0)
+    assert item1["keyword"] != item2["keyword"]
+    assert calls["n"] == 2
+
+
+def test_worker_queue_TTL지나면_다시조회(tmp_path, monkeypatch):
+    rt = make_runtime(tmp_path)
+    calls = {"n": 0}
+
+    def fake_batch(rt_, brand, n, now=None):
+        calls["n"] += 1
+        return [{"keyword": f"배치{calls['n']}-{i}", "cafe": "마이카페"} for i in range(5)]
+
+    monkeypatch.setattr(exposure_priority, "next_priority_batch", fake_batch)
+
+    wq = exposure_runner.WorkerQueue(batch_size=5, ttl_sec=60.0)
+    wq.take(rt, "테스트브랜드", worker_id=0, now=1_000_000.0)
+    assert calls["n"] == 1
+    # 아직 큐에 항목이 남아 있어도 TTL이 지났으면 다시 조회한다
+    wq.take(rt, "테스트브랜드", worker_id=0, now=1_000_000.0 + 61.0)
+    assert calls["n"] == 2
+
+
+def test_worker_queue_선점실패한_항목은_건너뜀(tmp_path, monkeypatch):
+    rt = make_runtime(tmp_path)
+    batch = [{"keyword": "이미잡힘", "cafe": "마이카페"}, {"keyword": "새것", "cafe": "마이카페"}]
+    monkeypatch.setattr(
+        exposure_priority, "next_priority_batch", lambda rt_, brand, n, now=None: list(batch)
+    )
+    # 다른 작업자가 먼저 "이미잡힘"을 선점한 상태를 흉내낸다
+    exposure_runner.claim_inflight(rt.settings.repo_root, "테스트브랜드", "이미잡힘", worker_id=9)
+
+    wq = exposure_runner.WorkerQueue(batch_size=2, ttl_sec=120.0)
+    item = wq.take(rt, "테스트브랜드", worker_id=0)
+    assert item["keyword"] == "새것"

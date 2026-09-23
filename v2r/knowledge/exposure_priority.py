@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -38,7 +39,71 @@ _DEFAULT_PRIORITY = {
     "pushed_recheck_hours": 12,
     "pushed_low_recheck_hours": 12,
     "top_volume_percentile": 0.7,
+    # 2026-09-24 큐 캐시 — keyword_universe(시트 CSV·키워드DB 전량 읽기)와
+    # 최근 발행 집합을 이 초만큼 브랜드별로 프로세스 메모리에 유지한다.
+    # `store.latest_by_keyword`(DB 조회 1건)는 가벼워서 캐시하지 않고 매번
+    # 새로 읽는다 — 그래서 방금 이 작업자가 저장한 검사 결과는 캐시와 무관하게
+    # 항상 바로 반영된다.
+    "universe_cache_sec": 120,
+    # 러너가 한 번에 뽑아 작업자 메모리 큐에 쌓아 둘 후보 수(1건씩 매번
+    # 조회하던 것을 배치로 바꿈 — exposure_runner.WorkerQueue 참고).
+    "batch_size": 10,
 }
+
+
+# =======================================================================
+# 브랜드별 universe 캐시 — keyword_universe + 최근 발행 집합 + 검색량 임계값을
+# 한 묶음(번들)으로 TTL 동안 프로세스 메모리에 유지한다.
+# =======================================================================
+
+#: (repo_root, brand) -> (expires_at_epoch, bundle)
+_UNIVERSE_CACHE: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
+
+
+def _cache_key(rt: Any, brand: str) -> tuple[str, str]:
+    return (str(rt.settings.repo_root), brand)
+
+
+def invalidate_universe_cache(rt: Any, brand: str | None = None) -> None:
+    """이 브랜드(또는 전체, brand=None)의 universe 캐시를 즉시 비운다.
+
+    캐시 자체는 판정 상태(last_checked)를 담지 않으므로(그건 매번 DB에서
+    새로 읽음) 꼭 필요하진 않지만, 발행·키워드 시트가 방금 바뀐 걸 알 때
+    (예: 새 키워드 발굴 직후) 다음 조회에서 바로 반영하고 싶으면 부른다."""
+    if brand is None:
+        _UNIVERSE_CACHE.clear()
+        return
+    key = (str(rt.settings.repo_root), brand)
+    _UNIVERSE_CACHE.pop(key, None)
+
+
+def _universe_bundle(rt: Any, brand: str, cfg: dict, now: datetime) -> dict[str, Any]:
+    """`keyword_universe` + 최근 발행 집합 + 검색량 임계값을 TTL 캐시에서 꺼낸다.
+
+    같은 브랜드를 여러 작업자 프로세스가 부르더라도 캐시는 프로세스별
+    메모리라 서로 섞이지 않는다 — 작업자 간 중복 선점 방지는 이미
+    `exposure_runner.claim_inflight`(파일 기반)가 맡고 있으므로, 여기서
+    같은 번들을 여러 작업자가 동시에 읽어도(같은 순서로 정렬돼도) 실제로
+    같은 키워드를 두 번 검사하는 일은 claim_inflight가 막는다.
+    """
+    from v2r.knowledge.keyword_exposure import keyword_universe
+
+    ttl = float(cfg.get("universe_cache_sec", 120))
+    key = _cache_key(rt, brand)
+    cached = _UNIVERSE_CACHE.get(key)
+    now_epoch = time.time()
+    if cached is not None and cached[0] > now_epoch:
+        return cached[1]
+
+    universe = keyword_universe(rt, brand)
+    cafes = {i.get("cafe") for i in universe if i.get("cafe")}
+    recent_norm = _recent_publish_keywords(
+        rt, brand, cafes, now, [float(h) for h in cfg.get("recent_publish_hours", [4, 24, 72])]
+    )
+    vol_threshold = _volume_threshold(universe, float(cfg.get("top_volume_percentile", 0.7)))
+    bundle = {"universe": universe, "cafes": cafes, "recent_norm": recent_norm, "vol_threshold": vol_threshold}
+    _UNIVERSE_CACHE[key] = (now_epoch + ttl, bundle)
+    return bundle
 
 #: 발행 시각이 이 창(±시간) 안이면 "최근 발행"으로 본다
 _RECENT_PUBLISH_WINDOW_HOURS = 2.0
@@ -256,25 +321,26 @@ def next_priority_batch(rt: Any, brand: str, n: int, now: datetime | None = None
     99등급(주기가 아직 안 돎)은 절대 뽑히지 않는다 — n개를 못 채우면 그만큼만
     돌려준다(빈 목록도 정상, 순환이 다음 틱에 다시 부른다).
     """
-    from v2r.knowledge.keyword_exposure import keyword_universe, _norm
+    from v2r.knowledge.keyword_exposure import _norm
     from v2r.store import keyword_exposure_store as store
 
     now = now or datetime.now(timezone.utc)
     cfg = load_config(rt.settings.repo_root).get("priority", dict(_DEFAULT_PRIORITY))
 
-    universe = keyword_universe(rt, brand)
+    bundle = _universe_bundle(rt, brand, cfg, now)
+    universe = bundle["universe"]
     if not universe:
         return []
 
+    # last_checked(DB)는 캐시하지 않고 매번 새로 읽는다 — 방금 이 작업자가
+    # 저장한 검사 결과가 바로 다음 조회에 반영돼야 같은 키워드가 연속으로
+    # 다시 뽑히지 않는다(단위 시험 참고).
     last_checked = {
         _norm(r["keyword"]): {"checked_at": str(r["checked_at"] or ""), "status": str(r["status"] or "")}
         for r in store.latest_by_keyword(rt.conn, brand)
     }
-    cafes = {i.get("cafe") for i in universe if i.get("cafe")}
-    recent_norm = _recent_publish_keywords(
-        rt, brand, cafes, now, [float(h) for h in cfg.get("recent_publish_hours", [4, 24, 72])]
-    )
-    vol_threshold = _volume_threshold(universe, float(cfg.get("top_volume_percentile", 0.7)))
+    recent_norm = bundle["recent_norm"]
+    vol_threshold = bundle["vol_threshold"]
 
     scored = []
     for item in universe:
@@ -291,23 +357,21 @@ def next_priority_batch(rt: Any, brand: str, n: int, now: datetime | None = None
 
 def queue_counts(rt: Any, brand: str, now: datetime | None = None) -> dict[str, int]:
     """브랜드별 등급별 대기 수(보고서용)."""
-    from v2r.knowledge.keyword_exposure import keyword_universe, _norm
+    from v2r.knowledge.keyword_exposure import _norm
     from v2r.store import keyword_exposure_store as store
 
     now = now or datetime.now(timezone.utc)
     cfg = load_config(rt.settings.repo_root).get("priority", dict(_DEFAULT_PRIORITY))
-    universe = keyword_universe(rt, brand)
+    bundle = _universe_bundle(rt, brand, cfg, now)
+    universe = bundle["universe"]
     if not universe:
         return {}
     last_checked = {
         _norm(r["keyword"]): {"checked_at": str(r["checked_at"] or ""), "status": str(r["status"] or "")}
         for r in store.latest_by_keyword(rt.conn, brand)
     }
-    cafes = {i.get("cafe") for i in universe if i.get("cafe")}
-    recent_norm = _recent_publish_keywords(
-        rt, brand, cafes, now, [float(h) for h in cfg.get("recent_publish_hours", [4, 24, 72])]
-    )
-    vol_threshold = _volume_threshold(universe, float(cfg.get("top_volume_percentile", 0.7)))
+    recent_norm = bundle["recent_norm"]
+    vol_threshold = bundle["vol_threshold"]
     counts: dict[str, int] = {}
     for item in universe:
         tier, _ = priority_tier(item, last_checked, recent_norm, cfg, vol_threshold, now)
@@ -321,4 +385,5 @@ __all__ = [
     "priority_tier",
     "next_priority_batch",
     "queue_counts",
+    "invalidate_universe_cache",
 ]

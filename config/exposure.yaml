@@ -33,3 +33,9 @@ priority:
   recent_publish_hours: [2, 6, 24]      # 2순위: 발행 후 이 시각 근방(±2시간)이면 우선
   pushed_min_gap_hours: 12              # 3순위: 밀려남·미확인은 검색량 순, 같은 키워드는 12시간 지나야 다시
   top_volume_percentile: 0.7            # (보고용) 검색량 상위 30% 기준
+  # 2026-09-24 큐 캐시(exposure-speed-2026-09-24.md 6절) — keyword_universe(시트
+  # CSV·키워드DB 전량 읽기)+최근 발행 집합을 이 초만큼 브랜드별로 캐시한다.
+  # last_checked(DB)는 캐시하지 않고 매번 새로 읽어 즉시 반영한다.
+  universe_cache_sec: 120
+  # 한 번에 뽑아 작업자 메모리 큐에 쌓아 둘 후보 수(매번 n=1로 조회하던 것을 배치로).
+  batch_size: 10
