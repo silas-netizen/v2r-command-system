@@ -126,7 +126,13 @@ def priority_tier(
 
     key = _norm(item.get("keyword", ""))
     last = last_checked.get(key)
+    # "기존 노출완" = 시트 G열이 노출완인 키워드(아직 러너가 제대로 안 본 것 포함) 또는
+    # 러너 마지막 판정이 exposed — 2026-09-24 사용자: DB 판정만 보면 안 됨(아직 노출 검사가
+    # 제대로 안 됐으므로 시트 기준이 우선).
+    sheet_exposed = str(item.get("t0_status") or "").replace(" ", "") in ("노출완", "exposed")
     if last is None:
+        if sheet_exposed:
+            return (1, float("inf"))
         # 미확인 — 3등급(밀려남과 같이 검색량 순), 경과 시간은 무한대
         return (3, float("inf"))
 
@@ -134,7 +140,7 @@ def priority_tier(
     age_h = age_h if age_h is not None else float("inf")
     status = last.get("status", "")
 
-    if status == "exposed":
+    if status == "exposed" or sheet_exposed:
         due = float(cfg.get("exposed_recheck_hours", 6))
         return (1, age_h) if age_h >= due else (99, age_h)
 

@@ -103,6 +103,15 @@ def test_priority_tier_노출완_주기전이면_제외():
     assert tier == 99
 
 
+def test_priority_tier_시트G열_노출완은_미검사여도_1순위():
+    now = datetime(2026, 9, 24, 12, 0, tzinfo=timezone.utc)
+    tier, _ = exposure_priority.priority_tier({"keyword": "시트노출완", "t0_status": "노출완"}, {}, set(), _cfg(), 10.0, now)
+    assert tier == 1
+    fresh = {"시트노출완": {"checked_at": "2026-09-24T11:00:00+00:00", "status": "pushed"}}
+    tier, _ = exposure_priority.priority_tier({"keyword": "시트노출완", "t0_status": "노출완"}, fresh, set(), _cfg(), 10.0, now)
+    assert tier == 99
+
+
 def test_priority_tier_최근발행이_2순위():
     now = datetime(2026, 9, 24, 12, 0, tzinfo=timezone.utc)
     last_checked = {"키워드": {"checked_at": "2026-09-23T00:00:00+00:00", "status": "pushed"}}
