@@ -232,9 +232,24 @@ def _verify(
         for c, val in enumerate(row):
             col_idx = col0 + c
             actual = actual_row[col_idx] if col_idx < len(actual_row) else ""
-            if str(actual) != str(val):
+            if _norm_cell(actual) != _norm_cell(val):
                 return False
     return True
+
+
+def _norm_cell(value: Any) -> str:
+    """검증용 정규화 — 시트가 숫자를 자동 서식(천 단위 콤마, 12345.0)해서 돌려주거나
+    앞뒤 공백·개행 종류가 달라지는 것을 같은 값으로 본다 (사고 2026-09-23: P1/Q1 합계와
+    검색량 열이 이 차이로 1,000회 넘게 "검증 불일치"로 찍혔다)."""
+    s = str(value if value is not None else "").strip().replace("\r\n", "\n")
+    t = s.replace(",", "")
+    try:
+        f = float(t)
+        if f == int(f):
+            return str(int(f))
+        return repr(f)
+    except ValueError:
+        return s
 
 
 def _write_verified(
@@ -353,7 +368,9 @@ def append_rows(
     start_row1 = len(table) + 1
     written = 0
     errors: list[str] = []
-    CHUNK = 1000
+    # 2026-09-23 실측: 1,000행을 한 번에 붙여넣으면 690행쯤에서 잘려 검증이 늘 실패했다
+    # (같은 자리에 3번 다시 붙여넣기만 반복). 200행씩 나누면 전부 붙는다.
+    CHUNK = 200
     for i in range(0, len(value_rows), CHUNK):
         chunk = value_rows[i : i + CHUNK]
         cell = _cell_ref(start_row1 + i, "A")
