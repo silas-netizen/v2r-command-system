@@ -755,8 +755,9 @@ def build_exposure_column_updates(
         updates["K"] = str(volume)
         if status_label == "노출완":
             updates["L"] = str(volume)
-        elif status_label == "밀려남":
-            updates["L"] = "0"
+    # 밀려남이면 검색량을 몰라도 L은 0 (K는 모르면 건드리지 않음 — 2026-09-24)
+    if status_label == "밀려남":
+        updates["L"] = "0"
     return updates
 
 

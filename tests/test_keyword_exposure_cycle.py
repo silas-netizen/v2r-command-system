@@ -561,7 +561,7 @@ def test_relevance_eligible_keywords_무관_제외(tmp_path):
         db_path,
         [
             ("직접키워드", 500, 0, 1, 0),
-            ("무관키워드", 300, 3, 3, 0),  # 무관(3) — 제외돼야 함
+            ("무관키워드", 300, 4, 4, 0),  # 무관(4) — 제외돼야 함(2026-09-24 척도 0에서 4)
             ("검토대기", 200, 1, 1, 1),  # needs_review — 제외돼야 함
         ],
     )
@@ -578,7 +578,7 @@ def test_keyword_universe_시트와_DB_합친다(tmp_path, monkeypatch):
     ])
     db_path = tmp_path / "data" / "keywords" / "우아덤.sqlite"
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    _make_relevance_db(db_path, [("DB키워드", 400, 2, 0, 0), ("무관", 100, 3, 3, 0)])
+    _make_relevance_db(db_path, [("DB키워드", 400, 2, 0, 0), ("무관", 100, 4, 4, 0)])
 
     universe = ke.keyword_universe(rt, "우아덤")
     kws = {i["keyword"] for i in universe}

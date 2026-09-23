@@ -381,3 +381,11 @@ def test_run_check_하루_상한_60개로_자른다(rt, monkeypatch):
     results = run_check(rt, "우아덤", sleep_fn=lambda *a, **k: None)
     assert len(results) == DEFAULT_DAILY_CAP == 60
     assert len(seen) == 60
+
+
+def test_sheet_row_does_not_write_zero_volume():
+    from v2r.knowledge.keyword_exposure import ExposureRow, _sheet_row_from_result
+
+    row = ExposureRow(keyword="다이어트약", brand="팥순이", cafe="", article_url="", rank=None, status="pushed", checked_at="2026-09-24 01:00:00")
+    assert _sheet_row_from_result({"keyword": "다이어트약", "volume": 0}, row)["volume"] is None
+    assert _sheet_row_from_result({"keyword": "다이어트약", "volume": 20450}, row)["volume"] == 20450

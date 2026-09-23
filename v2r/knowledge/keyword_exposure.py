@@ -868,6 +868,40 @@ def _relevance_keywords_db_path(rt: Any, brand: str) -> Path:
     return Path(rt.settings.repo_root) / "data" / "keywords" / f"{brand}.sqlite"
 
 
+def _db_volume_map(rt: Any, brand: str) -> dict[str, int]:
+    """`data/keywords/<브랜드>.sqlite`의 키워드 → 검색량(total, 모바일+PC 합).
+
+    원고 대상 여부와 무관하게 전부 읽는다 — 시트에 이미 있는 키워드의 K열은
+    연관도와 상관없이 키워드 도구 검색량이어야 한다(2026-09-24: 원고 대상이 아닌
+    시트 키워드가 volume 0으로 잡혀 K열이 0으로 덮인 사고).
+    """
+    import sqlite3
+
+    db_path = _relevance_keywords_db_path(rt, brand)
+    if not db_path.exists():
+        return {}
+    try:
+        con = sqlite3.connect(str(db_path))
+        try:
+            cols = {row[1] for row in con.execute("PRAGMA table_info(keywords)")}
+            if "total" not in cols:
+                return {}
+            out: dict[str, int] = {}
+            for kw, total in con.execute("SELECT keyword, total FROM keywords"):
+                try:
+                    v = int(total or 0)
+                except (TypeError, ValueError):
+                    v = 0
+                if kw and v > 0:
+                    out[_norm(kw)] = max(out.get(_norm(kw), 0), v)
+            return out
+        finally:
+            con.close()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("검색량 DB 읽기 실패(%s): %s", brand, exc)
+        return {}
+
+
 def _relevance_eligible_keywords(rt: Any, brand: str) -> list[dict]:
     """`data/keywords/<브랜드>.sqlite`에서 원고 대상(`is_manuscript_target`)만.
 
@@ -991,6 +1025,12 @@ def keyword_universe(rt: Any, brand: str) -> list[dict]:
                         }
         except Exception as exc:
             log.warning("발굴 키워드 CSV 읽기 실패(%s, %s): %s", brand, disc_path, exc)
+    # 시트·발굴 CSV에 검색량이 없는 키워드는 DB 검색량으로 채운다(연관도 무관).
+    vol_map = _db_volume_map(rt, brand)
+    if vol_map:
+        for key, item in out.items():
+            if int(item.get("volume") or 0) <= 0 and vol_map.get(key):
+                item["volume"] = vol_map[key]
     return list(out.values())
 
 
@@ -1107,7 +1147,8 @@ def _sheet_row_from_result(item: dict, row: "ExposureRow") -> dict:
         "final_url": integrated_search_url(row.search_query or row.keyword),
         "edited_at": row.checked_at,
         "cafe": row.cafe if row.status == "exposed" else "",
-        "volume": int(item.get("volume") or 0) if item.get("volume") is not None else None,
+        # 검색량을 모르면(0 포함) K열을 건드리지 않는다 — 0으로 덮지 않음(2026-09-24)
+        "volume": int(item["volume"]) if item.get("volume") and int(item.get("volume") or 0) > 0 else None,
         "rank": "예" if top5 else "",
     }
 
