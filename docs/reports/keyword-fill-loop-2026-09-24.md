@@ -4,7 +4,7 @@
 
 ## 1. 현재 원고 대상 수 (작업 시작 시점, 발굴 1만 개 기준)
 
-원고 대상 = `relevance_llm` 0~2 AND `relevance_codex` 0~2 AND `needs_review` 아님
+원고 대상 = `relevance_llm` 0–2 AND `relevance_codex` 0–2 AND `needs_review` 아님
 (`data/keywords/<브랜드>.sqlite`).
 
 | 브랜드 | 원고 대상 | DB 총 키워드(발굴분) |
@@ -37,7 +37,7 @@
   — 이미 채점된 기존 키워드는 건드리지 않는다.
 - **진행 기록** (`data/keywords/fill_progress.json`): 회차마다 브랜드별
   `eligible`(누적 원고 대상)·`new_this_round`(신규 수집)·`adopted_this_round`
-  (신규 중 0~2로 채택된 수)·`adoption_rate`(채택률)·`seed_exhausted`·`status`를
+  (신규 중 0–2로 채택된 수)·`adoption_rate`(채택률)·`seed_exhausted`·`status`를
   기록.
 - **정지 조건**: 3회차 연속 채택률 5% 미만이면 그 브랜드를 `시드고갈`로 표시하고
   멈춘다(`LOW_ADOPTION_STREAK_LIMIT=3`, `LOW_ADOPTION_THRESHOLD=0.05`). 브랜드당
