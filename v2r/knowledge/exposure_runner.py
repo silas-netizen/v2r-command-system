@@ -164,6 +164,51 @@ def update_worker_state(
     return w
 
 
+def maybe_set_global_pause(
+    repo_root: str | Path, expected_workers: int, rest_minutes: float, now: float | None = None
+) -> float | None:
+    """전체 작업자(0..expected_workers-1)가 지금 동시에 휴식 중이면 순환
+    상태 파일에 `global_paused_until`(30분 정지)을 기록한다.
+
+    작업자 하나라도 상태를 모르거나(아직 상태 파일에 없음) 쉬는 중이 아니면
+    아무것도 안 쓰고 `None`을 돌려준다. 이미 전역 정지가 걸려 있으면(아직 안
+    지났으면) 그대로 둔다(연장하지 않음 — 매번 15분 휴식할 때마다 30분씩
+    밀리지 않게).
+    """
+    now = now if now is not None else time.time()
+    state = _load_state(repo_root)
+    workers = state.get("workers", {})
+    if expected_workers <= 0:
+        return None
+    for i in range(expected_workers):
+        w = workers.get(str(i))
+        if not w:
+            return None
+        resting_until = w.get("resting_until")
+        if not resting_until or float(resting_until) <= now:
+            return None
+    existing = state.get("global_paused_until")
+    if existing and float(existing) > now:
+        return float(existing)
+    global_until = now + rest_minutes * 60
+    state["global_paused_until"] = global_until
+    state["global_paused_at"] = now_iso_utc()
+    _write_state(repo_root, state)
+    log.warning("노출 러너: 작업자 전원 동시 휴식 — 전체 %s분 정지 기록", rest_minutes)
+    return global_until
+
+
+def global_pause_remaining(repo_root: str | Path, now: float | None = None) -> float:
+    """지금부터 전역 정지가 끝날 때까지 남은 초(0이면 정지 아님)."""
+    now = now if now is not None else time.time()
+    state = _load_state(repo_root)
+    until = state.get("global_paused_until")
+    if not until:
+        return 0.0
+    remaining = float(until) - now
+    return remaining if remaining > 0 else 0.0
+
+
 def is_alive(repo_root: str | Path, stale_seconds: float = 120.0) -> bool:
     """러너가 살아 있는지(사이드카 `cycle_tick` 중복 방지용) — 상태 파일이
     최근에 갱신됐으면 산다고 본다."""
@@ -271,6 +316,8 @@ def run_worker(worker_id: int, brands: list[str] | None = None, max_iterations: 
     delay_max = float(cfg.get("delay_max_sec", 10))
     block_streak_limit = int(cfg.get("worker_block_streak_limit", 3))
     rest_minutes = float(cfg.get("worker_rest_minutes", 15))
+    expected_workers = int(cfg.get("workers", 2))
+    global_rest_minutes = float(cfg.get("global_block_rest_minutes", 30))
 
     cookies_path = Path(rt.settings.repo_root) / "data" / "naver_cookies.json"
     storage_state = str(cookies_path) if cookies_path.exists() else None
@@ -292,6 +339,14 @@ def run_worker(worker_id: int, brands: list[str] | None = None, max_iterations: 
         )
         try:
             while max_iterations is None or iterations < max_iterations:
+                # 전체 작업자가 동시에 휴식 중이면(다른 작업자가 이미 전역
+                # 정지를 기록했을 수 있음) 그 정지가 끝날 때까지 이 작업자도 쉰다.
+                remaining = global_pause_remaining(rt.settings.repo_root)
+                if remaining > 0:
+                    log.warning("작업자 %s: 전체 정지 중, %.0f초 남음", worker_id, remaining)
+                    time.sleep(min(remaining, 60.0))
+                    continue
+
                 iterations += 1
                 brand = brand_list[brand_idx % len(brand_list)]
                 brand_idx += 1
@@ -307,7 +362,13 @@ def run_worker(worker_id: int, brands: list[str] | None = None, max_iterations: 
                     resting_until = time.time() + rest_minutes * 60
                     update_worker_state(rt.settings.repo_root, worker_id, resting_until=resting_until)
                     log.warning("작업자 %s: 연속 %s건 미확인, %s분 휴식", worker_id, unknown_streak, rest_minutes)
-                    time.sleep(rest_minutes * 60)
+                    # 이 작업자를 쉬게 기록한 직후, 전체(설정된 작업자 수)가 다
+                    # 동시에 쉬는 중인지 확인해 전역 30분 정지를 남긴다.
+                    global_until = maybe_set_global_pause(
+                        rt.settings.repo_root, expected_workers, global_rest_minutes
+                    )
+                    sleep_target = max(resting_until, global_until or 0.0)
+                    time.sleep(max(0.0, sleep_target - time.time()))
                     unknown_streak = 0
                     update_worker_state(rt.settings.repo_root, worker_id, resting_until=None)
                 time.sleep(random.uniform(delay_min, delay_max))
@@ -339,6 +400,8 @@ __all__ = [
     "fetch_integrated_search_dom_resident",
     "state_path",
     "update_worker_state",
+    "maybe_set_global_pause",
+    "global_pause_remaining",
     "is_alive",
     "process_one",
     "run_worker",

@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import time
 from datetime import datetime, timedelta, timezone
 
 from v2r.knowledge import exposure_priority, exposure_runner
@@ -49,6 +50,39 @@ def test_state_file_round_trip(tmp_path):
 
 def test_is_alive_없으면_false(tmp_path):
     assert not exposure_runner.is_alive(tmp_path)
+
+
+def test_전체작업자_동시휴식이면_전역정지_기록(tmp_path):
+    now = 1_000_000.0
+    exposure_runner.update_worker_state(tmp_path, 0, processed_delta=1)
+    exposure_runner.update_worker_state(tmp_path, 1, processed_delta=1)
+    # 작업자 0만 쉬는 중 — 아직 전역 정지 아님
+    exposure_runner.update_worker_state(tmp_path, 0, resting_until=now + 900)
+    assert exposure_runner.maybe_set_global_pause(tmp_path, 2, 30, now=now) is None
+    assert exposure_runner.global_pause_remaining(tmp_path, now=now) == 0.0
+
+    # 작업자 1도 쉬는 중 — 이제 전원 동시 휴식, 전역 30분 정지 기록
+    exposure_runner.update_worker_state(tmp_path, 1, resting_until=now + 900)
+    until = exposure_runner.maybe_set_global_pause(tmp_path, 2, 30, now=now)
+    assert until == now + 30 * 60
+    assert exposure_runner.global_pause_remaining(tmp_path, now=now) == 30 * 60
+    assert exposure_runner.global_pause_remaining(tmp_path, now=now + 31 * 60) == 0.0
+
+
+def test_전역정지_이미있으면_연장안함(tmp_path):
+    now = 2_000_000.0
+    exposure_runner.update_worker_state(tmp_path, 0, resting_until=now + 900)
+    exposure_runner.update_worker_state(tmp_path, 1, resting_until=now + 900)
+    first = exposure_runner.maybe_set_global_pause(tmp_path, 2, 30, now=now)
+    # 5분 뒤 다시 불러도(다른 작업자가 또 휴식 조건에 걸림) 처음 정지 시각을 유지한다
+    second = exposure_runner.maybe_set_global_pause(tmp_path, 2, 30, now=now + 300)
+    assert first == second
+
+
+def test_전역정지_작업자_상태모르면_설정안함(tmp_path):
+    exposure_runner.update_worker_state(tmp_path, 0, resting_until=time.time() + 900)
+    # 작업자 1은 아직 상태 파일에 없음 — 전원 휴식인지 알 수 없으므로 정지 안 걸림
+    assert exposure_runner.maybe_set_global_pause(tmp_path, 2, 30) is None
 
 
 def test_priority_tier_미확인이_1순위():
