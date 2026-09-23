@@ -163,7 +163,56 @@ def login_interactive(site: Site, timeout: int = ns.LOGIN_TIMEOUT) -> bool:
         ns._close(playwright, context, page)
 
 
+#: 이 프로필로 이미 떠 있는 진짜 크롬의 원격 디버깅 포트(슬랙·앱스 스크립트 조작용, 2026-09-22부터 상주).
+CDP_PORTS: dict[str, int] = {"claude": 9333}
+
+
+def _check_via_running_chrome(site: Site, path: Path) -> dict | None:
+    """같은 프로필을 진짜 크롬이 붙잡고 있으면 그 크롬에 CDP로 붙어 확인한다.
+
+    사고 2026-09-23 09:20: 상주 크롬이 프로필을 쓰는 동안 헤드리스 크로미움을 같은 폴더로
+    또 띄우자 쿠키를 못 읽어 "풀림" 오경보가 났고, 그 위에 백업 복구까지 돌았다.
+    """
+    port = CDP_PORTS.get(site.key)
+    if not port:
+        return None
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception:  # noqa: BLE001
+        return None
+    out: dict[str, Any] = {"ok": True, "site": site.key, "logged_in": False, "profile": str(path), "note": "", "via": f"cdp:{port}"}
+    try:
+        with sync_playwright() as pw:
+            try:
+                browser = pw.chromium.connect_over_cdp(f"http://127.0.0.1:{port}", timeout=3000)
+            except Exception:  # noqa: BLE001
+                return None  # 상주 크롬 없음 → 평소 방식
+            ctx = browser.contexts[0] if browser.contexts else browser.new_context()
+            page = ctx.new_page()
+            try:
+                page.goto(site.touch_url, wait_until="domcontentloaded", timeout=60000)
+                page.wait_for_timeout(3000)
+                if _logged_out(page, site):
+                    out["note"] = "상주 크롬에서도 로그인 표식 없음 → 풀림"
+                else:
+                    out.update(logged_in=True, note="상주 크롬(CDP)으로 세션 연장 방문 완료")
+            except Exception as exc:  # noqa: BLE001
+                out.update(logged_in=True, unverified=True, note=f"상주 크롬 접속 실패({exc.__class__.__name__}) → 판정 보류")
+            finally:
+                try:
+                    page.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            browser.close()  # CDP 연결만 끊는다(크롬은 그대로)
+    except Exception as exc:  # noqa: BLE001
+        out.update(logged_in=True, unverified=True, note=f"CDP 점검 실패({exc.__class__.__name__}) → 판정 보류")
+    return out
+
+
 def _check_once(site: Site, path: Path) -> dict:
+    via_chrome = _check_via_running_chrome(site, path)
+    if via_chrome is not None:
+        return via_chrome
     out: dict[str, Any] = {"ok": True, "site": site.key, "logged_in": False, "profile": str(path), "note": ""}
     playwright = context = page = None
     try:
@@ -198,7 +247,8 @@ def check_site(site: Site) -> dict:
         again["restored_from_backup"] = True
         again["note"] = f"풀림({out.get('note')}) → 백업 복구 후: {again.get('note')}"
         out = again
-    if out.get("logged_in") and not out.get("unverified"):
+    if out.get("logged_in") and not out.get("unverified") and not out.get("via"):
+        # 상주 크롬이 쓰는 중인 프로필은 복사하지 않는다(쓰는 중 복사 → 깨진 백업)
         out["backup"] = ns.backup_profile(path)
     return out
 
