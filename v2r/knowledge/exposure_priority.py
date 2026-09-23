@@ -4,12 +4,11 @@
 판정 규칙은 건드리지 않는다 — 이 모듈은 "다음에 어떤 키워드를 검사할지"만
 정하고, 실제 검사·판정은 `keyword_exposure.judge_keyword_exposure`(호출만)가 한다.
 
-등급(숫자가 작을수록 먼저):
-    1. 미확인 — `keyword_exposure` 표에 한 번도 안 나온 키워드
+등급(숫자가 작을수록 먼저) — 2026-09-24 사용자 재정의:
+    1. 노출완 — 마지막 판정이 exposed고 재검사 주기(기본 6시간) 지남 (빠르게 확인)
     2. 최근 발행 — 같은 카페에 우리 글이 최근(설정한 시각 근방) 발행된 키워드
-    3. 노출완 — 마지막 판정이 exposed고 재검사 주기(기본 24시간) 지남
-    4. 밀려남(상위) — 검색량 상위 구간이고 재검사 주기(기본 48시간) 지남
-    5. 밀려남(하위) — 나머지, 재검사 주기(기본 7일) 지남
+    3. 밀려남·미확인 — 검색량 높은 순. 한 번 검사한 키워드는 최소 간격
+       (기본 12시간)만 지나면 다시 대상. 48시간/7일 같은 긴 주기는 없다.
 
 연관도 3(무관)은 `keyword_exposure.keyword_universe`가 애초에 뽑지 않으므로
 여기서 따로 걸러낼 필요가 없다(연결 3 규칙 그대로 재사용).
@@ -32,10 +31,12 @@ log = logging.getLogger(__name__)
 CONFIG_PATH = "config/exposure.yaml"
 
 _DEFAULT_PRIORITY = {
-    "recent_publish_hours": [4, 24, 72],
-    "exposed_recheck_hours": 24,
-    "pushed_recheck_hours": 48,
-    "pushed_low_recheck_hours": 168,
+    "recent_publish_hours": [2, 6, 24],
+    "exposed_recheck_hours": 6,
+    "pushed_min_gap_hours": 12,
+    # 구 설정 호환(더 이상 등급을 가르지 않음)
+    "pushed_recheck_hours": 12,
+    "pushed_low_recheck_hours": 12,
     "top_volume_percentile": 0.7,
 }
 
@@ -126,30 +127,23 @@ def priority_tier(
     key = _norm(item.get("keyword", ""))
     last = last_checked.get(key)
     if last is None:
-        return (1, float("inf"))
+        # 미확인 — 3등급(밀려남과 같이 검색량 순), 경과 시간은 무한대
+        return (3, float("inf"))
 
     age_h = _hours_since(last.get("checked_at", ""), now)
     age_h = age_h if age_h is not None else float("inf")
     status = last.get("status", "")
 
+    if status == "exposed":
+        due = float(cfg.get("exposed_recheck_hours", 6))
+        return (1, age_h) if age_h >= due else (99, age_h)
+
     if key in recent_publish_norm:
         return (2, age_h)
 
-    if status == "exposed":
-        due = float(cfg.get("exposed_recheck_hours", 24))
-        return (3, age_h) if age_h >= due else (99, age_h)
-
-    if status == "pushed":
-        volume = float(item.get("volume") or 0)
-        if volume >= volume_threshold:
-            due = float(cfg.get("pushed_recheck_hours", 48))
-            return (4, age_h) if age_h >= due else (99, age_h)
-        due = float(cfg.get("pushed_low_recheck_hours", 168))
-        return (5, age_h) if age_h >= due else (99, age_h)
-
-    # unpublished/unknown 등 — 밀려남 하위 취급으로 완만히 재검사
-    due = float(cfg.get("pushed_low_recheck_hours", 168))
-    return (5, age_h) if age_h >= due else (99, age_h)
+    # 밀려남·미확인·unknown — 최소 간격만 지나면 대상(검색량 순 정렬은 배치 쪽)
+    due = float(cfg.get("pushed_min_gap_hours", 12))
+    return (3, age_h) if age_h >= due else (99, age_h)
 
 
 def _volume_threshold(universe: list[dict], percentile: float) -> float:
@@ -191,7 +185,10 @@ def next_priority_batch(rt: Any, brand: str, n: int, now: datetime | None = None
         tier, age = priority_tier(item, last_checked, recent_norm, cfg, vol_threshold, now)
         if tier >= 99:
             continue
-        scored.append((tier, -age, item))
+        vol = float(item.get("volume") or 0)
+        # 1·2등급: 오래된 순. 3등급(밀려남·미확인): 검색량 높은 순 → 오래된 순
+        sub = (-vol, -age) if tier == 3 else (0.0, -age)
+        scored.append((tier, sub, item))
     scored.sort(key=lambda t: (t[0], t[1]))
     return [item for _, _, item in scored[: max(0, n)]]
 

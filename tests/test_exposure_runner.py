@@ -85,50 +85,38 @@ def test_전역정지_작업자_상태모르면_설정안함(tmp_path):
     assert exposure_runner.maybe_set_global_pause(tmp_path, 2, 30) is None
 
 
-def test_priority_tier_미확인이_1순위():
-    now = datetime.now(timezone.utc)
-    cfg = {"exposed_recheck_hours": 24, "pushed_recheck_hours": 48, "pushed_low_recheck_hours": 168}
-    tier, _ = exposure_priority.priority_tier({"keyword": "새키워드"}, {}, set(), cfg, 10.0, now)
+def _cfg():
+    return {"exposed_recheck_hours": 6, "pushed_min_gap_hours": 12}
+
+
+def test_priority_tier_노출완_주기지나면_1순위():
+    now = datetime(2026, 9, 24, 12, 0, tzinfo=timezone.utc)
+    last_checked = {"키워드": {"checked_at": "2026-09-24T02:00:00+00:00", "status": "exposed"}}
+    tier, _ = exposure_priority.priority_tier({"keyword": "키워드"}, last_checked, set(), _cfg(), 10.0, now)
     assert tier == 1
 
 
-def test_priority_tier_최근발행이_2순위():
-    now = datetime.now(timezone.utc)
-    cfg = {"exposed_recheck_hours": 24, "pushed_recheck_hours": 48, "pushed_low_recheck_hours": 168}
-    last_checked = {"최근키워드": {"checked_at": (now - timedelta(hours=100)).isoformat(), "status": "pushed"}}
-    tier, _ = exposure_priority.priority_tier(
-        {"keyword": "최근키워드", "volume": 0}, last_checked, {"최근키워드"}, cfg, 10.0, now
-    )
-    assert tier == 2
-
-
 def test_priority_tier_노출완_주기전이면_제외():
-    now = datetime.now(timezone.utc)
-    cfg = {"exposed_recheck_hours": 24, "pushed_recheck_hours": 48, "pushed_low_recheck_hours": 168}
-    last_checked = {"키워드": {"checked_at": (now - timedelta(hours=1)).isoformat(), "status": "exposed"}}
-    tier, _ = exposure_priority.priority_tier({"keyword": "키워드"}, last_checked, set(), cfg, 10.0, now)
+    now = datetime(2026, 9, 24, 12, 0, tzinfo=timezone.utc)
+    last_checked = {"키워드": {"checked_at": "2026-09-24T10:00:00+00:00", "status": "exposed"}}
+    tier, _ = exposure_priority.priority_tier({"keyword": "키워드"}, last_checked, set(), _cfg(), 10.0, now)
     assert tier == 99
 
 
-def test_priority_tier_노출완_주기지나면_3순위():
-    now = datetime.now(timezone.utc)
-    cfg = {"exposed_recheck_hours": 24, "pushed_recheck_hours": 48, "pushed_low_recheck_hours": 168}
-    last_checked = {"키워드": {"checked_at": (now - timedelta(hours=25)).isoformat(), "status": "exposed"}}
-    tier, _ = exposure_priority.priority_tier({"keyword": "키워드"}, last_checked, set(), cfg, 10.0, now)
-    assert tier == 3
+def test_priority_tier_최근발행이_2순위():
+    now = datetime(2026, 9, 24, 12, 0, tzinfo=timezone.utc)
+    last_checked = {"키워드": {"checked_at": "2026-09-23T00:00:00+00:00", "status": "pushed"}}
+    tier, _ = exposure_priority.priority_tier({"keyword": "키워드"}, last_checked, {"키워드"}, _cfg(), 10.0, now)
+    assert tier == 2
 
 
-def test_priority_tier_밀려남_상위검색량이_4순위_하위가_5순위():
-    now = datetime.now(timezone.utc)
-    cfg = {"exposed_recheck_hours": 24, "pushed_recheck_hours": 48, "pushed_low_recheck_hours": 168}
-    last_checked = {
-        "상위": {"checked_at": (now - timedelta(hours=50)).isoformat(), "status": "pushed"},
-        "하위": {"checked_at": (now - timedelta(hours=200)).isoformat(), "status": "pushed"},
-    }
-    tier_top, _ = exposure_priority.priority_tier({"keyword": "상위", "volume": 100}, last_checked, set(), cfg, 10.0, now)
-    tier_low, _ = exposure_priority.priority_tier({"keyword": "하위", "volume": 1}, last_checked, set(), cfg, 10.0, now)
-    assert tier_top == 4
-    assert tier_low == 5
+def test_priority_tier_미확인과_밀려남은_3순위_최소간격():
+    now = datetime(2026, 9, 24, 12, 0, tzinfo=timezone.utc)
+    assert exposure_priority.priority_tier({"keyword": "새키워드"}, {}, set(), _cfg(), 10.0, now)[0] == 3
+    old = {"오래": {"checked_at": "2026-09-23T00:00:00+00:00", "status": "pushed"}}
+    fresh = {"방금": {"checked_at": "2026-09-24T11:00:00+00:00", "status": "pushed"}}
+    assert exposure_priority.priority_tier({"keyword": "오래"}, old, set(), _cfg(), 10.0, now)[0] == 3
+    assert exposure_priority.priority_tier({"keyword": "방금"}, fresh, set(), _cfg(), 10.0, now)[0] == 99
 
 
 def test_next_priority_batch_같은_키워드_연속_두번_안뽑힘(tmp_path, monkeypatch):

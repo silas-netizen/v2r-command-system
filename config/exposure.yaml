@@ -27,9 +27,8 @@ pending_confirm_max_minutes: 10
 
 # 우선순위 등급별 재검사 주기(시간) — exposure_priority.py
 priority:
-  # 1순위: 한 번도 검사 안 한 키워드 — 주기 없음(늘 최우선)
-  recent_publish_hours: [4, 24, 72]     # 2순위: 발행 후 이 시각 근방이면 우선
-  exposed_recheck_hours: 24             # 3순위: 노출완 → 이 시간 지나면 재검사
-  pushed_recheck_hours: 48              # 4순위: 밀려남(검색량 상위 30%) → 이 시간 지나면
-  pushed_low_recheck_hours: 168         # 5순위: 밀려남(하위) → 이 시간 지나면(7일)
-  top_volume_percentile: 0.7            # 검색량 상위 30% 기준(0.7 = 70번째 백분위 이상)
+  # 2026-09-24 사용자 재정의 — 1 노출완(빠르게) → 2 최근 발행(빠르게) → 3 밀려남·미확인 검색량 높은 순
+  exposed_recheck_hours: 6              # 1순위: 노출완 → 6시간마다 재확인
+  recent_publish_hours: [2, 6, 24]      # 2순위: 발행 후 이 시각 근방(±2시간)이면 우선
+  pushed_min_gap_hours: 12              # 3순위: 밀려남·미확인은 검색량 순, 같은 키워드는 12시간 지나야 다시
+  top_volume_percentile: 0.7            # (보고용) 검색량 상위 30% 기준
