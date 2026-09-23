@@ -2,7 +2,8 @@
 # exposure_runner.py / exposure_priority.py가 읽는다.
 
 # 작업자(브라우저 상주 프로세스) 수. 2로 시작해 실측 후 올린다.
-workers: 2
+# 2026-09-24 15:xx — 3개 15분 실측에서 차단 징후 0건 확인 후 4로 상향.
+workers: 4
 
 # 작업자별 요청 간격(초) — 무작위 범위
 delay_min_sec: 6

@@ -256,7 +256,11 @@ def judge_once(
     from v2r.knowledge.keyword_exposure import ExposureRow, judge_keyword_exposure, now_iso, resolve_search_query
 
     keyword = item["keyword"]
+    # 2026-09-24 코디네이터 지시 — 병목 파악용 구간별 타이밍(자동완성/스크롤/
+    # 후보 확인). "타이밍" 태그로 로그에 남기고, 실측 뒤 grep으로 집계한다.
+    t0 = time.perf_counter()
     query = resolve_search_query(keyword)
+    t1 = time.perf_counter()
     cookies_path = Path(rt.settings.repo_root) / "data" / "naver_cookies.json"
     try:
         html = fetch_integrated_search_dom_resident(
@@ -269,6 +273,7 @@ def judge_once(
     except Exception as exc:
         log.warning("페이지 로드 실패(%s): %s", keyword, exc)
         return ExposureRow(brand, keyword, item.get("cafe", ""), "", None, "unknown", now_iso(), item.get("t0_status", ""), query)
+    t2 = time.perf_counter()
 
     judge_kwargs = dict(
         cookies_path=cookies_path,
@@ -280,6 +285,11 @@ def judge_once(
         verdict = executor.submit(judge_keyword_exposure, rt, brand, keyword, **judge_kwargs).result()
     else:
         verdict = judge_keyword_exposure(rt, brand, keyword, **judge_kwargs)
+    t3 = time.perf_counter()
+    log.info(
+        "타이밍 %s autocomplete=%.2fs scroll=%.2fs confirm=%.2fs total=%.2fs",
+        keyword, t1 - t0, t2 - t1, t3 - t2, t3 - t0,
+    )
     return ExposureRow(
         brand,
         keyword,
@@ -611,7 +621,9 @@ def run_worker(worker_id: int, brands: list[str] | None = None, max_iterations: 
                     brand_idx += 1
                     # n=1로는 이미 진행 중인 후보 하나뿐일 때 고를 게 없으니
                     # 넉넉히 받아 첫 번째로 안 잡힌 후보를 고른다.
+                    _sheet_t0 = time.perf_counter()
                     batch = exposure_priority.next_priority_batch(rt, brand, n=5)
+                    log.info("타이밍 우선순위조회 브랜드=%s sheet_read=%.2fs", brand, time.perf_counter() - _sheet_t0)
                     for candidate in batch:
                         if claim_inflight(rt.settings.repo_root, brand, candidate["keyword"], worker_id):
                             item = candidate
