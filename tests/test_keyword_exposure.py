@@ -389,3 +389,121 @@ def test_sheet_row_does_not_write_zero_volume():
     row = ExposureRow(keyword="다이어트약", brand="팥순이", cafe="", article_url="", rank=None, status="pushed", checked_at="2026-09-24 01:00:00")
     assert _sheet_row_from_result({"keyword": "다이어트약", "volume": 0}, row)["volume"] is None
     assert _sheet_row_from_result({"keyword": "다이어트약", "volume": 20450}, row)["volume"] == 20450
+
+
+class _FakeKeywordRow:
+    def __init__(self, keyword: str, pc: int, mobile: int):
+        self.keyword = keyword
+        self.pc = pc
+        self.mobile = mobile
+        self.total = pc + mobile
+
+
+def test_ensure_volumes_db에_있으면_도구를_안_부른다(rt, tmp_path):
+    import sqlite3
+
+    from v2r.knowledge.keyword_exposure import ensure_volumes, _relevance_keywords_db_path
+
+    rt.settings.repo_root = tmp_path
+    db_path = _relevance_keywords_db_path(rt, "팥순이")
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(str(db_path))
+    con.execute(
+        "CREATE TABLE keywords (keyword TEXT PRIMARY KEY, pc INTEGER, mobile INTEGER, total INTEGER, "
+        "source_seed TEXT, depth INTEGER, relevance INTEGER, collected_at TEXT)"
+    )
+    con.execute("INSERT INTO keywords VALUES ('다이어트약', 100, 200, 300, '', 0, 2, '2026-01-01')")
+    con.commit()
+    con.close()
+
+    def boom(seeds):
+        raise AssertionError("도구를 부르면 안 됨")
+
+    out = ensure_volumes(rt, "팥순이", ["다이어트약"], fetch_fn=boom)
+    assert out["다이어트약"] == 300
+
+
+def test_ensure_volumes_없으면_도구로_조회해_db에_저장(rt, tmp_path):
+    from v2r.knowledge.keyword_exposure import ensure_volumes, _relevance_keywords_db_path
+    import sqlite3
+
+    rt.settings.repo_root = tmp_path
+    calls = []
+
+    def fake_fetch(seeds):
+        calls.append(list(seeds))
+        return [_FakeKeywordRow(seeds[0], 100, 50)]
+
+    out = ensure_volumes(rt, "팥순이", ["새키워드"], fetch_fn=fake_fetch)
+    assert out["새키워드"] == 150
+    assert calls == [["새키워드"]]
+
+    db_path = _relevance_keywords_db_path(rt, "팥순이")
+    con = sqlite3.connect(str(db_path))
+    row = con.execute("SELECT pc, mobile, total, relevance FROM keywords WHERE keyword=?", ("새키워드",)).fetchone()
+    con.close()
+    assert row == (100, 50, 150, 0)
+
+
+def test_ensure_volumes_기존_relevance는_안_건드린다(rt, tmp_path):
+    import sqlite3
+
+    from v2r.knowledge.keyword_exposure import ensure_volumes, _relevance_keywords_db_path
+
+    rt.settings.repo_root = tmp_path
+    db_path = _relevance_keywords_db_path(rt, "팥순이")
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(str(db_path))
+    con.execute(
+        "CREATE TABLE keywords (keyword TEXT PRIMARY KEY, pc INTEGER, mobile INTEGER, total INTEGER, "
+        "source_seed TEXT, depth INTEGER, relevance INTEGER, collected_at TEXT)"
+    )
+    con.execute("INSERT INTO keywords VALUES ('기존키워드', 0, 0, 0, '', 0, 2, '2026-01-01')")
+    con.commit()
+    con.close()
+
+    def fake_fetch(seeds):
+        return [_FakeKeywordRow(seeds[0], 10, 5)]
+
+    ensure_volumes(rt, "팥순이", ["기존키워드"], fetch_fn=fake_fetch)
+
+    con = sqlite3.connect(str(db_path))
+    row = con.execute("SELECT total, relevance FROM keywords WHERE keyword=?", ("기존키워드",)).fetchone()
+    con.close()
+    assert row == (15, 2)
+
+
+def test_ensure_volumes_도구가_씨앗을_안돌려주면_최소값(rt, tmp_path):
+    from v2r.knowledge.keyword_exposure import ensure_volumes
+
+    rt.settings.repo_root = tmp_path
+    out = ensure_volumes(rt, "팥순이", ["안잡힘"], fetch_fn=lambda seeds: [])
+    assert out["안잡힘"] == 5
+
+
+def test_ensure_volumes_조회실패는_경고만_예외없음(rt, tmp_path):
+    from v2r.knowledge.keyword_exposure import ensure_volumes
+
+    rt.settings.repo_root = tmp_path
+
+    def broken(seeds):
+        raise RuntimeError("차단됨")
+
+    out = ensure_volumes(rt, "팥순이", ["실패키워드"], fetch_fn=broken)
+    assert "실패키워드" not in out
+
+
+def test_next_cycle_batch_검색량_0이면_ensure_volumes로_채운다(rt, monkeypatch, tmp_path):
+    import v2r.knowledge.keyword_exposure as ke_mod
+
+    rt.settings.repo_root = tmp_path
+    monkeypatch.setattr(
+        ke_mod,
+        "keyword_universe",
+        lambda rt, brand: [
+            {"keyword": "무검색량", "cafe": "", "article_url": "", "t0_status": "", "candidate_title_norm": "", "volume": 0}
+        ],
+    )
+    monkeypatch.setattr(ke_mod, "ensure_volumes", lambda rt, brand, kws: {"무검색량": 1234})
+    batch = ke_mod.next_cycle_batch(rt, "팥순이", n=1)
+    assert batch[0]["volume"] == 1234
