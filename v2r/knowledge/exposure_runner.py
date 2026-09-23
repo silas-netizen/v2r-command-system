@@ -716,12 +716,16 @@ def run_worker(worker_id: int, brands: list[str] | None = None, max_iterations: 
                         brand, item = entry["brand"], entry["item"]
                         break
                 if item is None:
+                    # 2026-09-24 3차 지시로 발견 — 이전엔 반복마다 브랜드를
+                    # 무조건 바꿔서, 배치(WorkerQueue)를 가져와도 평균 1개만
+                    # 쓰고 버리는 셈이었다(큐소비 로그 실측: 소비=1.0). 이 배치가
+                    # 빌 때까지는 같은 브랜드에 머물러 실제로 배치를 다 쓴다 —
+                    # 브랜드 로테이션은 큐가 빈 시점(=배치 소진 또는 이 브랜드에
+                    # 지금 검사할 게 없음)에만 진행한다.
                     brand = brand_list[brand_idx % len(brand_list)]
-                    brand_idx += 1
-                    # 배치를 메모리 큐에 두고 하나씩 소비한다(매번 n=1로 조회하던
-                    # 것을 바꿈 — 조회 자체도 브랜드별 TTL 캐시를 쓴다).
                     item = worker_queue.take(rt, brand, worker_id)
                     if item is None:
+                        brand_idx += 1
                         time.sleep(2.0)
                         continue
 
