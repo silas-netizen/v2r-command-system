@@ -184,7 +184,8 @@ def test_serve는_명령을_보낸_방에_답한다(tmp_path):
     out = worker.serve_poll(rt)
     assert out["received"] == 1
     replies = [t for cid, t in channel.sent if cid == "777"]
-    assert len(replies) >= 2  # 접수 안내 + 완료 보고
+    # 접수 답장은 없앴다(정책 2026-09-23) — 짧은 작업은 완료 보고 1건만.
+    assert len(replies) == 1
     assert any("완료" in t or "상태 조회" in t for t in replies)
     rt.close()
 
@@ -207,7 +208,12 @@ def test_serve는_해석_실패를_그_방에_알린다(tmp_path):
     rt._channels = [channel]
 
     worker.serve_poll(rt)
-    assert channel.sent and "해석" in channel.sent[0][1]
+    # 문법에 안 맞으면 자유 대화 해석기로 넘어간다(모델 없으면 되묻기 1건,
+    # "명령을 해석하지 못했습니다" 문구는 나가지 않는다 — 정책 2026-09-23).
+    assert channel.sent
+    text = channel.sent[0][1]
+    assert "못 알아들었어요" in text
+    assert "해석하지 못했습니다" not in text
     rt.close()
 
 

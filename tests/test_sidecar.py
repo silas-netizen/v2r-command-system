@@ -165,8 +165,8 @@ def test_틱이_예약과_감시와_수신과_가벼운_작업을_모두_돌린�
     # 접수된 `미처리 알림`(가벼운 작업)이 같은 틱에서 바로 실행된다
     assert [o["status"] for o in out["done"]] == ["done"]
     assert rt.jobs.recent(1)[0]["task"] == "pending_report"
-    # 명령을 보낸 그 방에 접수·결과 답장이 모두 갔다
-    assert len(channel.sent) >= 2
+    # 명령을 보낸 그 방에 결과 답장 1건이 갔다(접수 답장은 정책상 없앴다, 2026-09-23)
+    assert len(channel.sent) == 1
     assert sidecar_mod.heartbeat_age_seconds(rt) is not None
     rt.close()
 

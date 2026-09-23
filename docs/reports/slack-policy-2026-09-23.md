@@ -128,14 +128,18 @@ tests/test_notify_policy.py (신규) .......  7 passed
 tests/test_engine.py, tests/test_parser.py  전부 통과
 ```
 
-이번에 건드린 파일(`v2r/channels/__init__.py`, `v2r/channels/freeform.py`,
-`v2r/engine/worker.py`, `v2r/engine/monitor.py` 관련 없음, `v2r/engine/sidecar.py`
-관련 없음, `v2r/engine/schedule.py`, `v2r/llm/router.py`, `config/notify.yaml`)를
-직접 덮는 스위트는 모두 통과를 확인했다. `pytest tests/`(저장소 전체, 300개 이상)는
-백그라운드로 25분 넘게 돌았지만 이 코드 변경과 무관한 브라우저·네트워크 의존 테스트가
-섞여 있어 시간 안에 끝나지 않았다 — 실행기 재시작 없이 반복 실행해도 되는 명령이니
-필요하면 `PYTHONIOENCODING=utf-8 .venv\Scripts\python.exe -m pytest tests/ -q` 로
-따로 오래 돌려 확인해도 된다.
+전체 `pytest tests/`(1397개)를 끝까지 돌렸다(약 30분). 처음 통과분 이후
+접수 답장 제거로 어긋난 기존 테스트 3개를 추가로 찾아 새 정책에 맞게 고쳤다:
+
+- `tests/test_cleanup_orphans.py::test_serve는_명령을_보낸_방에_답한다` — "접수+완료"
+  2건을 기대하던 것을 "완료 1건"으로.
+- `tests/test_cleanup_orphans.py::test_serve는_해석_실패를_그_방에_알린다` — "해석"
+  문구 기대를 "못 알아들었어요"(자유 대화 되묻기)로, "해석하지 못했습니다"가
+  안 나가는지도 같이 확인.
+- `tests/test_sidecar.py::test_틱이_예약과_감시와_수신과_가벼운_작업을_모두_돌린다` —
+  "접수+결과" 2건 기대를 "결과 1건"으로.
+
+최종 결과: `1397 passed`(제외/스킵 없음).
 
 ## 8. 적용 시점
 
