@@ -262,6 +262,35 @@ def test_confirm_our_article_캐시_24시간_재사용(tmp_path, monkeypatch):
     assert len(calls) == 1  # 다시 열지 않았다
 
 
+def test_confirm_our_article_캐시는_브랜드별로_분리된다(tmp_path, monkeypatch):
+    """2026-09-24 수정 — 크로스 브랜드 캐시 오염 발견: 캐시 키가 URL만이라
+    한 브랜드가 `ours=True`로 확정한 글이 다른 브랜드의 같은 URL 판정에도
+    그대로 재사용됐다(우아덤 "엉덩이종기", 뉴더미스 "비만도계산기" 등 실사례,
+    docs/reports/exposure-audit-5brands-2026-09-24.md 3절). 이제 캐시 키에
+    브랜드를 포함해 브랜드마다 독립적으로 다시 확인해야 한다."""
+    rt = make_runtime(tmp_path)
+    rt.settings.repo_root = tmp_path
+    calls = []
+    # 이 글은 "우아덤" 식별어만 있고 "뉴더미스" 식별어는 없다.
+    comment_page = "댓글 1\n작성자\n\n우아덤 후기입니다\n\n2026.09.10. 10:00\n답글쓰기\n댓글을 입력하세요"
+    monkeypatch.setattr(ke, "fetch_article_text", lambda url, cookies_path=None: calls.append(url) or comment_page)
+
+    woadeom = ke.confirm_our_article(rt, "우아덤", OUR_URL, ["우아덤"])
+    assert woadeom is True
+    assert len(calls) == 1
+
+    # 같은 URL을 다른 브랜드("뉴더미스")로 확인하면 캐시를 재사용하지 않고
+    # 새로 열어야 하고, 그 브랜드 식별어가 없으므로 거짓이어야 한다.
+    newdermis = ke.confirm_our_article(rt, "뉴더미스", OUR_URL, ["뉴더미스"])
+    assert newdermis is False
+    assert len(calls) == 2  # 다시 열었다(캐시 오염 없음)
+
+    # 우아덤 쪽은 여전히 24시간 캐시로 재사용된다(브랜드 내에서는 그대로 유지).
+    woadeom_again = ke.confirm_our_article(rt, "우아덤", OUR_URL, ["우아덤"])
+    assert woadeom_again is True
+    assert len(calls) == 2  # 우아덤은 다시 열지 않았다
+
+
 def test_confirm_our_article_식별어_없으면_거짓(tmp_path, monkeypatch):
     rt = make_runtime(tmp_path)
     rt.settings.repo_root = tmp_path

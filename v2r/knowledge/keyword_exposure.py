@@ -1824,12 +1824,23 @@ def _article_cache_save(rt: Any, data: dict) -> None:
     os.replace(tmp, p)
 
 
-def cached_verdict(rt: Any, url: str, now: str | None = None) -> bool | None:
-    """이 글 URL을 24시간 안에 이미 확인했으면 그 결과(참/거짓), 아니면 `None`."""
+def _cache_key(brand: str, url: str) -> str:
+    """캐시 키 = 브랜드 + 정규화 URL(2026-09-24 수정 — 브랜드 없는 URL 전용 키는 다른
+    브랜드가 먼저 확정한 판정을 그대로 재사용하는 오염을 일으켰다. 예: 팥순이 글
+    `cafe.naver.com/cantsb/3544901`이 `ours=True`로 캐시된 뒤, 같은 URL이 뉴더미스
+    후보로도 잡히면 뉴더미스 식별어 확인 없이 그대로 노출완으로 잘못 확정됐다)."""
+    return f"{brand}::{_norm_url(url)}"
+
+
+def cached_verdict(rt: Any, brand: str, url: str, now: str | None = None) -> bool | None:
+    """이 브랜드의 이 글 URL을 24시간 안에 이미 확인했으면 그 결과(참/거짓), 아니면 `None`.
+
+    브랜드 없이 저장된 옛 캐시 항목(`_norm_url(url)`만 키인 것)은 브랜드를 구분할
+    수 없으므로 무효로 보고 무시한다(2026-09-24 크로스 브랜드 오염 수정)."""
     from datetime import datetime as _dt
 
     data = _article_cache_load(rt)
-    entry = data.get(_norm_url(url))
+    entry = data.get(_cache_key(brand, url))
     if not entry:
         return None
     try:
@@ -1842,9 +1853,9 @@ def cached_verdict(rt: Any, url: str, now: str | None = None) -> bool | None:
     return bool(entry.get("ours"))
 
 
-def set_cached_verdict(rt: Any, url: str, ours: bool, now: str | None = None) -> None:
+def set_cached_verdict(rt: Any, brand: str, url: str, ours: bool, now: str | None = None) -> None:
     data = _article_cache_load(rt)
-    data[_norm_url(url)] = {"ours": bool(ours), "at": now or now_iso()}
+    data[_cache_key(brand, url)] = {"ours": bool(ours), "at": now or now_iso()}
     _article_cache_save(rt, data)
 
 
@@ -2087,7 +2098,7 @@ def confirm_our_article_detail(
         except Exception as exc:  # pragma: no cover - 방어용
             log.warning("article_index 확인 실패(%s): %s", url, exc)
 
-    cached = cached_verdict(rt, url, now=now)
+    cached = cached_verdict(rt, brand, url, now=now)
     if cached is not None:
         return {"ours": cached, "via": "cache", "hit": None}
 
@@ -2113,7 +2124,7 @@ def confirm_our_article_detail(
     except Exception as exc:
         log.warning("글 열람 확인 실패(%s): %s", url, exc)
         return {"ours": False, "via": "error", "hit": None}
-    set_cached_verdict(rt, url, ours, now=now)
+    set_cached_verdict(rt, brand, url, ours, now=now)
     return {"ours": ours, "via": via, "hit": hit}
 
 
