@@ -54,3 +54,14 @@ priority:
   # `exposure_priority.mark_checked`로 그 키워드만 즉시 갱신하므로, 같은
   # 키워드가 TTL 안에 바로 다시 뽑히는 일은 없다.
   last_checked_cache_sec: 20
+  # 2026-09-24 5차(실측 9, 6-7·6-8절) — 4차(작업자별 정렬 캐시)로도 중복
+  # 재검사가 19.4%로 늘었다(작업자 5개가 각자 계산한 정렬 목록의 앞쪽을
+  # 동시에 다툼). 공유 큐(`exposure_queue` 표)로 바꿔, 등급·정렬은 이
+  # 초마다 브랜드당 한 프로세스만 갱신하고 선점은 sqlite 원자적 UPDATE로
+  # 한다. 기본은 universe_cache_sec과 같지만 따로 조정 가능.
+  queue_refresh_sec: 600
+  # 공유 큐 선점(claim) TTL(초) — 이 시간 넘게 완료(done_at) 안 된 선점은
+  # 죽은 작업자의 것으로 보고 다시 선점 가능하다(기존
+  # exposure_runner.INFLIGHT_TTL_SECONDS와 같은 값 유지, 5차에서 파일 기반
+  # claim_inflight는 제거하고 이 값으로 대체).
+  claim_ttl_sec: 180

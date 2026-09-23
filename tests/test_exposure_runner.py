@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 
 from v2r.knowledge import exposure_priority, exposure_runner
 from v2r.knowledge import keyword_exposure as ke
+from v2r.store import exposure_queue_store as qstore
 from v2r.store import keyword_exposure_store as store
 from v2r.store.db import now_iso
 
@@ -344,35 +345,59 @@ def test_recent_publish_keywords_합집합_article_index와_DB(tmp_path, monkeyp
 
 
 # =======================================================================
-# 작업자 간 배타(중복 검사 방지) — 2026-09-24 코디네이터 지적
+# 작업자 간 배타(중복 검사 방지) — 2026-09-24 5차: 공유 큐(exposure_queue 표)
+# `exposure_queue_store.claim_batch`/`claim_specific`/`mark_done`/
+# `release_claim`이 옛 파일 기반 `claim_inflight`/`release_inflight`/
+# `complete_inflight`를 대체한다.
 # =======================================================================
 
-def test_claim_inflight_먼저_잡은쪽만_성공(tmp_path):
-    assert exposure_runner.claim_inflight(tmp_path, "브랜드", "키워드", worker_id=0) is True
+def test_claim_specific_먼저_잡은쪽만_성공(tmp_path):
+    rt = make_runtime(tmp_path)
+    item = {"keyword": "키워드"}
+    assert qstore.claim_specific(rt.conn, "브랜드", "키워드", "키워드", item, "worker0") is True
     # 만료 전에는 다른 작업자가 같은 키워드를 못 잡는다
-    assert exposure_runner.claim_inflight(tmp_path, "브랜드", "키워드", worker_id=1) is False
-    assert exposure_runner.is_inflight(tmp_path, "브랜드", "키워드") is True
+    assert qstore.claim_specific(rt.conn, "브랜드", "키워드", "키워드", item, "worker1") is False
 
 
-def test_claim_inflight_release후_다시_잡을수있음(tmp_path):
-    exposure_runner.claim_inflight(tmp_path, "브랜드", "키워드", worker_id=0)
-    exposure_runner.release_inflight(tmp_path, "브랜드", "키워드")
-    assert exposure_runner.is_inflight(tmp_path, "브랜드", "키워드") is False
-    assert exposure_runner.claim_inflight(tmp_path, "브랜드", "키워드", worker_id=1) is True
+def test_release_claim_후_다시_잡을수있음(tmp_path):
+    rt = make_runtime(tmp_path)
+    item = {"keyword": "키워드"}
+    qstore.claim_specific(rt.conn, "브랜드", "키워드", "키워드", item, "worker0")
+    qstore.release_claim(rt.conn, "브랜드", "키워드")
+    assert qstore.claim_specific(rt.conn, "브랜드", "키워드", "키워드", item, "worker1") is True
 
 
-def test_claim_inflight_만료되면_다시_잡을수있음(tmp_path):
+def test_claim_만료되면_다시_잡을수있음(tmp_path):
+    rt = make_runtime(tmp_path)
+    item = {"keyword": "키워드"}
     now0 = 1_000_000.0
-    exposure_runner.claim_inflight(tmp_path, "브랜드", "키워드", worker_id=0, now=now0)
+    qstore.claim_specific(rt.conn, "브랜드", "키워드", "키워드", item, "worker0", now_epoch=now0)
     # TTL(180초) 전 — 여전히 막힘
-    assert exposure_runner.claim_inflight(tmp_path, "브랜드", "키워드", worker_id=1, now=now0 + 60) is False
+    assert qstore.claim_specific(rt.conn, "브랜드", "키워드", "키워드", item, "worker1", now_epoch=now0 + 60) is False
     # TTL 지남(죽은 작업자로 간주) — 다른 작업자가 잡을 수 있음
-    assert exposure_runner.claim_inflight(tmp_path, "브랜드", "키워드", worker_id=1, now=now0 + 200) is True
+    assert qstore.claim_specific(rt.conn, "브랜드", "키워드", "키워드", item, "worker1", now_epoch=now0 + 200) is True
 
 
-def test_claim_inflight_다른_키워드는_서로_안막음(tmp_path):
-    assert exposure_runner.claim_inflight(tmp_path, "브랜드", "키워드A", worker_id=0) is True
-    assert exposure_runner.claim_inflight(tmp_path, "브랜드", "키워드B", worker_id=1) is True
+def test_mark_done_후에는_claim_batch에_안뽑힘(tmp_path):
+    rt = make_runtime(tmp_path)
+    candidates = [(1, -1.0, "키워드", "키워드", {"keyword": "키워드"})]
+    qstore.upsert_candidates(rt.conn, "브랜드", candidates)
+    picked = qstore.claim_batch(rt.conn, "브랜드", "worker0", 1)
+    assert len(picked) == 1
+    qstore.mark_done(rt.conn, "브랜드", "키워드")
+    assert qstore.claim_batch(rt.conn, "브랜드", "worker1", 1) == []
+
+
+def test_claim_batch_동시선점_경쟁없음(tmp_path):
+    """같은 키워드를 두 "작업자"가 동시에 claim_batch로 뽑아도 한쪽만
+    가져간다 — 5차의 핵심(원자적 UPDATE)."""
+    rt = make_runtime(tmp_path)
+    candidates = [(1, -1.0, "키워드", "키워드", {"keyword": "키워드"})]
+    qstore.upsert_candidates(rt.conn, "브랜드", candidates)
+    first = qstore.claim_batch(rt.conn, "브랜드", "worker0", 1)
+    second = qstore.claim_batch(rt.conn, "브랜드", "worker1", 1)
+    assert len(first) == 1
+    assert second == []
 
 
 # =======================================================================
@@ -447,13 +472,13 @@ def test_universe_캐시_브랜드마다_따로(tmp_path, monkeypatch):
     assert calls == ["브랜드A", "브랜드B"], "브랜드별로 캐시가 따로 유지돼야 한다"
 
 
-def test_universe_캐시_last_checked는_mark_checked로_즉시반영(tmp_path, monkeypatch):
-    """universe(시트) 캐시와 정렬 캐시가 TTL 안이어도, `mark_checked`로 갱신한
-    키워드는 last_checked 캐시(TTL 20초)와 무관하게 같은 키워드가 바로 다시
-    뽑히지 않아야 한다(2026-09-24 2차 — last_checked도 캐시하되 즉시 반영)."""
+def test_next_priority_batch_공유큐_선점이_같은키워드_다시안뽑음(tmp_path, monkeypatch):
+    """2026-09-24 5차 — 정렬은 공유 큐(`exposure_queue` 표)에서 한 번만
+    계산되고, `next_priority_batch`는 그 표에서 원자적으로 선점(claim)한다.
+    같은 프로세스가 연속으로 불러도(같은 worker_id든 다르든) 이미 선점된
+    (완료 전) 키워드는 다시 안 뽑혀야 한다 — 프로세스별 캐시가 아니라 DB
+    표 자체가 "누가 뭘 가져갔는지"의 유일한 진실이므로."""
     exposure_priority.invalidate_universe_cache(None)
-    exposure_priority.invalidate_last_checked_cache(None)
-    exposure_priority.invalidate_sorted_cache(None)
     rt = make_runtime(tmp_path)
     monkeypatch.setattr(ke, "keyword_universe", lambda rt_, brand: _universe_fixture())
 
@@ -461,36 +486,27 @@ def test_universe_캐시_last_checked는_mark_checked로_즉시반영(tmp_path, 
     assert len(picked) == 1
     first_keyword = picked[0]["keyword"]
 
-    row = ke.ExposureRow("테스트브랜드", first_keyword, "마이카페", "", None, "pushed", now_iso())
-    store.save(rt.conn, row.as_row())
-    exposure_priority.mark_checked(rt, "테스트브랜드", first_keyword, row.status, row.checked_at)
-
     picked2 = exposure_priority.next_priority_batch(rt, "테스트브랜드", n=1)
     assert len(picked2) == 1
     assert picked2[0]["keyword"] != first_keyword
 
 
-def test_next_priority_batch_mark_checked_없이도_DB직전확인으로_즉시반영(tmp_path, monkeypatch):
-    """2026-09-24 3차 — 재실측(중복 13%, 브랜드 고정 시 67%)에서 프로세스별
-    캐시(last_checked 포함)가 다른 프로세스의 검사 결과를 못 보는 게 근본
-    원인으로 드러났다. 그래서 `next_priority_batch`는 배치에 넣을 후보마다
-    캐시가 아니라 DB 단건 조회(`store.latest_for_keyword`)로 항상 최종
-    확인한다 — `mark_checked`를 안 불러도(다른 프로세스가 저장한 것처럼)
-    바로 반영돼야 한다."""
+def test_next_priority_batch_mark_done_후에도_큐갱신TTL안이면_다시_안뽑힘(tmp_path, monkeypatch):
+    """2026-09-24 5차 — 검사를 마쳐 `mark_done`을 불러도, 큐 갱신 TTL(기본
+    600초) 안에서는 그 키워드가 다시 정렬 대상으로 들어오지 않는다(등급
+    규칙상 아직 재검사 주기가 안 지났으므로 — `mark_done`은 그저 "이번
+    선점을 끝냈다"는 표시일 뿐, 등급 재계산은 다음 갱신 때 한다)."""
     exposure_priority.invalidate_universe_cache(None)
-    exposure_priority.invalidate_last_checked_cache(None)
-    exposure_priority.invalidate_sorted_cache(None)
     rt = make_runtime(tmp_path)
     monkeypatch.setattr(ke, "keyword_universe", lambda rt_, brand: _universe_fixture())
 
     picked = exposure_priority.next_priority_batch(rt, "테스트브랜드", n=1)
     first_keyword = picked[0]["keyword"]
-    # last_checked 캐시(사람이 안 볼 뿐 여전히 존재)를 먼저 채워 둔다(TTL 20초 시작)
-    exposure_priority.next_priority_batch(rt, "테스트브랜드", n=1)
 
-    # 다른 작업자 프로세스가 이 키워드를 검사해 저장한 것처럼 흉내낸다
-    # (mark_checked를 일부러 안 부름 — 다른 프로세스면 애초에 이 캐시에
-    # 손댈 방법이 없다).
+    from v2r.knowledge.keyword_exposure import _norm
+    from v2r.store import exposure_queue_store as qstore
+
+    qstore.mark_done(rt.conn, "테스트브랜드", _norm(first_keyword))
     row = ke.ExposureRow("테스트브랜드", first_keyword, "마이카페", "", None, "pushed", now_iso())
     store.save(rt.conn, row.as_row())
 
@@ -514,6 +530,10 @@ def test_is_due_now_직전확인(tmp_path, monkeypatch):
 
 
 def test_invalidate_universe_cache_비우면_다시조회(tmp_path, monkeypatch):
+    """`invalidate_universe_cache`는 (5차부터) `_universe_bundle`의 프로세스
+    캐시만 비운다 — 공유 큐 갱신 여부는 `exposure_priority.
+    maybe_refresh_queue`(TTL 기반)가 따로 결정하므로, 이 시험은
+    `_universe_bundle`을 직접 불러 확인한다."""
     exposure_priority.invalidate_universe_cache(None)
     monkeypatch.setattr(exposure_priority, "_read_universe_file_cache", lambda rt_, brand, ttl: None)
     rt = make_runtime(tmp_path)
@@ -524,10 +544,13 @@ def test_invalidate_universe_cache_비우면_다시조회(tmp_path, monkeypatch)
         return _universe_fixture()
 
     monkeypatch.setattr(ke, "keyword_universe", fake_universe)
+    cfg = {"universe_cache_sec": 600, "top_volume_percentile": 0.7, "recent_publish_hours": [2, 6, 24]}
+    now = datetime.now(timezone.utc)
 
-    exposure_priority.next_priority_batch(rt, "테스트브랜드", n=1)
+    exposure_priority._universe_bundle(rt, "테스트브랜드", cfg, now)
+    assert calls["n"] == 1
     exposure_priority.invalidate_universe_cache(rt, "테스트브랜드")
-    exposure_priority.next_priority_batch(rt, "테스트브랜드", n=1)
+    exposure_priority._universe_bundle(rt, "테스트브랜드", cfg, now)
     assert calls["n"] == 2
 
 
@@ -541,7 +564,7 @@ def test_worker_queue_배치를_하나씩_소비(tmp_path, monkeypatch):
     batch = [{"keyword": f"키워드{i}", "cafe": "마이카페"} for i in range(3)]
     calls = {"n": 0}
 
-    def fake_batch(rt_, brand, n, now=None):
+    def fake_batch(rt_, brand, n, worker_id="0", now=None):
         calls["n"] += 1
         return list(batch)
 
@@ -553,7 +576,6 @@ def test_worker_queue_배치를_하나씩_소비(tmp_path, monkeypatch):
         item = wq.take(rt, "테스트브랜드", worker_id=0)
         assert item is not None
         seen.append(item["keyword"])
-        exposure_runner.release_inflight(rt.settings.repo_root, "테스트브랜드", item["keyword"])
 
     assert seen == ["키워드0", "키워드1", "키워드2"]
     assert calls["n"] == 1, "큐가 남아 있는 동안은 다시 조회하지 않아야 한다"
@@ -563,7 +585,7 @@ def test_worker_queue_비면_다시조회(tmp_path, monkeypatch):
     rt = make_runtime(tmp_path)
     calls = {"n": 0}
 
-    def fake_batch(rt_, brand, n, now=None):
+    def fake_batch(rt_, brand, n, worker_id="0", now=None):
         calls["n"] += 1
         return [{"keyword": f"배치{calls['n']}", "cafe": "마이카페"}]
 
@@ -571,7 +593,6 @@ def test_worker_queue_비면_다시조회(tmp_path, monkeypatch):
 
     wq = exposure_runner.WorkerQueue(batch_size=1, ttl_sec=120.0)
     item1 = wq.take(rt, "테스트브랜드", worker_id=0)
-    exposure_runner.release_inflight(rt.settings.repo_root, "테스트브랜드", item1["keyword"])
     item2 = wq.take(rt, "테스트브랜드", worker_id=0)
     assert item1["keyword"] != item2["keyword"]
     assert calls["n"] == 2
@@ -581,7 +602,7 @@ def test_worker_queue_TTL지나면_다시조회(tmp_path, monkeypatch):
     rt = make_runtime(tmp_path)
     calls = {"n": 0}
 
-    def fake_batch(rt_, brand, n, now=None):
+    def fake_batch(rt_, brand, n, worker_id="0", now=None):
         calls["n"] += 1
         return [{"keyword": f"배치{calls['n']}-{i}", "cafe": "마이카페"} for i in range(5)]
 
@@ -595,46 +616,21 @@ def test_worker_queue_TTL지나면_다시조회(tmp_path, monkeypatch):
     assert calls["n"] == 2
 
 
-def test_worker_queue_선점실패한_항목은_건너뜀(tmp_path, monkeypatch):
-    rt = make_runtime(tmp_path)
-    batch = [{"keyword": "이미잡힘", "cafe": "마이카페"}, {"keyword": "새것", "cafe": "마이카페"}]
-    monkeypatch.setattr(
-        exposure_priority, "next_priority_batch", lambda rt_, brand, n, now=None: list(batch)
-    )
-    # 다른 작업자가 먼저 "이미잡힘"을 선점한 상태를 흉내낸다
-    exposure_runner.claim_inflight(rt.settings.repo_root, "테스트브랜드", "이미잡힘", worker_id=9)
-
-    wq = exposure_runner.WorkerQueue(batch_size=2, ttl_sec=120.0)
-    item = wq.take(rt, "테스트브랜드", worker_id=0)
-    assert item["keyword"] == "새것"
-
-
 # =======================================================================
-# 2026-09-24 3차 — 완료 표시(complete_inflight)·중복률 집계
+# 2026-09-24 5차 — WorkerQueue의 직전 확인(is_due_now) 건너뛰기.
+#
+# 선점 실패("다른 작업자가 먼저 집음") 시나리오는 이제 `next_priority_batch`
+# (내부적으로 `exposure_queue_store.claim_batch`, 원자적 sqlite 트랜잭션)의
+# 몫이라(단위 시험은 위 `test_claim_batch_동시선점_경쟁없음`) WorkerQueue
+# 자체에는 더 이상 "선점 실패" 개념이 없다. WorkerQueue.take()에 남은 유일한
+# 필터는 검사 직전 DB 단건 확인(`is_due_now`, 3차부터 유지)이다.
 # =======================================================================
-
-
-def test_complete_inflight_완료후에도_TTL동안_is_inflight(tmp_path):
-    now0 = 5_000_000.0
-    exposure_runner.claim_inflight(tmp_path, "브랜드", "키워드", worker_id=0, now=now0)
-    exposure_runner.complete_inflight(tmp_path, "브랜드", "키워드", now=now0 + 1.0)
-    # 완료됐지만 TTL(180초) 안이라 여전히 선점 중으로 취급된다
-    assert exposure_runner.is_inflight(tmp_path, "브랜드", "키워드", now=now0 + 100.0) is True
-    assert exposure_runner.claim_inflight(tmp_path, "브랜드", "키워드", worker_id=1, now=now0 + 100.0) is False
-
-
-def test_complete_inflight_TTL지나면_다시_잡을수있음(tmp_path):
-    now0 = 6_000_000.0
-    exposure_runner.claim_inflight(tmp_path, "브랜드", "키워드", worker_id=0, now=now0)
-    exposure_runner.complete_inflight(tmp_path, "브랜드", "키워드", now=now0 + 1.0)
-    assert exposure_runner.is_inflight(tmp_path, "브랜드", "키워드", now=now0 + 200.0) is False
-    assert exposure_runner.claim_inflight(tmp_path, "브랜드", "키워드", worker_id=1, now=now0 + 200.0) is True
 
 
 def test_worker_queue_직전확인에서_걸리면_다음후보(tmp_path, monkeypatch):
-    """다른 작업자가 방금(최소 간격 안) 검사해 DB에 저장해 둔 키워드가 배치에
-    섞여 있어도(정렬 캐시가 그 사이 갱신 안 됐다고 흉내), take()가 직전
-    DB 확인에서 걸러 다음 후보로 넘어가야 한다."""
+    """다른 경로(예: 2단계 확인 재검사)로 방금(최소 간격 안) 검사돼 DB에
+    저장된 키워드가 배치에 섞여 있어도(공유 큐 갱신이 그 사이 안 됐다고
+    흉내), take()가 직전 DB 확인에서 걸러 다음 후보로 넘어가야 한다."""
     rt = make_runtime(tmp_path)
     row = ke.ExposureRow("테스트브랜드", "방금검사됨", "마이카페", "", None, "pushed", now_iso())
     store.save(rt.conn, row.as_row())
@@ -643,14 +639,12 @@ def test_worker_queue_직전확인에서_걸리면_다음후보(tmp_path, monkey
         {"keyword": "방금검사됨", "cafe": "마이카페", "volume": 0},
         {"keyword": "새것", "cafe": "마이카페", "volume": 0},
     ]
-    monkeypatch.setattr(exposure_priority, "next_priority_batch", lambda rt_, brand, n, now=None: list(batch))
+    monkeypatch.setattr(exposure_priority, "next_priority_batch", lambda rt_, brand, n, worker_id="0", now=None: list(batch))
 
     wq = exposure_runner.WorkerQueue(batch_size=2, ttl_sec=120.0)
     item = wq.take(rt, "테스트브랜드", worker_id=0)
     assert item["keyword"] == "새것"
     assert wq._state("테스트브랜드").stale_skipped == 1
-    # 직전 확인에서 걸린 "방금검사됨"은 선점이 다시 풀려 다른 작업자가 집을 수 있다
-    assert exposure_runner.is_inflight(rt.settings.repo_root, "테스트브랜드", "방금검사됨") is False
 
 
 def test_update_worker_state_중복률_집계(tmp_path):
@@ -706,7 +700,7 @@ def test_worker_queue_브랜드순환해도_배치가_유지됨(tmp_path, monkey
     rt = make_runtime(tmp_path)
     calls: dict[str, int] = {}
 
-    def fake_batch(rt_, brand, n, now=None):
+    def fake_batch(rt_, brand, n, worker_id="0", now=None):
         calls[brand] = calls.get(brand, 0) + 1
         return [{"keyword": f"{brand}-{calls[brand]}-{i}", "cafe": "마이카페", "volume": 0} for i in range(n)]
 
@@ -719,7 +713,6 @@ def test_worker_queue_브랜드순환해도_배치가_유지됨(tmp_path, monkey
         for b in brands:
             item = wq.take(rt, b, worker_id=0)
             assert item is not None
-            exposure_runner.release_inflight(rt.settings.repo_root, b, item["keyword"])
 
     # 브랜드마다 배치(10개)가 정확히 한 번씩만 조회됐어야 한다(10라운드×10개=100건을
     # 배치 1번으로 다 소비) — 이전 결함이면 브랜드당 10회(라운드마다) 조회됐을 것.

@@ -69,6 +69,16 @@ _DEFAULT_PRIORITY = {
     # 캐시한다. last_checked는 이 초만큼 캐시하되, 러너가 검사 결과를 저장한
     # 직후 `mark_checked`로 즉시 갱신해 정확도를 지킨다.
     "last_checked_cache_sec": 20,
+    # 2026-09-24 5차(실측 9, 6-7·6-8절) — 4차의 프로세스별 정렬 캐시는 작업자
+    # 5개가 각자 계산한 목록의 앞쪽을 동시에 다퉈 중복 재검사가 19.4%로
+    # 늘었다. 공유 큐(`exposure_queue` 표)로 바꿔 정렬은 브랜드당 이
+    # 초(기본은 universe_cache_sec와 동일)마다 한 프로세스만 갱신하고,
+    # 선점은 sqlite 원자적 UPDATE 한 번으로 한다.
+    "queue_refresh_sec": 600,
+    # 공유 큐 선점 TTL(초) — 이 시간 넘게 완료(done_at)되지 않은 선점은
+    # 죽은 작업자의 것으로 보고 다시 선점 가능하다(기존
+    # `exposure_runner.INFLIGHT_TTL_SECONDS`와 같은 값 유지).
+    "claim_ttl_sec": 180,
 }
 
 
@@ -165,9 +175,11 @@ def _universe_bundle(rt: Any, brand: str, cfg: dict, now: datetime) -> dict[str,
     남겨 `next_priority_batch`가 로그에 찍는다.
 
     같은 브랜드를 여러 작업자 프로세스가 부르더라도 실제로 같은 키워드를
-    두 번 검사하는 일은 (이 캐시가 아니라) `exposure_runner.claim_inflight`·
-    `next_priority_batch`의 후보별 DB 직전 확인이 막는다 — 이 캐시가 얼마나
-    낡아도(최대 파일 TTL) 정확성에는 영향이 없다.
+    두 번 검사하는 일은 (이 캐시가 아니라) 공유 큐(`exposure_queue` 표,
+    2026-09-24 5차)의 원자적 선점과 `is_due_now`의 DB 직전 확인이 막는다 —
+    이 캐시가 얼마나 낡아도(최대 파일 TTL) 정확성에는 영향이 없다. 이
+    번들(universe·최근 발행 집합)은 `_do_refresh_queue`가 공유 큐를 갱신할
+    재료로만 쓴다.
     """
     from v2r.knowledge.keyword_exposure import keyword_universe
 
@@ -220,14 +232,6 @@ def _universe_bundle(rt: Any, brand: str, cfg: dict, now: datetime) -> dict[str,
 #: (repo_root, brand) -> (expires_at_epoch, {norm_keyword: {"checked_at","status"}})
 _LAST_CHECKED_CACHE: dict[tuple[str, str], tuple[float, dict[str, dict]]] = {}
 
-#: (repo_root, brand) -> (expires_at_epoch, [(tier, item), ...] 정렬됨)
-_SORTED_CACHE: dict[tuple[str, str], tuple[float, list[tuple[int, dict]]]] = {}
-
-#: (repo_root, brand) -> {"hit": bool, "recompute_sec": float} — 직전
-#: `_sorted_candidates` 호출 진단(로그용).
-_SORTED_CACHE_META: dict[tuple[str, str], dict[str, Any]] = {}
-
-
 def _last_checked_map(rt: Any, brand: str, cfg: dict) -> dict[str, dict]:
     from v2r.knowledge.keyword_exposure import _norm
     from v2r.store import keyword_exposure_store as store
@@ -274,47 +278,128 @@ def invalidate_last_checked_cache(rt: Any, brand: str | None = None) -> None:
     _LAST_CHECKED_CACHE.pop((str(rt.settings.repo_root), brand), None)
 
 
-def _sorted_candidates(rt: Any, brand: str, cfg: dict, now: datetime) -> list[tuple[int, dict]]:
-    """등급·정렬을 한 번만 계산해 TTL(universe와 동일) 동안 캐시한다.
+# =======================================================================
+# 2026-09-24 5차 — 공유 큐(`exposure_queue` 표, `exposure_queue_store.py`).
+#
+# 재실측(exposure-speed-2026-09-24.md 6-7·6-8절): 4차로 큐 조회는 3.2초로
+# 빨라졌지만 중복 재검사가 19.4%로 늘었다 — 작업자 5개가 **각자 독립적으로**
+# 계산한 정렬 목록(`_SORTED_CACHE`, 프로세스별)의 앞쪽을 동시에 다퉈, 같은
+# 키워드를 여럿이 함께 고르는 경쟁이 됐기 때문(DB 직전 확인이 있어도, 확인과
+# 실제 저장 사이 수 초의 경쟁 구간은 못 막는다). 근본 해결책은 정렬·선점을
+# **공유 상태**(sqlite 표)로 옮기는 것 — 등급·정렬은 브랜드당 한 프로세스가
+# TTL(기본 600초)마다 한 번만 계산해 `exposure_queue` 표에 갱신하고, 작업자는
+# 그 표에서 원자적 `UPDATE`(한 트랜잭션) 한 번으로 배치를 선점한다. 같은
+# rowid를 두 프로세스가 동시에 못 고르므로(sqlite 쓰기 트랜잭션은 직렬화)
+# 애초에 경쟁이 없다.
+# =======================================================================
 
-    반환값은 `(tier, item)` 튜플의 정렬된 리스트 — 등급이 낮을수록,
-    같은 등급 안에서는 오래된/검색량 높은 순으로 이미 정렬돼 있다.
-    99등급(주기 전)은 여기서 이미 제외돼 있다."""
-    ttl = float(cfg.get("universe_cache_sec", 600))
-    key = _cache_key(rt, brand)
-    now_epoch = time.time()
-    cached = _SORTED_CACHE.get(key)
-    if cached is not None and cached[0] > now_epoch:
-        _SORTED_CACHE_META[key] = {"hit": True, "recompute_sec": 0.0}
-        return cached[1]
 
-    t0 = time.perf_counter()
+def _sort_key_for_tier(tier: int, vol: float, age_h: float) -> float:
+    """`(tier, 보조키)` 다중 정렬을, `exposure_queue.sort_key` 한 칸에 담을
+    단일 실수로 접는다 — 같은 tier 안에서는 `ORDER BY sort_key ASC`가 기존
+    `scored.sort(key=(tier, sub))`(1·2등급: 오래된 순, 3등급: 검색량 → 오래된
+    순)와 같은 순서가 되도록 만든다. 나이(시간)는 상한(약 114년)으로 잘라
+    `float("inf")`가 그대로 sqlite REAL로 들어가는 걸 피한다."""
+    age_h = min(age_h, 1_000_000.0) if age_h != float("inf") else 1_000_000.0
+    if tier == 3:
+        # 검색량 차이 1만 나도 나이 상한(1e6)보다 훨씬 크게 갈리도록 충분히
+        # 큰 배수(1e7)를 곱한다 — 검색량이 먼저, 그다음 나이 순.
+        return -(vol * 1e7 + age_h)
+    return -age_h
+
+
+def _do_refresh_queue(rt: Any, brand: str, cfg: dict, now: datetime) -> int:
+    """브랜드의 등급·정렬을 다시 계산해 `exposure_queue` 표에 갱신한다.
+
+    등급 규칙(`priority_tier`)은 그대로 재사용 — 이 함수는 그 결과를 어디에
+    보관하느냐만 바꾼다(프로세스 메모리 → 공유 표). universe·최근 발행
+    집합은 여전히 `_universe_bundle`(프로세스+파일 캐시, 4차)에서 가져와
+    시트 CSV 재읽기를 줄인다."""
+    from v2r.knowledge.keyword_exposure import _norm
+    from v2r.store import exposure_queue_store as qstore
+
     bundle = _universe_bundle(rt, brand, cfg, now)
     universe = bundle["universe"]
+    if not universe:
+        return 0
     last_checked = _last_checked_map(rt, brand, cfg)
     recent_norm = bundle["recent_norm"]
     vol_threshold = bundle["vol_threshold"]
 
-    scored = []
+    candidates: list[tuple[int, float, str, str, dict]] = []
     for item in universe:
         tier, age = priority_tier(item, last_checked, recent_norm, cfg, vol_threshold, now)
         if tier >= 99:
             continue
         vol = float(item.get("volume") or 0)
-        sub = (-vol, -age) if tier == 3 else (0.0, -age)
-        scored.append((tier, sub, item))
-    scored.sort(key=lambda t: (t[0], t[1]))
-    result = [(t[0], t[2]) for t in scored]
-    _SORTED_CACHE[key] = (now_epoch + ttl, result)
-    _SORTED_CACHE_META[key] = {"hit": False, "recompute_sec": time.perf_counter() - t0}
-    return result
+        sort_key = _sort_key_for_tier(tier, vol, age)
+        keyword = str(item.get("keyword", ""))
+        candidates.append((tier, sort_key, _norm(keyword), keyword, item))
+
+    qstore.upsert_candidates(rt.conn, brand, candidates, now_epoch=time.time())
+    return len(candidates)
 
 
-def invalidate_sorted_cache(rt: Any, brand: str | None = None) -> None:
-    if brand is None:
-        _SORTED_CACHE.clear()
-        return
-    _SORTED_CACHE.pop((str(rt.settings.repo_root), brand), None)
+#: 브랜드별 갱신 중복 방지용 mkdir 락(2026-09-24 5차) — "작업자 중 한
+#: 프로세스만" 갱신하게 한다. 갱신 자체는 보통 수 초 안에 끝나므로, 이보다
+#: 오래된 락은 죽은 작업자의 것으로 보고 무시한다.
+_REFRESH_LOCK_STALE_SEC = 60.0
+
+
+def _refresh_lock_dir(rt: Any, brand: str) -> Path:
+    return Path(rt.settings.repo_root) / "data" / "exposure_queue_refresh.lock" / brand
+
+
+def _try_refresh_lock(rt: Any, brand: str) -> bool:
+    d = _refresh_lock_dir(rt, brand)
+    d.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.mkdir(d)
+        return True
+    except FileExistsError:
+        try:
+            age = time.time() - d.stat().st_mtime
+        except OSError:
+            return False
+        if age <= _REFRESH_LOCK_STALE_SEC:
+            return False
+        try:
+            os.rmdir(d)
+            os.mkdir(d)
+            return True
+        except OSError:
+            return False
+
+
+def _release_refresh_lock(rt: Any, brand: str) -> None:
+    try:
+        os.rmdir(_refresh_lock_dir(rt, brand))
+    except OSError:
+        pass
+
+
+def maybe_refresh_queue(rt: Any, brand: str, cfg: dict, now: datetime) -> bool:
+    """이 브랜드 큐가 TTL(`priority.queue_refresh_sec`, 기본
+    `universe_cache_sec`와 동일)보다 오래됐으면 갱신한다. 락을 못 잡으면(다른
+    작업자가 갱신 중) 아무것도 안 하고 `False`를 돌려준다 — 락을 기다리지
+    않는다(그 작업자가 곧 끝낼 것이므로, 이 호출자는 그냥 지금 있는 표
+    내용으로 선점을 시도하면 된다)."""
+    from v2r.store import exposure_queue_store as qstore
+
+    ttl = float(cfg.get("queue_refresh_sec", cfg.get("universe_cache_sec", 600)))
+    now_epoch = time.time()
+    if now_epoch - qstore.last_refreshed_at(rt.conn, brand) < ttl:
+        return False
+    if not _try_refresh_lock(rt, brand):
+        return False
+    try:
+        # 락을 잡는 사이 다른 프로세스가 이미 갱신했을 수 있으니 다시 확인.
+        if now_epoch - qstore.last_refreshed_at(rt.conn, brand) < ttl:
+            return False
+        _do_refresh_queue(rt, brand, cfg, now)
+        return True
+    finally:
+        _release_refresh_lock(rt, brand)
 
 
 #: 발행 시각이 이 창(±시간) 안이면 "최근 발행"으로 본다
@@ -527,84 +612,42 @@ def _volume_threshold(universe: list[dict], percentile: float) -> float:
     return vols[idx]
 
 
-def next_priority_batch(rt: Any, brand: str, n: int, now: datetime | None = None) -> list[dict]:
-    """다음에 검사할 키워드 n개 — 위 등급 순, 같은 등급 안에서는 오래된 순.
+def next_priority_batch(
+    rt: Any, brand: str, n: int, worker_id: str = "0", now: datetime | None = None
+) -> list[dict]:
+    """다음에 검사할 키워드 n개를 공유 큐(`exposure_queue` 표)에서 원자적으로
+    선점해 돌려준다 — 위 등급 순, 같은 등급 안에서는 오래된/검색량 순.
 
     99등급(주기가 아직 안 돎)은 절대 뽑히지 않는다 — n개를 못 채우면 그만큼만
     돌려준다(빈 목록도 정상, 순환이 다음 틱에 다시 부른다).
 
-    2026-09-24 2차 개선 — 등급 매기기·정렬은 `_sorted_candidates`가 TTL 동안
-    캐시한 결과를 쓰고(전체 1만 개 재순회는 캐시 갱신 시점에만), 이 함수는
-    캐시된 정렬 목록 앞에서부터 (a) 캐시 이후 이미 검사돼 주기가 안 지난
-    항목, (b) 다른 작업자가 선점(claim_inflight) 중인 항목만 걸러 n개를
-    자른다."""
-    from v2r.knowledge.exposure_runner import is_inflight
-    from v2r.knowledge.keyword_exposure import _norm
-    from v2r.store import keyword_exposure_store as store
+    2026-09-24 5차(실측 9, 6-7·6-8절) — 4차까지는 작업자 프로세스마다 따로
+    정렬해 뒀다가 저장 순서로 경쟁했는데(중복 19.4%), 이제 등급·정렬은
+    `maybe_refresh_queue`가 TTL(기본 600초)마다 브랜드당 한 번만 계산해
+    공유 표에 쓰고, 이 함수는 `exposure_queue_store.claim_batch`의 원자적
+    `UPDATE`(한 sqlite 트랜잭션) 한 번으로 n개를 선점한다 — 같은 rowid를
+    두 작업자가 동시에 못 고르므로 근본적으로 중복이 안 난다. 선점 자체가
+    이제 "누가 먼저 검사했는지"의 최신 정보이므로, 파일 기반
+    `claim_inflight`/`complete_inflight`는 더 이상 쓰지 않는다(제거).
+    """
+    from v2r.store import exposure_queue_store as qstore
 
     now = now or datetime.now(timezone.utc)
     cfg = load_config(rt.settings.repo_root).get("priority", dict(_DEFAULT_PRIORITY))
     key = _cache_key(rt, brand)
 
     t0 = time.perf_counter()
-    candidates = _sorted_candidates(rt, brand, cfg, now)
+    refreshed = maybe_refresh_queue(rt, brand, cfg, now)
     t1 = time.perf_counter()
-    sorted_meta = _SORTED_CACHE_META.get(key, {})
     universe_meta = _UNIVERSE_BUNDLE_META.get(key, {})
-    if not candidates:
-        log.info(
-            "타이밍 우선순위조회 브랜드=%s 정렬캐시=%.3fs(정렬hit=%s) universe=%s(%.3fs) 후보없음",
-            brand, t1 - t0, sorted_meta.get("hit"), universe_meta.get("source"), universe_meta.get("fetch_sec", 0.0),
-        )
-        return []
 
-    bundle = _universe_bundle(rt, brand, cfg, now)
-    recent_norm = bundle["recent_norm"]
-    vol_threshold = bundle["vol_threshold"]
-
-    out: list[dict] = []
-    skipped_due, skipped_inflight = 0, 0
-    db_checks = 0
-    db_check_sec, inflight_sec = 0.0, 0.0
-    for _tier, item in candidates:
-        keyword = item["keyword"]
-        # 2026-09-24 3차 — 캐시(정렬·last_checked)는 작업자 프로세스별 메모리라
-        # 다른 작업자가 그 사이 검사한 걸 놓쳐 중복 재검사(실측 13%, 브랜드
-        # 고정 시 67%)가 났다. 그래서 배치에 넣을 후보마다 DB 단건 조회로
-        # 캐시와 무관하게 항상 최신 상태를 확인한다(인덱스로 밀리초 단위,
-        # 전체 순회가 아니라 앞에서부터 스캔하는 몇 건만이라 비용이 작다).
-        _tdb0 = time.perf_counter()
-        last_row = store.latest_for_keyword(rt.conn, brand, keyword)
-        db_check_sec += time.perf_counter() - _tdb0
-        db_checks += 1
-        last_checked = (
-            {_norm(keyword): {"checked_at": str(last_row["checked_at"] or ""), "status": str(last_row["status"] or "")}}
-            if last_row is not None
-            else {}
-        )
-        tier2, _age2 = priority_tier(item, last_checked, recent_norm, cfg, vol_threshold, now)
-        if tier2 >= 99:
-            skipped_due += 1
-            continue
-        # `is_inflight`는 진행 중(claim) 표시뿐 아니라 방금 완료된 표시
-        # (`complete_inflight`, TTL 동안 유지)도 함께 걸러낸다 — 다른 작업자의
-        # 오래된 정렬 캐시가 아직 이 키워드를 들고 있어도 배치에 다시 안 담긴다.
-        _tin0 = time.perf_counter()
-        blocked = is_inflight(rt.settings.repo_root, brand, keyword)
-        inflight_sec += time.perf_counter() - _tin0
-        if blocked:
-            skipped_inflight += 1
-            continue
-        out.append(item)
-        if len(out) >= max(0, n):
-            break
+    claim_ttl = float(cfg.get("claim_ttl_sec", 180.0))
+    out = qstore.claim_batch(rt.conn, brand, str(worker_id), n, now_epoch=time.time(), claim_ttl_sec=claim_ttl)
     t2 = time.perf_counter()
     log.info(
-        "타이밍 우선순위조회 브랜드=%s round_trip=%.3fs 정렬=%.3fs(hit=%s 재계산=%.3fs) "
-        "universe=%s(%.3fs) DB직전확인=%.3fs(%s건) 선점확인=%.3fs 후보=%s 주기전제외=%s 선점제외=%s",
-        brand, t2 - t0, t1 - t0, sorted_meta.get("hit"), sorted_meta.get("recompute_sec", 0.0),
-        universe_meta.get("source"), universe_meta.get("fetch_sec", 0.0),
-        db_check_sec, db_checks, inflight_sec, len(out), skipped_due, skipped_inflight,
+        "타이밍 공유큐조회 브랜드=%s round_trip=%.3fs 갱신=%s(%.3fs, universe=%s %.3fs) 선점=%.3fs 후보=%s",
+        brand, t2 - t0, refreshed, t1 - t0, universe_meta.get("source"), universe_meta.get("fetch_sec", 0.0),
+        t2 - t1, len(out),
     )
     return out
 
@@ -668,6 +711,6 @@ __all__ = [
     "invalidate_universe_cache",
     "mark_checked",
     "invalidate_last_checked_cache",
-    "invalidate_sorted_cache",
     "is_due_now",
+    "maybe_refresh_queue",
 ]

@@ -508,155 +508,20 @@ def due_pending(repo_root: str | Path, now: float | None = None) -> list[dict]:
 
 
 # =======================================================================
-# 작업자 간 배타(중복 검사 방지) — 2026-09-24 코디네이터 지적
+# 작업자 간 배타(중복 검사 방지) — 2026-09-24 5차: 공유 큐로 대체
 #
-# 작업자 3개가 각자 독립된 rt.conn으로 next_priority_batch를 부르니, 셋 다
-# 아직 아무도 저장하기 전에 같은(등급 1위) 키워드를 동시에 집어 실제로
-# 같은 키워드를 2~3번 따로 검색하는 낭비가 있었다(예: 02:30:16/19/19 "치루수술
-# 회복기간" 3연속). 검사 시작 직전 "진행 중" 표시를 남기고, 배치에서 이미
-# 진행 중인 항목은 건너뛴다. 여러 프로세스가 동시에 파일을 읽고 쓰는 경합
-# 자체는 파일 잠금(디렉터리 생성 기반, 원자적)으로 막는다.
+# 1~3차는 파일 기반 `claim_inflight`/`complete_inflight`(mkdir 잠금 +
+# `exposure_inflight.json`)로 "진행 중" 표시를 남겼다. 4차에서 작업자별
+# 정렬 캐시를 키우자 그 표시만으로는 부족해졌고(정렬 캐시 자체가 프로세스별
+# 경쟁을 낳음), 5차에서 정렬·선점을 통째로 공유 sqlite 표
+# (`exposure_queue`, `v2r/store/exposure_queue_store.py`)로 옮기면서 이
+# 파일 기반 선점 표시는 더 이상 필요 없어져 제거했다 — 선점은 이제
+# `exposure_priority.next_priority_batch`(배치 선점, 내부적으로
+# `exposure_queue_store.claim_batch`)와, 2단계 확인 대기 재확인용
+# `exposure_queue_store.claim_specific`이 표의 `claimed_by`/`claimed_at`
+# 칸으로 직접 한다. 검사 정상 완료는 `exposure_queue_store.mark_done`,
+# 실패(예외)는 `release_claim`을 쓴다(아래 `run_worker` 참고).
 # =======================================================================
-
-INFLIGHT_FILE = "exposure_inflight.json"
-#: 이 시간(초)이 지난 진행 중 표시는 죽은 작업자의 것으로 보고 무시한다
-#: (한 건 검사에 보통 10~40초, 넉넉히 잡음).
-INFLIGHT_TTL_SECONDS = 180
-
-
-def inflight_path(repo_root: str | Path) -> Path:
-    return Path(repo_root) / "data" / INFLIGHT_FILE
-
-
-def _inflight_lock_dir(repo_root: str | Path) -> Path:
-    return Path(repo_root) / "data" / (INFLIGHT_FILE + ".lock")
-
-
-def _with_inflight_lock(repo_root: str | Path, fn: Any, timeout: float = 2.0) -> Any:
-    """`os.mkdir`은 원자적이라(먼저 만든 프로세스만 성공) 여러 프로세스 간
-    간이 잠금으로 쓴다. 최대 `timeout`초 재시도, 그래도 못 잡으면(죽은 잠금
-    의심) 강제로 지우고 한 번 더 시도한다."""
-    lock_dir = _inflight_lock_dir(repo_root)
-    lock_dir.parent.mkdir(parents=True, exist_ok=True)
-    deadline = time.time() + timeout
-    while True:
-        try:
-            os.mkdir(lock_dir)
-            break
-        except FileExistsError:
-            if time.time() >= deadline:
-                try:
-                    os.rmdir(lock_dir)
-                except OSError:
-                    pass
-                continue
-            time.sleep(0.02)
-    try:
-        return fn()
-    finally:
-        try:
-            os.rmdir(lock_dir)
-        except OSError:
-            pass
-
-
-def _load_inflight(repo_root: str | Path) -> dict:
-    p = inflight_path(repo_root)
-    if not p.exists():
-        return {}
-    try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-
-
-def _write_inflight(repo_root: str | Path, data: dict) -> None:
-    p = inflight_path(repo_root)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    _atomic_write_json(p, data)
-
-
-def _inflight_key(brand: str, keyword: str) -> str:
-    return f"{brand}|{keyword}"
-
-
-def _inflight_entry_active(entry: dict, now: float) -> bool:
-    """항목이 아직 "선점 중"(진행 중이거나, 방금 끝나 배제 창 안)인지.
-
-    2026-09-24 3차 — 검사가 끝나도 바로 지우지 않고 `completed_at`을 남겨
-    두면(`complete_inflight`), 다른 작업자의 정렬 캐시(`priority.
-    universe_cache_sec`, 기본 120초)가 아직 이 키워드를 들고 있는 동안은
-    배치 필터에서 계속 제외된다 — `INFLIGHT_TTL_SECONDS`(180초)가 그 캐시
-    TTL보다 크므로 별도 설정 없이 요건을 만족한다."""
-    completed_at = entry.get("completed_at")
-    if completed_at is not None:
-        return (now - float(completed_at)) < INFLIGHT_TTL_SECONDS
-    return (now - float(entry.get("claimed_at", 0))) < INFLIGHT_TTL_SECONDS
-
-
-def is_inflight(repo_root: str | Path, brand: str, keyword: str, now: float | None = None) -> bool:
-    now = now if now is not None else time.time()
-    entry = _load_inflight(repo_root).get(_inflight_key(brand, keyword))
-    if not entry:
-        return False
-    return _inflight_entry_active(entry, now)
-
-
-def claim_inflight(
-    repo_root: str | Path, brand: str, keyword: str, worker_id: int, now: float | None = None
-) -> bool:
-    """지금부터 이 키워드를 이 작업자가 검사한다고 표시. 다른 작업자가 이미
-    (만료 전) 진행 중이거나 방금 검사를 끝냈으면(완료 표시, TTL 안) `False`
-    (이 작업자는 다른 후보를 골라야 함)."""
-    now = now if now is not None else time.time()
-    key = _inflight_key(brand, keyword)
-
-    def _do() -> bool:
-        data = _load_inflight(repo_root)
-        existing = data.get(key)
-        if existing and _inflight_entry_active(existing, now):
-            return False
-        data[key] = {"worker_id": worker_id, "claimed_at": now, "completed_at": None}
-        _write_inflight(repo_root, data)
-        return True
-
-    return _with_inflight_lock(repo_root, _do)
-
-
-def release_inflight(repo_root: str | Path, brand: str, keyword: str) -> None:
-    """선점 표시를 완전히 지운다 — 검사가 끝나서가 아니라 실패/예외로
-    중단됐을 때만 쓴다(다른 작업자가 바로 다시 집을 수 있어야 하므로).
-    정상 완료는 `complete_inflight`를 쓴다."""
-    key = _inflight_key(brand, keyword)
-
-    def _do() -> None:
-        data = _load_inflight(repo_root)
-        data.pop(key, None)
-        _write_inflight(repo_root, data)
-
-    _with_inflight_lock(repo_root, _do)
-
-
-def complete_inflight(
-    repo_root: str | Path, brand: str, keyword: str, now: float | None = None
-) -> None:
-    """검사를 정상적으로 마쳤을 때 부른다 — 선점 표시를 지우는 대신
-    `completed_at`을 남겨(2026-09-24 3차) `INFLIGHT_TTL_SECONDS`(180초, 정렬
-    캐시 TTL 이상) 동안 이 키워드가 다른 작업자의 배치에 다시 잡히지 않게
-    한다. 다른 작업자의 정렬 캐시(`next_priority_batch`가 매 후보마다 DB
-    직전 확인을 하므로 사실 이것만으로도 걸러지지만) TTL이 만료돼 재정렬될
-    때까지의 창을 한 번 더 막는 이중 방어다."""
-    now = now if now is not None else time.time()
-    key = _inflight_key(brand, keyword)
-
-    def _do() -> None:
-        data = _load_inflight(repo_root)
-        entry = data.get(key) or {"worker_id": None, "claimed_at": now}
-        entry["completed_at"] = now
-        data[key] = entry
-        _write_inflight(repo_root, data)
-
-    _with_inflight_lock(repo_root, _do)
 
 
 # =======================================================================
@@ -669,18 +534,17 @@ def complete_inflight(
 
 
 class _BrandQueueState:
-    __slots__ = ("items", "expires_at", "consumed", "claim_failed", "stale_skipped")
+    __slots__ = ("items", "expires_at", "consumed", "stale_skipped")
 
     def __init__(self) -> None:
         self.items: list[dict] = []
         self.expires_at: float = 0.0
         self.consumed = 0
-        self.claim_failed = 0
         self.stale_skipped = 0
 
 
 class WorkerQueue:
-    """브랜드별 우선순위 배치를 메모리에 들고 하나씩 내준다.
+    """브랜드별 배치를 메모리에 들고 하나씩 내준다.
 
     2026-09-24 4차(실측 8) — 작업자가 매 반복마다 브랜드를 바꿔 도는데(중복
     재검사 방지를 위해 브랜드 고정을 되돌린 ab32ce5), 이전 구현은 브랜드
@@ -688,7 +552,17 @@ class WorkerQueue:
     통째로 버리고 새로 조회했다 — 로그 실측으로 확인(`타이밍 큐소비`가
     항상 "소비=1 ... 남은채로재조회=9"). 브랜드별로 큐를 따로 둬서, 5개
     브랜드를 순환해도 각 브랜드의 배치(기본 10개)가 실제로 다 소비될 때까지
-    유지되게 고쳤다."""
+    유지되게 고쳤다.
+
+    2026-09-24 5차 — `next_priority_batch`가 이제 공유 큐(`exposure_queue`
+    표)에서 **이미 이 작업자 앞으로 선점(claim)까지 끝낸** 항목을 돌려준다
+    (`exposure_priority.next_priority_batch`/`exposure_queue_store.
+    claim_batch`, 원자적 sqlite 트랜잭션). 그래서 이 클래스는 더 이상
+    `claim_inflight`를 부르지 않는다 — 배치를 받은 시점에 이미 선점이
+    끝나 있다. `take()`는 검사 직전 DB 단건 확인(`is_due_now`, 3차 그대로
+    유지)만 한 번 더 해서, 큐 갱신(최대 `queue_refresh_sec`, 기본 600초
+    전) 이후 이 키워드가 그 사이 다른 경로(2단계 확인 재검사 등)로 이미
+    검사됐으면 건너뛴다."""
 
     def __init__(self, batch_size: int = 10, ttl_sec: float = 120.0):
         self.batch_size = max(1, int(batch_size))
@@ -701,7 +575,7 @@ class WorkerQueue:
     def _needs_refill(self, state: _BrandQueueState, now: float) -> bool:
         return now >= state.expires_at or not state.items
 
-    def refill_if_needed(self, rt: Any, brand: str, now: float | None = None) -> None:
+    def refill_if_needed(self, rt: Any, brand: str, worker_id: int, now: float | None = None) -> None:
         now = now if now is not None else time.time()
         state = self._state(brand)
         if not self._needs_refill(state, now):
@@ -710,45 +584,41 @@ class WorkerQueue:
 
         if state.expires_at > 0:
             log.info(
-                "타이밍 큐소비 브랜드=%s 소비=%s 선점실패=%s 직전확인제외=%s 남은채로재조회=%s",
-                brand, state.consumed, state.claim_failed, state.stale_skipped, len(state.items),
+                "타이밍 큐소비 브랜드=%s 소비=%s 직전확인제외=%s 남은채로재조회=%s",
+                brand, state.consumed, state.stale_skipped, len(state.items),
             )
-        # next_priority_batch 자체는 이미 선점 중인(claim_inflight) 항목을
-        # 걸러 주지만(2026-09-24 2차), 이 배치를 받은 뒤에도 다른 작업자가
-        # 그 사이 선점할 수 있으므로 take()에서 다시 한 번 확인한다.
         t0 = time.perf_counter()
-        state.items = list(exposure_priority.next_priority_batch(rt, brand, n=self.batch_size))
+        state.items = list(
+            exposure_priority.next_priority_batch(rt, brand, n=self.batch_size, worker_id=str(worker_id))
+        )
         log.info(
             "타이밍 큐조회 브랜드=%s round_trip=%.2fs 배치=%s",
             brand, time.perf_counter() - t0, len(state.items),
         )
         state.expires_at = now + self.ttl_sec
         state.consumed = 0
-        state.claim_failed = 0
         state.stale_skipped = 0
 
     def take(self, rt: Any, brand: str, worker_id: int, now: float | None = None) -> dict | None:
-        """이 브랜드 큐에서 `claim_inflight`로 선점에 성공하고, 검사 직전 DB
-        단건 확인(`exposure_priority.is_due_now`, 2026-09-24 3차)까지 통과하는
-        첫 항목을 꺼내 돌려준다.
+        """이 브랜드 큐(이미 이 작업자 앞으로 선점된 배치)에서, 검사 직전 DB
+        단건 확인(`exposure_priority.is_due_now`, 2026-09-24 3차)까지
+        통과하는 첫 항목을 꺼내 돌려준다.
 
-        선점 실패한 항목(다른 작업자가 방금 집음)이나, 선점엔 성공했지만
-        직전 확인에서 "이미 다른 작업자가 방금 검사했다"고 나온 항목은
-        버리고 다음 항목을 시도한다(후자는 선점을 도로 풀어 다른 작업자가
-        헛수고로 붙잡고 있지 않게 한다). 이 브랜드 큐가 다 비면 새로 조회하지
-        않고 `None`을 돌려준다 — 호출자가 다른 브랜드로 넘어갔다가 다음에
-        이 브랜드로 돌아오면 그때 TTL·빈 큐 조건으로 재조회된다."""
+        직전 확인에서 "이미 검사됐다"고 나온 항목은 선점을 풀고(
+        `exposure_queue_store.release_claim`) 다음 항목을 시도한다. 이
+        브랜드 큐가 다 비면 새로 조회하지 않고 `None`을 돌려준다 — 호출자가
+        다른 브랜드로 넘어갔다가 다음에 이 브랜드로 돌아오면 그때 TTL·빈 큐
+        조건으로 재조회된다."""
         from v2r.knowledge import exposure_priority
+        from v2r.knowledge.keyword_exposure import _norm
+        from v2r.store import exposure_queue_store as qstore
 
-        self.refill_if_needed(rt, brand, now)
+        self.refill_if_needed(rt, brand, worker_id, now)
         state = self._state(brand)
         while state.items:
             candidate = state.items.pop(0)
-            if not claim_inflight(rt.settings.repo_root, brand, candidate["keyword"], worker_id):
-                state.claim_failed += 1
-                continue
             if not exposure_priority.is_due_now(rt, brand, candidate):
-                release_inflight(rt.settings.repo_root, brand, candidate["keyword"])
+                qstore.release_claim(rt.conn, brand, _norm(candidate.get("keyword", "")))
                 state.stale_skipped += 1
                 continue
             state.consumed += 1
@@ -819,38 +689,34 @@ def run_worker(worker_id: int, brands: list[str] | None = None, max_iterations: 
                     continue
 
                 iterations += 1
+                from v2r.knowledge.keyword_exposure import _norm as _norm_kw
+                from v2r.store import exposure_queue_store as qstore
 
                 # 밀려남 2차 확인 대기 중인 키워드가 때(5~10분) 됐으면 그걸 먼저
                 # 처리한다 — 우선순위 등급과 무관하게 시간이 생명인 재확인.
-                # 두 경로 모두 claim_inflight로 같은 키워드를 다른 작업자와
-                # 동시에 집지 않게 막는다(2026-09-24 — 작업자 3개가 저장 전에
-                # 같은 1등급 키워드를 2~3번 중복 검사하던 문제 수정).
+                # 두 경로 모두 공유 큐(`exposure_queue` 표)의 원자적 선점으로
+                # 같은 키워드를 다른 작업자와 동시에 집지 않게 막는다
+                # (2026-09-24 5차 — 파일 기반 claim_inflight를 대체).
                 brand = None
                 item = None
                 due = due_pending(rt.settings.repo_root)
                 for entry in due:
-                    if claim_inflight(rt.settings.repo_root, entry["brand"], entry["item"]["keyword"], worker_id):
-                        brand, item = entry["brand"], entry["item"]
+                    e_brand, e_item = entry["brand"], entry["item"]
+                    if qstore.claim_specific(
+                        rt.conn, e_brand, _norm_kw(e_item["keyword"]), e_item["keyword"], e_item, str(worker_id)
+                    ):
+                        brand, item = e_brand, e_item
                         break
                 if item is None:
-                    # 2026-09-24 — 브랜드 고정(위 커밋 de22603)을 실측했더니
-                    # 처리량은 늘었지만(약 1,012건/시) 실제로는 267건 중 180건
-                    # (67%)이 같은 키워드 중복 재검사였다 — 되돌린다(아래 참고).
-                    #
-                    # 원인: exposure_priority의 universe/정렬/last_checked
-                    # 캐시가 **프로세스별 메모리**(모듈 전역 dict)라, mark_checked는
-                    # 그 호출을 한 작업자 자신의 캐시만 갱신하고 다른 4개 작업자
-                    # 프로세스의 캐시는 그대로다. 브랜드를 매번 바꿀 때는 이 문제가
-                    # 가려져 있었다(각 작업자가 그 브랜드에 머무는 시간이 짧아
-                    # 캐시가 실제로 많이 재사용되기 전에 다음 브랜드로 넘어갔음).
-                    # 브랜드에 오래 머물게 하자 5개 작업자가 각자의 정체된 캐시로
-                    # 같은 상위권 키워드를 반복해서 다시 뽑아냈다(예: "가정용좌욕기"
-                    # 6번, 05:50:04~05:51:03 사이). claim_inflight는 "동시" 선점만
-                    # 막을 뿐, TTL(120초) 동안 여러 번 순차로 다시 뽑히는 건 못 막는다.
-                    #
-                    # 안전한 순서: exposure_priority가 캐시를 프로세스 간 공유(파일
-                    # 기반 등)하거나 무효화 신호를 브로드캐스트하게 고치기 전에는
-                    # 브랜드를 매번 바꾸는 쪽이 낫다(중복 0건 확인된 방식).
+                    # 2026-09-24 — 브랜드 고정(커밋 de22603)을 실측했더니 처리량은
+                    # 늘었지만(약 1,012건/시) 267건 중 180건(67%)이 같은 키워드
+                    # 중복 재검사였다(6-4절) — 되돌리고 브랜드를 계속 순환한다.
+                    # 4차(캐시 TTL 600초·공유 파일)로도 중복이 19.4%까지 남았던
+                    # 근본 원인(작업자 프로세스마다 따로 정렬해 앞쪽을 다툼)은
+                    # 5차에서 공유 큐(`exposure_queue` 표 + 원자적 선점)로 고쳤다
+                    # (docs/reports/exposure-queue-cache-2026-09-24.md "5차" 참고)
+                    # — 브랜드 순환 자체는 그대로 유지한다(우선순위 규칙 일부이자
+                    # 한 브랜드에 쏠리지 않게 하는 장치).
                     brand = brand_list[brand_idx % len(brand_list)]
                     brand_idx += 1
                     item = worker_queue.take(rt, brand, worker_id)
@@ -864,13 +730,13 @@ def run_worker(worker_id: int, brands: list[str] | None = None, max_iterations: 
                     # 검사 자체가 실패(예외)했으면 선점을 완전히 풀어 다른
                     # 작업자가 바로 다시 집을 수 있게 한다 — "완료" 표시를
                     # 남기면 실제로 검사가 안 됐는데도 배제되어 버린다.
-                    release_inflight(rt.settings.repo_root, brand, item["keyword"])
+                    qstore.release_claim(rt.conn, brand, _norm_kw(item["keyword"]))
                     raise
-                # 2026-09-24 3차 — 정상 완료는 선점을 지우지 않고 "완료 표시"로
-                # 바꾼다(`complete_inflight`). 다른 작업자의 정렬 캐시가 아직
-                # 이 키워드를 들고 있어도(`INFLIGHT_TTL_SECONDS`=180초, 정렬
-                # 캐시 TTL 이상) 배치 필터에서 계속 제외된다.
-                complete_inflight(rt.settings.repo_root, brand, item["keyword"])
+                # 2026-09-24 5차 — 정상 완료는 공유 큐 표에 `done_at`을 남긴다
+                # (`exposure_queue_store.mark_done`). 다음 갱신(기본 600초)
+                # 때까지, 또는 다시 등급에 들 때까지 이 키워드가 배치에서
+                # 빠진다.
+                qstore.mark_done(rt.conn, brand, _norm_kw(item["keyword"]))
                 update_worker_state(
                     rt.settings.repo_root, worker_id, processed_delta=1, last_keyword=item["keyword"],
                     duplicate=bool(result.get("duplicate")),
@@ -929,11 +795,6 @@ __all__ = [
     "set_pending",
     "clear_pending",
     "due_pending",
-    "inflight_path",
-    "is_inflight",
-    "claim_inflight",
-    "release_inflight",
-    "complete_inflight",
     "WorkerQueue",
     "run_worker",
     "main",

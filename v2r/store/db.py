@@ -157,6 +157,27 @@ CREATE TABLE IF NOT EXISTS keyword_exposure (
     rank_overall INTEGER
 );
 
+-- 노출 확인 공유 큐 (2026-09-24 5차 — 작업자 프로세스별 정렬·캐시를 없애고
+-- 이 표 하나를 모든 작업자가 공유한다. docs/reports/exposure-queue-cache-2026-09-24.md
+-- "5차" 참고. 정렬은 브랜드당 하나의 프로세스가 TTL마다 갱신하고, 작업자는
+-- 원자적 UPDATE(claimed_by)로 선점한다.
+CREATE TABLE IF NOT EXISTS exposure_queue (
+    brand        TEXT NOT NULL,
+    keyword_norm TEXT NOT NULL,
+    keyword      TEXT NOT NULL,
+    item_json    TEXT NOT NULL,
+    tier         INTEGER NOT NULL,
+    sort_key     REAL NOT NULL,
+    enqueued_at  REAL NOT NULL,
+    claimed_by   TEXT,
+    claimed_at   REAL,
+    done_at      REAL,
+    PRIMARY KEY (brand, keyword_norm)
+);
+
+CREATE INDEX IF NOT EXISTS idx_exposure_queue_pick
+    ON exposure_queue(brand, done_at, claimed_by, tier, sort_key);
+
 -- 브랜드 대량 원고 생성 대기열 (밀려남 키워드 → 원고, 2026-09-23)
 CREATE TABLE IF NOT EXISTS brand_queue (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,

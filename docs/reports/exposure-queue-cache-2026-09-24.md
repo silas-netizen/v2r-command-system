@@ -354,9 +354,95 @@ dict)라, 한 작업자의 검사 결과(`mark_checked`)는 그 작업자 자신
 - 전체 `pytest` 스위트는 **미실행**(다른 일꾼이 동시에 돌리고 있어 관련
   시험만 통과 확인).
 
+## 5차 — 공유 큐(작업자별 정렬·선점을 근본적으로 없앰)
+
+배경: `docs/reports/exposure-speed-2026-09-24.md` 6-7·6-8절(실측 9) — 4차
+(작업자 프로세스별 캐시 + TTL 600초 + 파일 기반 완료 표시)로 큐 조회는
+9.8초 → 3.2초로 빨라졌지만, 중복 재검사가 오히려 13% → **19.4%**로 늘었다.
+원인: 작업자 5개가 **각자 독립적으로** 정렬한 목록의 앞쪽을(같은 상위권
+키워드) 동시에 고르는 경쟁이 됐기 때문 — DB 직전 확인(3차)이 있어도, "확인
+→ 브라우저 열기 → 저장" 사이 수 초의 경쟁 구간까지는 못 막았다. 코디네이터
+지시대로 **근본 설계를 바꿔** 작업자별 캐시·정렬을 없애고 공유 큐로
+옮겼다.
+
+### 바꾼 구조(5차)
+
+1. **`exposure_queue` 표 신설** — `v2r/store/db.py`에 추가(brand,
+   keyword_norm 복합 PK, keyword, item_json, tier, sort_key, enqueued_at,
+   claimed_by, claimed_at, done_at). item 전체를 JSON으로 저장해 판정에
+   필요한 부가 필드(카페·검색량·t0_status 등)를 잃지 않는다. 인덱스
+   `idx_exposure_queue_pick(brand, done_at, claimed_by, tier, sort_key)`.
+
+2. **정렬은 브랜드당 한 프로세스가 TTL마다 한 번만** —
+   `v2r/knowledge/exposure_priority.py`의 `_do_refresh_queue`가 등급 규칙
+   (`priority_tier`, 손 안 댐)으로 tier·`sort_key`(다중 정렬을 표 한 칸에
+   담는 단일 실수, `_sort_key_for_tier`)를 계산해
+   `exposure_queue_store.upsert_candidates`로 표에 갱신한다. `maybe_refresh_queue`
+   가 브랜드별 갱신 간격(기본 `queue_refresh_sec` 600초, `exposure_queue.
+   enqueued_at` 최댓값 기준)과 mkdir 기반 락(`data/
+   exposure_queue_refresh.lock/<브랜드>`, 죽은 락은 60초 뒤 무시)으로 "락을
+   잡은 아무 작업자 하나만" 갱신하게 한다. universe·최근 발행 집합은
+   여전히 `_universe_bundle`(4차의 프로세스+파일 캐시)에서 가져와 시트
+   CSV 재읽기를 줄인다.
+
+3. **선점은 원자적 sqlite 트랜잭션 한 번** —
+   `exposure_queue_store.claim_batch`가 `BEGIN IMMEDIATE` 안에서
+   `SELECT ... WHERE done_at IS NULL AND (claimed_by IS NULL OR claimed_at
+   < 컷오프) ORDER BY tier, sort_key LIMIT n`으로 rowid를 고르고, 그 자리에서
+   바로 `UPDATE ... SET claimed_by=?, claimed_at=? WHERE rowid IN (...)`를
+   커밋한다 — sqlite 쓰기 트랜잭션은 직렬화되므로 같은 rowid를 두 프로세스가
+   동시에 못 고른다. `exposure_priority.next_priority_batch(rt, brand, n,
+   worker_id)`는 이제 "갱신 필요하면 갱신 → 선점"의 얇은 래퍼다. 2단계
+   확인 대기(`due_pending`) 재확인은 `claim_specific`(없으면 최우선 등급으로
+   새로 넣고 바로 선점)으로 같은 표를 공유한다.
+4. **검사 직전 DB 최신 검사 시각 확인은 유지** — `exposure_priority.
+   is_due_now`(3차, `store.latest_for_keyword` 단건 조회)는 그대로 둬서,
+   `WorkerQueue.take()`가 배치를 소비하는 순간까지 한 번 더 확인한다.
+5. **파일 기반 `claim_inflight`/`complete_inflight`/`is_inflight`/
+   `release_inflight` 완전 제거** — `v2r/knowledge/exposure_runner.py`에서
+   삭제. 정상 완료는 `exposure_queue_store.mark_done`, 예외 실패는
+   `release_claim`으로 대체(`run_worker`의 `try/except`). 중복률 기록
+   (`process_one`의 `duplicate` 판정 → `update_worker_state`)은 그대로 유지.
+6. `WorkerQueue`(작업자 메모리, 4차의 브랜드별 큐 구조)는 그대로 두되,
+   `next_priority_batch`가 돌려주는 항목이 **이미 이 작업자 앞으로 선점
+   끝난 상태**라 더 이상 자체적으로 `claim_inflight`를 부르지 않는다 —
+   `is_due_now` 재확인만 남았다.
+7. 우선순위 규칙(1 노출완 6시간 → 2 최근 발행 → 3 밀려남·미확인 검색량 순,
+   12시간 간격)과 작업자의 브랜드 순환(중복 급증으로 브랜드 고정을 되돌린
+   전례, 6-4절)은 이번에도 전혀 건드리지 않았다.
+
+### 왜 이번엔 근본적으로 안전한가
+
+이전 1~4차는 모두 "얼마나 빨리, 얼마나 자주 동기화하느냐"의 문제였다 —
+캐시를 아무리 빨리 갱신해도 여러 프로세스가 **동시에 읽고 나중에 따로
+쓰는** 구조라면, 읽기와 쓰기 사이의 경쟁 구간은 절대 0이 될 수 없다.
+5차는 "정렬 결과를 어디에 두고 선점을 어떻게 하느냐"를 바꿔 — 여러
+프로세스가 **하나의 sqlite 표에 원자적 트랜잭션으로** 선점하므로, 그
+트랜잭션이 커밋되는 순간 다른 프로세스는 이미 사라진 rowid를 볼 수밖에
+없다. 경쟁 자체가 구조적으로 없다(같은 파일에 대한 sqlite의 쓰기
+직렬화가 보장).
+
+### 시험 결과(5차)
+
+- `tests/test_exposure_runner.py` 47개, `tests/test_keyword_exposure.py` +
+  `tests/test_keyword_exposure_cycle.py` + `tests/test_dashboard.py` 합쳐
+  98개 — **145개 전부 통과**. `v2r/store/db.py`에 `exposure_queue` 표를
+  추가한 뒤 신규 임시 DB에서 `init_schema`가 정상 생성하는지도 별도 확인.
+  옛 `claim_inflight`/`release_inflight`/`complete_inflight` 시험은
+  `exposure_queue_store.claim_specific`/`release_claim`/`mark_done`/
+  `claim_batch` 기반으로 다시 썼고(`test_claim_specific_먼저_잡은쪽만_성공`,
+  `test_release_claim_후_다시_잡을수있음`, `test_claim_만료되면_다시_잡을수있음`,
+  `test_mark_done_후에는_claim_batch에_안뽑힘`, `test_claim_batch_동시선점_경쟁없음`
+  — 마지막은 두 "작업자"가 같은 후보를 동시에 `claim_batch`해도 한쪽만
+  가져가는지 확인), `next_priority_batch`가 이제 선점까지 하므로 관련
+  시험도 이 동작에 맞춰 갱신했다(`test_next_priority_batch_공유큐_선점이_같은키워드_다시안뽑음`,
+  `test_next_priority_batch_mark_done_후에도_큐갱신TTL안이면_다시_안뽑힘`).
+- 전체 `pytest` 스위트는 **미실행**(다른 일꾼이 동시에 돌리고 있어 관련
+  시험만 통과 확인).
+
 ## 러너 재시작 필요
 
-1차·2차·3차·4차 변경(캐시·배치 큐·last_checked 캐시·정렬 캐시·DB 직전 확인·
-완료 표시·중복률 집계·브랜드별 큐·TTL 600초·작업자 간 공유 파일 캐시) 모두
-코드에만 반영됐고 현재 돌고 있는 러너 프로세스에는 적용되지 않았다 — 러너
-재시작 필요.
+1~5차 변경(캐시·배치 큐·last_checked 캐시·DB 직전 확인·브랜드별 큐·TTL
+600초·작업자 간 공유 파일 캐시·공유 큐(`exposure_queue` 표)·원자적 선점·
+파일 기반 claim_inflight 제거) 모두 코드에만 반영됐고 현재 돌고 있는 러너
+프로세스에는 적용되지 않았다 — 러너 재시작 필요.
