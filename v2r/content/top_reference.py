@@ -54,58 +54,65 @@ _EXCLUDE_URL_HINTS = ("MyBlog.naver", "BlogHome.naver", "gnb_", "/PostList.naver
 # 정확하다.
 # ---------------------------------------------------------------------------
 
-#: 순위 집계용 — 도메인 → (섹션 이름, 광고 여부)
-_SERP_DOMAIN_SECTION = [
-    (re.compile(r"ader\.naver\.com|adcr\.naver\.com|search\.ad\.naver\.com", re.I), "파워링크/광고", True),
-    (re.compile(r"shopping\.naver\.com", re.I), "쇼핑", False),
-    (re.compile(r"news\.naver\.com", re.I), "뉴스", False),
-    (re.compile(r"cafe\.naver\.com", re.I), "카페", False),
-    (re.compile(r"blog\.naver\.com", re.I), "블로그", False),
-    (re.compile(r"post\.naver\.com", re.I), "포스트", False),
-    (re.compile(r"kin\.naver\.com", re.I), "지식iN", False),
-]
-#: 화면에 보이는 모든 결과 링크를 문서 순서대로 훑는 정규식(위 도메인 전부)
-_SERP_LINK_RE = re.compile(
-    r'href="(https?://(?:[a-z0-9-]+\.)?naver\.com[^"]*)"', re.I
-)
-
-
-def _section_for(url: str) -> tuple[str, bool]:
-    for pattern, name, is_ad in _SERP_DOMAIN_SECTION:
-        if pattern.search(url):
-            return name, is_ad
-    return "", False
-
-
 def _norm_serp_url(url: str) -> str:
     u = re.sub(r"^https?://", "", url, flags=re.I)
     u = re.sub(r"^m\.", "", u, flags=re.I)
     return u.split("?", 1)[0].rstrip("/").casefold()
 
 
+#: 카페/블로그/포스트/지식iN 섹션 이름 -> (strict 패턴, source 키). 각 결과 블록에는
+#: "카페 이름 배지" 링크(`cafe.naver.com/<별칭>`, 글 번호 없음)가 실제 글 링크
+#: 바로 앞에 따로 박혀 있다 — 2026-09-23 재정정 실측에서 확인한 오탐 원인(이
+#: 배지 링크를 "카페 결과"로 잘못 세는 바람에 `rank_in_source`가 항상 실제보다
+#: 1 컸다). 느슨한 도메인 매칭 대신 글 번호가 있는 `_RESULT_LINK_PATTERNS`(진짜
+#: 글만 잡는 패턴)를 그대로 재사용해 이 오탐을 없앤다.
+_SERP_STRICT_SECTIONS = [
+    ("카페", "cafe"),
+    ("블로그", "blog"),
+    ("포스트", "post"),
+    ("지식iN", "jisik"),
+]
+_SERP_STRICT_PATTERN_BY_SOURCE = dict(_RESULT_LINK_PATTERNS)
+
+#: 광고/쇼핑/뉴스는 "진짜 글 번호" 개념이 없어 도메인 기반으로 그대로 훑는다.
+_SERP_LOOSE_SECTIONS = [
+    (re.compile(r"https?://(?:ader|adcr)\.naver\.com/[^\s\"'<>]+", re.I), "파워링크/광고", "ad", True),
+    (re.compile(r"https?://shopping\.naver\.com/[^\s\"'<>]+", re.I), "쇼핑", "shopping", False),
+    (re.compile(r"https?://(?:m\.)?news\.naver\.com/[^\s\"'<>]+", re.I), "뉴스", "news", False),
+]
+
+
 def extract_serp(dom_html: str, max_n: int = 15) -> list[dict]:
     """통검 최종 DOM에서 화면 순서대로 결과 링크를 뽑는다(상위 `max_n`개, 중복 제거).
 
-    반환: `[{rank, section, source, title, url, is_ad}]`. `source`는 판정에 쓰는
-    도메인 키(cafe/blog/post/jisik/…)와 맞춰 카페=cafe, 블로그=blog 식으로 적는다.
+    반환: `[{rank, section, source, title, url, is_ad}]`. 카페·블로그·포스트·
+    지식iN은 **진짜 글(글 번호가 있는 URL)만** 센다 — 카페 이름 배지 같은
+    비-글 링크는 여기서 아예 후보에 들지 않는다.
     """
     if not dom_html:
         return []
-    _SOURCE_KEY = {"카페": "cafe", "블로그": "blog", "포스트": "post", "지식iN": "jisik",
-                   "쇼핑": "shopping", "뉴스": "news", "파워링크/광고": "ad"}
+    matches: list[tuple[int, str, str, str, bool]] = []  # (start, url, section, source, is_ad)
+    for section, source in _SERP_STRICT_SECTIONS:
+        pattern = _SERP_STRICT_PATTERN_BY_SOURCE[source]
+        for m in pattern.finditer(dom_html):
+            url = m.group(0)
+            if any(h in url for h in _EXCLUDE_HOST_HINTS) or any(h in url for h in _EXCLUDE_URL_HINTS):
+                continue
+            matches.append((m.start(), url, section, source, False))
+    for pattern, section, source, is_ad in _SERP_LOOSE_SECTIONS:
+        for m in pattern.finditer(dom_html):
+            url = m.group(0)
+            if any(h in url for h in _EXCLUDE_URL_HINTS):
+                continue
+            path = urlparse(url).path
+            if not is_ad and section != "쇼핑" and path in ("", "/"):
+                continue  # 상단 메뉴 바로가기(실제 결과가 아니다)
+            matches.append((m.start(), url, section, source, is_ad))
+    matches.sort(key=lambda t: t[0])
+
     seen: set[str] = set()
     out: list[dict] = []
-    for m in _SERP_LINK_RE.finditer(dom_html):
-        url = m.group(1)
-        section, is_ad = _section_for(url)
-        if not section:
-            continue  # 섹션을 판정 못하는 링크(내비게이션 등)는 순위에서 뺀다
-        if any(h in url for h in _EXCLUDE_URL_HINTS):
-            continue
-        path = urlparse(url).path
-        if not is_ad and section != "쇼핑" and path in ("", "/"):
-            # 상단 메뉴(카페/뉴스/지식iN/도서 바로가기 등, 실제 검색 결과가 아니다)
-            continue
+    for start, url, section, source, is_ad in matches:
         norm = _norm_serp_url(url)
         if is_ad:
             # 파워링크 광고 한 칸에 썸네일/제목/설명 등 여러 클릭 영역이 있어 URL이
@@ -115,14 +122,14 @@ def extract_serp(dom_html: str, max_n: int = 15) -> list[dict]:
         if norm in seen:
             continue
         seen.add(norm)
-        start = max(0, m.start() - 40)
-        window = dom_html[start:start + 400]
+        window_start = max(0, start - 40)
+        window = dom_html[window_start:window_start + 400]
         title = _strip_tags(window)[:60].strip()
         out.append(
             {
                 "rank": len(out) + 1,
                 "section": section,
-                "source": _SOURCE_KEY.get(section, "기타"),
+                "source": source,
                 "title": title,
                 "url": url,
                 "is_ad": is_ad,
@@ -169,8 +176,10 @@ def _cfg() -> dict:
 
 
 #: 캐시 스키마 버전 — 2026-09-23 정정(카페 전용 + serp/rank_in_source 추가)으로
-#: 1 -> 2. 옛 캐시(버전 없음/구버전)는 무효로 보고 다시 수집한다.
-CACHE_VERSION = 2
+#: 1 -> 2, 같은 날 `extract_serp`의 "카페 이름 배지" 오탐(rank_in_source가 항상
+#: 실제보다 1 컸던 버그)을 고치면서 2 -> 3. 옛 캐시(버전 없음/구버전)는 무효로
+#: 보고 다시 수집한다.
+CACHE_VERSION = 3
 
 
 def _load_cache(repo_root: str | Path, keyword: str) -> dict | None:

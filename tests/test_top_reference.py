@@ -96,6 +96,58 @@ def test_allowed_sources_default_and_config(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# SERP 순위 추출 (2026-09-23 재정정: 카페 이름 배지 오탐 수정)
+# ---------------------------------------------------------------------------
+
+
+def test_extract_serp_ignores_cafe_badge_link_before_real_article():
+    # 실제 통검 DOM 모양 — 카페 이름 배지(글 번호 없음)가 진짜 글 링크 바로
+    # 앞에 따로 박혀 있다. 배지는 "카페" 결과로 세면 안 된다(2026-09-23 재정정
+    # 지시 — rank_in_source가 항상 2로 나오던 버그의 원인).
+    html = (
+        '<a href="https://cafe.naver.com/gpsf">카페이름배지</a>'
+        '<a href="https://cafe.naver.com/gpsf/1169447?art=xyz">진짜 첫 글</a>'
+        '<a href="https://cafe.naver.com/gloseems1">카페이름배지2</a>'
+        '<a href="https://cafe.naver.com/gloseems1/1299492">진짜 둘째 글</a>'
+    )
+    serp = tr.extract_serp(html, max_n=15)
+    cafe_items = [it for it in serp if it["source"] == "cafe"]
+    assert len(cafe_items) == 2
+    assert cafe_items[0]["url"] == "https://cafe.naver.com/gpsf/1169447"
+    assert cafe_items[1]["url"] == "https://cafe.naver.com/gloseems1/1299492"
+
+
+def test_extract_serp_ads_and_shopping_and_order():
+    html = (
+        '<a href="https://ader.naver.com/v1/AAAAAAAAAAAAAAAAtoken1">광고1</a>'
+        '<a href="https://shopping.naver.com/catalog/999">쇼핑</a>'
+        '<a href="https://cafe.naver.com/imsanbu">배지</a>'
+        '<a href="https://cafe.naver.com/imsanbu/80102656">진짜 글</a>'
+    )
+    serp = tr.extract_serp(html, max_n=15)
+    sections = [(it["section"], it["is_ad"]) for it in serp]
+    assert sections == [("파워링크/광고", True), ("쇼핑", False), ("카페", False)]
+
+
+def test_extract_serp_dedups_same_ad_slot():
+    html = (
+        '<a href="https://ader.naver.com/v1/AAAAAAAAAAAAAAAAtoken1">썸네일</a>'
+        '<a href="https://ader.naver.com/v1/AAAAAAAAAAAAAAAAtoken2">제목</a>'
+    )
+    serp = tr.extract_serp(html, max_n=15)
+    assert len(serp) == 1  # 리다이렉트 토큰 앞 16자가 같으면 한 광고 칸
+
+
+def test_extract_serp_respects_max_n():
+    html = "".join(
+        f'<a href="https://cafe.naver.com/c{i}/{100 + i}">글{i}</a>' for i in range(20)
+    )
+    serp = tr.extract_serp(html, max_n=5)
+    assert len(serp) == 5
+    assert serp[0]["rank"] == 1 and serp[-1]["rank"] == 5
+
+
+# ---------------------------------------------------------------------------
 # 형식 지표 계산
 # ---------------------------------------------------------------------------
 
