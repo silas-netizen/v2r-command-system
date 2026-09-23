@@ -32,6 +32,8 @@ from typing import Any
 
 import httpx
 
+from v2r.knowledge import keyword_relevance as _kr_mod
+
 log = logging.getLogger(__name__)
 
 #: 구 인터페이스 호환용(더 이상 실제로 쓰이지 않는다 — OAuth 불필요)
@@ -309,6 +311,129 @@ def _write_tsv_at(spreadsheet_id: str, gid: str | int, cell: str, tsv: str) -> N
             browser.close()
 
 
+def copy_row_format(
+    spreadsheet_id: str,
+    gid: str | int,
+    src_row: int,
+    dst_first: int,
+    dst_last: int,
+    *,
+    n_cols: int = 15,
+) -> None:
+    """`src_row`(서식·데이터 확인 드롭다운이 있는 기존 행, 보통 2행)의 서식을
+    `dst_first`~`dst_last`행에 복사한다. 값은 절대 건드리지 않는다.
+
+    헤드리스로: (a) 이름 상자로 `A{src}:{col}{src}` 선택 → Ctrl+C, (b) 대상 범위
+    선택 → 컨텍스트 메뉴 "선택하여 붙여넣기" → "서식만 붙여넣기", (c) 다시 같은
+    범위 선택 → "선택하여 붙여넣기" → "데이터 확인만 붙여넣기"(둘 다 있어야
+    드롭다운 칩+배경색이 옮겨진다). "값 붙여넣기"류 메뉴는 절대 클릭하지 않는다.
+    """
+    from playwright.sync_api import sync_playwright
+
+    last_col = _col_letter(n_cols - 1)
+    src_range = f"A{src_row}:{last_col}{src_row}"
+    dst_range = f"A{dst_first}:{last_col}{dst_last}"
+
+    with sync_playwright() as p:
+        browser = launch_chromium(p, headless=True)
+        try:
+            # 실측(2026-09-24): 클립보드 권한을 안 주면 Ctrl+C가 조용히 실패해서(예외
+            # 없음) "서식만"/"데이터 확인만" 메뉴 클릭은 정상 진행되고 메뉴도 닫히지만
+            # 실제로 붙일 클립보드 내용이 없어 아무 것도 안 바뀐다(장으뜸 탭에서 재현—
+            # 큰 범위건 한 행이건 산발적으로 실패). origin에 clipboard-read/write 권한을
+            # 미리 부여한다.
+            context = browser.new_context(permissions=["clipboard-read", "clipboard-write"])
+            page = context.new_page()
+            page.goto(EDIT_URL.format(sid=spreadsheet_id, gid=gid), wait_until="domcontentloaded", timeout=45000)
+            page.wait_for_selector("#t-name-box", timeout=45000)
+            page.wait_for_timeout(1000)
+
+            if _nav_to(page, src_range) != src_range.upper():
+                raise SheetsWriteError(f"서식 원본 선택 실패: {src_range}")
+            page.keyboard.press("Control+C")
+            page.wait_for_timeout(400)
+
+            if _nav_to(page, dst_range) != dst_range.upper():
+                raise SheetsWriteError(f"서식 대상 선택 실패: {dst_range}")
+
+            # 실측(2026-09-24): 하위 메뉴 항목 표기는 "서식만 붙여넣기"가 아니라
+            # "서식만"(단축키 Ctrl+Alt+V), "데이터 확인만"이다 — 긴 문구로 찾으면
+            # 못 찾는다. 부분 문자열로 맞춘다.
+            _paste_special(page, "서식만", fallback_keys="Control+Alt+V")
+            page.wait_for_timeout(600)
+
+            # 데이터 확인(드롭다운) 규칙은 서식 붙여넣기에 안 따라오므로 별도로 다시 한다.
+            # 실측(2026-09-24): 첫 붙여넣기 뒤 "marching ants"(복사 표시)가 풀려서
+            # 두 번째 선택하여 붙여넣기가 조용히 빈 클립보드에 대고 실행되는 경우가
+            # 있었다(장으뜸 탭에서 재현) — 원본을 다시 Ctrl+C한다.
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(300)
+            if _nav_to(page, src_range) != src_range.upper():
+                raise SheetsWriteError(f"서식 원본 재선택 실패: {src_range}")
+            page.keyboard.press("Control+C")
+            page.wait_for_timeout(400)
+            if _nav_to(page, dst_range) != dst_range.upper():
+                raise SheetsWriteError(f"서식 대상 재선택 실패: {dst_range}")
+            _paste_special(page, "데이터 확인만")
+            page.wait_for_timeout(600)
+        finally:
+            browser.close()
+
+
+def _paste_special(page: Any, menu_text: str, *, fallback_keys: str | None = None) -> None:
+    """Shift+F10 컨텍스트 메뉴 → "선택하여 붙여넣기" 하위 메뉴 → `menu_text` 클릭.
+
+    하위 메뉴 항목은 상위 메뉴를 hover/click 한 뒤에야 DOM에 나타나므로
+    `[role=menuitem]:visible`을 두 번 조회한다(부모 클릭 전/후).
+
+    실측(2026-09-24): 평범한 `.click()`은 가끔(특히 장으뜸 탭에서) 메뉴가 안 닫히고
+    조용히 무시됐다(예외도 없이 서식·데이터 확인이 반영 안 됨) — `force=True`로
+    다시 시도하고, 메뉴가 실제로 닫혔는지(`[role=menuitem]:visible` 개수가 메뉴바
+    수준으로 줄었는지)까지 확인한 뒤에야 성공으로 본다.
+    """
+    page.keyboard.press("Shift+F10")
+    page.wait_for_timeout(600)
+    items = page.locator("[role=menuitem]:visible")
+    baseline = items.count()  # 컨텍스트 메뉴 열기 전 상단 메뉴바 수(대조용)
+    parent_clicked = False
+    for i in range(items.count()):
+        text = items.nth(i).inner_text().strip()
+        if "선택하여 붙여넣기" in text:
+            items.nth(i).click(force=True)
+            page.wait_for_timeout(500)
+            parent_clicked = True
+            break
+    if not parent_clicked:
+        page.keyboard.press("Escape")
+        if fallback_keys:
+            page.keyboard.press(fallback_keys)
+            return
+        raise SheetsWriteError("'선택하여 붙여넣기' 메뉴를 찾지 못함")
+
+    sub_items = page.locator("[role=menuitem]:visible")
+    target_idx = None
+    for i in range(sub_items.count()):
+        text = sub_items.nth(i).inner_text().strip()
+        if menu_text in text:
+            target_idx = i
+            break
+    if target_idx is None:
+        page.keyboard.press("Escape")
+        if fallback_keys:
+            page.keyboard.press(fallback_keys)
+            return
+        raise SheetsWriteError(f"'{menu_text}' 메뉴를 찾지 못함")
+
+    for attempt in range(2):
+        page.locator("[role=menuitem]:visible").nth(target_idx).click(force=True)
+        page.wait_for_timeout(500)
+        still_open = page.locator("[role=menuitem]:visible").count()
+        if still_open <= baseline + 1:  # 메뉴가 닫혀 상단 메뉴바 수준으로 줄었으면 성공
+            return
+        page.wait_for_timeout(400)  # 첫 시도가 안 먹혔으면 한 번 더
+    raise SheetsWriteError(f"'{menu_text}' 클릭이 반영되지 않음(메뉴가 안 닫힘)")
+
+
 def _write_with_retry(spreadsheet_id: str, gid: str | int, cell: str, tsv: str) -> None:
     last_exc: Exception | None = None
     for attempt in range(1, _RETRIES + 1):
@@ -449,11 +574,15 @@ def append_rows(
     gid: str | int = 0,
     repo_root: str | Path = ".",
     token_path: str = DEFAULT_TOKEN_PATH,
+    copy_format: bool = True,
+    format_src_row: int = 2,
 ) -> dict[str, Any]:
     """시트 끝(마지막 데이터 행 다음)에 행을 append한다.
 
     `rows`는 리스트의 리스트(값 순서 그대로) 또는 딕셔너리(헤더명 필요) 모두
-    받는다. 1,000행 단위로 나눠 paste한다.
+    받는다. 200행 단위로 나눠 paste한다. `copy_format`(기본 True)이면 값을 쓴
+    뒤 `format_src_row`(기본 2행 — 드롭다운이 확인된 기존 행)의 서식·데이터
+    확인 규칙을 새로 추가된 행 범위에 복사한다(값은 그대로 유지).
     """
     try:
         table = _read_export_csv(spreadsheet_id, gid)
@@ -485,6 +614,15 @@ def append_rows(
     out: dict[str, Any] = {"written": written, "mode": "sheets" if written == len(value_rows) else "csv_only"}
     if errors:
         out["error"] = "; ".join(errors)
+    if copy_format and written and format_src_row < start_row1:
+        try:
+            copy_row_format(
+                spreadsheet_id, gid, format_src_row, start_row1, start_row1 + len(value_rows) - 1,
+                n_cols=max(len(hdr), 1) or 15,
+            )
+            out["format_copied"] = True
+        except Exception as exc:  # noqa: BLE001 — 서식 실패는 값 쓰기 성공을 무효화하지 않는다
+            out["format_error"] = str(exc)
     return out
 
 
@@ -636,7 +774,9 @@ KOREAN_STATUS_TO_CODE = {v: k for k, v in EXPOSURE_STATUS_LABEL.items()}
 #: `relevance_llm` 값 -> 본문 분류 라벨(0=가장 직접적, 값이 커질수록 느슨해진다는
 #: 기존 연관도 재산정 스케일 전제. `data/keywords/<브랜드>.sqlite`를 만드는
 #: keyword_relevance.py 쪽 스케일이 바뀌면 이 매핑도 같이 바꿔야 한다.)
-RELEVANCE_LABELS = {0: "직접", 1: "근접", 2: "확장"}
+#: 2026-09-24: keyword_relevance.RELEVANCE_LABELS와 동일해야 하므로 거기서 가져온다
+#: (0-3(무관 포함) → 0-4(당위성/무관 분리) 확장, 사용자 지시).
+RELEVANCE_LABELS = _kr_mod.RELEVANCE_LABELS
 IRRELEVANT_LABEL = "무관"
 IRRELEVANT_NOTE = "연관도 무관(자동)"
 
@@ -735,8 +875,8 @@ def sync_keywords_to_sheet(
     """`data/keywords/<브랜드>.sqlite`에서 최종 원고 대상 키워드를 골라 시트
     두 번째 탭에 append한다.
 
-    최종 원고 대상 = `relevance_llm`·`relevance_codex` 둘 다 0~2이고
-    `needs_review`가 아님. 두 열이 아예 없으면(아직 재산정 전) 건너뛴다.
+    최종 원고 대상 판정은 `keyword_relevance.is_manuscript_target`로 한다(0에서 3,
+    3=당위성 포함, 4=무관만 제외). 관련 열이 아예 없으면(아직 재산정 전) 건너뛴다.
     이미 시트 H열에 있는 키워드는 다시 넣지 않는다. 1,000행 단위(append_rows
     가 알아서 나눈다).
     """
@@ -751,22 +891,28 @@ def sync_keywords_to_sheet(
         return {"brand": brand, "skipped": True, "reason": f"키워드 DB 없음: {db_path}"}
 
     con = sqlite3.connect(str(db_path))
+    con.row_factory = sqlite3.Row
     try:
         cols = {row[1] for row in con.execute("PRAGMA table_info(keywords)")}
         required = {"relevance_llm", "relevance_codex", "needs_review"}
         if not required.issubset(cols):
             return {"brand": brand, "skipped": True, "reason": f"미산정 열 없음: {required - cols}"}
+        has_bridge = "bridge_rationale" in cols
 
-        rows = con.execute(
+        all_scored = con.execute(
             """
-            select keyword, total, rationale, relevance_llm
+            select keyword, total, rationale, relevance_llm, relevance_codex, needs_review
+            {bridge_col}
             from keywords
-            where relevance_llm between 0 and 2
-              and relevance_codex between 0 and 2
-              and (needs_review is null or needs_review = 0)
+            where relevance_llm is not null
             order by total desc
-            """
+            """.format(bridge_col=", bridge_rationale" if has_bridge else ", '' as bridge_rationale")
         ).fetchall()
+        rows = [
+            (r["keyword"], r["total"], r["rationale"], r["relevance_llm"], r["bridge_rationale"])
+            for r in all_scored
+            if _kr_mod.is_manuscript_target(r)
+        ]
     finally:
         con.close()
 
@@ -786,7 +932,7 @@ def sync_keywords_to_sheet(
     existing = {r[7].strip() for r in table[1:] if len(r) > 7 and r[7].strip()}
 
     out_rows: list[dict[str, Any]] = []
-    for kw, total, rationale, rel_llm in rows:
+    for kw, total, rationale, rel_llm, bridge_rationale in rows:
         if kw in existing:
             continue
         d = {h: "" for h in header}
@@ -794,7 +940,9 @@ def sync_keywords_to_sheet(
         d["키워드"] = kw
         d["통합검색"] = _keyword_search_url(kw)
         d["키워드 검색량"] = f"{total:,}" if total else ""
-        d["비고"] = rationale or ""
+        # M열 비고: 당위성(3)이면 연결 논리(bridge_rationale)를 우선 채우고,
+        # 없으면 기존 rationale로 채운다(2026-09-24).
+        d["비고"] = (bridge_rationale or "") if rel_llm == _kr_mod.RELEVANCE_BRIDGE else (rationale or "")
         d["본문 분류"] = RELEVANCE_LABELS.get(rel_llm, str(rel_llm))
         out_rows.append(d)
 
@@ -928,6 +1076,7 @@ __all__ = [
     "normalize_kst_timestamp",
     "EXPOSURE_STATUS_LABEL",
     "set_cell",
+    "copy_row_format",
     "get_spreadsheet_id",
     "list_configured_brands",
     "sync_keywords_to_sheet",

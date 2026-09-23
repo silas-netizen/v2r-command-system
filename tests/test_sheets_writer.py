@@ -168,6 +168,10 @@ def test_append_rows_starts_after_last_row(monkeypatch, tmp_path):
 
     monkeypatch.setattr(sw, "_read_export_csv", fake_read)
     monkeypatch.setattr(sw, "_write_verified", fake_write_verified)
+    format_calls = []
+    monkeypatch.setattr(
+        sw, "copy_row_format", lambda *a, **k: format_calls.append((a, k))
+    )
 
     result = sw.append_rows(
         "sid", "탭", [{"H": "kw2", "I": "url2"}], header=["H", "I"], repo_root=tmp_path
@@ -175,6 +179,87 @@ def test_append_rows_starts_after_last_row(monkeypatch, tmp_path):
     assert result["mode"] == "sheets"
     assert captured["cell"] == "A3"  # 헤더 1행 + 데이터 1행 다음 = 3행부터
     assert captured["rows"] == [["kw2", "url2"]]
+    # copy_format 기본 True: 2행(기존 드롭다운 행) 서식을 새 행(3행)에 복사한다.
+    assert format_calls == [(("sid", 0, 2, 3, 3), {"n_cols": 2})]
+
+
+def test_append_rows_skips_format_copy_when_disabled(monkeypatch, tmp_path):
+    table = [["H", "I"], ["kw1", "url1"]]
+    monkeypatch.setattr(sw, "_read_export_csv", lambda sid, gid, timeout=15.0: table)
+    monkeypatch.setattr(
+        sw, "_write_verified", lambda sid, gid, cell, rows, repo_root=".": {"written": len(rows), "mode": "sheets", "cell": cell}
+    )
+    called = []
+    monkeypatch.setattr(sw, "copy_row_format", lambda *a, **k: called.append(1))
+    sw.append_rows(
+        "sid", "탭", [{"H": "kw2", "I": "url2"}], header=["H", "I"], repo_root=tmp_path, copy_format=False
+    )
+    assert called == []
+
+
+def test_paste_special_finds_submenu_item(monkeypatch):
+    """`_paste_special`이 부모 메뉴 hover 후 하위 메뉴에서 대상 텍스트를 찾아 클릭하는지."""
+
+    class FakeItem:
+        def __init__(self, text):
+            self._text = text
+            self.clicked = False
+            self.hovered = False
+
+        def inner_text(self):
+            return self._text
+
+        def hover(self):
+            self.hovered = True
+
+        def click(self, force=False):
+            self.clicked = True
+
+    class FakeLocator:
+        def __init__(self, items):
+            self._items = items
+
+        def count(self):
+            return len(self._items)
+
+        def nth(self, i):
+            return self._items[i]
+
+    class FakePage:
+        def __init__(self):
+            self.round = 0
+            self.parent = FakeItem("선택하여 붙여넣기")
+            self.target = FakeItem("데이터 확인만 붙여넣기")
+            self.escaped = False
+
+        def locator(self, sel):
+            self.round += 1
+            if self.round == 1:
+                return FakeLocator([self.parent])  # baseline(부모 메뉴 찾기)
+            if self.round in (2, 3):
+                return FakeLocator([self.target])  # 하위 메뉴에서 대상 항목 찾기·클릭
+            return FakeLocator([])  # 클릭 뒤 메뉴가 닫혔는지 확인 -> 빈 목록 = 닫힘
+
+        class _KB:
+            def __init__(self, outer):
+                self.outer = outer
+
+            def press(self, key):
+                if key == "Escape":
+                    self.outer.escaped = True
+
+        @property
+        def keyboard(self):
+            return FakePage._KB(self)
+
+        def wait_for_timeout(self, ms):
+            pass
+
+    page = FakePage()
+    sw._paste_special(page, "데이터 확인만 붙여넣기")
+    assert page.parent.clicked  # hover가 아니라 click으로 하위 메뉴를 연다(2026-09-24 실측)
+    assert page.target.clicked
+    assert not page.escaped
 
 
 # --------------------------------------------------------------------------
@@ -247,7 +332,8 @@ def test_sync_keywords_to_sheet_picks_only_target_rows(tmp_path, monkeypatch):
         "insert into keywords values (?, ?, ?, ?, ?, ?)",
         [
             ("직접키워드", 100, "딱맞음", 0, 0, 0),
-            ("무관키워드", 50, "", 3, 3, 0),  # relevance 3 = 무관 -> 제외
+            ("당위성키워드", 60, "당위성 논리", 3, 3, 0),  # 2026-09-24: 3=당위성 -> 원고 대상 포함
+            ("무관키워드", 50, "", 4, 4, 0),  # relevance 4 = 무관 -> 제외
             ("검토대기", 30, "", 1, 1, 1),  # needs_review -> 제외
             ("이미시트에있음", 20, "", 2, 2, 0),  # 시트에 이미 있음 -> 제외
         ],
@@ -270,12 +356,15 @@ def test_sync_keywords_to_sheet_picks_only_target_rows(tmp_path, monkeypatch):
     monkeypatch.setattr(sw, "append_rows", fake_append_rows)
 
     res = sw.sync_keywords_to_sheet("테스트브랜드", repo_root=tmp_path)
-    # SQL 단계에서 무관키워드(relevance 3)·검토대기(needs_review) 제외 -> 2건 picked
-    assert res["picked"] == 2
-    # 그중 이미시트에있음은 시트 H열에 이미 있어 append에서 다시 제외 -> 1건만 appended
-    assert res["appended"] == 1
+    # SQL 단계에서 무관키워드(relevance 4)·검토대기(needs_review) 제외 -> 3건 picked
+    assert res["picked"] == 3
+    # 그중 이미시트에있음은 시트 H열에 이미 있어 append에서 다시 제외 -> 2건만 appended
+    assert res["appended"] == 2
     kws = [r["키워드"] for r in captured["rows"]]
-    assert kws == ["직접키워드"]
+    assert kws == ["직접키워드", "당위성키워드"]
+    # 당위성 등급은 본문 분류가 "당위성"이어야 한다
+    labels = {r["키워드"]: r["본문 분류"] for r in captured["rows"]}
+    assert labels["당위성키워드"] == "당위성"
 
 
 def test_apply_exposure_maps_columns_and_writes_totals(tmp_path, monkeypatch):
