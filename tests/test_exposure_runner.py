@@ -144,9 +144,12 @@ def test_next_priority_batch_같은_키워드_연속_두번_안뽑힘(tmp_path, 
     assert len(picked_first) == 1
     first_keyword = picked_first[0]["keyword"]
 
-    # 러너가 실제로 하는 것처럼: 검사 직후 바로 DB에 결과를 저장한다.
+    # 러너가 실제로 하는 것처럼: 검사 직후 바로 DB에 결과를 저장하고,
+    # last_checked 캐시(TTL 20초)도 즉시 갱신한다(2026-09-24 2차,
+    # `_finalize_row`가 이렇게 함).
     row = ke.ExposureRow("테스트브랜드", first_keyword, "마이카페", "", None, "pushed", now_iso())
     store.save(rt.conn, row.as_row())
+    exposure_priority.mark_checked(rt, "테스트브랜드", first_keyword, row.status, row.checked_at)
 
     # 같은 목록으로 곧바로 다시 뽑아도 방금 검사한 키워드는 다시 안 나온다
     # (아직 재검사 주기(기본 48시간/7일)가 안 지났으므로 99등급 → 제외).
@@ -156,6 +159,7 @@ def test_next_priority_batch_같은_키워드_연속_두번_안뽑힘(tmp_path, 
         assert picked_next[0]["keyword"] != first_keyword
         row = ke.ExposureRow("테스트브랜드", picked_next[0]["keyword"], "마이카페", "", None, "pushed", now_iso())
         store.save(rt.conn, row.as_row())
+        exposure_priority.mark_checked(rt, "테스트브랜드", picked_next[0]["keyword"], row.status, row.checked_at)
 
     # 이제 전부 방금 검사됨 — 주기 전이라 아무것도 안 뽑힌다(연속 재검사 방지)
     assert exposure_priority.next_priority_batch(rt, "테스트브랜드", n=1) == []
@@ -439,10 +443,13 @@ def test_universe_캐시_브랜드마다_따로(tmp_path, monkeypatch):
     assert calls == ["브랜드A", "브랜드B"], "브랜드별로 캐시가 따로 유지돼야 한다"
 
 
-def test_universe_캐시_last_checked는_캐시와_무관하게_즉시반영(tmp_path, monkeypatch):
-    """universe(시트) 캐시가 TTL 안이어도, 방금 저장한 검사 결과(last_checked,
-    DB)는 캐시하지 않으므로 같은 키워드가 바로 다시 뽑히지 않아야 한다."""
+def test_universe_캐시_last_checked는_mark_checked로_즉시반영(tmp_path, monkeypatch):
+    """universe(시트) 캐시와 정렬 캐시가 TTL 안이어도, `mark_checked`로 갱신한
+    키워드는 last_checked 캐시(TTL 20초)와 무관하게 같은 키워드가 바로 다시
+    뽑히지 않아야 한다(2026-09-24 2차 — last_checked도 캐시하되 즉시 반영)."""
     exposure_priority.invalidate_universe_cache(None)
+    exposure_priority.invalidate_last_checked_cache(None)
+    exposure_priority.invalidate_sorted_cache(None)
     rt = make_runtime(tmp_path)
     monkeypatch.setattr(ke, "keyword_universe", lambda rt_, brand: _universe_fixture())
 
@@ -452,10 +459,33 @@ def test_universe_캐시_last_checked는_캐시와_무관하게_즉시반영(tmp
 
     row = ke.ExposureRow("테스트브랜드", first_keyword, "마이카페", "", None, "pushed", now_iso())
     store.save(rt.conn, row.as_row())
+    exposure_priority.mark_checked(rt, "테스트브랜드", first_keyword, row.status, row.checked_at)
 
     picked2 = exposure_priority.next_priority_batch(rt, "테스트브랜드", n=1)
     assert len(picked2) == 1
     assert picked2[0]["keyword"] != first_keyword
+
+
+def test_last_checked_캐시_TTL안에서는_mark_checked없으면_stale(tmp_path, monkeypatch):
+    """last_checked 캐시가 살아 있는 동안, `store.save`만 하고 `mark_checked`를
+    안 부르면(비정상 호출 경로) 캐시가 그 저장을 못 보는 게 새 설계의 의도된
+    동작이다 — 정상 경로(`exposure_runner._finalize_row`)는 항상 함께 부른다."""
+    exposure_priority.invalidate_universe_cache(None)
+    exposure_priority.invalidate_last_checked_cache(None)
+    exposure_priority.invalidate_sorted_cache(None)
+    rt = make_runtime(tmp_path)
+    monkeypatch.setattr(ke, "keyword_universe", lambda rt_, brand: _universe_fixture())
+
+    picked = exposure_priority.next_priority_batch(rt, "테스트브랜드", n=1)
+    first_keyword = picked[0]["keyword"]
+    # last_checked 캐시를 먼저 채워 둔다(TTL 20초 시작)
+    exposure_priority.next_priority_batch(rt, "테스트브랜드", n=1)
+
+    row = ke.ExposureRow("테스트브랜드", first_keyword, "마이카페", "", None, "pushed", now_iso())
+    store.save(rt.conn, row.as_row())  # mark_checked를 일부러 생략
+
+    picked2 = exposure_priority.next_priority_batch(rt, "테스트브랜드", n=1)
+    assert picked2[0]["keyword"] == first_keyword, "mark_checked 없이는 TTL 안에서 그대로 다시 뽑혀야 stale 캐시임을 증명한다"
 
 
 def test_invalidate_universe_cache_비우면_다시조회(tmp_path, monkeypatch):

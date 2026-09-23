@@ -71,7 +71,86 @@
 - 전체 `pytest` 스위트는 **미실행**(다른 일꾼이 동시에 돌리고 있어 코디네이터
   지시로 관련 시험만 실행·통과 확인 후 중단).
 
+## 2차 — last_checked·정렬 결과 캐시 (같은 날 재실측 후)
+
+재실측 결과(`docs/reports/exposure-speed-2026-09-24.md` 6-1·6-2절): universe
+캐시 후에도 "타이밍 우선순위조회" 건당 9.9초(장으뜸 8초, 팥순이 18.7초)로
+개선이 없었다. 원인은 `next_priority_batch`가 매 호출마다 (1)
+`store.latest_by_keyword(rt.conn, brand)` 전체 이력 쿼리와 (2) universe
+1만 개 이상을 순회하며 `priority_tier`·정렬을 다시 했기 때문(1차에서는 이
+두 단계를 캐시하지 않았음).
+
+### 바꾼 구조(2차)
+
+1. **구간별 타이밍 로그** — `next_priority_batch`가 "타이밍 우선순위조회"
+   로그에 정렬캐시 조회 시간과 필터(후보별 재확인) 시간을 나눠 남긴다
+   (`v2r/knowledge/exposure_priority.py`). 러너 쪽 배치 조회(라운드트립)는
+   태그를 "타이밍 큐조회"로 분리해 겹치지 않게 했다
+   (`v2r/knowledge/exposure_runner.py` `WorkerQueue.refill_if_needed`).
+
+2. **last_checked(DB) TTL 캐시** — `_LAST_CHECKED_CACHE`(브랜드별, 기본
+   20초, `config/exposure.yaml` `priority.last_checked_cache_sec`). 러너가
+   검사 결과를 DB에 저장한 직후 새 함수 `exposure_priority.mark_checked(rt,
+   brand, keyword, status, checked_at)`를 불러 그 키워드 한 건만 캐시에 바로
+   갱신한다(`exposure_runner._finalize_row`에 연결). 그래서 TTL이 안 지났어도
+   방금 이 작업자가 검사한 키워드는 즉시 반영돼 같은 키워드가 연속으로
+   다시 뽑히지 않는다. DB 인덱스는 이미 `idx_keyword_exposure_brand
+   (brand, keyword, checked_at)`가 있어(`v2r/store/db.py`) 추가 인덱스는
+   필요 없었다.
+
+3. **정렬 결과 TTL 캐시** — `_sorted_candidates`가 등급(`priority_tier`)
+   매기기·정렬을 universe와 같은 TTL(기본 120초) 동안 캐시해 둔다(전체
+   순회·정렬은 캐시 갱신 시점에만). `next_priority_batch`는 캐시된 정렬
+   목록 앞에서부터, 최신 `last_checked`로 재확인해 이미 재검사 주기가 안
+   지난 항목(`tier>=99`)과 `claim_inflight` 중인(다른 작업자가 선점) 항목만
+   건너뛰고 n개를 채운다 — 후보 하나하나만 가벼운 재확인이라 1만 개 전체
+   재순회보다 훨씬 싸다.
+
+4. **배치 실제 소비 확인** — `WorkerQueue`가 다음 배치를 받기 전에 직전
+   배치에서 몇 개를 실제로 소비했는지(`_consumed`)·`claim_inflight` 실패로
+   버린 개수(`_claim_failed`)를 "타이밍 큐소비" 로그로 남긴다. 또한
+   `next_priority_batch` 자체가 이제 배치를 만들 때 이미 `is_inflight`인
+   키워드를 먼저 제외하므로(3번 항목), 다른 작업자가 선점한 키워드가 애초에
+   배치에 안 들어가 버려지는 일이 줄어든다.
+
+5. 우선순위 등급 규칙(1 노출완 6시간 → 2 최근 발행 → 3 밀려남·미확인 검색량
+   순, 12시간 간격)은 이번에도 그대로다 — `priority_tier` 함수 자체는
+   손대지 않았다.
+
+### 2차 설계상 유의점
+
+`mark_checked`를 부르지 않고 `store.save`만 직접 하는 호출 경로는 최대
+`last_checked_cache_sec`(기본 20초) 동안 그 저장이 배치 조회에 안 보일 수
+있다 — 정상 경로(`exposure_runner._finalize_row`)는 항상 둘을 같이 부르므로
+문제 없다. 이 동작은 단위 시험
+`test_last_checked_캐시_TTL안에서는_mark_checked없으면_stale`로 의도된
+설계임을 확인해 뒀다.
+
+### 예상 절감(2차, 건당 초)
+
+- 재실측 기준 9.9초(장으뜸 8초, 팥순이 18.7초)의 나머지가 대부분
+  `latest_by_keyword` 쿼리 + 1만 개 순회·정렬이었다고 보고, 이제 둘 다
+  브랜드당 TTL 동안(20초/120초) 최대 1회만 실행된다. 배치(기본 10개) 소비에
+  걸리는 시간이 TTL보다 길면 대부분의 조회는 "정렬캐시 히트 + 후보 몇 개만
+  재확인"으로 끝나 순회·정렬 비용이 사실상 0에 수렴한다. 정확한 개선폭은
+  "타이밍 우선순위조회"(정렬캐시=·필터=)와 "타이밍 큐조회"(round_trip=) 로그를
+  재실측해 확인 필요 — 이번에도 코드·단위 시험까지만 완료했고 운영 실측치는
+  아직 없음.
+
+### 시험 결과(2차)
+
+- `tests/test_exposure_runner.py` 39개, `tests/test_keyword_exposure.py` +
+  `tests/test_keyword_exposure_cycle.py` 합쳐 79개 — **3개 파일 118개 전부
+  통과**. 1차 시험(`test_next_priority_batch_같은_키워드_연속_두번_안뽑힘`,
+  `test_universe_캐시_last_checked는_캐시와_무관하게_즉시반영`)은 새 설계에
+  맞춰 `mark_checked` 호출을 추가해 갱신했고(이름도
+  `test_universe_캐시_last_checked는_mark_checked로_즉시반영`으로 변경),
+  `mark_checked` 없이는 TTL 안에서 stale임을 확인하는 시험을 새로 추가했다.
+- 전체 `pytest` 스위트는 **미실행**(다른 일꾼이 동시에 돌리고 있어 관련
+  시험만 통과 확인).
+
 ## 러너 재시작 필요
 
-이번 변경(캐시·배치 큐)은 코드에만 반영됐고 현재 돌고 있는 러너 프로세스에는
-적용되지 않았다 — 러너 재시작 필요.
+1차·2차 변경(캐시·배치 큐·last_checked 캐시·정렬 캐시) 모두 코드에만
+반영됐고 현재 돌고 있는 러너 프로세스에는 적용되지 않았다 — 러너 재시작
+필요.

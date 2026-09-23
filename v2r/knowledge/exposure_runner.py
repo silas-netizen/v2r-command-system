@@ -326,16 +326,19 @@ def judge_once(
 
 def _finalize_row(rt: Any, brand: str, item: dict, row: Any) -> None:
     """판정을 확정해 DB append + 시트 배치 큐(기존 함수 호출만)."""
+    from v2r.knowledge.exposure_priority import mark_checked
     from v2r.knowledge.keyword_exposure import _enqueue_sheet_row, write_exposure_csv
     from v2r.store import keyword_exposure_store as store
 
     store.save(rt.conn, row.as_row())
-    # `next_priority_batch`의 last_checked(DB)는 캐시하지 않고 매번 새로 읽으므로
-    # 이 저장은 다음 조회에 바로 반영된다(같은 키워드 연속 재선택 방지, 단위
-    # 시험 `test_next_priority_batch_같은_키워드_연속_두번_안뽑힘` 참고).
-    # universe 캐시(시트·발굴 CSV, `exposure_priority.invalidate_universe_cache`)는
-    # 검사 결과와 무관해 여기서 비우지 않는다 — 매 건 저장마다 비우면 배치
-    # 캐시 효과가 사라진다.
+    # 2026-09-24 2차 — last_checked(DB)도 이제 TTL(기본 20초) 캐시한다. 저장
+    # 직후 `mark_checked`로 이 키워드만 즉시 갱신해, 캐시가 아직 안 지났어도
+    # 같은 키워드가 연속으로 다시 뽑히지 않게 한다(단위 시험
+    # `test_next_priority_batch_같은_키워드_연속_두번_안뽑힘` 참고).
+    # universe·정렬 캐시(시트·발굴 CSV, `invalidate_universe_cache`/
+    # `invalidate_sorted_cache`)는 검사 결과와 무관해 여기서 비우지 않는다 —
+    # 매 건 저장마다 비우면 배치 캐시 효과가 사라진다.
+    mark_checked(rt, brand, item["keyword"], row.status, row.checked_at)
     _enqueue_sheet_row(rt, brand, item, row)
     try:
         write_exposure_csv(rt, brand)
@@ -586,6 +589,10 @@ class WorkerQueue:
         self.items: list[dict] = []
         self.brand: str | None = None
         self.expires_at: float = 0.0
+        # 2026-09-24 지시 — 배치가 실제로 몇 개나 소비되는지(claim_inflight
+        # 충돌로 대부분 버려져 재조회가 잦은 건 아닌지) 로그로 확인한다.
+        self._consumed = 0
+        self._claim_failed = 0
 
     def _needs_refill(self, brand: str, now: float) -> bool:
         return brand != self.brand or now >= self.expires_at or not self.items
@@ -596,14 +603,24 @@ class WorkerQueue:
             return
         from v2r.knowledge import exposure_priority
 
+        if self.brand is not None:
+            log.info(
+                "타이밍 큐소비 브랜드=%s 소비=%s 선점실패=%s 남은채로재조회=%s",
+                self.brand, self._consumed, self._claim_failed, len(self.items),
+            )
+        # next_priority_batch 자체는 이미 선점 중인(claim_inflight) 항목을
+        # 걸러 주지만(2026-09-24 2차), 이 배치를 받은 뒤에도 다른 작업자가
+        # 그 사이 선점할 수 있으므로 take()에서 다시 한 번 확인한다.
         t0 = time.perf_counter()
         self.items = list(exposure_priority.next_priority_batch(rt, brand, n=self.batch_size))
         log.info(
-            "타이밍 우선순위조회 브랜드=%s sheet_read=%.2fs 배치=%s",
+            "타이밍 큐조회 브랜드=%s round_trip=%.2fs 배치=%s",
             brand, time.perf_counter() - t0, len(self.items),
         )
         self.brand = brand
         self.expires_at = now + self.ttl_sec
+        self._consumed = 0
+        self._claim_failed = 0
 
     def take(self, rt: Any, brand: str, worker_id: int, now: float | None = None) -> dict | None:
         """큐에서 `claim_inflight`로 선점에 성공하는 첫 항목을 꺼내 돌려준다.
@@ -616,7 +633,9 @@ class WorkerQueue:
         while self.items:
             candidate = self.items.pop(0)
             if claim_inflight(rt.settings.repo_root, brand, candidate["keyword"], worker_id):
+                self._consumed += 1
                 return candidate
+            self._claim_failed += 1
         return None
 
 

@@ -48,6 +48,12 @@ _DEFAULT_PRIORITY = {
     # 러너가 한 번에 뽑아 작업자 메모리 큐에 쌓아 둘 후보 수(1건씩 매번
     # 조회하던 것을 배치로 바꿈 — exposure_runner.WorkerQueue 참고).
     "batch_size": 10,
+    # 2026-09-24 2차 재실측(exposure-speed-2026-09-24.md 6-2절) — universe
+    # 캐시 후에도 건당 9.9초로 개선이 없어, 매번 다시 읽던 `latest_by_keyword`
+    # (전체 이력 쿼리)와 매번 다시 하던 등급 매기기·정렬(1만 개 이상 순회)도
+    # 캐시한다. last_checked는 이 초만큼 캐시하되, 러너가 검사 결과를 저장한
+    # 직후 `mark_checked`로 즉시 갱신해 정확도를 지킨다.
+    "last_checked_cache_sec": 20,
 }
 
 
@@ -104,6 +110,117 @@ def _universe_bundle(rt: Any, brand: str, cfg: dict, now: datetime) -> dict[str,
     bundle = {"universe": universe, "cafes": cafes, "recent_norm": recent_norm, "vol_threshold": vol_threshold}
     _UNIVERSE_CACHE[key] = (now_epoch + ttl, bundle)
     return bundle
+
+
+# =======================================================================
+# 2026-09-24 2차 — last_checked(DB) 캐시 + 정렬 결과 캐시.
+#
+# 재실측(exposure-speed-2026-09-24.md 6-2절): universe 캐시 후에도 건당
+# 9.9초로 개선이 없었다. 원인은 `next_priority_batch`가 매 호출마다
+# (1) `store.latest_by_keyword`(브랜드 전체 이력 쿼리)를 다시 읽고
+# (2) 1만 개 이상 universe를 순회하며 `priority_tier`·정렬을 다시 하기 때문.
+#
+# last_checked는 20초(기본) TTL로 캐시하되, 러너가 결과를 저장한 직후
+# `mark_checked`를 불러 그 키워드만 즉시 갱신한다 — TTL이 남아 있어도
+# 방금 이 작업자가 검사한 키워드는 바로 반영된다(같은 키워드 연속 재선택
+# 방지). 정렬된 후보 목록은 universe와 같은 TTL로 캐시하고, 배치 요청마다
+# 캐시를 다시 정렬하지 않고 앞에서부터 아직 유효한(재검사 주기 안 지났거나
+# 다른 작업자가 선점한) 항목만 걸러 자른다 — 전체 재정렬은 캐시 갱신
+# 시점에만 한다.
+# =======================================================================
+
+#: (repo_root, brand) -> (expires_at_epoch, {norm_keyword: {"checked_at","status"}})
+_LAST_CHECKED_CACHE: dict[tuple[str, str], tuple[float, dict[str, dict]]] = {}
+
+#: (repo_root, brand) -> (expires_at_epoch, [(tier, item), ...] 정렬됨)
+_SORTED_CACHE: dict[tuple[str, str], tuple[float, list[tuple[int, dict]]]] = {}
+
+
+def _last_checked_map(rt: Any, brand: str, cfg: dict) -> dict[str, dict]:
+    from v2r.knowledge.keyword_exposure import _norm
+    from v2r.store import keyword_exposure_store as store
+
+    ttl = float(cfg.get("last_checked_cache_sec", 20))
+    key = _cache_key(rt, brand)
+    now_epoch = time.time()
+    cached = _LAST_CHECKED_CACHE.get(key)
+    if cached is not None and cached[0] > now_epoch:
+        return cached[1]
+
+    rows = store.latest_by_keyword(rt.conn, brand)
+    mapping = {
+        _norm(r["keyword"]): {"checked_at": str(r["checked_at"] or ""), "status": str(r["status"] or "")}
+        for r in rows
+    }
+    _LAST_CHECKED_CACHE[key] = (now_epoch + ttl, mapping)
+    return mapping
+
+
+def mark_checked(rt: Any, brand: str, keyword: str, status: str, checked_at: str) -> None:
+    """러너가 검사 결과를 저장한 직후 부른다 — last_checked 캐시(TTL 안이라도)를
+    이 키워드만 바로 갱신해, 다음 배치 조회에서 같은 키워드가 곧바로 다시
+    뽑히지 않게 한다. 캐시가 아직 없으면(TTL 만료 후 첫 검사 등) 이 한
+    항목만으로 새 캐시를 시작한다(다음 조회 때 `_last_checked_map`이 마저
+    채운다 — 그 전까지는 이 키워드에 대해서만 정확하면 충분)."""
+    from v2r.knowledge.keyword_exposure import _norm
+
+    key = _cache_key(rt, brand)
+    entry = {"checked_at": str(checked_at or ""), "status": str(status or "")}
+    cached = _LAST_CHECKED_CACHE.get(key)
+    if cached is None or cached[0] <= time.time():
+        cfg = load_config(rt.settings.repo_root).get("priority", dict(_DEFAULT_PRIORITY))
+        ttl = float(cfg.get("last_checked_cache_sec", 20))
+        _LAST_CHECKED_CACHE[key] = (time.time() + ttl, {_norm(keyword): entry})
+        return
+    cached[1][_norm(keyword)] = entry
+
+
+def invalidate_last_checked_cache(rt: Any, brand: str | None = None) -> None:
+    if brand is None:
+        _LAST_CHECKED_CACHE.clear()
+        return
+    _LAST_CHECKED_CACHE.pop((str(rt.settings.repo_root), brand), None)
+
+
+def _sorted_candidates(rt: Any, brand: str, cfg: dict, now: datetime) -> list[tuple[int, dict]]:
+    """등급·정렬을 한 번만 계산해 TTL(universe와 동일) 동안 캐시한다.
+
+    반환값은 `(tier, item)` 튜플의 정렬된 리스트 — 등급이 낮을수록,
+    같은 등급 안에서는 오래된/검색량 높은 순으로 이미 정렬돼 있다.
+    99등급(주기 전)은 여기서 이미 제외돼 있다."""
+    ttl = float(cfg.get("universe_cache_sec", 120))
+    key = _cache_key(rt, brand)
+    now_epoch = time.time()
+    cached = _SORTED_CACHE.get(key)
+    if cached is not None and cached[0] > now_epoch:
+        return cached[1]
+
+    bundle = _universe_bundle(rt, brand, cfg, now)
+    universe = bundle["universe"]
+    last_checked = _last_checked_map(rt, brand, cfg)
+    recent_norm = bundle["recent_norm"]
+    vol_threshold = bundle["vol_threshold"]
+
+    scored = []
+    for item in universe:
+        tier, age = priority_tier(item, last_checked, recent_norm, cfg, vol_threshold, now)
+        if tier >= 99:
+            continue
+        vol = float(item.get("volume") or 0)
+        sub = (-vol, -age) if tier == 3 else (0.0, -age)
+        scored.append((tier, sub, item))
+    scored.sort(key=lambda t: (t[0], t[1]))
+    result = [(t[0], t[2]) for t in scored]
+    _SORTED_CACHE[key] = (now_epoch + ttl, result)
+    return result
+
+
+def invalidate_sorted_cache(rt: Any, brand: str | None = None) -> None:
+    if brand is None:
+        _SORTED_CACHE.clear()
+        return
+    _SORTED_CACHE.pop((str(rt.settings.repo_root), brand), None)
+
 
 #: 발행 시각이 이 창(±시간) 안이면 "최근 발행"으로 본다
 _RECENT_PUBLISH_WINDOW_HOURS = 2.0
@@ -320,39 +437,52 @@ def next_priority_batch(rt: Any, brand: str, n: int, now: datetime | None = None
 
     99등급(주기가 아직 안 돎)은 절대 뽑히지 않는다 — n개를 못 채우면 그만큼만
     돌려준다(빈 목록도 정상, 순환이 다음 틱에 다시 부른다).
-    """
+
+    2026-09-24 2차 개선 — 등급 매기기·정렬은 `_sorted_candidates`가 TTL 동안
+    캐시한 결과를 쓰고(전체 1만 개 재순회는 캐시 갱신 시점에만), 이 함수는
+    캐시된 정렬 목록 앞에서부터 (a) 캐시 이후 이미 검사돼 주기가 안 지난
+    항목, (b) 다른 작업자가 선점(claim_inflight) 중인 항목만 걸러 n개를
+    자른다."""
+    from v2r.knowledge.exposure_runner import is_inflight
     from v2r.knowledge.keyword_exposure import _norm
-    from v2r.store import keyword_exposure_store as store
 
     now = now or datetime.now(timezone.utc)
     cfg = load_config(rt.settings.repo_root).get("priority", dict(_DEFAULT_PRIORITY))
 
-    bundle = _universe_bundle(rt, brand, cfg, now)
-    universe = bundle["universe"]
-    if not universe:
+    t0 = time.perf_counter()
+    candidates = _sorted_candidates(rt, brand, cfg, now)
+    t1 = time.perf_counter()
+    if not candidates:
         return []
 
-    # last_checked(DB)는 캐시하지 않고 매번 새로 읽는다 — 방금 이 작업자가
-    # 저장한 검사 결과가 바로 다음 조회에 반영돼야 같은 키워드가 연속으로
-    # 다시 뽑히지 않는다(단위 시험 참고).
-    last_checked = {
-        _norm(r["keyword"]): {"checked_at": str(r["checked_at"] or ""), "status": str(r["status"] or "")}
-        for r in store.latest_by_keyword(rt.conn, brand)
-    }
+    last_checked = _last_checked_map(rt, brand, cfg)
+    bundle = _universe_bundle(rt, brand, cfg, now)
     recent_norm = bundle["recent_norm"]
     vol_threshold = bundle["vol_threshold"]
 
-    scored = []
-    for item in universe:
-        tier, age = priority_tier(item, last_checked, recent_norm, cfg, vol_threshold, now)
-        if tier >= 99:
+    out: list[dict] = []
+    skipped_due, skipped_inflight = 0, 0
+    for _tier, item in candidates:
+        # 정렬 캐시 시점 이후 이 키워드가 검사됐을 수 있으니(같은 작업자의
+        # 직전 검사, mark_checked로 즉시 반영됨) 가벼운 last_checked만으로
+        # 다시 등급을 확인한다 — 전체 universe 재순회가 아니라 이 후보
+        # 하나만 보므로 비용이 거의 없다.
+        tier2, _age2 = priority_tier(item, last_checked, recent_norm, cfg, vol_threshold, now)
+        if tier2 >= 99:
+            skipped_due += 1
             continue
-        vol = float(item.get("volume") or 0)
-        # 1·2등급: 오래된 순. 3등급(밀려남·미확인): 검색량 높은 순 → 오래된 순
-        sub = (-vol, -age) if tier == 3 else (0.0, -age)
-        scored.append((tier, sub, item))
-    scored.sort(key=lambda t: (t[0], t[1]))
-    return [item for _, _, item in scored[: max(0, n)]]
+        if is_inflight(rt.settings.repo_root, brand, item["keyword"]):
+            skipped_inflight += 1
+            continue
+        out.append(item)
+        if len(out) >= max(0, n):
+            break
+    t2 = time.perf_counter()
+    log.info(
+        "타이밍 우선순위조회 브랜드=%s 정렬캐시=%.3fs 필터=%.3fs 후보=%s 주기전제외=%s 선점제외=%s",
+        brand, t1 - t0, t2 - t1, len(out), skipped_due, skipped_inflight,
+    )
+    return out
 
 
 def queue_counts(rt: Any, brand: str, now: datetime | None = None) -> dict[str, int]:
@@ -386,4 +516,7 @@ __all__ = [
     "next_priority_batch",
     "queue_counts",
     "invalidate_universe_cache",
+    "mark_checked",
+    "invalidate_last_checked_cache",
+    "invalidate_sorted_cache",
 ]

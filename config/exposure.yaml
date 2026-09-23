@@ -34,8 +34,13 @@ priority:
   pushed_min_gap_hours: 12              # 3순위: 밀려남·미확인은 검색량 순, 같은 키워드는 12시간 지나야 다시
   top_volume_percentile: 0.7            # (보고용) 검색량 상위 30% 기준
   # 2026-09-24 큐 캐시(exposure-speed-2026-09-24.md 6절) — keyword_universe(시트
-  # CSV·키워드DB 전량 읽기)+최근 발행 집합을 이 초만큼 브랜드별로 캐시한다.
-  # last_checked(DB)는 캐시하지 않고 매번 새로 읽어 즉시 반영한다.
+  # CSV·키워드DB 전량 읽기)+최근 발행 집합 및 정렬된 후보 목록을 이 초만큼
+  # 브랜드별로 캐시한다.
   universe_cache_sec: 120
   # 한 번에 뽑아 작업자 메모리 큐에 쌓아 둘 후보 수(매번 n=1로 조회하던 것을 배치로).
   batch_size: 10
+  # 2026-09-24 2차(6-2절) — universe 캐시 후에도 개선이 없어 last_checked(DB
+  # 전체 이력 쿼리)도 이 초만큼 캐시한다. 러너가 검사 결과를 저장한 직후
+  # `exposure_priority.mark_checked`로 그 키워드만 즉시 갱신하므로, 같은
+  # 키워드가 TTL 안에 바로 다시 뽑히는 일은 없다.
+  last_checked_cache_sec: 20
