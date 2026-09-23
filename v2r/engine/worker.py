@@ -2127,6 +2127,12 @@ def dispatch(rt: Runtime, job: Any, owner: str | None = None) -> dict:
         return _exposure_cycle_stop(rt, spec)
     if task == "exposure_cycle_status":
         return _exposure_cycle_status(rt, spec)
+    if task == "keyword_fill_start":
+        return _keyword_fill_start(rt, spec)
+    if task == "keyword_fill_stop":
+        return _keyword_fill_stop(rt, spec)
+    if task == "keyword_fill_status":
+        return _keyword_fill_status(rt, spec)
     if task == "keyword_discovery":
         return _keyword_discovery(rt, spec)
     if task == "keyword_discovery_all":
@@ -2264,6 +2270,67 @@ def _keyword_discovery_status(rt: Runtime, spec: TaskSpec) -> dict:
         finally:
             conn.close()
     return {"ok": True, "per_brand": per_brand}
+
+
+#: `scripts/keyword-fill-hidden.vbs` — 브랜드 5개를 숨김 프로세스로 띄운다(2026-09-24).
+#: 실행기 재시작 없이도 명령이 배선만 되도록 코드로만 넣은 상태 — 실제 사용은
+#: 다음 `v2r serve` 재시작부터(운영 규칙: 실행기 재시작 금지).
+_KEYWORD_FILL_VBS = "scripts\\keyword-fill-hidden.vbs"
+
+
+def _keyword_fill_start(rt: Runtime, spec: TaskSpec) -> dict:
+    """`키워드 채우기 시작` — 브랜드 5개 원고 대상(0~2) 1만 개 채우기를 숨김으로 띄운다."""
+    import subprocess
+
+    repo = Path(rt.settings.repo_root)
+    vbs = repo / _KEYWORD_FILL_VBS
+    if not vbs.exists():
+        return {"ok": False, "error": f"{_KEYWORD_FILL_VBS} 가 없습니다"}
+    try:
+        subprocess.Popen(
+            ["wscript.exe", str(vbs)],
+            cwd=str(repo),
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"{exc.__class__.__name__}: {exc}"}
+    msg = "키워드 채우기 시작: 브랜드 5개 숨김 실행(진행은 '키워드 채우기 현황')"
+    try:
+        notify_all(rt.channels, msg)
+    except Exception:  # noqa: BLE001
+        pass
+    return {"ok": True, "message": msg}
+
+
+def _keyword_fill_stop(rt: Runtime, spec: TaskSpec) -> dict:
+    """`키워드 채우기 중지` — 채우기 워커 파이썬 프로세스를 찾아 끝낸다."""
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            ["wmic", "process", "where", "commandline like '%keyword_fill_loop%'", "get", "processid"],
+            capture_output=True, text=True, timeout=15,
+        )
+        pids = [int(x) for x in out.stdout.split() if x.strip().isdigit()]
+        for pid in pids:
+            subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True, timeout=10)
+        msg = f"키워드 채우기 중지: 프로세스 {len(pids)}개 종료"
+    except Exception as exc:  # noqa: BLE001
+        msg = f"키워드 채우기 중지 시도 중 오류: {exc}"
+    try:
+        notify_all(rt.channels, msg)
+    except Exception:  # noqa: BLE001
+        pass
+    return {"ok": True, "message": msg}
+
+
+def _keyword_fill_status(rt: Runtime, spec: TaskSpec) -> dict:
+    """`키워드 채우기 현황` — `data/keywords/fill_progress.json` 그대로 보고."""
+    from v2r.knowledge import keyword_fill_loop as fill_mod
+
+    repo = Path(rt.settings.repo_root)
+    data = fill_mod.load_progress(fill_mod.progress_path(repo / "data"))
+    return {"ok": True, "per_brand": data}
 
 
 def _keyword_relevance_rescan(rt: Runtime, spec: TaskSpec) -> dict:

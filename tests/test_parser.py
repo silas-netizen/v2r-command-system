@@ -95,7 +95,24 @@ def test_all_tasks_covered_by_tests():
     # + 가상 PC 원고 내보내기 1건(vpc_export, 2026-09-23 — v2r/vpc 구분자 도입)
     # + 키워드 연관도 2건(keyword_relevance_rescan·keyword_relevance_status, 2026-09-23)
     # + 시트 키워드 반영 1건(sheet_sync_keywords, 2026-09-23 — 노출 순환 연결 2)
-    assert len(ALLOWED_TASKS) == 57
+    # + 키워드 채우기 3건(keyword_fill_start·keyword_fill_stop·keyword_fill_status, 2026-09-24 —
+    #   원고 대상 1만 개까지 순환. 코드만 배선, 다음 실행기 재시작부터 사용 가능)
+    assert len(ALLOWED_TASKS) == 60
+
+
+def test_keyword_fill_start():
+    spec = parse_korean_command("키워드 채우기 시작", now=NOW)
+    assert spec.task == "keyword_fill_start"
+
+
+def test_keyword_fill_stop():
+    spec = parse_korean_command("키워드 채우기 중지", now=NOW)
+    assert spec.task == "keyword_fill_stop"
+
+
+def test_keyword_fill_status():
+    spec = parse_korean_command("키워드 채우기 현황", now=NOW)
+    assert spec.task == "keyword_fill_status"
 
 
 def test_wash_photos_count():

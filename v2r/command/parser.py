@@ -29,6 +29,11 @@ TASK_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     # "키워드 발굴"에 가로채이지 않는다("연관도"가 있으면 이쪽이 맞다)
     ("keyword_relevance_status", re.compile(r"키워드\s*연관도\s*현황")),
     ("keyword_relevance_rescan", re.compile(r"키워드\s*연관도\s*재산정")),
+    # 키워드 채우기(원고 대상 1만 개까지 순환, 2026-09-24) — 현황/중지를 시작보다 먼저 봐야
+    # "시작"이 없어도 "채우기"만으로 가로채이지 않는다
+    ("keyword_fill_status", re.compile(r"키워드\s*채우기\s*현황")),
+    ("keyword_fill_stop", re.compile(r"키워드\s*채우기\s*(중지|정지|멈춰)")),
+    ("keyword_fill_start", re.compile(r"키워드\s*채우기\s*시작")),
     # 시트 키워드 반영 (연결 2, 2026-09-23) — `시트 키워드 반영 우아덤` / `시트 키워드 반영 전체`.
     # 다른 "시트...동기화/갱신" 패턴보다 먼저 봐야 "반영"이 그쪽으로 안 가로채인다.
     ("sheet_sync_keywords", re.compile(r"시트\s*키워드\s*반영")),
@@ -267,6 +272,8 @@ _NO_SLOT_TASKS = frozenset(
         "keyword_relevance_status",
         "keyword_relevance_rescan",
         "sheet_sync_keywords",
+        "keyword_fill_status",
+        "keyword_fill_stop",
     }
 )
 
