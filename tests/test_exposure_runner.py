@@ -162,3 +162,68 @@ def test_next_priority_batch_같은_키워드_연속_두번_안뽑힘(tmp_path, 
 
     # 이제 전부 방금 검사됨 — 주기 전이라 아무것도 안 뽑힌다(연속 재검사 방지)
     assert exposure_priority.next_priority_batch(rt, "테스트브랜드", n=1) == []
+
+
+# =======================================================================
+# 노출완 → 밀려남 2단계 확인 (2026-09-24, 비만도 계산기 23:31 일시 변동 사례)
+# =======================================================================
+
+def _fake_row(brand, keyword, status, cafe="마이카페"):
+    return ke.ExposureRow(brand, keyword, cafe, "", None, status, now_iso())
+
+
+def test_노출완에서_밀려남_첫관측은_보류만_DB안바뀜(tmp_path, monkeypatch):
+    rt = make_runtime(tmp_path)
+    brand, keyword = "테스트브랜드", "비만도계산기"
+    store.save(rt.conn, _fake_row(brand, keyword, "exposed").as_row())
+
+    monkeypatch.setattr(exposure_runner, "judge_once", lambda rt_, ctx, b, item, cfg: _fake_row(b, item["keyword"], "pushed"))
+    item = {"keyword": keyword, "cafe": "마이카페", "t0_status": "", "volume": 0}
+
+    result = exposure_runner.process_one(rt, object(), brand, item, {})
+    assert result["status"] == "pending_confirm"
+
+    assert exposure_runner._latest_status(rt.conn, brand, keyword) == "exposed"  # DB는 아직 안 바뀜
+    pending = exposure_runner.get_pending(rt.settings.repo_root, brand, keyword)
+    assert pending is not None and pending["item"]["keyword"] == keyword
+
+
+def test_재확인에서도_밀려남이면_확정(tmp_path, monkeypatch):
+    rt = make_runtime(tmp_path)
+    brand, keyword = "테스트브랜드", "비만도계산기"
+    store.save(rt.conn, _fake_row(brand, keyword, "exposed").as_row())
+    item = {"keyword": keyword, "cafe": "마이카페", "t0_status": "", "volume": 0}
+
+    monkeypatch.setattr(exposure_runner, "judge_once", lambda rt_, ctx, b, i, cfg: _fake_row(b, i["keyword"], "pushed"))
+    exposure_runner.process_one(rt, object(), brand, item, {})  # 1차: 보류
+
+    result = exposure_runner.process_one(rt, object(), brand, item, {})  # 2차: 또 밀려남
+    assert result["status"] == "pushed"
+    assert result.get("confirmed") is True
+    assert exposure_runner._latest_status(rt.conn, brand, keyword) == "pushed"
+    assert exposure_runner.get_pending(rt.settings.repo_root, brand, keyword) is None
+
+
+def test_재확인에서_다시_노출완이면_일시변동으로_취소(tmp_path, monkeypatch):
+    rt = make_runtime(tmp_path)
+    brand, keyword = "테스트브랜드", "비만도계산기"
+    store.save(rt.conn, _fake_row(brand, keyword, "exposed").as_row())
+    item = {"keyword": keyword, "cafe": "마이카페", "t0_status": "", "volume": 0}
+
+    monkeypatch.setattr(exposure_runner, "judge_once", lambda rt_, ctx, b, i, cfg: _fake_row(b, i["keyword"], "pushed"))
+    exposure_runner.process_one(rt, object(), brand, item, {})  # 1차: 보류
+
+    monkeypatch.setattr(exposure_runner, "judge_once", lambda rt_, ctx, b, i, cfg: _fake_row(b, i["keyword"], "exposed"))
+    result = exposure_runner.process_one(rt, object(), brand, item, {})  # 2차: 다시 노출완
+    assert result.get("false_alarm_cleared") is True
+    assert exposure_runner._latest_status(rt.conn, brand, keyword) == "exposed"
+    assert exposure_runner.get_pending(rt.settings.repo_root, brand, keyword) is None
+
+
+def test_due_pending_시간지나야만_뽑힘(tmp_path):
+    item = {"keyword": "키워드", "cafe": "", "t0_status": "", "volume": 0}
+    exposure_runner.set_pending(tmp_path, "브랜드", item, {"pending_confirm_min_minutes": 5, "pending_confirm_max_minutes": 5}, now=1000.0)
+    assert exposure_runner.due_pending(tmp_path, now=1000.0) == []
+    due = exposure_runner.due_pending(tmp_path, now=1000.0 + 301)
+    assert len(due) == 1
+    assert due[0]["item"]["keyword"] == "키워드"

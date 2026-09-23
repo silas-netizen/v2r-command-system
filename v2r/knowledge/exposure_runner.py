@@ -236,16 +236,10 @@ def _to_epoch(iso: str) -> float:
 # 작업자 루프
 # =======================================================================
 
-def process_one(rt: Any, context: Any, brand: str, item: dict, cfg: dict) -> dict:
-    """키워드 하나: 조기 종료 스크롤 → 기존 판정 함수 → DB/시트 큐. 반환은 판정 요약."""
-    from v2r.knowledge.keyword_exposure import (
-        ExposureRow,
-        _enqueue_sheet_row,
-        judge_keyword_exposure,
-        now_iso,
-        resolve_search_query,
-    )
-    from v2r.store import keyword_exposure_store as store
+def judge_once(rt: Any, context: Any, brand: str, item: dict, cfg: dict) -> "ExposureRow":  # noqa: F821
+    """키워드 하나 조기 종료 스크롤 → 기존 판정 함수. DB/시트에는 아직 안 쓴다
+    (2차 확인 대기 로직이 `process_one`에서 저장 여부를 결정한다)."""
+    from v2r.knowledge.keyword_exposure import ExposureRow, judge_keyword_exposure, now_iso, resolve_search_query
 
     keyword = item["keyword"]
     query = resolve_search_query(keyword)
@@ -260,10 +254,7 @@ def process_one(rt: Any, context: Any, brand: str, item: dict, cfg: dict) -> dic
         )
     except Exception as exc:
         log.warning("페이지 로드 실패(%s): %s", keyword, exc)
-        row = ExposureRow(brand, keyword, item.get("cafe", ""), "", None, "unknown", now_iso(), item.get("t0_status", ""), query)
-        store.save(rt.conn, row.as_row())
-        _enqueue_sheet_row(rt, brand, item, row)
-        return {"status": "unknown", "keyword": keyword}
+        return ExposureRow(brand, keyword, item.get("cafe", ""), "", None, "unknown", now_iso(), item.get("t0_status", ""), query)
 
     verdict = judge_keyword_exposure(
         rt,
@@ -274,7 +265,7 @@ def process_one(rt: Any, context: Any, brand: str, item: dict, cfg: dict) -> dic
         search_query=query,
         article_index=getattr(rt, "article_index", None),
     )
-    row = ExposureRow(
+    return ExposureRow(
         brand,
         keyword,
         item.get("cafe", ""),
@@ -286,15 +277,132 @@ def process_one(rt: Any, context: Any, brand: str, item: dict, cfg: dict) -> dic
         verdict["search_query"],
         verdict.get("rank_overall"),
     )
+
+
+def _finalize_row(rt: Any, brand: str, item: dict, row: Any) -> None:
+    """판정을 확정해 DB append + 시트 배치 큐(기존 함수 호출만)."""
+    from v2r.knowledge.keyword_exposure import _enqueue_sheet_row, write_exposure_csv
+    from v2r.store import keyword_exposure_store as store
+
     store.save(rt.conn, row.as_row())
     _enqueue_sheet_row(rt, brand, item, row)
     try:
-        from v2r.knowledge.keyword_exposure import write_exposure_csv
-
         write_exposure_csv(rt, brand)
     except Exception as exc:  # pragma: no cover - 방어용
         log.warning("노출 CSV 갱신 실패(%s): %s", brand, exc)
+
+
+def _latest_status(conn: Any, brand: str, keyword: str) -> str:
+    # checked_at은 초 단위라 같은 초 안에 두 번 저장되면 값이 같을 수 있다
+    # (테스트, 또는 확인 즉시 재확인) — rowid로 동률을 깬다(나중에 쓴 쪽 우선).
+    row = conn.execute(
+        "SELECT status FROM keyword_exposure WHERE brand = ? AND keyword = ? "
+        "ORDER BY checked_at DESC, rowid DESC LIMIT 1",
+        (brand, keyword),
+    ).fetchone()
+    return str(row["status"]) if row else ""
+
+
+def process_one(rt: Any, context: Any, brand: str, item: dict, cfg: dict) -> dict:
+    """키워드 하나 검사 + 노출완→밀려남 2단계 확인(아래 참고) + DB/시트 반영.
+
+    2026-09-24 코디네이터 지시(비만도 계산기 23:31 일시 변동 사례) — 직전
+    판정이 `exposed`였는데 이번에 `pushed`가 나오면 **바로 확정하지 않는다**.
+    `data/exposure_pending_confirm.json`에 `pending_confirm`으로만 기록해 두고
+    5~10분 뒤(`pending_confirm_min_minutes`~`pending_confirm_max_minutes`,
+    설정 기본값) 같은 키워드를 다시 확인한 결과가 **또** `pushed`일 때만 DB·
+    시트를 밀려남으로 바꾼다. 재확인에서 `exposed`가 나오면(일시 변동) 대기를
+    지우고 아무 것도 바꾸지 않는다 — 직전 `exposed` 행이 이미 최신이라 그대로
+    유지된다. 판정 규칙 자체(`judge_keyword_exposure`)는 그대로 호출만 한다.
+    """
+    keyword = item["keyword"]
+    prev_status = _latest_status(rt.conn, brand, keyword)
+    pending = get_pending(rt.settings.repo_root, brand, keyword)
+
+    row = judge_once(rt, context, brand, item, cfg)
+
+    if row.status == "pushed" and (prev_status == "exposed" or pending is not None):
+        if pending is None:
+            # 노출완 → 밀려남 첫 관측 — 바로 확정하지 않고 대기만 남긴다(DB 미기록).
+            set_pending(rt.settings.repo_root, brand, item, cfg)
+            return {"status": "pending_confirm", "keyword": keyword}
+        # 대기 중이던 키워드의 재확인 — 이번에도 밀려남이면 확정.
+        clear_pending(rt.settings.repo_root, brand, keyword)
+        _finalize_row(rt, brand, item, row)
+        return {"status": row.status, "keyword": keyword, "rank": row.rank, "confirmed": True}
+
+    if pending is not None:
+        # 대기 중이었는데 이번엔 밀려남이 아님(exposed로 되돌아옴) — 일시 변동,
+        # 대기만 지우고 DB는 안 건드린다(직전 exposed 행이 이미 최신).
+        clear_pending(rt.settings.repo_root, brand, keyword)
+        if row.status != "exposed":
+            _finalize_row(rt, brand, item, row)
+        return {"status": row.status, "keyword": keyword, "rank": row.rank, "false_alarm_cleared": True}
+
+    _finalize_row(rt, brand, item, row)
     return {"status": row.status, "keyword": keyword, "rank": row.rank}
+
+
+# =======================================================================
+# 노출완→밀려남 2단계 확인 대기열
+# =======================================================================
+
+PENDING_CONFIRM_FILE = "exposure_pending_confirm.json"
+
+
+def pending_confirm_path(repo_root: str | Path) -> Path:
+    return Path(repo_root) / "data" / PENDING_CONFIRM_FILE
+
+
+def _load_pending_all(repo_root: str | Path) -> dict:
+    p = pending_confirm_path(repo_root)
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _write_pending_all(repo_root: str | Path, data: dict) -> None:
+    p = pending_confirm_path(repo_root)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, p)
+
+
+def _pending_key(brand: str, keyword: str) -> str:
+    return f"{brand}|{keyword}"
+
+
+def get_pending(repo_root: str | Path, brand: str, keyword: str) -> dict | None:
+    return _load_pending_all(repo_root).get(_pending_key(brand, keyword))
+
+
+def set_pending(repo_root: str | Path, brand: str, item: dict, cfg: dict, now: float | None = None) -> dict:
+    now = now if now is not None else time.time()
+    min_m = float(cfg.get("pending_confirm_min_minutes", 5))
+    max_m = float(cfg.get("pending_confirm_max_minutes", 10))
+    due_at = now + random.uniform(min_m, max_m) * 60
+    data = _load_pending_all(repo_root)
+    entry = {"brand": brand, "item": item, "since": now, "due_at": due_at, "first_status": "pushed"}
+    data[_pending_key(brand, item["keyword"])] = entry
+    _write_pending_all(repo_root, data)
+    return entry
+
+
+def clear_pending(repo_root: str | Path, brand: str, keyword: str) -> None:
+    data = _load_pending_all(repo_root)
+    data.pop(_pending_key(brand, keyword), None)
+    _write_pending_all(repo_root, data)
+
+
+def due_pending(repo_root: str | Path, now: float | None = None) -> list[dict]:
+    """지금 재확인할 때가 된(`due_at` 지남) 대기 목록."""
+    now = now if now is not None else time.time()
+    data = _load_pending_all(repo_root)
+    return [e for e in data.values() if float(e.get("due_at", 0)) <= now]
 
 
 def run_worker(worker_id: int, brands: list[str] | None = None, max_iterations: int | None = None) -> None:
@@ -348,13 +456,22 @@ def run_worker(worker_id: int, brands: list[str] | None = None, max_iterations: 
                     continue
 
                 iterations += 1
-                brand = brand_list[brand_idx % len(brand_list)]
-                brand_idx += 1
-                batch = exposure_priority.next_priority_batch(rt, brand, n=1)
-                if not batch:
-                    time.sleep(2.0)
-                    continue
-                item = batch[0]
+
+                # 밀려남 2차 확인 대기 중인 키워드가 때(5~10분) 됐으면 그걸 먼저
+                # 처리한다 — 우선순위 등급과 무관하게 시간이 생명인 재확인.
+                due = due_pending(rt.settings.repo_root)
+                if due:
+                    entry = due[0]
+                    brand = entry["brand"]
+                    item = entry["item"]
+                else:
+                    brand = brand_list[brand_idx % len(brand_list)]
+                    brand_idx += 1
+                    batch = exposure_priority.next_priority_batch(rt, brand, n=1)
+                    if not batch:
+                        time.sleep(2.0)
+                        continue
+                    item = batch[0]
                 result = process_one(rt, context, brand, item, cfg)
                 update_worker_state(rt.settings.repo_root, worker_id, processed_delta=1, last_keyword=item["keyword"])
                 unknown_streak = unknown_streak + 1 if result["status"] == "unknown" else 0
@@ -403,7 +520,13 @@ __all__ = [
     "maybe_set_global_pause",
     "global_pause_remaining",
     "is_alive",
+    "judge_once",
     "process_one",
+    "pending_confirm_path",
+    "get_pending",
+    "set_pending",
+    "clear_pending",
+    "due_pending",
     "run_worker",
     "main",
 ]

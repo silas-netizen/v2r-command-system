@@ -20,6 +20,11 @@ worker_rest_minutes: 15
 # 전체 작업자가 동시에 휴식 상태 → 순환 전체 정지(분)
 global_block_rest_minutes: 30
 
+# 노출완 → 밀려남 2단계 확인(2026-09-24, 비만도 계산기 23:31 일시 변동 사례)
+# 첫 밀려남은 확정하지 않고 이 범위(분) 안에서 무작위로 다시 확인한다.
+pending_confirm_min_minutes: 5
+pending_confirm_max_minutes: 10
+
 # 우선순위 등급별 재검사 주기(시간) — exposure_priority.py
 priority:
   # 1순위: 한 번도 검사 안 한 키워드 — 주기 없음(늘 최우선)
