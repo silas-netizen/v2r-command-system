@@ -716,16 +716,28 @@ def run_worker(worker_id: int, brands: list[str] | None = None, max_iterations: 
                         brand, item = entry["brand"], entry["item"]
                         break
                 if item is None:
-                    # 2026-09-24 3차 지시로 발견 — 이전엔 반복마다 브랜드를
-                    # 무조건 바꿔서, 배치(WorkerQueue)를 가져와도 평균 1개만
-                    # 쓰고 버리는 셈이었다(큐소비 로그 실측: 소비=1.0). 이 배치가
-                    # 빌 때까지는 같은 브랜드에 머물러 실제로 배치를 다 쓴다 —
-                    # 브랜드 로테이션은 큐가 빈 시점(=배치 소진 또는 이 브랜드에
-                    # 지금 검사할 게 없음)에만 진행한다.
+                    # 2026-09-24 — 브랜드 고정(위 커밋 de22603)을 실측했더니
+                    # 처리량은 늘었지만(약 1,012건/시) 실제로는 267건 중 180건
+                    # (67%)이 같은 키워드 중복 재검사였다 — 되돌린다(아래 참고).
+                    #
+                    # 원인: exposure_priority의 universe/정렬/last_checked
+                    # 캐시가 **프로세스별 메모리**(모듈 전역 dict)라, mark_checked는
+                    # 그 호출을 한 작업자 자신의 캐시만 갱신하고 다른 4개 작업자
+                    # 프로세스의 캐시는 그대로다. 브랜드를 매번 바꿀 때는 이 문제가
+                    # 가려져 있었다(각 작업자가 그 브랜드에 머무는 시간이 짧아
+                    # 캐시가 실제로 많이 재사용되기 전에 다음 브랜드로 넘어갔음).
+                    # 브랜드에 오래 머물게 하자 5개 작업자가 각자의 정체된 캐시로
+                    # 같은 상위권 키워드를 반복해서 다시 뽑아냈다(예: "가정용좌욕기"
+                    # 6번, 05:50:04~05:51:03 사이). claim_inflight는 "동시" 선점만
+                    # 막을 뿐, TTL(120초) 동안 여러 번 순차로 다시 뽑히는 건 못 막는다.
+                    #
+                    # 안전한 순서: exposure_priority가 캐시를 프로세스 간 공유(파일
+                    # 기반 등)하거나 무효화 신호를 브로드캐스트하게 고치기 전에는
+                    # 브랜드를 매번 바꾸는 쪽이 낫다(중복 0건 확인된 방식).
                     brand = brand_list[brand_idx % len(brand_list)]
+                    brand_idx += 1
                     item = worker_queue.take(rt, brand, worker_id)
                     if item is None:
-                        brand_idx += 1
                         time.sleep(2.0)
                         continue
 
