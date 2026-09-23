@@ -1946,17 +1946,21 @@ def build_body_prompt(
     guide_text: str = "",
     manuscript_type: str = "",
     examples: list[str] | None = None,
+    reference_brief: str = "",
 ) -> tuple[str, str]:
     """본문 생성용 `(공용 system, 이번 할 일 user)` 프롬프트.
 
     system은 `build_shared_system`이 만든 **브랜드 공용** 문자열 그대로다.
-    "본문을 써라"와 출력 형식, 키워드·카페는 user로 간다.
+    "본문을 써라"와 출력 형식, 키워드·카페는 user로 간다. `reference_brief`(통검
+    1등 글 형식 요약, 2026-09-23 지시)도 키워드마다 달라지므로 user에만 넣는다
+    — system(브랜드 공용, 캐시 대상)은 건드리지 않는다.
     """
     rule = rule_for(brand, manuscript_type)
     system = build_shared_system(brand, manuscript_type, guide_text, examples)
-    user = "\n".join(
-        [BRAND_BODY_TASK, "", *_body_dynamic_block(rule, keyword, cafe)]
-    )
+    lines = [BRAND_BODY_TASK, "", *_body_dynamic_block(rule, keyword, cafe)]
+    if reference_brief:
+        lines += ["", "【참고 형식(통검 1등 글)】", reference_brief]
+    user = "\n".join(lines)
     return system, user
 
 
@@ -2091,12 +2095,16 @@ def build_combined_prompt(
     guide_text: str = "",
     manuscript_type: str = "",
     examples: list[str] | None = None,
+    reference_brief: str = "",
 ) -> tuple[str, str]:
     """본문 + 댓글 12개를 **한 번에** 받는 `(공용 system, 이번 할 일 user)` 프롬프트."""
     rule = rule_for(brand, manuscript_type)
     system = build_shared_system(brand, manuscript_type, guide_text, examples)
+    combined_lines = [BRAND_COMBINED_TASK, "", *_body_dynamic_block(rule, keyword, cafe)]
+    if reference_brief:
+        combined_lines += ["", "【참고 형식(통검 1등 글)】", reference_brief]
     user = "\n".join(
-        [BRAND_COMBINED_TASK, "", *_body_dynamic_block(rule, keyword, cafe)]
+        combined_lines
     )
     return system, user
 
@@ -2842,6 +2850,7 @@ def generate_manuscript(
     mode: str = "",
     examples: list[str] | None = None,
     recent_openings: list[str] | None = None,
+    reference_brief: str = "",
 ) -> Manuscript:
     """키워드 한 개로 제목·본문·댓글 12개를 만든다.
 
@@ -2873,11 +2882,12 @@ def generate_manuscript(
 
     if mode == "combined":
         return _generate_combined(
-            llm, rule, brand, keyword, cafe, guide_text, stats, cap, before, examples
+            llm, rule, brand, keyword, cafe, guide_text, stats, cap, before, examples,
+            reference_brief,
         )
 
     body_sys, body_user = build_body_prompt(
-        brand, keyword, cafe, guide_text, rule.manuscript_type, examples
+        brand, keyword, cafe, guide_text, rule.manuscript_type, examples, reference_brief
     )
     draft: Manuscript | None = None
     body_bad: list[str] = []
@@ -3222,13 +3232,14 @@ def _generate_combined(
     cap: int,
     before: dict,
     examples: list[str] | None = None,
+    reference_brief: str = "",
 ) -> Manuscript:
     """본문 + 댓글 12개를 한 번에 받는 방식 (`mode="combined"`).
 
     본문이 어긋나면 통째로 다시, 댓글만 어긋나면 **걸린 자리만** 다시 받는다.
     """
     sys_p, user_p = build_combined_prompt(
-        brand, keyword, cafe, guide_text, rule.manuscript_type, examples
+        brand, keyword, cafe, guide_text, rule.manuscript_type, examples, reference_brief
     )
     draft: Manuscript | None = None
     bad_all: list[str] = []

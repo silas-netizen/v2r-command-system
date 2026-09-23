@@ -16,11 +16,14 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 
 from v2r.config import load_yaml
 from v2r.content import brand_queue
+
+log = logging.getLogger(__name__)
 
 MAX_ATTEMPTS = 3
 
@@ -114,6 +117,16 @@ def generate_for_brand(rt: Any, brand: str, n: int, target: str = "") -> dict:
                 examples_cache[mtype] = examples
 
             brand_queue.mark(rt, row["id"], "generating")
+            reference_brief = ""
+            reference_meta: dict = {}
+            try:
+                from v2r.content import top_reference
+
+                reference_brief = top_reference.reference_for(
+                    rt, brand, row["keyword"], meta=reference_meta
+                )
+            except Exception as exc:  # 참고 형식은 덤 — 실패해도 원고 생성은 막지 않는다
+                log.warning("참고 형식 조회 실패(%s/%s): %s", brand, row["keyword"], exc)
             try:
                 m, stats = _worker.generate_and_crosscheck_one(
                     rt,
@@ -125,6 +138,7 @@ def generate_for_brand(rt: Any, brand: str, n: int, target: str = "") -> dict:
                     examples,
                     recent_openings,
                     closings,
+                    reference_brief=reference_brief,
                 )
             except Exception as exc:
                 from v2r.llm.plan_backend import PlanLimit
@@ -139,6 +153,7 @@ def generate_for_brand(rt: Any, brand: str, n: int, target: str = "") -> dict:
                 failed.append({"keyword": row["keyword"], "error": str(exc)})
                 continue
 
+            stats["reference_url"] = reference_meta.get("reference_url", "")
             hard_unresolved = stats.get("unresolved_hard") or []
             out_path = out_dir / f"{row['keyword']}.json"
             bw.save_json(m, out_path, stats)

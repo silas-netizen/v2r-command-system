@@ -568,6 +568,7 @@ def generate_and_crosscheck_one(
     recent_openings: Any,
     closings: list[str],
     mode: str = "",
+    reference_brief: str = "",
 ) -> tuple[Any, dict]:
     """원고 한 건 생성 + GPT 교차 검증 (본문·댓글 만들기와 검증 호출이 여기 한 곳뿐이다).
 
@@ -591,7 +592,9 @@ def generate_and_crosscheck_one(
         mode=mode,
         examples=examples,
         recent_openings=recent_openings,
+        reference_brief=reference_brief,
     )
+    stats["reference_used"] = bool(reference_brief)
     reply2 = next(
         (c for c in m.comments if c.label.replace(" ", "") == "대대댓글2"), None
     )
