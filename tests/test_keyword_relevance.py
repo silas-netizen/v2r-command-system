@@ -111,6 +111,22 @@ def test_parse_response_reads_bridge_for_relevance_3():
     assert out[1]["bridge_rationale"] == ""
 
 
+def test_default_batch_size_is_50():
+    assert kr.DEFAULT_BATCH_SIZE == 50
+
+
+def test_score_batch_uses_higher_max_tokens():
+    calls = {}
+
+    class RecordingRouter:
+        def complete(self, purpose, system, user, max_tokens=1200):
+            calls["max_tokens"] = max_tokens
+            return json.dumps([{"keyword": "a", "relevance": 0, "rationale": "직접"}])
+
+    kr.score_batch(RecordingRouter(), "브랜드", ["a"], "요약")
+    assert calls["max_tokens"] == kr.DEFAULT_MAX_TOKENS == 8000
+
+
 def test_parse_response_count_mismatch():
     raw = json.dumps([{"keyword": "a", "relevance": 0, "rationale": "x"}])
     with pytest.raises(kr.RelevanceParseError):
@@ -118,9 +134,10 @@ def test_parse_response_count_mismatch():
 
 
 def test_parse_response_keyword_mismatch():
-    raw = json.dumps([{"keyword": "다른", "relevance": 0, "rationale": "x"}])
+    # 편집 거리가 커서(전혀 다른 단어) 오타 허용 범위를 넘는 경우
+    raw = json.dumps([{"keyword": "완전히다른단어", "relevance": 0, "rationale": "x"}])
     with pytest.raises(kr.RelevanceParseError):
-        kr.parse_response(raw, ["a"])
+        kr.parse_response(raw, ["감기약전용키워드"])
 
 
 def test_parse_response_bad_relevance_range():
@@ -132,6 +149,43 @@ def test_parse_response_bad_relevance_range():
 def test_parse_response_not_json_array():
     with pytest.raises(kr.RelevanceParseError):
         kr.parse_response("이건 그냥 텍스트", ["a"])
+
+
+def test_parse_response_accepts_typo_corrected_keyword():
+    """모델이 오타를 "교정"해 돌려줘도(예: 클랜징폼 → 클렌징폼) 위치로 대응해 받아들인다."""
+    keywords = ["클랜징폼", "리포즘글루타치온", "때타월"]
+    raw = json.dumps(
+        [
+            {"keyword": "클렌징폼", "relevance": 1, "rationale": "근접"},
+            {"keyword": "리포솜글루타치온", "relevance": 2, "rationale": "확장"},
+            {"keyword": "때타올", "relevance": 3, "rationale": "당위성", "bridge": "다리"},
+        ],
+        ensure_ascii=False,
+    )
+    out = kr.parse_response(raw, keywords)
+    # 응답의 철자가 아니라 기대 키워드 그대로 저장한다
+    assert [r["keyword"] for r in out] == keywords
+    assert [r["relevance"] for r in out] == [1, 2, 3]
+
+
+def test_parse_response_no_keyword_field_matches_by_position():
+    keywords = ["a", "b"]
+    raw = json.dumps(
+        [
+            {"relevance": 0, "rationale": "직접"},
+            {"relevance": 4, "rationale": ""},
+        ],
+        ensure_ascii=False,
+    )
+    out = kr.parse_response(raw, keywords)
+    assert [r["keyword"] for r in out] == ["a", "b"]
+
+
+def test_parse_response_rejects_wildly_different_keyword():
+    """편집 거리가 큰(전혀 다른 단어) 경우는 여전히 실패해야 한다."""
+    raw = json.dumps([{"keyword": "완전히다른키워드입니다", "relevance": 0, "rationale": "x"}])
+    with pytest.raises(kr.RelevanceParseError):
+        kr.parse_response(raw, ["감기약"])
 
 
 # --- score_batch 재시도 ------------------------------------------------
@@ -190,6 +244,27 @@ def test_score_brand_writes_scores_and_progress(tmp_path):
     data = kr.load_progress(progress)
     assert data["브랜드"]["status"] == "done"
     assert data["브랜드"]["scored"] == 2
+
+
+def test_score_brand_leaves_failed_batch_keywords_pending(tmp_path):
+    """묶음이 포기되면 scored_at을 건드리지 않아 다음 회차에 다시 대상이 된다."""
+    db = tmp_path / "브랜드.sqlite"
+    _make_db(db, [("키워드1", 100), ("키워드2", 50)])
+
+    guides = tmp_path / "guides"
+    guides.mkdir()
+    (guides / "브랜드.md").write_text("- 브랜드/제품: 테스트", encoding="utf-8")
+
+    router = FakeRouter(["나쁨1", "나쁨2", "나쁨3"])  # RETRY_COUNT=2 → 3회 모두 실패
+    result = kr.score_brand(router, "브랜드", db, guides, progress_path=None)
+    assert result == {"scored": 0, "failed_batches": 1}
+
+    conn = sqlite3.connect(str(db))
+    unscored = conn.execute(
+        "SELECT COUNT(*) FROM keywords WHERE scored_at = ''"
+    ).fetchone()[0]
+    conn.close()
+    assert unscored == 2  # 실패한 묶음의 키워드가 그대로 남아, 다음 회차 pending_keywords 대상
 
 
 def test_score_brand_skips_already_scored(tmp_path):

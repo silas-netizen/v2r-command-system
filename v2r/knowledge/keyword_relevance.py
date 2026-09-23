@@ -62,11 +62,19 @@ RELEVANCE_BRIDGE = 3
 #: 무관 등급(4) — rationale이 비어야 하는 등급
 RELEVANCE_UNRELATED = 4
 
-#: 한 번에 모델에 넣는 키워드 수
-DEFAULT_BATCH_SIZE = 100
+#: 한 번에 모델에 넣는 키워드 수 (2026-09-24: 100 → 50, JSON 잘림 방지)
+DEFAULT_BATCH_SIZE = 50
 
 #: 실패 묶음 재시도 횟수
 RETRY_COUNT = 2
+
+#: 모델 응답 최대 토큰 (2026-09-24: 4000 → 8000, "JSON이 끝나지 않았습니다" 잘림 방지)
+DEFAULT_MAX_TOKENS = 8000
+
+#: keyword 대조 시 허용하는 편집 거리 비율(기대 키워드 길이 대비) — 오타 교정 응답 수용
+KEYWORD_FUZZY_RATIO = 0.3
+#: 편집 거리 허용 최소값(짧은 키워드도 최소 이만큼은 봐준다)
+KEYWORD_FUZZY_MIN = 2
 
 PURPOSE = "keyword_relevance"
 
@@ -238,10 +246,43 @@ class RelevanceParseError(ValueError):
     """모델 응답이 기대한 형식이 아니다."""
 
 
+def _levenshtein(a: str, b: str) -> int:
+    """편집 거리(삽입/삭제/치환 1회씩). 짧은 문자열용 표준 DP."""
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, start=1):
+        cur = [i] + [0] * len(b)
+        for j, cb in enumerate(b, start=1):
+            cost = 0 if ca == cb else 1
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
+        prev = cur
+    return prev[-1]
+
+
+def _keyword_matches(expected: str, got: str) -> bool:
+    """정규화(공백 제거·소문자) 후 같거나, 오타 수준(편집거리 <= 길이의 30%, 최소 2)이면 허용."""
+    norm_expected = expected.replace(" ", "").lower()
+    norm_got = got.replace(" ", "").lower()
+    if norm_expected == norm_got:
+        return True
+    limit = max(KEYWORD_FUZZY_MIN, int(len(norm_expected) * KEYWORD_FUZZY_RATIO))
+    return _levenshtein(norm_expected, norm_got) <= limit
+
+
 def parse_response(raw_text: str, keywords: list[str]) -> list[dict[str, Any]]:
     """모델 응답 텍스트에서 키워드별 relevance/rationale을 뽑는다.
 
-    입력 `keywords` 순서·개수와 어긋나면 `RelevanceParseError`.
+    응답 항목은 **위치(index)로 기대 키워드에 대응**시킨다(모델이 이따금
+    오타를 "교정"해 돌려주는 탓에 keyword 문자열 그대로 비교하면 묶음 전체가
+    실패하는 문제 — 2026-09-24). 정규화 후 같거나 편집 거리가 작으면 기대
+    키워드 그대로 저장한다(응답의 철자는 버린다). 응답에 keyword 필드가 아예
+    없어도 위치로만 대응한다. 개수가 다르거나 대응이 크게 어긋나면
+    `RelevanceParseError`.
     """
     from ..llm.router import extract_json
 
@@ -260,11 +301,14 @@ def parse_response(raw_text: str, keywords: list[str]) -> list[dict[str, Any]]:
     for idx, (item, expected_kw) in enumerate(zip(data, keywords)):
         if not isinstance(item, dict):
             raise RelevanceParseError(f"{idx}번째 항목이 객체가 아닙니다")
-        kw = str(item.get("keyword", "")).strip()
-        if kw != expected_kw:
-            raise RelevanceParseError(
-                f"{idx}번째 keyword 불일치: 기대 '{expected_kw}', 응답 '{kw}'"
-            )
+        raw_kw = item.get("keyword")
+        if raw_kw is not None:
+            got_kw = str(raw_kw).strip()
+            if not _keyword_matches(expected_kw, got_kw):
+                raise RelevanceParseError(
+                    f"{idx}번째 keyword 크게 어긋남: 기대 '{expected_kw}', 응답 '{got_kw}'"
+                )
+        kw = expected_kw
         try:
             rel = int(item.get("relevance"))
         except (TypeError, ValueError) as exc:
@@ -299,7 +343,7 @@ def score_batch(
     last_error: Exception | None = None
     for attempt in range(retries + 1):
         try:
-            text = router.complete(PURPOSE, system, user, max_tokens=4000)
+            text = router.complete(PURPOSE, system, user, max_tokens=DEFAULT_MAX_TOKENS)
             return parse_response(text, keywords)
         except Exception as exc:  # noqa: BLE001 - 재시도 대상이면 전부 잡는다
             last_error = exc
