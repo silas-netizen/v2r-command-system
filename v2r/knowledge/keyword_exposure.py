@@ -1024,7 +1024,18 @@ def _sheet_totals(rt: Any, brand: str) -> dict[str, Any] | None:
         data = json.loads(p.read_text(encoding="utf-8"))
     except Exception:
         return None
-    return {"P1": data.get("total_volume_p1", 0), "Q1": data.get("exposed_volume_q1", 0)}
+    # 사용자 지시 2026-09-23: P1/Q1에 숫자만 덜렁 쓰지 말고 P2부터 이름 붙은 표로.
+    total = int(data.get("total_volume_p1", 0) or 0)
+    exposed = int(data.get("exposed_volume_q1", 0) or 0)
+    return {
+        "block": {
+            "cell": "P2",
+            "rows": [
+                ["키워드 총 검색량", f"{total:,}"],
+                ["노출 키워드 총 검색량", f"{exposed:,}"],
+            ],
+        }
+    }
 
 
 def _flush_sheet_batch_async(rt: Any, brand: str, rows: list[dict]) -> None:

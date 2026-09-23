@@ -813,7 +813,15 @@ def apply_exposure(
             errors.append(f"{kw}: {res['error']}")
 
     if totals:
+        block = totals.get("block") if isinstance(totals, dict) else None
+        if isinstance(block, dict) and block.get("rows"):
+            # 이름 붙은 합계 표(P2:Q3 등)를 한 번에 쓴다 (사용자 지시 2026-09-23)
+            res = _write_verified(sid, gid, str(block.get("cell") or "P2"), [[str(v) for v in r] for r in block["rows"]], repo_root)
+            if res.get("mode") != "sheets":
+                errors.append(f"{block.get('cell', 'P2')} 표: {res.get('error', '실패')}")
         for cell, value in totals.items():
+            if cell == "block":
+                continue
             res = set_cell(sid, EXPOSURE_TAB_NAME, cell, value, gid=gid, repo_root=repo_root)
             if not res.get("written"):
                 errors.append(f"{cell}: {res.get('error', '실패')}")
