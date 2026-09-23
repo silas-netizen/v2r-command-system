@@ -190,13 +190,29 @@ class ExposureRow:
 
 
 def _sheet_rows(brand: str, cfg: dict | None, xlsx_path: str | Path | None) -> list[dict]:
+    """브랜드 시트 두 번째 탭 행. **항상 실시간 시트를 먼저** 읽는다(2026-09-24 사고:
+    09-19에 받아 둔 xlsx 스냅샷을 우선 써서 G열 노출완이 옛 값으로 잡혔다). export CSV
+    (필터 무시)를 먼저, 안 되면 gviz, 둘 다 안 되면 그제야 xlsx 스냅샷."""
+    sid = _brand_spreadsheet_id(brand, cfg)
+    if sid:
+        try:
+            from v2r.sources.sheets_writer import _read_export_csv, _second_tab_gid
+
+            table = _read_export_csv(sid, _second_tab_gid(sid))
+            if table and len(table) > 1:
+                hdr = [str(h).strip() for h in table[0]]
+                rows = [dict(zip(hdr, r + [""] * (len(hdr) - len(r)))) for r in table[1:]]
+                return _drop_password_columns(rows)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("시트 실시간 읽기 실패(%s), 대체 경로 사용: %s", brand, exc)
+        try:
+            url = gviz_csv_url(sid, sheet=EXPOSURE_SHEET, headers=0)
+            return _drop_password_columns(fetch_csv(url))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("시트 gviz 읽기 실패(%s): %s", brand, exc)
     if xlsx_path:
         return rows_from_xlsx(xlsx_path)
-    sid = _brand_spreadsheet_id(brand, cfg)
-    if not sid:
-        raise SourceError(f"브랜드 시트를 찾을 수 없습니다: {brand}")
-    url = gviz_csv_url(sid, sheet=EXPOSURE_SHEET, headers=0)
-    return _drop_password_columns(fetch_csv(url))
+    raise SourceError(f"브랜드 시트를 찾을 수 없습니다: {brand}")
 
 
 def target_keywords(
@@ -254,6 +270,8 @@ def target_keywords(
                 "cafe": cafe,
                 "article_url": article_url,
                 "t0_status": _pick(row, _T0_HEADERS),
+                # 시트 G열(노출 상태) — 우선순위 1등급 "기존 노출완" 판단용(2026-09-24)
+                "sheet_status": _pick(row, _STATUS_HEADERS),
                 "candidate_title_norm": candidate_title_norm,
             }
         )
@@ -902,6 +920,135 @@ def _db_volume_map(rt: Any, brand: str) -> dict[str, int]:
         return {}
 
 
+#: `naver_keyword_tool.fetch_related_keywords` 한 번 호출 최대 씨앗 수(기존 값)
+_VOLUME_SEED_BATCH_SIZE = 5
+#: 프로필 잠금 "대기 시간 초과"일 때 재시도 전 대기(초, 사용자 지시 2026-09-24)
+_VOLUME_LOCK_RETRY_WAIT_SEC = 3.0
+
+
+def _real_volume_fetch_fn(brand: str, repo_root: str) -> Any:
+    """`ensure_volumes` 기본 조회 함수 — 브랜드 전용 복제 프로필로 키워드 도구를
+    헤드리스로 열어 씨앗(최대 5개)의 pc/mobile 검색량을 받는다.
+
+    러너(노출 순환)와 채우기 순환이 같은 프로필을 동시에 열지 않도록
+    `open_keyword_tool_page`가 내부에서 쓰는 프로필 잠금을 그대로 따른다 —
+    "잠금 대기 시간 초과"면 3초 쉬고 1회 재시도한다.
+    """
+    from v2r.knowledge import keyword_discovery_parallel as kdp
+    from v2r.knowledge import naver_keyword_tool as kt
+    from v2r.warehouse import naver_session
+
+    data_dir = Path(repo_root) / "data"
+    profile_dir = data_dir / kdp.clone_profile_name(brand)
+    if not profile_dir.is_dir():
+        kdp.clone_all_profiles(data_dir, [brand])
+
+    def _fetch(seeds: list[str]) -> list[Any]:
+        for attempt in range(2):
+            try:
+                playwright, context, page, logged_in = kt.open_keyword_tool_page(
+                    profile_dir=profile_dir, headless=True
+                )
+            except naver_session.ProfileLockTimeout as exc:
+                if attempt == 0:
+                    log.warning("검색량 조회: 프로필 잠금 대기 시간 초과, 3초 후 재시도(%s): %s", brand, exc)
+                    time.sleep(_VOLUME_LOCK_RETRY_WAIT_SEC)
+                    continue
+                log.warning("검색량 조회: 프로필 잠금 재시도도 실패(%s): %s", brand, exc)
+                return []
+            try:
+                if not logged_in:
+                    log.warning("검색량 조회: 네이버 로그인이 풀려 있어 건너뜁니다(%s)", brand)
+                    return []
+                return kt.fetch_related_keywords(page, seeds, account_id="685753", download_dir=data_dir / "keywords" / "_tmp")
+            finally:
+                naver_session._close(playwright, context, page)
+        return []
+
+    return _fetch
+
+
+def ensure_volumes(rt: Any, brand: str, keywords: list[str], fetch_fn: Any = None) -> dict[str, int]:
+    """요청한 키워드마다 검색량(total = pc+mobile)을 반드시 채워 돌려준다.
+
+    1) `data/keywords/<브랜드>.sqlite`에 total>0 이면 그 값을 쓴다.
+    2) 없거나 0이면 네이버 키워드 도구에 5개씩 넣어 조회하고, 그 결과(씨앗 자신의
+       행 포함)를 DB에 반영한다(없는 키워드는 새 행 삽입, 있으면 pc/mobile/total만
+       갱신 — `relevance` 열은 건드리지 않는다).
+    3) 도구가 그 키워드를 돌려주지 않으면(네이버 "< 10" 표기 규칙과 같은 최소값
+       관례를 따라 `naver_keyword_tool._to_count`가 이미 쓰는 5) 최소값으로 채운다.
+    4) 조회 자체가 실패하면(로그인 풀림·차단 등) 예외를 올리지 않고 경고만 남기고
+       그 키워드는 빈 값(0, dict에서 제외)으로 둔다 — 이때만 호출 쪽(K열)을 건드리지 않는다.
+    """
+    import sqlite3
+
+    from v2r.knowledge import naver_keyword_tool as kt
+
+    want = [str(k).strip() for k in keywords if str(k or "").strip()]
+    if not want:
+        return {}
+    norm_to_raw: dict[str, str] = {}
+    for k in want:
+        norm_to_raw.setdefault(_norm(k), k)
+
+    db_path = _relevance_keywords_db_path(rt, brand)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(str(db_path))
+    try:
+        con.execute(
+            "CREATE TABLE IF NOT EXISTS keywords ("
+            "keyword TEXT PRIMARY KEY, pc INTEGER NOT NULL DEFAULT 0, "
+            "mobile INTEGER NOT NULL DEFAULT 0, total INTEGER NOT NULL DEFAULT 0, "
+            "source_seed TEXT NOT NULL DEFAULT '', depth INTEGER NOT NULL DEFAULT 0, "
+            "relevance INTEGER NOT NULL DEFAULT 0, collected_at TEXT NOT NULL)"
+        )
+        con.commit()
+
+        result: dict[str, int] = {}
+        missing: list[str] = []
+        for norm_kw, raw_kw in norm_to_raw.items():
+            row = con.execute("SELECT total FROM keywords WHERE keyword = ?", (raw_kw,)).fetchone()
+            total = int(row[0]) if row and row[0] else 0
+            if total > 0:
+                result[norm_kw] = total
+            else:
+                missing.append(raw_kw)
+        if not missing:
+            return result
+
+        fetch = fetch_fn or _real_volume_fetch_fn(brand, rt.settings.repo_root)
+        for i in range(0, len(missing), _VOLUME_SEED_BATCH_SIZE):
+            batch = missing[i : i + _VOLUME_SEED_BATCH_SIZE]
+            try:
+                rows = fetch(batch) or []
+            except Exception as exc:  # noqa: BLE001 - 조회 실패는 경고만
+                log.warning("검색량 조회 실패(%s, %s): %s", brand, batch, exc)
+                continue
+            by_norm = {_norm(r.keyword): r for r in rows if getattr(r, "keyword", "")}
+            now = now_iso()
+            for raw_kw in batch:
+                norm_kw = _norm(raw_kw)
+                r = by_norm.get(norm_kw)
+                if r is None:
+                    # 도구가 씨앗 자신을 돌려주지 않음 — 네이버 "< 10" 관례를 따른 최소값
+                    pc, mobile, total = 0, 5, 5
+                else:
+                    pc, mobile, total = int(r.pc), int(r.mobile), int(r.total)
+                if total <= 0:
+                    continue
+                con.execute(
+                    "INSERT INTO keywords (keyword, pc, mobile, total, source_seed, depth, relevance, collected_at) "
+                    "VALUES (?, ?, ?, ?, '', 0, 0, ?) "
+                    "ON CONFLICT(keyword) DO UPDATE SET pc=excluded.pc, mobile=excluded.mobile, total=excluded.total",
+                    (raw_kw, pc, mobile, total, now),
+                )
+                result[norm_kw] = total
+        con.commit()
+        return result
+    finally:
+        con.close()
+
+
 def _relevance_eligible_keywords(rt: Any, brand: str) -> list[dict]:
     """`data/keywords/<브랜드>.sqlite`에서 원고 대상(`is_manuscript_target`)만.
 
@@ -1054,7 +1201,21 @@ def next_cycle_batch(rt: Any, brand: str, n: int = 1) -> list[dict]:
         return (vol, last)
 
     ordered = sorted(universe, key=sort_key)
-    return ordered[: max(0, n)]
+    picked = ordered[: max(0, n)]
+    # 2026-09-24 사용자 지시: 검색량은 몰라선 안 된다 — 배치를 뽑을 때 0/없음인
+    # 키워드는 키워드 도구로 직접 조회해 채운다(실패 시에만 그대로 0 유지).
+    need = [p["keyword"] for p in picked if int(p.get("volume") or 0) <= 0]
+    if need:
+        try:
+            got = ensure_volumes(rt, brand, need)
+        except Exception as exc:  # noqa: BLE001 - 방어용(조회 실패는 volume 미기재로)
+            log.warning("배치 검색량 채우기 실패(%s): %s", brand, exc)
+            got = {}
+        for p in picked:
+            v = got.get(_norm(p["keyword"]))
+            if v:
+                p["volume"] = v
+    return picked
 
 
 def cycle_state_path(rt: Any) -> Path:
@@ -2097,6 +2258,7 @@ __all__ = [
     "known_brands",
     "keyword_universe",
     "next_cycle_batch",
+    "ensure_volumes",
     "cycle_state_path",
     "cycle_status",
     "cycle_start",

@@ -217,7 +217,9 @@ def priority_tier(
     # "기존 노출완" = 시트 G열이 노출완인 키워드(아직 러너가 제대로 안 본 것 포함) 또는
     # 러너 마지막 판정이 exposed — 2026-09-24 사용자: DB 판정만 보면 안 됨(아직 노출 검사가
     # 제대로 안 됐으므로 시트 기준이 우선).
-    sheet_exposed = str(item.get("t0_status") or "").replace(" ", "") in ("노출완", "exposed")
+    sheet_exposed = any(
+        str(item.get(k) or "").replace(" ", "") in ("노출완", "exposed") for k in ("sheet_status", "t0_status")
+    )
     if last is None:
         if sheet_exposed:
             return (1, float("inf"))
