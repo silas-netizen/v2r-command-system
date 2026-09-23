@@ -33,8 +33,6 @@ log = logging.getLogger(__name__)
 DEFAULT_TARGET = 10_000
 #: 한 회차 시드 개수(부족분은 정리본 용어로 보충)
 DEFAULT_SEED_LIMIT = 50
-#: 정리본에서 LLM으로 뽑을 보충 시드 개수
-DEFAULT_GUIDE_SEED_N = 30
 #: 네이버 키워드 도구 한 번 조회 최대 씨앗 수(기존 값 그대로)
 SEED_BATCH_SIZE = 5
 #: 브랜드당 DB 총 행수 상한(무관 키워드 폭증 방지)
@@ -69,33 +67,95 @@ def _kt_mod():
     return kt
 
 
-# --- 마이그레이션(seeded_at) --------------------------------------------
+# --- 마이그레이션(seeded_at·seed_source_type·fill_seeds) --------------------
+
+#: 시드 출처 이름(사용자 승인 2026-09-24 00:50 — 4가지 + 기존 원고 대상)
+SOURCE_ELIGIBLE = "원고대상"
+SOURCE_GUIDE = "정리본"
+SOURCE_COMPETITOR = "경쟁"
+SOURCE_AUTOCOMPLETE = "자동완성"
+SOURCE_RELATED = "연관검색"
+SOURCE_TYPES = (SOURCE_ELIGIBLE, SOURCE_GUIDE, SOURCE_COMPETITOR, SOURCE_AUTOCOMPLETE, SOURCE_RELATED)
+
+#: 출처별 한 회차 시드 상한
+DEFAULT_GUIDE_SEED_N = 60
+DEFAULT_COMPETITOR_SEED_N = 20
+#: 자동완성·연관검색을 뽑을 원고 대상 키워드 수(검색량 상위)
+DEFAULT_EXPAND_TOP_N = 30
+#: 자동완성·연관검색 출처 각각의 회차당 시드 상한(조회 횟수 폭증 방지)
+DEFAULT_EXPAND_SEED_CAP = 100
+
+_FILL_SEEDS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS fill_seeds (
+    seed TEXT PRIMARY KEY,
+    source_type TEXT NOT NULL DEFAULT '',
+    used_at TEXT NOT NULL DEFAULT ''
+);
+"""
 
 
 def migrate_fill_columns(conn: sqlite3.Connection) -> list[str]:
-    """`keywords`에 `seeded_at`(시드로 쓴 시각, 안 썼으면 '')를 더한다."""
+    """`keywords`에 `seeded_at`(시드로 쓴 시각)·`seed_source_type`(어느 출처 시드에서
+    수집됐는지)을 더하고 `fill_seeds`(시드 사용 기록) 표를 만든다."""
     existing = {row[1] for row in conn.execute("PRAGMA table_info(keywords)")}
     added: list[str] = []
     if "seeded_at" not in existing:
         conn.execute("ALTER TABLE keywords ADD COLUMN seeded_at TEXT NOT NULL DEFAULT ''")
         added.append("seeded_at")
-        conn.commit()
+    if "seed_source_type" not in existing:
+        conn.execute("ALTER TABLE keywords ADD COLUMN seed_source_type TEXT NOT NULL DEFAULT ''")
+        added.append("seed_source_type")
+    conn.executescript(_FILL_SEEDS_SCHEMA)
+    conn.commit()
     return added
 
 
 # --- 원고 대상 판정 -------------------------------------------------------
 
-#: 사용자 지시(2026-09-24): relevance_llm 0~2 AND relevance_codex 0~2 AND
-#: needs_review 아님 = 원고 대상.
-ELIGIBLE_SQL = (
-    "relevance_llm IS NOT NULL AND relevance_llm <= 2"
-    " AND relevance_codex IS NOT NULL AND relevance_codex <= 2"
-    " AND (needs_review = 0 OR needs_review IS NULL)"
-)
+#: 원고 대상 = 클로드·Codex 둘 다 `keyword_relevance.MANUSCRIPT_MAX_RELEVANCE` 이하
+#: AND needs_review 아님. 상한을 하드코딩하지 않고 keyword_relevance 쪽 값을 따른다
+#: (2026-09-24 relevance-split: 0–2 → 0–3으로 넓어져도 이 모듈은 그대로 맞춰 간다).
+#: dict 한 건 판정은 `keyword_relevance.is_manuscript_target`(있으면)을 쓴다.
+#: 2026-09-24 01:12 코디네이터 지시: 연관도 0–4 척도 커밋 후 원고 대상 판정은 전부
+#: `keyword_relevance.is_manuscript_target`(둘 다 0에서 3, needs_review 아님)을 따른다.
+#: SQL 집계도 같은 상한(`MANUSCRIPT_MAX_RELEVANCE`)을 그대로 쓴다 — 하드코딩 금지.
+def manuscript_max_relevance() -> int:
+    return int(getattr(_kr_mod(), "MANUSCRIPT_MAX_RELEVANCE", 3))
+
+
+def eligible_sql() -> str:
+    mx = manuscript_max_relevance()
+    return (
+        # is_manuscript_target과 동일: 클로드 0에서 mx, Codex는 값이 있으면 0에서 mx, needs_review 아님
+        # scored_at이 비어 있으면(예: 옛 3=무관 점수를 재채점 대기로 돌려놓은 행) 아직
+        # 판정이 확정되지 않은 것이므로 세지 않는다 — 실측(01:15): 이 행이 브랜드당 약
+        # 6,000개라 그대로 세면 원고 대상이 9,000대로 부풀려진다.
+        "scored_at != '' AND scored_at IS NOT NULL"
+        f" AND relevance_llm IS NOT NULL AND relevance_llm <= {mx}"
+        f" AND (relevance_codex IS NULL OR relevance_codex <= {mx})"
+        " AND (needs_review = 0 OR needs_review IS NULL)"
+    )
+
+
+def is_eligible_row(row: Any) -> bool:
+    """dict/sqlite Row 한 건의 원고 대상 판정 = `keyword_relevance.is_manuscript_target`."""
+    try:
+        scored = row["scored_at"]
+    except (KeyError, IndexError):
+        scored = "x"
+    if not scored:
+        return False
+    return bool(_kr_mod().is_manuscript_target(row))
 
 
 def eligible_count(conn: sqlite3.Connection) -> int:
-    return int(conn.execute(f"SELECT COUNT(*) FROM keywords WHERE {ELIGIBLE_SQL}").fetchone()[0])
+    return int(conn.execute(f"SELECT COUNT(*) FROM keywords WHERE {eligible_sql()}").fetchone()[0])
+
+
+def top_eligible_keywords(conn: sqlite3.Connection, limit: int = DEFAULT_EXPAND_TOP_N) -> list[str]:
+    """검색량 상위 원고 대상 키워드(자동완성·연관검색 확장의 출발점)."""
+    sql = f"SELECT keyword FROM keywords WHERE {eligible_sql()} ORDER BY total DESC LIMIT ?"
+    return [row[0] for row in conn.execute(sql, (int(limit),))]
 
 
 # --- 시드 선택 ------------------------------------------------------------
@@ -104,7 +164,7 @@ def eligible_count(conn: sqlite3.Connection) -> int:
 def select_seed_keywords(conn: sqlite3.Connection, limit: int = DEFAULT_SEED_LIMIT) -> list[str]:
     """아직 시드로 안 쓴 원고 대상 키워드 중 검색량(total) 상위 `limit`개."""
     sql = (
-        f"SELECT keyword FROM keywords WHERE {ELIGIBLE_SQL}"
+        f"SELECT keyword FROM keywords WHERE {eligible_sql()}"
         " AND (seeded_at = '' OR seeded_at IS NULL) ORDER BY total DESC LIMIT ?"
     )
     return [row[0] for row in conn.execute(sql, (int(limit),))]
@@ -121,13 +181,60 @@ def mark_seeded(conn: sqlite3.Connection, keywords: list[str]) -> None:
     conn.commit()
 
 
-#: 정리본에서 시드 후보를 뽑는 프롬프트(제품·증상·타깃 용어, 검색어로 쓸 수 있는 짧은 낱말만)
+def used_seeds(conn: sqlite3.Connection) -> set[str]:
+    return {row[0] for row in conn.execute("SELECT seed FROM fill_seeds")}
+
+
+def record_seeds(conn: sqlite3.Connection, seeds: list[tuple[str, str]]) -> None:
+    """`[(seed, source_type)]`를 `fill_seeds`에 기록(이미 있으면 유지)."""
+    if not seeds:
+        return
+    stamp = _now_iso()
+    conn.executemany(
+        "INSERT OR IGNORE INTO fill_seeds (seed, source_type, used_at) VALUES (?, ?, ?)",
+        [(s, t, stamp) for s, t in seeds],
+    )
+    conn.commit()
+
+
+def _guide_text(brand: str, guides_dir: str | Path, max_chars: int = 6000) -> str:
+    guides_dir = Path(guides_dir)
+    candidates = list(guides_dir.glob(f"{brand}*.md"))
+    if not candidates:
+        return ""
+    return candidates[0].read_text(encoding="utf-8")[:max_chars]
+
+
+def _llm_string_list(router: Any, purpose: str, system: str, user: str, n: int) -> list[str]:
+    from ..llm.router import extract_json
+
+    raw = router.complete(purpose, system, user, max_tokens=1500)
+    data = extract_json(raw)
+    if not isinstance(data, list):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for t in data:
+        t = str(t or "").strip()
+        if 1 < len(t) <= 20 and t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out[:n]
+
+
+#: (1) 정리본 → 검색창에 칠 법한 증상·상황·타깃·고민 표현
 _GUIDE_SEED_PROMPT = (
-    "아래는 브랜드 정리본 원문이다. 이 안에서 네이버 검색광고 키워드 도구에 '시드'로"
-    " 넣을 만한 제품명·증상명·타깃 용어를 최대 {n}개, 짧은 명사(2~8자)로 뽑아라."
-    " 문장·설명·중복은 빼고 검색어로 자연스러운 낱말만.\n"
-    "출력은 오직 JSON 배열: [\"용어1\", \"용어2\", ...]. 다른 텍스트는 쓰지 않는다.\n\n"
-    "정리본:\n{text}"
+    "아래는 브랜드 정리본 원문이다. 이 브랜드의 타깃이 **네이버 검색창에 실제로 칠 법한**"
+    " 증상·상황·타깃·고민 표현을 최대 {n}개 뽑아라. 제품명·브랜드명은 빼고, 사람들이 검색하는"
+    " 말투(예: '아기 밤에 자주 깸', '코막힘 잠 못잘때')로 2에서 15자 짜리 검색어만. 중복·설명 금지.\n"
+    "출력은 오직 JSON 배열: [\"검색어1\", \"검색어2\", ...].\n\n정리본:\n{text}"
+)
+#: (2) 경쟁·대체 제품명
+_COMPETITOR_SEED_PROMPT = (
+    "아래 브랜드 정리본과 이 브랜드의 원고 대상 키워드 일부를 보고, 같은 고민을 가진 사람이"
+    " 대신 검색할 **경쟁 제품·대체 제품·대체 방법의 이름**을 최대 {n}개 뽑아라(일반 명사형,"
+    " 2에서 15자, 브랜드 자기 제품명은 제외). 중복·설명 금지.\n"
+    "출력은 오직 JSON 배열: [\"이름1\", \"이름2\", ...].\n\n정리본:\n{text}\n\n원고 대상 키워드 예:\n{keywords}"
 )
 
 
@@ -138,34 +245,123 @@ def guide_seed_terms(
     n: int = DEFAULT_GUIDE_SEED_N,
     purpose: str = "keyword_fill_seed",
 ) -> list[str]:
-    """정리본에서 시드 후보 낱말을 최대 `n`개 뽑는다.
-
-    `router`가 있으면 클로드(요금제 길)로 뽑고, 없거나 실패하면
-    `naver_keyword_tool.extract_guide_keywords`(정규식 추출)로 대체한다.
-    """
+    """(1) 정리본에서 검색 표현 시드를 최대 `n`개. LLM 실패 시 정규식 추출로 대체."""
     kt = _kt_mod()
     fallback = kt.extract_guide_keywords(brand, guides_dir)[:n]
     if router is None:
         return fallback
     try:
-        guides_dir = Path(guides_dir)
-        candidates = list(guides_dir.glob(f"{brand}*.md"))
-        if not candidates:
+        text = _guide_text(brand, guides_dir)
+        if not text:
             return fallback
-        text = candidates[0].read_text(encoding="utf-8")[:4000]
-        prompt = _GUIDE_SEED_PROMPT.format(n=n, text=text)
-        raw = router.complete(purpose, "정리본에서 키워드 시드를 뽑는 도우미다.", prompt, max_tokens=1000)
-        from ..llm.router import extract_json
-
-        data = extract_json(raw)
-        if not isinstance(data, list):
-            return fallback
-        terms = [str(t).strip() for t in data if str(t or "").strip()]
-        terms = [t for t in terms if 1 < len(t) <= 12][:n]
+        terms = _llm_string_list(
+            router, purpose, "정리본에서 검색어 시드를 뽑는 도우미다.",
+            _GUIDE_SEED_PROMPT.format(n=n, text=text), n,
+        )
         return terms or fallback
-    except Exception as exc:  # noqa: BLE001 - LLM 실패는 정규식 대체로 흡수
+    except Exception as exc:  # noqa: BLE001
         log.warning("정리본 LLM 시드 추출 실패(%s) — 정규식 대체 사용: %s", brand, exc)
         return fallback
+
+
+def competitor_seed_terms(
+    brand: str,
+    guides_dir: str | Path,
+    router: Any,
+    sample_keywords: list[str],
+    n: int = DEFAULT_COMPETITOR_SEED_N,
+    purpose: str = "keyword_fill_seed",
+) -> list[str]:
+    """(2) 경쟁·대체 제품명 시드 최대 `n`개(LLM 없거나 실패하면 빈 목록)."""
+    if router is None:
+        return []
+    try:
+        text = _guide_text(brand, guides_dir)
+        terms = _llm_string_list(
+            router, purpose, "경쟁·대체 제품명을 뽑는 도우미다.",
+            _COMPETITOR_SEED_PROMPT.format(n=n, text=text, keywords=", ".join(sample_keywords[:40])), n,
+        )
+        if not terms:
+            log.warning("경쟁 제품 LLM 시드가 비었습니다(%s)", brand)
+        return terms
+    except Exception as exc:  # noqa: BLE001
+        log.warning("경쟁 제품 LLM 시드 추출 실패(%s): %s", brand, exc)
+        return []
+
+
+def expand_seed_terms(
+    base_keywords: list[str],
+    expand_fn: Callable[[str], list[str]],
+    cap: int = DEFAULT_EXPAND_SEED_CAP,
+) -> list[str]:
+    """(3)(4) 기준 키워드마다 `expand_fn`(자동완성/연관검색)을 불러 후보를 모은다.
+    기준 키워드 자신과 중복은 뺀다. 기준 키워드를 돌아가며 고르게 담아 `cap`까지."""
+    per: list[list[str]] = []
+    base_set = set(base_keywords)
+    for kw in base_keywords:
+        try:
+            items = [str(t).strip() for t in expand_fn(kw) if str(t or "").strip()]
+        except Exception as exc:  # noqa: BLE001
+            log.warning("시드 확장 실패(%s): %s", kw, exc)
+            items = []
+        per.append([t for t in items if t not in base_set])
+    out: list[str] = []
+    seen: set[str] = set()
+    while len(out) < cap and any(per):
+        for lst in per:
+            if not lst:
+                continue
+            t = lst.pop(0)
+            if t not in seen:
+                seen.add(t)
+                out.append(t)
+            if len(out) >= cap:
+                break
+    return out
+
+
+def gather_seeds(
+    conn: sqlite3.Connection,
+    brand: str,
+    guides_dir: str | Path,
+    router: Any,
+    autocomplete_fn: Callable[[str], list[str]] | None = None,
+    related_fn: Callable[[str], list[str]] | None = None,
+    seed_limit: int = DEFAULT_SEED_LIMIT,
+    guide_seed_n: int = DEFAULT_GUIDE_SEED_N,
+    competitor_seed_n: int = DEFAULT_COMPETITOR_SEED_N,
+    expand_top_n: int = DEFAULT_EXPAND_TOP_N,
+    expand_cap: int = DEFAULT_EXPAND_SEED_CAP,
+) -> list[tuple[str, str]]:
+    """이번 회차 시드 `[(seed, source_type)]` — 5가지 출처, 중복·DB 기존 키워드·이미 쓴 시드 제외."""
+    already_kw = {row[0] for row in conn.execute("SELECT keyword FROM keywords")}
+    used = used_seeds(conn)
+    picked: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    def _add(terms: list[str], source: str, allow_in_db: bool = False) -> None:
+        for t in terms:
+            t = str(t or "").strip()
+            if not t or t in seen or t in used:
+                continue
+            if not allow_in_db and t in already_kw:
+                continue
+            seen.add(t)
+            picked.append((t, source))
+
+    _add(select_seed_keywords(conn, seed_limit), SOURCE_ELIGIBLE, allow_in_db=True)
+    _add(guide_seed_terms(brand, guides_dir, router, guide_seed_n), SOURCE_GUIDE)
+    top = top_eligible_keywords(conn, expand_top_n)
+    _add(competitor_seed_terms(brand, guides_dir, router, top, competitor_seed_n), SOURCE_COMPETITOR)
+    if autocomplete_fn is not None and top:
+        _add(expand_seed_terms(top, autocomplete_fn, expand_cap), SOURCE_AUTOCOMPLETE)
+    if related_fn is not None and top:
+        _add(expand_seed_terms(top, related_fn, expand_cap), SOURCE_RELATED)
+    counts: dict[str, int] = {}
+    for _s, t in picked:
+        counts[t] = counts.get(t, 0) + 1
+    log.info("%s: 이번 회차 시드 출처별 개수 %s", brand, counts)
+    return picked
 
 
 # --- 진행 파일 -------------------------------------------------------------
@@ -205,6 +401,29 @@ def update_fill_progress(path: str | Path, brand: str, **fields: Any) -> dict[st
     return data
 
 
+# --- 출처별 채택률 ---------------------------------------------------------
+
+
+def source_stats(conn: sqlite3.Connection, since_iso: str) -> dict[str, dict[str, Any]]:
+    """`since_iso` 이후 수집된 키워드를 출처별로 신규·채택·채택률로 묶는다."""
+    out: dict[str, dict[str, Any]] = {}
+    rows = conn.execute(
+        "SELECT seed_source_type, COUNT(*),"
+        f" SUM(CASE WHEN {eligible_sql()} THEN 1 ELSE 0 END)"
+        " FROM keywords WHERE collected_at >= ? GROUP BY seed_source_type",
+        (since_iso,),
+    ).fetchall()
+    for src, new, adopted in rows:
+        new = int(new or 0)
+        adopted = int(adopted or 0)
+        out[src or "(없음)"] = {
+            "new": new,
+            "adopted": adopted,
+            "adoption_rate": round(adopted / new, 4) if new else 0.0,
+        }
+    return out
+
+
 # --- 한 회차 --------------------------------------------------------------
 
 
@@ -219,15 +438,20 @@ def run_cycle(
     guide_seed_n: int = DEFAULT_GUIDE_SEED_N,
     cap: int = DEFAULT_CAP,
     batch_size: int = SEED_BATCH_SIZE,
+    autocomplete_fn: Callable[[str], list[str]] | None = None,
+    related_fn: Callable[[str], list[str]] | None = None,
+    competitor_seed_n: int = DEFAULT_COMPETITOR_SEED_N,
+    expand_top_n: int = DEFAULT_EXPAND_TOP_N,
+    expand_cap: int = DEFAULT_EXPAND_SEED_CAP,
 ) -> dict[str, Any]:
-    """시드 선택 → 조회 → 새 키워드 채점/교차검증까지 한 회차.
+    """시드 수집(5출처) → 조회 → 새 키워드 채점/교차검증 → 출처별 채택률까지 한 회차.
 
-    `fetch_fn(seeds, depth) -> list[KeywordRow-like]` — 실전에서는
-    `naver_keyword_tool.fetch_related_keywords`를 얇게 감싼 함수, 테스트에서는
-    가짜 함수를 준다(`.keyword/.pc/.mobile` 속성 또는 dict).
+    `fetch_fn(seeds, depth) -> list[KeywordRow-like]`; `autocomplete_fn`/`related_fn`
+    (키워드 → 후보 목록)은 없으면 그 출처를 건너뛴다(테스트·오프라인).
     """
     kd_store = _kd_store()
     kr = _kr_mod()
+    from v2r.store.db import now_iso as _store_now
 
     conn = kd_store.open_db(db_path)
     try:
@@ -236,65 +460,68 @@ def run_cycle(
 
         total_before = kd_store.count(conn)
         if total_before >= cap:
-            eligible_now = eligible_count(conn)
             return {
-                "brand": brand,
-                "capped": True,
-                "total": total_before,
-                "eligible": eligible_now,
-                "new_collected": 0,
-                "adopted": 0,
-                "adoption_rate": 0.0,
-                "seed_exhausted": False,
+                "brand": brand, "capped": True, "total": total_before,
+                "eligible": eligible_count(conn), "new_collected": 0, "adopted": 0,
+                "adoption_rate": 0.0, "seed_exhausted": False, "by_source": {},
             }
 
         eligible_before = eligible_count(conn)
-        seeds = select_seed_keywords(conn, seed_limit)
-        used_eligible_seeds = list(seeds)
-        guide_used = False
-        if len(seeds) < seed_limit:
-            guide_terms = guide_seed_terms(brand, guides_dir, router, guide_seed_n)
-            already = {row[0] for row in conn.execute("SELECT keyword FROM keywords")}
-            need = seed_limit - len(seeds)
-            extra = [g for g in guide_terms if g not in already and g not in seeds][:need]
-            if extra:
-                guide_used = True
-            seeds = seeds + extra
-
+        seeds = gather_seeds(
+            conn, brand, guides_dir, router, autocomplete_fn, related_fn,
+            seed_limit=seed_limit, guide_seed_n=guide_seed_n,
+            competitor_seed_n=competitor_seed_n, expand_top_n=expand_top_n, expand_cap=expand_cap,
+        )
+        seed_counts: dict[str, int] = {}
+        for _s, t in seeds:
+            seed_counts[t] = seed_counts.get(t, 0) + 1
         seed_exhausted = len(seeds) == 0
-        mark_seeded(conn, used_eligible_seeds)
+        mark_seeded(conn, [s for s, t in seeds if t == SOURCE_ELIGIBLE])
+        record_seeds(conn, seeds)
 
+        round_start = _store_now()
         new_saved = 0
-        for start in range(0, len(seeds), batch_size):
-            batch = seeds[start : start + batch_size]
-            try:
-                related = fetch_fn(batch, 1)
-            except Exception as exc:  # noqa: BLE001 - 이 브랜드 회차만 중단
-                log.warning("%s: 조회 실패(씨앗=%s): %s", brand, batch, exc)
+        # 같은 출처끼리 5개씩 묶어 조회(출처별 채택률을 정확히 나누기 위해)
+        by_type: dict[str, list[str]] = {}
+        for s, t in seeds:
+            by_type.setdefault(t, []).append(s)
+        stop = False
+        for source_type, terms in by_type.items():
+            if stop:
                 break
-            rows_to_save: list[dict[str, Any]] = []
-            source_seed = ",".join(batch)
-            for kr_row in related:
-                kw = getattr(kr_row, "keyword", None) if not isinstance(kr_row, dict) else kr_row.get("keyword")
-                if not kw:
-                    continue
-                pc = getattr(kr_row, "pc", None) if not isinstance(kr_row, dict) else kr_row.get("pc")
-                mobile = getattr(kr_row, "mobile", None) if not isinstance(kr_row, dict) else kr_row.get("mobile")
-                pc = int(pc or 0)
-                mobile = int(mobile or 0)
-                rows_to_save.append(
-                    {
-                        "keyword": str(kw).strip(),
-                        "pc": pc,
-                        "mobile": mobile,
-                        "total": pc + mobile,
-                        "source_seed": source_seed,
-                        "depth": 1,
-                        "relevance": 0,
-                    }
-                )
-            if rows_to_save:
-                new_saved += kd_store.save_many(conn, rows_to_save)
+            for start in range(0, len(terms), batch_size):
+                batch = terms[start : start + batch_size]
+                try:
+                    related = fetch_fn(batch, 1)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("%s: 조회 실패(출처=%s, 씨앗=%s): %s", brand, source_type, batch, exc)
+                    stop = True
+                    break
+                rows_to_save: list[dict[str, Any]] = []
+                source_seed = ",".join(batch)
+                for kr_row in related:
+                    is_dict = isinstance(kr_row, dict)
+                    kw = kr_row.get("keyword") if is_dict else getattr(kr_row, "keyword", None)
+                    if not kw:
+                        continue
+                    pc = int((kr_row.get("pc") if is_dict else getattr(kr_row, "pc", 0)) or 0)
+                    mobile = int((kr_row.get("mobile") if is_dict else getattr(kr_row, "mobile", 0)) or 0)
+                    rows_to_save.append(
+                        {"keyword": str(kw).strip(), "pc": pc, "mobile": mobile, "total": pc + mobile,
+                         "source_seed": source_seed, "depth": 1, "relevance": 0}
+                    )
+                if rows_to_save:
+                    before = kd_store.count(conn)
+                    kd_store.save_many(conn, rows_to_save)
+                    inserted = kd_store.count(conn) - before
+                    new_saved += inserted
+                    if inserted:
+                        conn.execute(
+                            "UPDATE keywords SET seed_source_type = ? WHERE collected_at >= ?"
+                            " AND (seed_source_type = '' OR seed_source_type IS NULL)",
+                            (source_type, round_start),
+                        )
+                        conn.commit()
     finally:
         conn.close()
 
@@ -308,6 +535,7 @@ def run_cycle(
     try:
         eligible_after = eligible_count(conn)
         total_after = kd_store.count(conn)
+        by_source = source_stats(conn, round_start)
     finally:
         conn.close()
 
@@ -315,18 +543,10 @@ def run_cycle(
     adoption_rate = round(adopted / new_saved, 4) if new_saved else 0.0
 
     return {
-        "brand": brand,
-        "capped": False,
-        "total": total_after,
-        "eligible": eligible_after,
-        "new_collected": new_saved,
-        "adopted": adopted,
-        "adoption_rate": adoption_rate,
-        "seed_exhausted": seed_exhausted,
-        "guide_seed_used": guide_used,
-        "seeds_used": len(seeds),
-        "score_result": score_result,
-        "cross_result": cross_result,
+        "brand": brand, "capped": False, "total": total_after, "eligible": eligible_after,
+        "new_collected": new_saved, "adopted": adopted, "adoption_rate": adoption_rate,
+        "seed_exhausted": seed_exhausted, "seeds_used": len(seeds), "seed_counts": seed_counts,
+        "by_source": by_source, "score_result": score_result, "cross_result": cross_result,
     }
 
 
@@ -346,6 +566,8 @@ def fill_until_target(
     guide_seed_n: int = DEFAULT_GUIDE_SEED_N,
     cap: int = DEFAULT_CAP,
     max_rounds: int = 100_000,
+    autocomplete_fn: Callable[[str], list[str]] | None = None,
+    related_fn: Callable[[str], list[str]] | None = None,
 ) -> dict[str, Any]:
     """`eligible >= target`이거나 시드 고갈로 멈출 때까지 `run_cycle`을 반복한다."""
     ppath = progress_path(data_dir)
@@ -357,6 +579,7 @@ def fill_until_target(
         result = run_cycle(
             brand, db_path, guides_dir, router, fetch_fn,
             codex_exe=codex_exe, seed_limit=seed_limit, guide_seed_n=guide_seed_n, cap=cap,
+            autocomplete_fn=autocomplete_fn, related_fn=related_fn,
         )
         last = result
         eligible = result["eligible"]
@@ -391,6 +614,8 @@ def fill_until_target(
             adoption_rate=rate,
             low_adoption_streak=low_streak,
             seed_exhausted=result["seed_exhausted"],
+            seed_counts=result.get("seed_counts", {}),
+            by_source=result.get("by_source", {}),
         )
 
         if status in ("done", "시드고갈"):
@@ -407,8 +632,20 @@ def fill_until_target(
 def _real_fetch_fn(page: Any, account_id: str, download_dir: Path) -> Callable[[list[str], int], list[Any]]:
     kt = _kt_mod()
 
+    url = kt.KEYWORD_PLANNER_URL.format(account_id=account_id)
+
     def _fetch(seeds: list[str], depth: int) -> list[Any]:
-        return kt.fetch_related_keywords(page, seeds, account_id, download_dir=download_dir)
+        try:
+            return kt.fetch_related_keywords(page, seeds, account_id, download_dir=download_dir)
+        except RuntimeError as exc:
+            # 시드 수집(LLM·자동완성·연관검색)에 몇 분이 걸리는 동안 페이지가 바뀌어
+            # 입력창/버튼을 못 찾을 수 있다(실측 2026-09-24) — 도구 페이지를 다시 열고 1회 재시도.
+            if "찾지 못했습니다" not in str(exc) and "비활성" not in str(exc):
+                raise
+            log.warning("키워드 도구 페이지 재진입 후 재시도: %s", exc)
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(3000)
+            return kt.fetch_related_keywords(page, seeds, account_id, download_dir=download_dir)
 
     return _fetch
 
@@ -452,9 +689,13 @@ def worker_main(argv: list[str]) -> int:
         fetch_fn = _real_fetch_fn(page, account_id="685753", download_dir=data_dir / "keywords" / "_tmp")
         guides_dir = repo / "warehouse" / "guides" / "정리본"
         db_path = _kt_mod().db_path_for_brand(brand, data_dir)
+        from v2r.knowledge import keyword_exposure as ke
+
         result = fill_until_target(
             brand, db_path, guides_dir, router, fetch_fn,
             target=target, data_dir=data_dir,
+            autocomplete_fn=ke.naver_autocomplete_all,
+            related_fn=ke.naver_related_searches,
         )
         log.info("%s: 채우기 종료 %s", brand, result)
         return 0
@@ -479,7 +720,9 @@ __all__ = [
     "DEFAULT_CAP",
     "LOW_ADOPTION_STREAK_LIMIT",
     "LOW_ADOPTION_THRESHOLD",
-    "ELIGIBLE_SQL",
+    "eligible_sql",
+    "is_eligible_row",
+    "manuscript_max_relevance",
     "migrate_fill_columns",
     "eligible_count",
     "select_seed_keywords",
@@ -492,4 +735,12 @@ __all__ = [
     "run_cycle",
     "fill_until_target",
     "worker_main",
+    "SOURCE_TYPES",
+    "gather_seeds",
+    "expand_seed_terms",
+    "competitor_seed_terms",
+    "source_stats",
+    "record_seeds",
+    "used_seeds",
+    "top_eligible_keywords",
 ]
