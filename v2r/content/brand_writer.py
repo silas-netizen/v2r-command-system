@@ -1691,6 +1691,11 @@ def load_recent_openings(generated_dir: str | Path, limit: int = 20) -> list[str
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
+        if not isinstance(data, dict):
+            # 원고 1건이 아닌 다른 모양의 JSON(예: 시험용 요약 목록)이 같은
+            # generated/ 트리에 섞여 있어도 조용히 건너뛴다 (2026-09-23 실측에서
+            # `_compare5_summary.json`처럼 list 꼴이 섞여 있어 재현된 문제).
+            continue
         word = opening_word(str(data.get("body") or ""))
         if word:
             out.append(word)

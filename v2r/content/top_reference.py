@@ -133,8 +133,8 @@ def extract_serp(dom_html: str, max_n: int = 15) -> list[dict]:
     return out
 
 
-def _requests_crosscheck(keyword_query: str, cookies: dict | None = None) -> dict:
-    """다른 방식(requests, 비로그인 헤더 쿠키만)으로 한 번 더 1등 일반 글을 확인한다.
+def _requests_crosscheck(keyword_query: str, cookies: dict | None = None, sources: list[str] | None = None) -> dict:
+    """다른 방식(requests, 비로그인 헤더 쿠키만)으로 한 번 더 1등 글(기본: 카페)을 확인한다.
 
     Playwright(로그인 프로필·끝까지 스크롤) 결과와 URL이 같은지만 본다 — 실패해도
     예외를 올리지 않고 `{"url": "", "error": ...}`를 돌려준다.
@@ -145,7 +145,7 @@ def _requests_crosscheck(keyword_query: str, cookies: dict | None = None) -> dic
         html = fetch_integrated_search_html(keyword_query, cookies=cookies)
     except Exception as exc:
         return {"url": "", "error": str(exc)}
-    picked = _pick_top_link(html)
+    picked = _pick_top_link(html, sources=sources)
     return {"url": picked["url"] if picked else "", "source": picked["source"] if picked else ""}
 
 _RE_TAG = re.compile(r"<[^>]+>")
@@ -168,6 +168,11 @@ def _cfg() -> dict:
     return (load_yaml("bulk") or {}).get("top_reference") or {}
 
 
+#: 캐시 스키마 버전 — 2026-09-23 정정(카페 전용 + serp/rank_in_source 추가)으로
+#: 1 -> 2. 옛 캐시(버전 없음/구버전)는 무효로 보고 다시 수집한다.
+CACHE_VERSION = 2
+
+
 def _load_cache(repo_root: str | Path, keyword: str) -> dict | None:
     p = _cache_path(repo_root, keyword)
     if not p.exists():
@@ -175,6 +180,8 @@ def _load_cache(repo_root: str | Path, keyword: str) -> dict | None:
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
     except Exception:
+        return None
+    if int(data.get("version") or 0) != CACHE_VERSION:
         return None
     fetched_at = str(data.get("fetched_at") or "")
     if not fetched_at:
@@ -195,6 +202,7 @@ def _load_cache(repo_root: str | Path, keyword: str) -> dict | None:
 
 
 def _save_cache(repo_root: str | Path, keyword: str, data: dict) -> None:
+    data = {**data, "version": CACHE_VERSION}
     p = _cache_path(repo_root, keyword)
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_suffix(".json.tmp")
@@ -213,17 +221,32 @@ def _strip_tags(html: str) -> str:
     return text.strip()
 
 
-def _pick_top_link(dom_html: str) -> dict | None:
-    """통검 DOM에서 광고/쇼핑/뉴스를 뺀 첫 일반 글 — 카페>블로그>포스트>지식iN 순.
+#: 2026-09-23 정정 — 참고할 "1위 글"은 카페 글만. `config/bulk.yaml`
+#: `top_reference.sources`(기본 `[cafe]`)로 확장 가능하게 둔다.
+DEFAULT_SOURCES = ["cafe"]
 
-    각 소스별로 DOM 안에서 가장 먼저 등장하는 링크의 위치(offset)를 비교해,
-    "먼저 나오는 카테고리"를 우선하되 그 카테고리 안 첫 항목을 쓴다(사용자
-    지시: 카페·블로그·포스트·지식iN "순으로 나오는 첫 결과").
+
+def _allowed_sources() -> list[str]:
+    sources = _cfg().get("sources")
+    if not sources:
+        return list(DEFAULT_SOURCES)
+    return [str(s).strip() for s in sources if str(s).strip()]
+
+
+def _pick_top_link(dom_html: str, sources: list[str] | None = None) -> dict | None:
+    """통검 DOM에서 광고/쇼핑/뉴스를 뺀, `sources`(기본 카페만)에 속하는 첫 글.
+
+    `sources`를 안 주면 `config/bulk.yaml`의 `top_reference.sources`(기본
+    `["cafe"]`)를 따른다. 여러 소스를 허용하면 각 소스별 DOM 첫 등장 위치를
+    비교해 화면에 먼저 나오는 쪽을 우선한다.
     """
     if not dom_html:
         return None
+    allowed = set(sources) if sources is not None else set(_allowed_sources())
     best: tuple[int, str, str] | None = None  # (offset, source, url)
     for source, pattern in _RESULT_LINK_PATTERNS:
+        if source not in allowed:
+            continue
         m = pattern.search(dom_html)
         if not m:
             continue
@@ -388,9 +411,11 @@ def fetch_top_article(
         log.warning("참고 형식: 통검 조회 실패(%s): %s", keyword, exc)
         return {"error": f"통검 조회 실패: {exc}", "fetched_at": now_iso()}
 
-    picked = _pick_top_link(dom_html)
+    sources = _allowed_sources()
+    picked = _pick_top_link(dom_html, sources=sources)
     if not picked:
-        return {"error": "일반 글을 찾지 못함(광고/쇼핑만 있음)", "fetched_at": now_iso()}
+        label = "카페 글" if sources == ["cafe"] else "일반 글"
+        return {"error": f"{label} 없음", "fetched_at": now_iso()}
 
     serp_info: dict = {}
     if capture_serp:
@@ -400,18 +425,28 @@ def fetch_top_article(
         picked_norm = _norm_serp_url(picked["url"])
         rank_overall = None
         rank_organic = None
+        rank_in_source = None
         organic_i = 0
+        source_i = 0
         for item in serp_full:
             if not item["is_ad"] and item["section"] != "쇼핑":
                 organic_i += 1
+            if item["source"] == picked["source"] and not item["is_ad"]:
+                source_i += 1
             if _norm_serp_url(item["url"]) == picked_norm:
                 rank_overall = item["rank"]
                 rank_organic = organic_i if not item["is_ad"] else None
-        serp_info = {"serp": serp_full[:15], "rank_overall": rank_overall, "rank_organic": rank_organic}
+                rank_in_source = source_i if not item["is_ad"] else None
+        serp_info = {
+            "serp": serp_full[:15],
+            "rank_overall": rank_overall,
+            "rank_organic": rank_organic,
+            "rank_in_source": rank_in_source,
+        }
 
     crosscheck_info: dict = {}
     if crosscheck:
-        cc = _requests_crosscheck(query, cookies=_cookie_dict_for(cookies_path))
+        cc = _requests_crosscheck(query, cookies=_cookie_dict_for(cookies_path), sources=sources)
         cc_norm = _norm_serp_url(cc.get("url") or "") if cc.get("url") else ""
         picked_norm = _norm_serp_url(picked["url"])
         match = bool(cc.get("url")) and cc_norm == picked_norm

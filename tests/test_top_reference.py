@@ -64,6 +64,37 @@ def test_pick_top_link_none_when_nothing_matches():
     assert tr._pick_top_link("") is None
 
 
+def test_pick_top_link_default_is_cafe_only_ignores_earlier_blog():
+    # 2026-09-23 정정 — 블로그가 화면에 먼저 나와도 카페만 대상이면 블로그는 무시한다
+    html = (
+        '<a href="https://blog.naver.com/someone/224403640216">먼저 나오는 블로그</a>'
+        '<a href="https://cafe.naver.com/imsanbu/80102656">나중에 나오는 카페</a>'
+    )
+    picked = tr._pick_top_link(html)  # sources 생략 → 기본 config(카페만)
+    assert picked is not None
+    assert picked["source"] == "cafe"
+    assert picked["url"] == "https://cafe.naver.com/imsanbu/80102656"
+
+
+def test_pick_top_link_none_when_only_blog_and_sources_is_cafe():
+    html = '<a href="https://blog.naver.com/someone/224403640216">블로그만 있음</a>'
+    assert tr._pick_top_link(html, sources=["cafe"]) is None
+
+
+def test_pick_top_link_sources_param_can_widen():
+    html = '<a href="https://blog.naver.com/someone/224403640216">블로그</a>'
+    picked = tr._pick_top_link(html, sources=["cafe", "blog"])
+    assert picked is not None
+    assert picked["source"] == "blog"
+
+
+def test_allowed_sources_default_and_config(monkeypatch):
+    monkeypatch.setattr(tr, "_cfg", lambda: {})
+    assert tr._allowed_sources() == ["cafe"]
+    monkeypatch.setattr(tr, "_cfg", lambda: {"sources": ["cafe", "blog"]})
+    assert tr._allowed_sources() == ["cafe", "blog"]
+
+
 # ---------------------------------------------------------------------------
 # 형식 지표 계산
 # ---------------------------------------------------------------------------
@@ -241,3 +272,26 @@ def test_build_body_prompt_no_block_when_brief_empty():
 
     sys_p, user_p = bw.build_body_prompt("우아덤", "테스트키워드", "", "", "", None, reference_brief="")
     assert "【참고 형식(통검 1등 글)】" not in user_p
+
+
+# ---------------------------------------------------------------------------
+# 캐시 버전(2026-09-23 정정: 카페 전용으로 스키마가 바뀌어 옛 캐시는 무효)
+# ---------------------------------------------------------------------------
+
+
+def test_load_cache_rejects_old_version(tmp_path):
+    import json
+
+    cache_path = tr._cache_path(tmp_path, "옛키워드")
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(
+        json.dumps({"fetched_at": tr.now_iso(), "source": "blog"}), encoding="utf-8"
+    )  # version 필드 없음 = 구버전
+    assert tr._load_cache(tmp_path, "옛키워드") is None
+
+
+def test_save_cache_then_load_roundtrip_has_current_version(tmp_path):
+    tr._save_cache(tmp_path, "새키워드", {"fetched_at": tr.now_iso(), "source": "cafe"})
+    loaded = tr._load_cache(tmp_path, "새키워드")
+    assert loaded is not None
+    assert loaded["version"] == tr.CACHE_VERSION
