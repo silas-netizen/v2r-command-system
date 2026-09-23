@@ -162,9 +162,15 @@ def update_worker_state(
     last_keyword: str | None = None,
     resting_until: float | None = None,
     started_at: str | None = None,
+    duplicate: bool | None = None,
 ) -> dict:
     """작업자 상태 갱신(다른 프로세스와 동시에 써도 마지막 쓰기가 이긴다 —
-    작업자별 키가 나뉘어 있어 충돌해도 서로 덮어쓰지 않는다)."""
+    작업자별 키가 나뉘어 있어 충돌해도 서로 덮어쓰지 않는다).
+
+    2026-09-24 3차 — `duplicate`(이번 처리 건이 중복 재검사였는지, `True`/
+    `False`)를 넘기면 작업자별·전체 중복률(`duplicate_rate`)을 같이 집계해
+    `data/exposure_runner_state.json`에 남긴다(`exposure_runner.process_one`의
+    `_is_duplicate_recheck` 판정 결과)."""
     state = _load_state(repo_root)
     workers = state.setdefault("workers", {})
     w = workers.setdefault(str(worker_id), {"processed": 0, "started_at": started_at or now_iso_utc()})
@@ -175,11 +181,20 @@ def update_worker_state(
         w["last_at"] = now_iso_utc()
     if resting_until is not None:
         w["resting_until"] = resting_until
+    if duplicate is not None:
+        w["duplicate_count"] = int(w.get("duplicate_count", 0)) + (1 if duplicate else 0)
+        w["checked_count"] = int(w.get("checked_count", 0)) + 1
+        w["duplicate_rate"] = round(w["duplicate_count"] / max(1, w["checked_count"]), 4)
     elapsed_h = max(
         1e-6,
         (time.time() - _to_epoch(w.get("started_at", now_iso_utc()))) / 3600.0,
     )
     w["rate_per_hour"] = round(int(w.get("processed", 0)) / elapsed_h, 1)
+    if duplicate is not None:
+        totals = state.setdefault("duplicate_totals", {"duplicate_count": 0, "checked_count": 0})
+        totals["duplicate_count"] = int(totals.get("duplicate_count", 0)) + (1 if duplicate else 0)
+        totals["checked_count"] = int(totals.get("checked_count", 0)) + 1
+        totals["duplicate_rate"] = round(totals["duplicate_count"] / max(1, totals["checked_count"]), 4)
     state["updated_at"] = now_iso_utc()
     _write_state(repo_root, state)
     return w
@@ -357,6 +372,29 @@ def _latest_status(conn: Any, brand: str, keyword: str) -> str:
     return str(row["status"]) if row else ""
 
 
+def _is_duplicate_recheck(prev_row: Any, row: Any, cfg: dict, *, exempt: bool) -> bool:
+    """2026-09-24 3차 — 이번 검사가 최소 간격 규칙(노출완 6시간, 밀려남·미확인
+    12시간)보다 먼저 같은 키워드를 다시 본 "중복 재검사"인지 판정한다(통계용,
+    `exposure_priority.is_due_now`가 미리 걸렀어야 정상적으로는 거의 안 남아야
+    한다). `exempt=True`(2단계 확인 대기 재확인)면 의도된 재검사이므로 중복이
+    아니다."""
+    if exempt or prev_row is None:
+        return False
+    from v2r.knowledge.exposure_priority import _parse_iso
+
+    prev_dt = _parse_iso(str(prev_row["checked_at"] or ""))
+    row_dt = _parse_iso(row.checked_at)
+    if prev_dt is None or row_dt is None:
+        return False
+    age_h = (row_dt - prev_dt).total_seconds() / 3600.0
+    priority_cfg = cfg.get("priority", {}) if isinstance(cfg.get("priority"), dict) else {}
+    prev_status = str(prev_row["status"] or "")
+    due = float(priority_cfg.get("exposed_recheck_hours", 6)) if prev_status == "exposed" else float(
+        priority_cfg.get("pushed_min_gap_hours", 12)
+    )
+    return age_h < due
+
+
 def process_one(
     rt: Any, context: Any, brand: str, item: dict, cfg: dict, executor: "concurrent.futures.ThreadPoolExecutor | None" = None
 ) -> dict:
@@ -370,22 +408,32 @@ def process_one(
     시트를 밀려남으로 바꾼다. 재확인에서 `exposed`가 나오면(일시 변동) 대기를
     지우고 아무 것도 바꾸지 않는다 — 직전 `exposed` 행이 이미 최신이라 그대로
     유지된다. 판정 규칙 자체(`judge_keyword_exposure`)는 그대로 호출만 한다.
+
+    2026-09-24 3차 — 반환 딕셔너리에 `duplicate`(bool)를 추가한다 — 이번
+    검사가 최소 간격 규칙보다 먼저 같은 키워드를 다시 본 것인지(중복
+    재검사)를, 검사 시작 전 읽어 둔 직전 행(`prev_row`)과 이번 결과의
+    시간 차로 판정한다(`_is_duplicate_recheck`). 상태 파일에 집계된다
+    (`update_worker_state`의 `duplicate` 인자, `run_worker` 참고).
     """
+    from v2r.store import keyword_exposure_store as store
+
     keyword = item["keyword"]
-    prev_status = _latest_status(rt.conn, brand, keyword)
+    prev_row = store.latest_for_keyword(rt.conn, brand, keyword)
+    prev_status = str(prev_row["status"]) if prev_row is not None else ""
     pending = get_pending(rt.settings.repo_root, brand, keyword)
 
     row = judge_once(rt, context, brand, item, cfg, executor=executor)
+    duplicate = _is_duplicate_recheck(prev_row, row, cfg, exempt=pending is not None)
 
     if row.status == "pushed" and (prev_status == "exposed" or pending is not None):
         if pending is None:
             # 노출완 → 밀려남 첫 관측 — 바로 확정하지 않고 대기만 남긴다(DB 미기록).
             set_pending(rt.settings.repo_root, brand, item, cfg)
-            return {"status": "pending_confirm", "keyword": keyword}
+            return {"status": "pending_confirm", "keyword": keyword, "duplicate": duplicate}
         # 대기 중이던 키워드의 재확인 — 이번에도 밀려남이면 확정.
         clear_pending(rt.settings.repo_root, brand, keyword)
         _finalize_row(rt, brand, item, row)
-        return {"status": row.status, "keyword": keyword, "rank": row.rank, "confirmed": True}
+        return {"status": row.status, "keyword": keyword, "rank": row.rank, "confirmed": True, "duplicate": duplicate}
 
     if pending is not None:
         # 대기 중이었는데 이번엔 밀려남이 아님(exposed로 되돌아옴) — 일시 변동,
@@ -393,10 +441,10 @@ def process_one(
         clear_pending(rt.settings.repo_root, brand, keyword)
         if row.status != "exposed":
             _finalize_row(rt, brand, item, row)
-        return {"status": row.status, "keyword": keyword, "rank": row.rank, "false_alarm_cleared": True}
+        return {"status": row.status, "keyword": keyword, "rank": row.rank, "false_alarm_cleared": True, "duplicate": duplicate}
 
     _finalize_row(rt, brand, item, row)
-    return {"status": row.status, "keyword": keyword, "rank": row.rank}
+    return {"status": row.status, "keyword": keyword, "rank": row.rank, "duplicate": duplicate}
 
 
 # =======================================================================
@@ -532,28 +580,43 @@ def _inflight_key(brand: str, keyword: str) -> str:
     return f"{brand}|{keyword}"
 
 
+def _inflight_entry_active(entry: dict, now: float) -> bool:
+    """항목이 아직 "선점 중"(진행 중이거나, 방금 끝나 배제 창 안)인지.
+
+    2026-09-24 3차 — 검사가 끝나도 바로 지우지 않고 `completed_at`을 남겨
+    두면(`complete_inflight`), 다른 작업자의 정렬 캐시(`priority.
+    universe_cache_sec`, 기본 120초)가 아직 이 키워드를 들고 있는 동안은
+    배치 필터에서 계속 제외된다 — `INFLIGHT_TTL_SECONDS`(180초)가 그 캐시
+    TTL보다 크므로 별도 설정 없이 요건을 만족한다."""
+    completed_at = entry.get("completed_at")
+    if completed_at is not None:
+        return (now - float(completed_at)) < INFLIGHT_TTL_SECONDS
+    return (now - float(entry.get("claimed_at", 0))) < INFLIGHT_TTL_SECONDS
+
+
 def is_inflight(repo_root: str | Path, brand: str, keyword: str, now: float | None = None) -> bool:
     now = now if now is not None else time.time()
     entry = _load_inflight(repo_root).get(_inflight_key(brand, keyword))
     if not entry:
         return False
-    return (now - float(entry.get("claimed_at", 0))) < INFLIGHT_TTL_SECONDS
+    return _inflight_entry_active(entry, now)
 
 
 def claim_inflight(
     repo_root: str | Path, brand: str, keyword: str, worker_id: int, now: float | None = None
 ) -> bool:
     """지금부터 이 키워드를 이 작업자가 검사한다고 표시. 다른 작업자가 이미
-    (만료 전) 진행 중이면 `False`(이 작업자는 다른 후보를 골라야 함)."""
+    (만료 전) 진행 중이거나 방금 검사를 끝냈으면(완료 표시, TTL 안) `False`
+    (이 작업자는 다른 후보를 골라야 함)."""
     now = now if now is not None else time.time()
     key = _inflight_key(brand, keyword)
 
     def _do() -> bool:
         data = _load_inflight(repo_root)
         existing = data.get(key)
-        if existing and (now - float(existing.get("claimed_at", 0))) < INFLIGHT_TTL_SECONDS:
+        if existing and _inflight_entry_active(existing, now):
             return False
-        data[key] = {"worker_id": worker_id, "claimed_at": now}
+        data[key] = {"worker_id": worker_id, "claimed_at": now, "completed_at": None}
         _write_inflight(repo_root, data)
         return True
 
@@ -561,11 +624,36 @@ def claim_inflight(
 
 
 def release_inflight(repo_root: str | Path, brand: str, keyword: str) -> None:
+    """선점 표시를 완전히 지운다 — 검사가 끝나서가 아니라 실패/예외로
+    중단됐을 때만 쓴다(다른 작업자가 바로 다시 집을 수 있어야 하므로).
+    정상 완료는 `complete_inflight`를 쓴다."""
     key = _inflight_key(brand, keyword)
 
     def _do() -> None:
         data = _load_inflight(repo_root)
         data.pop(key, None)
+        _write_inflight(repo_root, data)
+
+    _with_inflight_lock(repo_root, _do)
+
+
+def complete_inflight(
+    repo_root: str | Path, brand: str, keyword: str, now: float | None = None
+) -> None:
+    """검사를 정상적으로 마쳤을 때 부른다 — 선점 표시를 지우는 대신
+    `completed_at`을 남겨(2026-09-24 3차) `INFLIGHT_TTL_SECONDS`(180초, 정렬
+    캐시 TTL 이상) 동안 이 키워드가 다른 작업자의 배치에 다시 잡히지 않게
+    한다. 다른 작업자의 정렬 캐시(`next_priority_batch`가 매 후보마다 DB
+    직전 확인을 하므로 사실 이것만으로도 걸러지지만) TTL이 만료돼 재정렬될
+    때까지의 창을 한 번 더 막는 이중 방어다."""
+    now = now if now is not None else time.time()
+    key = _inflight_key(brand, keyword)
+
+    def _do() -> None:
+        data = _load_inflight(repo_root)
+        entry = data.get(key) or {"worker_id": None, "claimed_at": now}
+        entry["completed_at"] = now
+        data[key] = entry
         _write_inflight(repo_root, data)
 
     _with_inflight_lock(repo_root, _do)
@@ -593,6 +681,9 @@ class WorkerQueue:
         # 충돌로 대부분 버려져 재조회가 잦은 건 아닌지) 로그로 확인한다.
         self._consumed = 0
         self._claim_failed = 0
+        # 2026-09-24 3차 — 캐시(정렬 목록)가 이미 다른 작업자가 검사한 후보를
+        # 들고 있어 뽑혔지만, 검사 직전 DB 단건 확인(`is_due_now`)에서 걸린 수.
+        self._stale_skipped = 0
 
     def _needs_refill(self, brand: str, now: float) -> bool:
         return brand != self.brand or now >= self.expires_at or not self.items
@@ -605,8 +696,8 @@ class WorkerQueue:
 
         if self.brand is not None:
             log.info(
-                "타이밍 큐소비 브랜드=%s 소비=%s 선점실패=%s 남은채로재조회=%s",
-                self.brand, self._consumed, self._claim_failed, len(self.items),
+                "타이밍 큐소비 브랜드=%s 소비=%s 선점실패=%s 직전확인제외=%s 남은채로재조회=%s",
+                self.brand, self._consumed, self._claim_failed, self._stale_skipped, len(self.items),
             )
         # next_priority_batch 자체는 이미 선점 중인(claim_inflight) 항목을
         # 걸러 주지만(2026-09-24 2차), 이 배치를 받은 뒤에도 다른 작업자가
@@ -621,21 +712,33 @@ class WorkerQueue:
         self.expires_at = now + self.ttl_sec
         self._consumed = 0
         self._claim_failed = 0
+        self._stale_skipped = 0
 
     def take(self, rt: Any, brand: str, worker_id: int, now: float | None = None) -> dict | None:
-        """큐에서 `claim_inflight`로 선점에 성공하는 첫 항목을 꺼내 돌려준다.
+        """큐에서 `claim_inflight`로 선점에 성공하고, 검사 직전 DB 단건 확인
+        (`exposure_priority.is_due_now`, 2026-09-24 3차)까지 통과하는 첫
+        항목을 꺼내 돌려준다.
 
-        선점 실패한 항목(다른 작업자가 방금 집음)은 버리고 다음 항목을
-        시도한다. 큐가 (선점 실패로) 다 비면 새로 조회하지 않고 `None`을
-        돌려준다 — 호출자가 잠시 쉬었다 다음 틱에 다시 부르면 그때
+        선점 실패한 항목(다른 작업자가 방금 집음)이나, 선점엔 성공했지만
+        직전 확인에서 "이미 다른 작업자가 방금 검사했다"고 나온 항목은
+        버리고 다음 항목을 시도한다(후자는 선점을 도로 풀어 다른 작업자가
+        헛수고로 붙잡고 있지 않게 한다). 큐가 다 비면 새로 조회하지 않고
+        `None`을 돌려준다 — 호출자가 잠시 쉬었다 다음 틱에 다시 부르면 그때
         TTL·빈 큐 조건으로 재조회된다."""
+        from v2r.knowledge import exposure_priority
+
         self.refill_if_needed(rt, brand, now)
         while self.items:
             candidate = self.items.pop(0)
-            if claim_inflight(rt.settings.repo_root, brand, candidate["keyword"], worker_id):
-                self._consumed += 1
-                return candidate
-            self._claim_failed += 1
+            if not claim_inflight(rt.settings.repo_root, brand, candidate["keyword"], worker_id):
+                self._claim_failed += 1
+                continue
+            if not exposure_priority.is_due_now(rt, brand, candidate):
+                release_inflight(rt.settings.repo_root, brand, candidate["keyword"])
+                self._stale_skipped += 1
+                continue
+            self._consumed += 1
+            return candidate
         return None
 
 
@@ -743,9 +846,21 @@ def run_worker(worker_id: int, brands: list[str] | None = None, max_iterations: 
 
                 try:
                     result = process_one(rt, context, brand, item, cfg, executor=confirm_executor)
-                finally:
+                except Exception:
+                    # 검사 자체가 실패(예외)했으면 선점을 완전히 풀어 다른
+                    # 작업자가 바로 다시 집을 수 있게 한다 — "완료" 표시를
+                    # 남기면 실제로 검사가 안 됐는데도 배제되어 버린다.
                     release_inflight(rt.settings.repo_root, brand, item["keyword"])
-                update_worker_state(rt.settings.repo_root, worker_id, processed_delta=1, last_keyword=item["keyword"])
+                    raise
+                # 2026-09-24 3차 — 정상 완료는 선점을 지우지 않고 "완료 표시"로
+                # 바꾼다(`complete_inflight`). 다른 작업자의 정렬 캐시가 아직
+                # 이 키워드를 들고 있어도(`INFLIGHT_TTL_SECONDS`=180초, 정렬
+                # 캐시 TTL 이상) 배치 필터에서 계속 제외된다.
+                complete_inflight(rt.settings.repo_root, brand, item["keyword"])
+                update_worker_state(
+                    rt.settings.repo_root, worker_id, processed_delta=1, last_keyword=item["keyword"],
+                    duplicate=bool(result.get("duplicate")),
+                )
                 unknown_streak = unknown_streak + 1 if result["status"] == "unknown" else 0
                 if unknown_streak >= block_streak_limit:
                     resting_until = time.time() + rest_minutes * 60
@@ -804,6 +919,7 @@ __all__ = [
     "is_inflight",
     "claim_inflight",
     "release_inflight",
+    "complete_inflight",
     "WorkerQueue",
     "run_worker",
     "main",

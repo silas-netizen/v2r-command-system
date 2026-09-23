@@ -29,6 +29,18 @@ def save(conn: sqlite3.Connection, row: dict[str, Any]) -> None:
     )
 
 
+def latest_for_keyword(conn: sqlite3.Connection, brand: str, keyword: str) -> sqlite3.Row | None:
+    """이 브랜드·키워드 한 건의 가장 최근 검사 결과 — 단건 조회(`idx_keyword_exposure_brand`
+    (brand, keyword, checked_at) 인덱스로 밀리초 단위). 2026-09-24 3차 — 작업자가
+    실제로 검사하기 직전에 캐시와 무관하게 항상 이걸로 최종 확인한다(다른
+    작업자가 그 사이 검사한 걸 캐시가 놓쳐 중복 재검사되던 문제 수정)."""
+    return conn.execute(
+        "SELECT status, checked_at FROM keyword_exposure WHERE brand = ? AND keyword = ? "
+        "ORDER BY checked_at DESC, rowid DESC LIMIT 1",
+        (brand, keyword),
+    ).fetchone()
+
+
 def latest_by_keyword(conn: sqlite3.Connection, brand: str = "") -> list[sqlite3.Row]:
     """브랜드(비우면 전체)의 키워드별 **가장 최근** 검사 결과 1행씩."""
     where = "WHERE brand = ?" if brand else ""
@@ -88,4 +100,4 @@ def summary(conn: sqlite3.Connection) -> dict[str, Any]:
     return by_brand
 
 
-__all__ = ["save", "latest_by_keyword", "pushed_keywords", "summary"]
+__all__ = ["save", "latest_for_keyword", "latest_by_keyword", "pushed_keywords", "summary"]

@@ -445,6 +445,7 @@ def next_priority_batch(rt: Any, brand: str, n: int, now: datetime | None = None
     자른다."""
     from v2r.knowledge.exposure_runner import is_inflight
     from v2r.knowledge.keyword_exposure import _norm
+    from v2r.store import keyword_exposure_store as store
 
     now = now or datetime.now(timezone.utc)
     cfg = load_config(rt.settings.repo_root).get("priority", dict(_DEFAULT_PRIORITY))
@@ -455,23 +456,35 @@ def next_priority_batch(rt: Any, brand: str, n: int, now: datetime | None = None
     if not candidates:
         return []
 
-    last_checked = _last_checked_map(rt, brand, cfg)
     bundle = _universe_bundle(rt, brand, cfg, now)
     recent_norm = bundle["recent_norm"]
     vol_threshold = bundle["vol_threshold"]
 
     out: list[dict] = []
     skipped_due, skipped_inflight = 0, 0
+    db_checks = 0
     for _tier, item in candidates:
-        # 정렬 캐시 시점 이후 이 키워드가 검사됐을 수 있으니(같은 작업자의
-        # 직전 검사, mark_checked로 즉시 반영됨) 가벼운 last_checked만으로
-        # 다시 등급을 확인한다 — 전체 universe 재순회가 아니라 이 후보
-        # 하나만 보므로 비용이 거의 없다.
+        keyword = item["keyword"]
+        # 2026-09-24 3차 — 캐시(정렬·last_checked)는 작업자 프로세스별 메모리라
+        # 다른 작업자가 그 사이 검사한 걸 놓쳐 중복 재검사(실측 13%, 브랜드
+        # 고정 시 67%)가 났다. 그래서 배치에 넣을 후보마다 DB 단건 조회로
+        # 캐시와 무관하게 항상 최신 상태를 확인한다(인덱스로 밀리초 단위,
+        # 전체 순회가 아니라 앞에서부터 스캔하는 몇 건만이라 비용이 작다).
+        last_row = store.latest_for_keyword(rt.conn, brand, keyword)
+        db_checks += 1
+        last_checked = (
+            {_norm(keyword): {"checked_at": str(last_row["checked_at"] or ""), "status": str(last_row["status"] or "")}}
+            if last_row is not None
+            else {}
+        )
         tier2, _age2 = priority_tier(item, last_checked, recent_norm, cfg, vol_threshold, now)
         if tier2 >= 99:
             skipped_due += 1
             continue
-        if is_inflight(rt.settings.repo_root, brand, item["keyword"]):
+        # `is_inflight`는 진행 중(claim) 표시뿐 아니라 방금 완료된 표시
+        # (`complete_inflight`, TTL 동안 유지)도 함께 걸러낸다 — 다른 작업자의
+        # 오래된 정렬 캐시가 아직 이 키워드를 들고 있어도 배치에 다시 안 담긴다.
+        if is_inflight(rt.settings.repo_root, brand, keyword):
             skipped_inflight += 1
             continue
         out.append(item)
@@ -479,10 +492,36 @@ def next_priority_batch(rt: Any, brand: str, n: int, now: datetime | None = None
             break
     t2 = time.perf_counter()
     log.info(
-        "타이밍 우선순위조회 브랜드=%s 정렬캐시=%.3fs 필터=%.3fs 후보=%s 주기전제외=%s 선점제외=%s",
-        brand, t1 - t0, t2 - t1, len(out), skipped_due, skipped_inflight,
+        "타이밍 우선순위조회 브랜드=%s 정렬캐시=%.3fs 필터=%.3fs DB직전확인=%s 후보=%s 주기전제외=%s 선점제외=%s",
+        brand, t1 - t0, t2 - t1, db_checks, len(out), skipped_due, skipped_inflight,
     )
     return out
+
+
+def is_due_now(rt: Any, brand: str, item: dict, now: datetime | None = None) -> bool:
+    """작업자가 이 후보를 실제로 검사하기 직전(브라우저를 열기 바로 전) 마지막
+    으로 확인한다 — 캐시(universe·정렬·last_checked 전부)와 무관하게 항상 DB
+    단건 조회(인덱스, 밀리초)로 최소 간격 규칙(노출완 6시간, 밀려남·미확인
+    12시간)을 다시 본다. `True`면 검사해도 된다(주기가 지났거나 최근 발행
+    예외), `False`면 다른 작업자가 그 사이 이미 검사한 것이니 건너뛰어야
+    한다. 2단계 확인 대기(pending_confirm) 재확인은 이 함수를 거치지 않는다
+    (`exposure_runner.run_worker`가 `due_pending` 경로로 별도 처리, 의도된
+    예외이므로)."""
+    from v2r.knowledge.keyword_exposure import _norm
+    from v2r.store import keyword_exposure_store as store
+
+    now = now or datetime.now(timezone.utc)
+    cfg = load_config(rt.settings.repo_root).get("priority", dict(_DEFAULT_PRIORITY))
+    keyword = item.get("keyword", "")
+    last_row = store.latest_for_keyword(rt.conn, brand, keyword)
+    last_checked = (
+        {_norm(keyword): {"checked_at": str(last_row["checked_at"] or ""), "status": str(last_row["status"] or "")}}
+        if last_row is not None
+        else {}
+    )
+    bundle = _universe_bundle(rt, brand, cfg, now)
+    tier, _age = priority_tier(item, last_checked, bundle["recent_norm"], cfg, bundle["vol_threshold"], now)
+    return tier < 99
 
 
 def queue_counts(rt: Any, brand: str, now: datetime | None = None) -> dict[str, int]:
@@ -519,4 +558,5 @@ __all__ = [
     "mark_checked",
     "invalidate_last_checked_cache",
     "invalidate_sorted_cache",
+    "is_due_now",
 ]

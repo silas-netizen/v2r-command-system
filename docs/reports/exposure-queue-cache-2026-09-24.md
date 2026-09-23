@@ -149,8 +149,98 @@
 - 전체 `pytest` 스위트는 **미실행**(다른 일꾼이 동시에 돌리고 있어 관련
   시험만 통과 확인).
 
+## 3차 — 작업자 프로세스 간 캐시 불일치로 인한 중복 재검사 수정
+
+배경: `docs/reports/exposure-speed-2026-09-24.md` 6-4절 실측 — `exposure_priority`의
+universe·정렬·last_checked 캐시가 **작업자 프로세스별 메모리**(모듈 전역
+dict)라, 한 작업자의 검사 결과(`mark_checked`)는 그 작업자 자신의 캐시만
+갱신하고 다른 작업자 프로세스의 캐시는 그대로였다. 브랜드를 자주 바꿀 때는
+가려져 있었지만(캐시가 재사용되기 전에 다음 브랜드로 넘어감), 브랜드에 오래
+머물게 하자(de22603) 작업자 5개가 각자 정체된 캐시로 같은 상위권 키워드를
+반복해서 다시 뽑아 267건 중 180건(67%)이 중복 재검사였다. 브랜드 고정을
+되돌린 뒤(ab32ce5)에도 중복 13%는 남았다 — claim_inflight는 "동시" 선점만
+막을 뿐, TTL(120초) 동안 여러 번 **순차로** 다시 뽑히는 건 못 막았기 때문.
+
+### 바꾼 구조(3차)
+
+1. **검사 직전 DB 단건 확인 — 캐시와 무관하게 항상 수행.**
+   `v2r/store/keyword_exposure_store.py`에 `latest_for_keyword(conn, brand,
+   keyword)`(단건, 기존 `idx_keyword_exposure_brand(brand, keyword,
+   checked_at)` 인덱스로 밀리초) 추가. `exposure_priority.next_priority_batch`는
+   이제 배치에 넣을 후보마다(정렬 캐시가 준 순서를 그대로 쓰되) 이 단건
+   조회로 최소 간격 규칙(노출완 6시간, 밀려남·미확인 12시간)을 다시 확인—
+   캐시된 `last_checked` 맵을 더 이상 이 최종 판정에 쓰지 않는다. 새 함수
+   `exposure_priority.is_due_now(rt, brand, item, now=None)`도 추가해
+   `exposure_runner.WorkerQueue.take()`가 큐에서 항목을 꺼낼 때(실제로
+   브라우저를 열기 직전) 한 번 더 같은 확인을 한다 — 정렬 캐시 구성 시점과
+   실제 소비 시점 사이(배치 10개를 다 쓰는 데 최대 TTL만큼 걸릴 수 있음)의
+   간극을 막는다. 걸리면 선점을 풀고(`release_inflight`) 다음 후보로 넘어간다.
+   2단계 확인 대기(`due_pending`) 경로는 원래 예외이므로 이 확인을 거치지
+   않는다.
+
+2. **완료 표시(`complete_inflight`)** — `exposure_inflight.json` 항목에
+   `completed_at`을 추가했다. 검사가 정상 끝나면(`run_worker`) 기존처럼
+   선점을 바로 지우지 않고(`release_inflight`) `complete_inflight`로
+   `completed_at`만 남긴다. `is_inflight`가 `completed_at` 기준으로도
+   `INFLIGHT_TTL_SECONDS`(180초) 동안 "선점 중"으로 본다 — 이 TTL이
+   `priority.universe_cache_sec`(기본 120초, 정렬 캐시 TTL)보다 크므로 별도
+   설정 없이 "다른 작업자의 정렬 캐시가 만료되기 전까지 제외" 요건을
+   만족한다. 검사가 예외로 실패했을 때는 `release_inflight`로 완전히 지워
+   다른 작업자가 바로 다시 집을 수 있게 했다(완료가 아니므로).
+
+3. **정렬 캐시에서 자를 때 둘 다 통과한 것만** — `next_priority_batch`의
+   후보 필터 순서를 (1) DB 직전 확인(위 1번) → (2) `is_inflight`(진행 중 +
+   완료 표시, 위 2번) 순으로 둬서, 두 조건을 모두 통과한 항목만 배치에
+   담긴다.
+
+4. **중복률 기록** — `exposure_runner.process_one`이 검사 시작 전에 읽어 둔
+   직전 행(`prev_row`)과 이번 결과의 시간 차로 "이번 검사가 최소 간격
+   규칙보다 먼저 같은 키워드를 다시 본 것인지"(`_is_duplicate_recheck`,
+   2단계 확인 대기 재확인은 예외)를 판정해 반환값에 `duplicate`(bool)로
+   담는다. `run_worker`가 이 값을 `update_worker_state(..., duplicate=...)`로
+   넘기면 `data/exposure_runner_state.json`에 작업자별
+   `checked_count`/`duplicate_count`/`duplicate_rate`와 전체
+   `duplicate_totals`(`checked_count`/`duplicate_count`/`duplicate_rate`)가
+   쌓인다. 참고: `duplicate_totals`는 작업자 프로세스 여럿이 같은 파일을
+   잠금 없이 갱신하므로(기존 설계 — 작업자별 키는 안 겹쳐 괜찮지만 이
+   합계는 전역 공유 키) 동시 쓰기가 겹치면 드물게 소폭 과소 집계될 수
+   있다 — 감시용 지표로는 충분하나 정확한 감사 수치가 필요하면 DB
+   `keyword_exposure.checked_at` 간격을 직접 집계하는 편이 정확하다.
+
+5. 우선순위 등급 규칙은 이번에도 전혀 건드리지 않았다.
+
+### 예상 절감/효과(3차)
+
+- 목표는 속도가 아니라 **정확성**(중복 재검사 근절)이다 — 13%(브랜드 고정
+  시 67%)의 헛수고를 없애면 그만큼 유효 처리량이 늘어난다(같은 시간에 실제로
+  더 많은 고유 키워드를 검사).
+- DB 단건 조회는 인덱스가 있어 밀리초 단위이므로(이미 존재하던
+  `idx_keyword_exposure_brand`), `next_priority_batch` 필터 루프에 후보당
+  1회씩 추가돼도 "타이밍 우선순위조회" 로그의 "DB직전확인=" 카운트로 비용을
+  확인할 수 있게 로그에 남긴다(기존 로그에 필드 추가).
+- 실제 중복률 개선폭은 `data/exposure_runner_state.json`의
+  `duplicate_totals.duplicate_rate`를 재시작 후 실측해 확인 필요 — 이번에도
+  코드·단위 시험까지만 완료했고 운영 실측치는 아직 없음.
+
+### 시험 결과(3차)
+
+- `tests/test_exposure_runner.py` 46개, `tests/test_keyword_exposure.py` +
+  `tests/test_keyword_exposure_cycle.py` 합쳐 79개, `tests/test_dashboard.py`
+  19개(`keyword_exposure_store` 변경 영향 확인차 추가 실행) — **3개 관련
+  파일 + 대시보드 총 144개 전부 통과**. 2차 시험 중
+  `test_universe_캐시_last_checked는_mark_checked로_즉시반영`은 이제
+  `mark_checked` 없이도 DB 직전 확인이 즉시 반영함을 확인하는
+  `test_next_priority_batch_mark_checked_없이도_DB직전확인으로_즉시반영`으로
+  바꿨다(3차 설계가 캐시 의존을 없앴으므로). 새로 추가: `is_due_now` 단위
+  동작, `complete_inflight` 완료 표시·TTL 동작, `WorkerQueue`가 직전 확인에
+  걸린 후보를 건너뛰고 선점을 풀어 주는지, `update_worker_state` 중복률
+  집계, `process_one`이 최소 간격 안/밖 재검사를 각각 `duplicate` True/False로
+  판정하는지.
+- 전체 `pytest` 스위트는 **미실행**(다른 일꾼이 동시에 돌리고 있어 관련
+  시험만 통과 확인).
+
 ## 러너 재시작 필요
 
-1차·2차 변경(캐시·배치 큐·last_checked 캐시·정렬 캐시) 모두 코드에만
-반영됐고 현재 돌고 있는 러너 프로세스에는 적용되지 않았다 — 러너 재시작
-필요.
+1차·2차·3차 변경(캐시·배치 큐·last_checked 캐시·정렬 캐시·DB 직전 확인·완료
+표시·중복률 집계) 모두 코드에만 반영됐고 현재 돌고 있는 러너 프로세스에는
+적용되지 않았다 — 러너 재시작 필요.
