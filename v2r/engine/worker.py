@@ -2146,7 +2146,7 @@ def dispatch(rt: Runtime, job: Any, owner: str | None = None) -> dict:
     if task == "keyword_relevance_rescan":
         return _keyword_relevance_rescan(rt, spec)
     if task == "keyword_relevance_rescore_legacy":
-        return _keyword_relevance_rescore_legacy(rt, spec)
+        return _keyword_relevance_rescore_legacy(rt, spec, job_id=job_id, owner=owner)
     if task == "keyword_relevance_status":
         return _keyword_relevance_status(rt, spec)
     if task == "sheet_sync_keywords":
@@ -2404,7 +2404,9 @@ def _keyword_relevance_rescan(rt: Runtime, spec: TaskSpec) -> dict:
     return {"ok": True, "message": msg, "per_brand": results, "skipped": skipped, "primary_brand": primary_counts}
 
 
-def _keyword_relevance_rescore_legacy(rt: Runtime, spec: TaskSpec) -> dict:
+def _keyword_relevance_rescore_legacy(
+    rt: Runtime, spec: TaskSpec, *, job_id: int | None = None, owner: str | None = None
+) -> dict:
     """`키워드 연관도 재채점 <브랜드|전체>` — 구 척도 3(무관)이던 키워드만
 
     새 척도(0에서 4, 3=당위성/4=무관)로 다시 채점한다(사용자 지시 2026-09-24).
@@ -2423,6 +2425,34 @@ def _keyword_relevance_rescore_legacy(rt: Runtime, spec: TaskSpec) -> dict:
     brand = (spec.brand or "").strip()
     brands = [brand] if brand else [b for b in BRAND_NAMES if (data_dir / f"{b}.sqlite").exists()]
 
+    # 2026-09-24 사고: 재채점은 몇 시간짜리 작업인데 진행 표시(리스 연장·이벤트)가 없어
+    # 감시기가 "30분 멈춤"으로 실패 처리·재큐잉했다(작업 180→181). 5분마다 리스를 연장하고
+    # 진행 파일의 숫자를 이벤트로 남겨 감시기가 "움직이는 작업"으로 보게 한다.
+    import json as _json
+    import threading as _threading
+
+    stop = _threading.Event()
+
+    def _beat_loop() -> None:
+        while not stop.wait(300):
+            try:
+                touch_heartbeat(rt)
+                if owner and job_id is not None:
+                    rt.jobs.heartbeat(job_id, owner)
+                    prog = {}
+                    if progress_path.exists():
+                        prog = _json.loads(progress_path.read_text(encoding="utf-8")) or {}
+                    summary = ", ".join(
+                        f"{k} {v.get('scored', 0)}/{v.get('total_pending_at_start', '?')}"
+                        for k, v in prog.items() if isinstance(v, dict)
+                    )
+                    rt.events.log(job_id, "info", f"재채점 진행: {summary or '시작'}")
+            except Exception as exc:  # noqa: BLE001
+                log.warning("재채점 진행 표시 실패: %s", exc)
+
+    beat_th = _threading.Thread(target=_beat_loop, name="v2r-rescore-beat", daemon=True)
+    beat_th.start()
+
     results: dict[str, dict] = {}
     for b in brands:
         db_path = data_dir / f"{b}.sqlite"
@@ -2437,6 +2467,7 @@ def _keyword_relevance_rescore_legacy(rt: Runtime, spec: TaskSpec) -> dict:
         except Exception as exc:  # noqa: BLE001
             results[b] = {"ok": False, "error": f"{exc.__class__.__name__}: {exc}"}
 
+    stop.set()
     lines = []
     for b, out in results.items():
         if out.get("ok"):
