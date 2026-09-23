@@ -627,5 +627,8 @@ def describe_spec(spec: TaskSpec) -> str:
         parts.append("승인됨")
     if spec.immediate:
         parts.append("즉시")
-    parts.append("모의 실행" if spec.dry_run else "실제 발행")
+    # `모의 실행/실제 발행` 구분은 발행·정리 작업에만 뜻이 있다 — "GPT 세션 점검, 모의 실행"처럼
+    # 점검 작업에 붙으면 사용자가 헷갈린다 (지적 2026-09-23).
+    if spec.task in PUBLISH_TASKS or spec.task == "cleanup_emoji":
+        parts.append("모의 실행" if spec.dry_run else "실제 발행")
     return ", ".join(parts)

@@ -8,6 +8,7 @@ import re
 from typing import Any, Callable
 from urllib.parse import quote
 
+import logging
 import httpx
 
 from v2r.content.manuscript import (
@@ -27,6 +28,9 @@ _LINK = re.compile(r"^https?://", re.IGNORECASE)
 
 class SourceError(RuntimeError):
     """원본 적재 실패."""
+
+
+log = logging.getLogger(__name__)
 
 
 def gviz_csv_url(
@@ -337,6 +341,43 @@ def load_source(
         if cached is None:
             raise
         return cached
+    if not sheet and _looks_filtered(rows, cache_get(key) if cache_get else None):
+        # 사고 2026-09-23 09:00: 계정 시트 탭에 필터(연동=가상피씨)가 걸리자 gviz가
+        # **보이는 31행만** 돌려줘 "사용 가능한 계정이 없습니다"로 하루 발행이 멈췄다.
+        # export?format=csv 는 필터를 무시하고 전 행을 주므로 그쪽으로 다시 읽는다.
+        try:
+            full = fetch_csv(export_csv_url(sid, gid), timeout=20.0)
+        except SourceError:
+            full = []
+        if len(_nonblank(full)) > len(_nonblank(rows)):
+            log.warning(
+                "%s: gviz %d행 → 필터가 걸린 듯해 export로 %d행 읽음",
+                key, len(_nonblank(rows)), len(_nonblank(full)),
+            )
+            rows = full
     if cache_put:
         cache_put(key, rows)
     return rows
+
+
+def export_csv_url(spreadsheet_id: str, gid: str | int = 0) -> str:
+    """필터를 무시하는 CSV 내보내기 URL(탭은 gid로만 고른다)."""
+    if spreadsheet_id in EXCLUDED_DOCUMENT_IDS:
+        raise SourceError(f"동기화 금지 문서입니다: {spreadsheet_id}")
+    return f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/export?format=csv&gid={gid}"
+
+
+def _nonblank(rows: list[dict]) -> list[dict]:
+    return [r for r in rows if any(str(v or "").strip() for v in r.values())]
+
+
+def _looks_filtered(rows: list[dict], cached: list[dict] | None) -> bool:
+    """필터로 잘린 결과인지 짐작: 직전 캐시보다 절반 이하로 줄었거나, 첫 행 번호가 1이 아니다."""
+    live = _nonblank(rows)
+    if cached and len(_nonblank(cached)) >= 2 * max(len(live), 1) and len(_nonblank(cached)) >= 20:
+        return True
+    if live:
+        first = str(next(iter(live[0].values()), "") or "").strip()
+        if first.isdigit() and int(first) > 1:
+            return True
+    return False

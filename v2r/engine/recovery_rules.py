@@ -33,6 +33,14 @@ class RecoveryRule:
 #: 순서대로 첫 매치. 좁은 규칙을 위에 둔다.
 RULES: list[tuple[re.Pattern[str], RecoveryRule]] = [
     (
+        re.compile(r"사용\s*가능한\s*계정이\s*없|계정\s*시트를\s*읽지\s*못", re.I),
+        RecoveryRule(
+            "no_accounts",
+            "retry",
+            "계정 시트가 비어 보였습니다(탭에 필터가 걸리면 gviz가 보이는 행만 줍니다). export로 다시 읽어 한 번 더 시도합니다.",
+        ),
+    ),
+    (
         re.compile(r"로그인\s*(한도|budget)|login[_ ]budget|하루\s*20회|로그인\s*횟수", re.I),
         RecoveryRule(
             "login_budget",
