@@ -311,6 +311,16 @@ def fire(rt: Any, entry: ScheduleEntry, *, handle_text: Callable | None = None) 
         worker.clear_stop(rt)
     except Exception as exc:  # noqa: BLE001
         log.warning("중지 플래그 해제 실패: %s", exc)
+    # 2026-09-24 사고: "시트 키워드 반영 전체"가 이미 돌고 있는데(작업 186) 예약이 같은
+    # 명령을 두 번 더 쏘고(187·188) 감시견이 "예약 실패"를 슬랙에 보냈다. 같은 명령이
+    # 아직 queued/running 이면 새로 만들지 않고 그 작업을 그대로 쓴다.
+    dup = _open_job_for_command(rt, entry.command)
+    if dup is not None:
+        try:
+            rt.events.log(int(dup["id"]), "info", f"예약 발사 생략: {entry.name} — 같은 명령 작업 {dup['id']} 진행 중")
+        except Exception:  # noqa: BLE001 pragma: no cover
+            pass
+        return {"ok": True, "job_id": int(dup["id"]), "description": entry.command, "deduped": True}
     handler = handle_text or _handler(rt)
     out = handler(rt, entry.command)
     job_id = out.get("job_id")
@@ -337,7 +347,43 @@ def _job_healthy(rt: Any, job_id: Any) -> bool:
         return False
     if job is None:
         return False
-    return str(job.get("status")) in ("running", "done", "uncertain", "failed")
+    status = str(job.get("status"))
+    if status == "queued":
+        # 실행기가 다른 작업을 돌리는 중이라 차례를 기다리는 것 — 방치가 아니다(2026-09-24)
+        try:
+            return bool(rt.jobs.running_jobs())
+        except Exception:  # noqa: BLE001
+            return False
+    return status in ("running", "done", "uncertain", "failed")
+
+
+def _open_job_for_command(rt: Any, command: str) -> dict | None:
+    """같은 명령(설명 텍스트 또는 task)이 아직 queued/running 이면 그 작업."""
+    try:
+        from v2r.command.parser import parse_korean_command
+
+        spec = parse_korean_command(command)
+        task = getattr(spec, "task", "") or ""
+        brand = (getattr(spec, "brand", "") or "").strip()
+    except Exception:  # noqa: BLE001
+        return None
+    if not task:
+        return None
+    try:
+        for job in rt.jobs.open_jobs():
+            if str(job.get("task") or "") != task:
+                continue
+            try:
+                import json as _json
+
+                jb = (_json.loads(job.get("spec_json") or "{}").get("brand") or "").strip()
+            except Exception:  # noqa: BLE001
+                jb = ""
+            if jb == brand:
+                return job
+    except Exception:  # noqa: BLE001
+        return None
+    return None
 
 
 def check_pending(

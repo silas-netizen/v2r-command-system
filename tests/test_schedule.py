@@ -394,3 +394,45 @@ def test_health_report_mentions_heartbeat_and_schedule(tmp_path):
 def test_now_iso_is_parseable():
     """상태 파일 비교에 쓰는 시각 형식이 계속 읽히는지 확인."""
     assert datetime.fromisoformat(now_iso()) is not None
+
+
+def test_fire_dedupes_same_command_when_open_job_exists(monkeypatch):
+    from v2r.engine import schedule as sch
+
+    class Jobs:
+        def open_jobs(self):
+            return [{"id": 186, "task": "sheet_sync_keywords", "status": "running", "spec_json": "{}"}]
+
+        def running_jobs(self):
+            return [{"id": 186}]
+
+    class Events:
+        def log(self, *a, **k):
+            pass
+
+    class RT:
+        jobs = Jobs()
+        events = Events()
+        settings = type("S", (), {"repo_root": "."})()
+
+    called = []
+    out = sch.fire(RT(), sch.ScheduleEntry(name="시트 키워드 반영(자동)", time="05:30", command="시트 키워드 반영 전체"),
+                   handle_text=lambda rt, text: called.append(text) or {"ok": True, "job_id": 999})
+    assert out.get("deduped") is True and out["job_id"] == 186
+    assert called == []
+
+
+def test_job_healthy_queued_behind_running_job():
+    from v2r.engine import schedule as sch
+
+    class Jobs:
+        def get(self, job_id):
+            return {"id": job_id, "status": "queued"}
+
+        def running_jobs(self):
+            return [{"id": 1}]
+
+    class RT:
+        jobs = Jobs()
+
+    assert sch._job_healthy(RT(), 187) is True
