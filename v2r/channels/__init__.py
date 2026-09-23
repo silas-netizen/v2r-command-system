@@ -113,7 +113,14 @@ def push_channels(channels: list[Channel]) -> list[Channel]:
     names = _PUSH_CACHE["names"]
     if not names:
         return list(channels or [])
-    return [c for c in channels or [] if str(getattr(c, "name", "")).lower() in names]
+    # 목록에 없는 "알려진" 채널(텔레그램·슬랙)만 뺀다 — 시험용 가짜 채널 등 이름을 모르는
+    # 채널은 그대로 둔다.
+    known = {"telegram", "slack"}
+    return [
+        c for c in channels or []
+        if str(getattr(c, "name", "")).lower() in names
+        or str(getattr(c, "name", "")).lower() not in known
+    ]
 
 
 def build_channels(settings: Any | None = None) -> list[Channel]:

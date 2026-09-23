@@ -6,6 +6,7 @@ import json
 import logging
 import random
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -2140,7 +2141,13 @@ def _create_and_verify(
     )
     if on_created is not None:  # 등록 직후 source_id를 먼저 보존한다 (C-2)
         on_created(str(source_id))
-    detail = api_articles.get_article(rt.client, source_id)
+    detail = _get_article_after_create(rt, source_id, job_id, title)
+    if detail is None:
+        # 글은 만들어졌는데 되읽기만 계속 실패 → 실패가 아니라 "확인 대기"(uncertain)로
+        # 남기고 끊긴 작업 점검(reconcile)이 확정한다. 사고 2026-09-23: 500건 중 5건이
+        # 이 되읽기 1회 실패로 "발행 실패"로 찍혀 작업 전체가 failed·🔴 경보가 났는데,
+        # 점검해 보니 5건 모두 실제로 올라가 있었다.
+        return str(source_id), "등록 직후 조회 실패 — 확인 대기"
     problems = api_articles.verify_article(
         detail,
         title=title,
@@ -2181,6 +2188,42 @@ def _create_and_verify(
                 return str(source_id), f"등록 확인 대기: {exc}"
             raise
     return str(source_id), None
+
+
+#: 등록 직후 되읽기 재시도 대기(초). 서버가 글을 만들고 조회 가능해지기까지 잠깐 걸릴 수 있다.
+READBACK_WAITS = (3.0, 5.0, 8.0, 13.0, 20.0)
+
+
+def _get_article_after_create(rt: Runtime, source_id: str, job_id: int | None, title: str) -> dict | None:
+    """등록 직후 글 상세를 되읽는다. 실패하면 잠깐씩 쉬며 최대 6회 시도하고, 끝내 안 되면
+    None(→ 확인 대기)을 돌려준다. 여기서 예외를 올리지 않는다."""
+    last: Exception | None = None
+    for i in range(len(READBACK_WAITS) + 1):
+        try:
+            return api_articles.get_article(rt.client, source_id)
+        except V2RApiError as exc:
+            last = exc
+            kind = exc.kind or classify(exc)
+            if kind in DEFINITIVE_REJECTIONS or kind == "deleted":
+                break
+            if i < len(READBACK_WAITS):
+                try:
+                    rt.events.log(
+                        job_id, "info",
+                        f"등록 직후 조회 재시도 {i + 1}/{len(READBACK_WAITS)} ({kind}, HTTP {exc.status}): {title}",
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+                time.sleep(READBACK_WAITS[i])
+        except Exception as exc:  # noqa: BLE001 - 네트워크 예외 등
+            last = exc
+            if i < len(READBACK_WAITS):
+                time.sleep(READBACK_WAITS[i])
+    try:
+        rt.events.log(job_id, "warn", f"등록 직후 조회 실패({last}) — 확인 대기로 남김: {title}")
+    except Exception:  # noqa: BLE001
+        pass
+    return None
 
 
 def sanitize_slot(rt: Runtime, slot: Slot, job_id: int | None = None) -> Manuscript:

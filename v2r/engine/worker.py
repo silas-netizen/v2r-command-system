@@ -2587,6 +2587,13 @@ def _finish_run(
     rt.events.log(job_id, "info", f"작업 종료({status}): {description}")
     if spec.task in PUBLISH_TASKS or spec.task == "reconcile":
         refresh_dashboard(rt)  # 발행·점검이 끝날 때마다 현황판을 새로 그린다
+    if spec.task in PUBLISH_TASKS and (uncertain or result.get("pending")) and not spec.dry_run:
+        # 확인 대기 건이 남았으면 다음 날 08:30까지 기다리지 않고 바로 점검을 건다
+        # (사고 2026-09-23: 되읽기 실패 5건이 하루 종일 "실패"로 보였다).
+        try:
+            handle_text(rt, "끊긴 작업 점검")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("끊긴 작업 점검 자동 등록 실패: %s", exc)
     # 개별 작업 완료·실패는 "summary" 등급 — 채널로 따로 안 보내고 정기 보고에 담는다
     # (사용자 지시 2026-09-23: 메시지가 너무 많다).
     notify_all(rt.channels, format_report(job_id, status, description), level="summary", tag="publish")
