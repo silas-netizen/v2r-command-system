@@ -224,3 +224,116 @@ def test_due_pending_시간지나야만_뽑힘(tmp_path):
     due = exposure_runner.due_pending(tmp_path, now=1000.0 + 301)
     assert len(due) == 1
     assert due[0]["item"]["keyword"] == "키워드"
+
+
+# =======================================================================
+# 최근 발행 키워드 — DB publications × 시트 F열(발행 URL) URL 대조 (2026-09-24)
+# =======================================================================
+
+def _insert_publication(conn, url, created_at, status="done"):
+    from v2r.store.db import now_iso as _now_iso
+
+    conn.execute(
+        "INSERT INTO publications (source_key, row_number, content_hash, status, stage,"
+        " source_id, url, account, cafe, menu_id, scheduled_at, created_at, updated_at, board)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ("소스", 1, url, status, None, "s1", url, "acc", "마이카페", "", "", created_at, _now_iso(), ""),
+    )
+
+
+def test_publications_recent_article_ids_창안이면_포함(tmp_path):
+    rt = make_runtime(tmp_path)
+    now = datetime(2026, 9, 24, 12, 0, tzinfo=timezone.utc)
+    # 2시간 전(정확히 창 중앙) — 포함
+    _insert_publication(
+        rt.conn,
+        "https://cafe.naver.com/ca-fe/cafes/111/articles/222?query=1",
+        "2026-09-24T10:00:00+00:00",
+    )
+    ids = exposure_priority._publications_recent_article_ids(rt.conn, now, [2.0, 6.0, 24.0])
+    assert ids == {"222"}
+
+
+def test_publications_recent_article_ids_창밖이면_제외(tmp_path):
+    rt = make_runtime(tmp_path)
+    now = datetime(2026, 9, 24, 12, 0, tzinfo=timezone.utc)
+    _insert_publication(rt.conn, "https://cafe.naver.com/ca-fe/cafes/111/articles/333", "2026-09-24T00:00:00+00:00")
+    ids = exposure_priority._publications_recent_article_ids(rt.conn, now, [2.0, 6.0, 24.0])
+    assert ids == set()
+
+
+def test_publications_recent_article_ids_실패상태는_제외(tmp_path):
+    rt = make_runtime(tmp_path)
+    now = datetime(2026, 9, 24, 12, 0, tzinfo=timezone.utc)
+    _insert_publication(
+        rt.conn, "https://cafe.naver.com/ca-fe/cafes/111/articles/444", "2026-09-24T10:00:00+00:00", status="failed"
+    )
+    ids = exposure_priority._publications_recent_article_ids(rt.conn, now, [2.0, 6.0, 24.0])
+    assert ids == set()
+
+
+def test_recent_publish_keywords_from_db_시트F열_URL대조로_H열키워드(tmp_path, monkeypatch):
+    rt = make_runtime(tmp_path)
+    now = datetime(2026, 9, 24, 12, 0, tzinfo=timezone.utc)
+    _insert_publication(
+        rt.conn,
+        "https://cafe.naver.com/ca-fe/cafes/111/articles/999/",  # 끝 슬래시
+        "2026-09-24T10:00:00+00:00",
+    )
+    fake_sheet_rows = [
+        {
+            "카페": "마이카페",
+            "발행 URL": "https://cafe.naver.com/mycafe/999?ref=abc",  # 쿼리스트링 다름
+            "노출 상태": "밀려남",
+            "키워드": "다이어트보조제",
+        },
+        {
+            "카페": "마이카페",
+            "발행 URL": "https://cafe.naver.com/mycafe/555",
+            "노출 상태": "밀려남",
+            "키워드": "관련없는키워드",
+        },
+    ]
+    monkeypatch.setattr(
+        "v2r.knowledge.keyword_exposure._sheet_rows", lambda brand, cfg, xlsx_path: fake_sheet_rows
+    )
+    out = exposure_priority._recent_publish_keywords_from_db(rt, "테스트브랜드", now, [2.0, 6.0, 24.0])
+    assert out == {"다이어트보조제"}
+
+
+def test_recent_publish_keywords_from_db_대조안되면_빈집합(tmp_path, monkeypatch):
+    rt = make_runtime(tmp_path)
+    now = datetime(2026, 9, 24, 12, 0, tzinfo=timezone.utc)
+    # publications가 비어 있으면 시트를 읽으러 가지도 않는다
+    called = {"n": 0}
+
+    def _boom(*a, **kw):
+        called["n"] += 1
+        raise AssertionError("호출되면 안 됨")
+
+    monkeypatch.setattr("v2r.knowledge.keyword_exposure._sheet_rows", _boom)
+    out = exposure_priority._recent_publish_keywords_from_db(rt, "테스트브랜드", now, [2.0, 6.0, 24.0])
+    assert out == set()
+    assert called["n"] == 0
+
+
+def test_recent_publish_keywords_합집합_article_index와_DB(tmp_path, monkeypatch):
+    rt = make_runtime(tmp_path)
+    now = datetime(2026, 9, 24, 12, 0, tzinfo=timezone.utc)
+    _insert_publication(
+        rt.conn, "https://cafe.naver.com/ca-fe/cafes/111/articles/777", "2026-09-24T10:00:00+00:00"
+    )
+    fake_sheet_rows = [
+        {"카페": "마이카페", "발행 URL": "https://cafe.naver.com/mycafe/777", "키워드": "DB발행키워드"},
+    ]
+    monkeypatch.setattr(
+        "v2r.knowledge.keyword_exposure._sheet_rows", lambda brand, cfg, xlsx_path: fake_sheet_rows
+    )
+
+    class FakeArticleIndex:
+        def rows_for_cafe(self, cafe):
+            return [{"title": "제목키워드 나머지 제목", "published_at": "2026-09-24T10:00:00+00:00"}]
+
+    rt.article_index = FakeArticleIndex()
+    out = exposure_priority._recent_publish_keywords(rt, "테스트브랜드", {"마이카페"}, now, [2.0, 6.0, 24.0])
+    assert out == {"제목키워드", "db발행키워드"}

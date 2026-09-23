@@ -80,32 +80,120 @@ def _hours_since(checked_at: str, now: datetime) -> float | None:
 
 
 def _recent_publish_keywords(rt: Any, brand: str, cafes: set[str], now: datetime, window_hours: list[float]) -> set[str]:
-    """`article_index`에서 최근(설정한 시각 근방) 발행된 우리 글의 제목 맨 앞 키워드."""
-    article_index = getattr(rt, "article_index", None)
-    if article_index is None or not cafes:
-        return set()
+    """최근(설정한 시각 근방) 발행된 우리 글의 키워드 — 두 갈래의 합집합.
+
+    (a) `article_index`에서 제목 맨 앞 키워드(기존 방식).
+    (b) `publications` 표(DB)에서 성공(uncertain/done) 발행의 URL·시각을 읽어,
+        같은 창 안이면 그 URL을 브랜드 시트 F열(발행 URL)과 글 번호로 대조해
+        같은 행 H열(키워드)을 더한다(`_recent_publish_keywords_from_db`).
+    """
     from v2r.knowledge.keyword_exposure import _title_lead_keyword, _norm
 
     out: set[str] = set()
-    for cafe in cafes:
+
+    article_index = getattr(rt, "article_index", None)
+    if article_index is not None and cafes:
+        for cafe in cafes:
+            try:
+                rows = article_index.rows_for_cafe(cafe)
+            except Exception:
+                rows = []
+            for row in rows or []:
+                ts = row.get("published_at") or row.get("synced_at") or ""
+                dt = _parse_iso(str(ts))
+                if dt is None:
+                    continue
+                age_h = (now - dt).total_seconds() / 3600.0
+                if age_h < 0:
+                    continue
+                for target in window_hours:
+                    if abs(age_h - float(target)) <= _RECENT_PUBLISH_WINDOW_HOURS:
+                        kw = _title_lead_keyword(row.get("title") or "")
+                        if kw:
+                            out.add(_norm(kw))
+                        break
+
+    out |= _recent_publish_keywords_from_db(rt, brand, now, window_hours)
+    return out
+
+
+def _publications_recent_article_ids(conn: Any, now: datetime, window_hours: list[float]) -> set[str]:
+    """`publications` 표에서 성공(uncertain/done) 발행 중 `created_at`이 각
+    `window_hours` 시점 ±2시간 창 안인 행의 글 번호(정규화) 집합.
+
+    URL의 쿼리스트링·끝 슬래시 차이는 `_article_id`(글 번호만 뽑음)가 이미
+    무시한다. E열(비밀번호)은 이 표에 없으므로 접근하지 않는다.
+    """
+    from v2r.knowledge.keyword_exposure import _article_id
+    from v2r.store.publications import BLOCKING_STATUSES
+
+    out: set[str] = set()
+    if conn is None:
+        return out
+    try:
+        placeholders = ", ".join("?" for _ in BLOCKING_STATUSES)
+        rows = conn.execute(
+            f"SELECT url, created_at FROM publications WHERE status IN ({placeholders})",
+            tuple(BLOCKING_STATUSES),
+        ).fetchall()
+    except Exception:
+        return out
+    for row in rows or []:
         try:
-            rows = article_index.rows_for_cafe(cafe)
+            url = row["url"] if hasattr(row, "keys") else row[0]
+            created_at = row["created_at"] if hasattr(row, "keys") else row[1]
         except Exception:
-            rows = []
-        for row in rows or []:
-            ts = row.get("published_at") or row.get("synced_at") or ""
-            dt = _parse_iso(str(ts))
-            if dt is None:
-                continue
-            age_h = (now - dt).total_seconds() / 3600.0
-            if age_h < 0:
-                continue
-            for target in window_hours:
-                if abs(age_h - float(target)) <= _RECENT_PUBLISH_WINDOW_HOURS:
-                    kw = _title_lead_keyword(row.get("title") or "")
-                    if kw:
-                        out.add(_norm(kw))
-                    break
+            continue
+        dt = _parse_iso(str(created_at or ""))
+        if dt is None:
+            continue
+        age_h = (now - dt).total_seconds() / 3600.0
+        if age_h < 0:
+            continue
+        for target in window_hours:
+            if abs(age_h - float(target)) <= _RECENT_PUBLISH_WINDOW_HOURS:
+                aid = _article_id(str(url or ""))
+                if aid:
+                    out.add(aid)
+                break
+    return out
+
+
+#: 브랜드 시트 두 번째 탭(노출 현황) F열 헤더 — "발행 URL"
+_PUBLISH_URL_HEADERS = ("발행url", "발행 url")
+
+
+def _recent_publish_keywords_from_db(rt: Any, brand: str, now: datetime, window_hours: list[float]) -> set[str]:
+    """DB `publications` 최근 발행 URL을 시트 F열(발행 URL)과 글 번호로 대조해
+    같은 행 H열(키워드)을 뽑는다. F열 값은 대조에만 쓰고 어디에도 기록하지
+    않는다 — E열(비밀번호)은 `_sheet_rows`가 이미 버린 뒤라 아예 접근하지 못한다.
+    """
+    from v2r.knowledge.keyword_exposure import _article_id, _sheet_rows
+    from v2r.sources.keyword_list import _norm as _norm_kw
+    from v2r.sources.keyword_list import _pick
+
+    article_ids = _publications_recent_article_ids(getattr(rt, "conn", None), now, window_hours)
+    if not article_ids:
+        return set()
+
+    try:
+        cfg = getattr(rt, "sources_cfg", None)
+        xlsx = Path(rt.settings.repo_root) / "data" / f"brand_sheet_{brand}.xlsx"
+        rows = _sheet_rows(brand, cfg, str(xlsx) if xlsx.exists() else None)
+    except Exception:
+        return set()
+
+    out: set[str] = set()
+    for row in rows or []:
+        url = _pick(row, _PUBLISH_URL_HEADERS)
+        if not url:
+            continue
+        aid = _article_id(url)
+        if not aid or aid not in article_ids:
+            continue
+        kw = _pick(row, ("키워드",))
+        if kw:
+            out.add(_norm_kw(kw))
     return out
 
 
