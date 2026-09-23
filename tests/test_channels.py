@@ -288,13 +288,18 @@ def test_info와_summary는_채널로_안_나간다():
     assert ch.sent == []
 
 
+#: critical 허용 목록(config/notify.yaml)에 실제로 든 범주 하나. 정책 필터를
+#: 거치면서도 통과해야 하므로 임의 문자열("X" 등) 대신 이걸 쓴다.
+_ALLOWED_CAT = "publish_failed_confirmed"
+
+
 def test_critical은_사건당_한번만_되풀이하지_않는다(monkeypatch):
     from v2r import channels as channels_mod
 
     channels_mod._CRITICAL_STATE.clear()
     ch = _Recorder()
-    assert notify_all([ch], "발행 정지", level="critical", category="X") == 1
-    assert notify_all([ch], "발행 정지", level="critical", category="X") == 0  # 되풀이 억제
+    assert notify_all([ch], "발행 정지", level="critical", category=_ALLOWED_CAT) == 1
+    assert notify_all([ch], "발행 정지", level="critical", category=_ALLOWED_CAT) == 0  # 되풀이 억제
     assert ch.sent == ["🔴 발행 정지"]
     channels_mod._CRITICAL_STATE.clear()
 
@@ -304,9 +309,37 @@ def test_critical은_카테고리별로_따로_되풀이_억제한다():
 
     channels_mod._CRITICAL_STATE.clear()
     ch = _Recorder()
-    assert notify_all([ch], "A 사건", level="critical", category="A") == 1
-    assert notify_all([ch], "B 사건", level="critical", category="B") == 1  # 다른 사건은 억제 안 됨
+    assert notify_all([ch], "A 사건", level="critical", category=_ALLOWED_CAT) == 1
+    assert (
+        notify_all([ch], "B 사건", level="critical", category="sidecar_heartbeat_stale") == 1
+    )  # 다른 사건은 억제 안 됨
     assert len(ch.sent) == 2
+    channels_mod._CRITICAL_STATE.clear()
+
+
+def test_critical은_허용_목록_밖_범주는_강등한다():
+    """허용 목록(config/notify.yaml critical_categories)에 없는 category는 채널로 안 나간다."""
+    from v2r import channels as channels_mod
+
+    channels_mod._CRITICAL_STATE.clear()
+    ch = _Recorder()
+    assert notify_all([ch], "잡다한 진단", level="critical", category="아무거나") == 0
+    assert ch.sent == []
+    channels_mod._CRITICAL_STATE.clear()
+
+
+def test_critical은_에스컬레이션_문구를_보내지_않는다():
+    """오래 이어져도 '계속됨' 재전송은 없다(사용자 지시 2026-09-23 추가분)."""
+    from v2r import channels as channels_mod
+
+    channels_mod._CRITICAL_STATE.clear()
+    ch = _Recorder()
+    notify_all([ch], "사건 발생", level="critical", category=_ALLOWED_CAT)
+    # 상태를 오래 전으로 되돌려도(경과 시간 흉내) 되풀이 전송을 안 한다 — 에스컬레이션 없음
+    state = channels_mod._CRITICAL_STATE[_ALLOWED_CAT]
+    state["first"] -= 3600
+    state["last"] -= 3600 - 1  # repeat 간격보단 넘게, 흉내만
+    assert not any("계속됨" in s for s in ch.sent)
     channels_mod._CRITICAL_STATE.clear()
 
 
@@ -315,11 +348,26 @@ def test_복구되면_다시_알린다(monkeypatch):
 
     channels_mod._CRITICAL_STATE.clear()
     ch = _Recorder()
-    notify_all([ch], "사건 발생", level="critical", category="Y")
-    assert notify_all([ch], "사건 발생", level="critical", category="Y") == 0  # 되풀이 억제
-    assert channels_mod.clear_critical("Y") is True  # 복구됨
-    assert channels_mod.clear_critical("Y") is False  # 이미 지웠다(경고 중이 아니었다)
-    assert notify_all([ch], "사건 재발", level="critical", category="Y") == 1  # 새 사건으로 다시 보낸다
+    notify_all([ch], "사건 발생", level="critical", category=_ALLOWED_CAT)
+    assert notify_all([ch], "사건 발생", level="critical", category=_ALLOWED_CAT) == 0  # 되풀이 억제
+    assert channels_mod.clear_critical(_ALLOWED_CAT) is True  # 복구됨
+    assert channels_mod.clear_critical(_ALLOWED_CAT) is False  # 이미 지웠다(경고 중이 아니었다)
+    assert (
+        notify_all([ch], "사건 재발", level="critical", category=_ALLOWED_CAT) == 1
+    )  # 새 사건으로 다시 보낸다
+    channels_mod._CRITICAL_STATE.clear()
+
+
+def test_복구_메시지는_체크표시로_나간다():
+    """category가 ':recovered'로 끝나면 🔴 대신 ✅ 를 붙인다."""
+    from v2r import channels as channels_mod
+
+    channels_mod._CRITICAL_STATE.clear()
+    ch = _Recorder()
+    notify_all(
+        [ch], "복구됨", level="critical", category=f"{_ALLOWED_CAT}:recovered", tag="publish"
+    )
+    assert ch.sent[-1].startswith("✅")
     channels_mod._CRITICAL_STATE.clear()
 
 
@@ -328,7 +376,7 @@ def test_등급_범주_아이콘이_붙는다():
 
     channels_mod._CRITICAL_STATE.clear()
     ch = _Recorder()
-    notify_all([ch], "발행 정지 — 작업 123", level="critical", category="Z", tag="publish")
+    notify_all([ch], "발행 정지 — 작업 123", level="critical", category=_ALLOWED_CAT, tag="publish")
     notify_all([ch], "중간 보고 12:00", level="summary", tag="dashboard")
     notify_all([ch], "상태: 정상", level="always", tag="reply")
     assert ch.sent[0].startswith("🔴📢 ")

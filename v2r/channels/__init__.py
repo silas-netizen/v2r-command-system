@@ -56,23 +56,59 @@ CATEGORY_ICONS = {
 }
 
 
-def _icon_prefix(level: str, tag: str | None) -> str:
+def _icon_prefix(level: str, tag: str | None, *, recovered: bool = False) -> str:
     """등급·범주 아이콘을 앞에 붙일 문구를 만든다. 없으면 빈 문자열."""
     cat_icon = CATEGORY_ICONS.get(str(tag)) if tag else ""
     if level == "always":
         # 사용자 직접 명령 응답: 범주 아이콘만(있으면). 등급 아이콘은 안 붙인다.
         return f"{cat_icon} " if cat_icon else ""
+    if recovered:
+        parts = "".join(p for p in ("✅", cat_icon) if p)
+        return f"{parts} " if parts else ""
     level_icon = LEVEL_ICONS.get(level, "")
     parts = "".join(p for p in (level_icon, cat_icon) if p)
     return f"{parts} " if parts else ""
 
 #: 같은 사건(critical) 경고를 되풀이하지 않는 간격(초)
 CRITICAL_REPEAT_SECONDS = 600
-#: 이 시간 넘게 이어지면 에스컬레이션(다시 한번) 보낸다(초)
-CRITICAL_ESCALATE_SECONDS = 600
 
-#: category → 마지막으로 보낸 시각(단조 시계), 첫 알림 시각, 에스컬레이션 여부
+#: category → 마지막으로 보낸 시각(단조 시계), 첫 알림 시각
 _CRITICAL_STATE: dict[str, dict[str, Any]] = {}
+
+_CRITICAL_CATS_CACHE: dict[str, Any] = {"at": 0.0, "cats": None}
+
+
+def _critical_categories() -> tuple[str, ...]:
+    """config/notify.yaml 의 critical_categories (채널로 실제로 내보낼 범주 접두어).
+
+    60초마다 다시 읽는다(재시작 없이 튜닝 가능). 못 읽으면 빈 튜플(전부 강등 —
+    과다 전송보단 안전).
+    """
+    now = _time.monotonic()
+    if _CRITICAL_CATS_CACHE["cats"] is None or now - _CRITICAL_CATS_CACHE["at"] > 60:
+        cats: tuple[str, ...] = ()
+        try:
+            import yaml
+            from pathlib import Path
+
+            cfg_path = Path(__file__).resolve().parents[2] / "config" / "notify.yaml"
+            data = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+            raw = data.get("critical_categories")
+            if isinstance(raw, list):
+                cats = tuple(str(x).strip() for x in raw if str(x).strip())
+        except Exception as exc:  # noqa: BLE001
+            log.debug("critical_categories 읽기 실패: %s", exc)
+        _CRITICAL_CATS_CACHE.update(at=now, cats=cats)
+    return _CRITICAL_CATS_CACHE["cats"]
+
+
+def _critical_allowed(category: str) -> bool:
+    """이 category 가 채널로 나갈 자격이 있는가(허용 목록 접두어 일치)."""
+    cats = _critical_categories()
+    if not cats:
+        return True  # 설정을 못 읽으면 기존처럼 통과(설정 오류로 진짜 실패를 숨기지 않는다)
+    cat = str(category or "")
+    return any(cat == c or cat.startswith(c + ":") or cat.startswith(c) for c in cats)
 
 
 def clear_critical(category: str) -> bool:
@@ -198,25 +234,27 @@ def notify_all(
         return 0  # 채널로 안 보낸다 — 로그·DB·정기 보고가 대신한다
 
     out_text = text
+    recovered = False
     if level == "critical":
         cat = str(category or text)
-        now = _time.monotonic()
-        state = _CRITICAL_STATE.get(cat)
-        if state is not None:
-            since_first = now - state["first"]
-            since_last = now - state["last"]
-            escalate = since_first >= CRITICAL_ESCALATE_SECONDS and not state.get("escalated")
-            if since_last < CRITICAL_REPEAT_SECONDS and not escalate:
-                return 0  # 같은 사건, 되풀이 억제
-            if escalate:
-                state["escalated"] = True
-                out_text = f"{text} (계속됨, {int(since_first)}초째)"
-        else:
-            state = {"first": now, "escalated": False}
-            _CRITICAL_STATE[cat] = state
-        state["last"] = now
+        recovered = cat.endswith(":recovered") or cat.endswith(":해결")
+        base_cat = cat[: -len(":recovered")] if recovered else cat
+        if not _critical_allowed(base_cat):
+            log.info("critical 강등(허용 목록 밖) category=%s: %s", cat, text[:80])
+            return 0  # 정책 표(config/notify.yaml)에 없는 범주 — 로그만
+        if not recovered:
+            now = _time.monotonic()
+            state = _CRITICAL_STATE.get(cat)
+            if state is not None:
+                since_last = now - state["last"]
+                if since_last < CRITICAL_REPEAT_SECONDS:
+                    return 0  # 같은 사건, 되풀이 억제. 중간 경과("계속됨") 문구는 보내지 않는다
+            else:
+                state = {"first": now}
+                _CRITICAL_STATE[cat] = state
+            state["last"] = now
 
-    out_text = f"{_icon_prefix(level, tag)}{out_text}"
+    out_text = f"{_icon_prefix(level, tag, recovered=recovered)}{out_text}"
 
     sent = 0
     for channel in push_channels(channels):

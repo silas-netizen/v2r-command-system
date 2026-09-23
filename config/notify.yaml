@@ -24,7 +24,40 @@
 #   - 항상 채널로 보낸다(등급 억제 대상이 아니다).
 
 critical_repeat_seconds: 600   # 같은 사건 경고를 되풀이하지 않는 간격
-critical_escalate_seconds: 600 # 이 시간 넘게 계속되면 에스컬레이션 1회 더
+
+# 채널로 실제 내보낼 critical 범주(사용자 지시 2026-09-23 "진짜 실패만").
+# category 문자열의 접두어가 이 목록의 항목으로 시작하면 통과, 아니면 summary로
+# 강등(로그에만 남고 채널로 안 나간다). 코드: v2r/channels/__init__.py _critical_allowed().
+#   (a) 발행 실패(끊긴 작업 점검까지 거친 뒤에도 남은 실패)
+#   (b) 실행기/사이드카 죽음 + 자동 재시작 실패
+#   (c) 예약 발사 실패 + 자동 복구 실패
+#   (d) 로그인 풀림(백업 복구·상주 크롬 확인까지 실패)
+#   (e) 요금제 한도로 생성 중단
+#   (f) 계정 등록 제한 5건 이상
+critical_categories:
+  - publish_failed_confirmed   # (a)
+  - sidecar_heartbeat_stale    # (b) 사이드카/실행기 죽음(재시작 실패까지 확인 후, sidecar.py)
+  - sidecar_restart_exhausted  # (b) 자동 재시작도 실패(worker.py)
+  - schedule_mismatch          # (c) 예약이 다른 작업으로 잘못 해석돼 발사를 막음(schedule.py fire)
+  - schedule_recovery_failed   # (c) 예약 발사 실패 + 자동 복구(재시도)까지 실패(schedule.py watchdog)
+  - relogin_needed             # (d) 로그인 풀림(백업 복구 실패까지 확인 후)
+  - gpt_login_pending          # (d)
+  - gpt_image_quota            # (e) 요금제 한도
+  - plan_quota_stopped         # (e)
+  - register_limit_spike       # (f) 계정 등록 제한 5건 이상 (reconcile.py)
+
+# 채널에서 "접수 — 약 N분 예상" 1줄을 보낼 오래 걸리는 작업(사용자 지시 2026-09-23).
+# 코드: v2r/channels/freeform.py _long_job_eta().
+long_job_tasks:
+  publish_daily: 8
+  publish_brand: 8
+  publish_info: 8
+  publish_batch: 10
+  bulk_generate: 6
+  bulk_generate_all: 15
+  keyword_discovery: 5
+  keyword_discovery_all: 15
+  generate_photos: 5
 
 # 범주 아이콘 (사용자 지시 2026-09-23: 텔레그램·슬랙 메시지 구분).
 # 코드는 v2r/channels/__init__.py 의 CATEGORY_ICONS 를 실제로 쓴다 — 여기는 설명서.

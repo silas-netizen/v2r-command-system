@@ -262,9 +262,10 @@ def test_watchdog_reenqueues_when_job_stays_queued(tmp_path):
     out = sched.tick(rt, start + timedelta(minutes=6), handle_text=handler)
     assert [a["action"] for a in out["watchdog"]] == ["retry"]
     assert len(handler.calls) == 2
-    assert any("예약 실패" in t and "자동 재시도" in t for t in channel.sent)
+    # 자동 재시도(중간 경과)는 채널로 안 나간다(사용자 지시 2026-09-23: 진짜 실패만).
+    assert not any("자동 재시도" in t for t in channel.sent)
 
-    # 다시 6분 뒤 — 이번엔 사람에게 알리고 포기
+    # 다시 6분 뒤 — 자동 복구도 실패하면 그제야 사람에게 알린다
     out2 = sched.tick(rt, start + timedelta(minutes=12), handle_text=handler)
     assert [a["action"] for a in out2["watchdog"]] == ["failed"]
     assert len(handler.calls) == 2

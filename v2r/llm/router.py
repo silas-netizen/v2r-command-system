@@ -60,6 +60,8 @@ MODELS: dict[str, str] = {
     "brand_comments": "claude-sonnet-5",
     # 키워드-브랜드 연관도 재산정 (100개씩 묶음, 요금제 길 0원)
     "keyword_relevance": "claude-haiku-4-5",
+    # 슬랙/텔레그램 자유 대화 명령 해석 (요금제 길 plan, 0원, 사용자 지시 2026-09-23)
+    "freeform_command": "claude-sonnet-5",
 }
 
 DEFAULT_MODEL = "claude-haiku-4-5"

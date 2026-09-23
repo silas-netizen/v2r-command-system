@@ -2597,6 +2597,16 @@ def _finish_run(
     # 개별 작업 완료·실패는 "summary" 등급 — 채널로 따로 안 보내고 정기 보고에 담는다
     # (사용자 지시 2026-09-23: 메시지가 너무 많다).
     notify_all(rt.channels, format_report(job_id, status, description), level="summary", tag="publish")
+    if spec.task == "reconcile" and int(result.get("failed") or 0) > 0:
+        # (a) 발행 실패 — "끊긴 작업 점검"까지 거친 뒤에도 남은 확정 실패만 진짜 실패로 본다
+        # (사용자 지시 2026-09-23). 되읽기 실패·미확정(`unresolved`)은 여기 안 든다.
+        notify_all(
+            rt.channels,
+            f"발행 실패 확정: 점검 결과 {result['failed']}건이 최종 실패로 남았습니다",
+            level="critical",
+            category="publish_failed_confirmed",
+            tag="publish",
+        )
     out = {"job_id": job_id, "status": status, "result": result, "description": description}
     if error:
         out["error"] = error
@@ -2713,22 +2723,18 @@ def poll_channels(rt: Runtime) -> int:
         for cmd in incoming:
             received += 1
             try:
-                out = handle_text(rt, cmd.text, via_channel=True)
+                from v2r.channels.freeform import handle_channel_message
+
+                handle_channel_message(rt, channel, cmd.chat_id, cmd.text)
             except Exception as exc:
+                # 자유 대화 경로 자체가 죽은 예외적인 경우에만 되묻기로 대신한다.
+                # "명령을 해석하지 못했습니다" 류 문구는 내보내지 않는다(사용자 지시 2026-09-23).
                 log.exception("명령 처리 실패: %s", exc)
-                _reply(channel, cmd.chat_id, f"명령 처리 중 오류가 났습니다: {exc}")
-                continue
-            if out.get("stopped"):
-                _reply(channel, cmd.chat_id, out.get("message") or "중지했습니다")
-                continue
-            if not out.get("ok"):
-                _reply(channel, cmd.chat_id, out.get("error") or "명령을 해석하지 못했습니다")
-                continue
-            # 중지 뒤에 들어온 새 명령은 중지 상태를 푼다(그래야 큐가 다시 돈다)
-            clear_stop(rt)
-            job_id = out.get("job_id")
-            remember_origin(job_id, channel, cmd.chat_id)
-            _reply(channel, cmd.chat_id, format_report(job_id, "running", out["description"]))
+                _reply(
+                    channel,
+                    cmd.chat_id,
+                    "잠깐 못 알아들었어요. 예: 현황 / 우아덤 대량 원고 3건 / 오늘 글 몇 개 나갔어?",
+                )
     return received
 
 

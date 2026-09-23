@@ -75,12 +75,8 @@ def test_queued_job_alerts_and_self_heals(tmp_path):
     assert [a["action"] for a in out["actions"]] == ["start_delay"]
     assert "중지 플래그 해제" in out["actions"][0]["healed"]
     assert not worker.stop_requested(rt)
-    sent = rt.channels[0].sent
-    assert any(f"작업 {job_id} 시작 지연" in t for t in sent)
-
-    # 같은 알림을 되풀이하지 않는다(상태 파일에 남는다)
-    rt.channels[0].sent.clear()
-    monitor.tick(rt, NOW + timedelta(minutes=1))
+    # "시작 지연" 자동 진단은 채널로 안 나간다(사용자 지시 2026-09-23: 진짜 실패만
+    # critical, 자동 진단·중간 경과는 로그에만).
     assert rt.channels[0].sent == []
     rt.close()
 
@@ -92,7 +88,8 @@ def test_queued_job_second_alert_names_reason(tmp_path):
     rt.channels[0].sent.clear()
     out = monitor.tick(rt, NOW + timedelta(minutes=6))
     assert [a["action"] for a in out["actions"]] == ["start_blocked"]
-    assert any("아직 시작 못 함" in t for t in rt.channels[0].sent)
+    # 두 번째 경고도 자동 진단이라 채널로 안 나간다(사용자 지시 2026-09-23).
+    assert rt.channels[0].sent == []
     rt.close()
 
 
@@ -127,7 +124,8 @@ def test_running_job_stall_alert_then_reap_and_requeue(tmp_path):
     job_id = add_job(rt, task="repair_comments", status="running", ago_min=16)
     out = monitor.tick(rt, NOW)
     assert [a["action"] for a in out["actions"]] == ["stalled"]
-    assert any("정체" in t for t in rt.channels[0].sent)
+    # 정체 경고도 자동 진단이라 채널로 안 나간다(사용자 지시 2026-09-23).
+    assert rt.channels[0].sent == []
 
     # 30분을 넘기고 리스도 끊겼으면 실패 처리 + 같은 명령 재등록
     rt.conn.execute(
@@ -154,7 +152,8 @@ def test_publish_daily_정체시_즉시_큐로_되돌려_이어서_실행한다(
     assert [a["action"] for a in out["actions"]] == ["stall_recovered"]
     row = rt.jobs.get(job_id)
     assert row["status"] == "queued"
-    assert any("이어서 실행" in t or "되돌렸습니다" in t for t in rt.channels[0].sent)
+    # 자동 복구(재개) 알림도 자동 진단이라 채널로 안 나간다(사용자 지시 2026-09-23).
+    assert rt.channels[0].sent == []
     rt.close()
 
 
@@ -217,10 +216,9 @@ def test_failed_job_rate_limited_rule_is_tier0_and_retries(tmp_path):
     out = monitor.tick(rt, NOW)
     act = [a for a in out["actions"] if a["action"] == "failed"][0]
     assert act["rule"] == "rate_limited"
-    text = "\n".join(rt.channels[0].sent)
-    assert f"작업 {job_id} 실패" in text
-    # 자동 진단 문구("판정: … / Tier …")는 채널로 안 나가고 이벤트 상세에만 남는다
-    # (사용자 지시 2026-09-23: "메시지가 너무 많다").
+    # 개별 작업 실패는 정책표의 (a)~(f)에 안 드는 일반 실패라 채널로 안 나간다
+    # (사용자 지시 2026-09-23 추가분: 진짜 실패 6종만 critical). 판정 상세는 이벤트에 남는다.
+    assert rt.channels[0].sent == []
     detail = "\n".join(r["message"] for r in rt.events.recent(job_id, limit=20))
     assert "Tier 0" in detail
     rt.close()
@@ -243,12 +241,15 @@ def test_failed_job_network_error_requeued_once(tmp_path):
 
 def test_failed_job_logic_error_is_not_retried_and_shows_resume(tmp_path):
     rt = make_rt(tmp_path)
-    add_job(rt, status="failed", error="카페를 찾을 수 없습니다: 없는카페")
+    job_id = add_job(rt, status="failed", error="카페를 찾을 수 없습니다: 없는카페")
     out = monitor.tick(rt, NOW)
     act = [a for a in out["actions"] if a["action"] == "failed"][0]
     assert act["rule"] == "catalog_mismatch"
     assert act["new_job_id"] is None
-    assert any("다시 하려면 이렇게 보내세요" in t for t in rt.channels[0].sent)
+    # 이 안내도 일반 실패(정책표 a~f 밖)라 채널로 안 나가고 이벤트에만 남는다.
+    assert rt.channels[0].sent == []
+    detail = "\n".join(r["message"] for r in rt.events.recent(job_id, limit=20))
+    assert "다시 하려면 이렇게 보내세요" in detail
     rt.close()
 
 
