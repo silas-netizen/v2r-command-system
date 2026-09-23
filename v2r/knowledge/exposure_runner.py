@@ -422,6 +422,120 @@ def due_pending(repo_root: str | Path, now: float | None = None) -> list[dict]:
     return [e for e in data.values() if float(e.get("due_at", 0)) <= now]
 
 
+# =======================================================================
+# 작업자 간 배타(중복 검사 방지) — 2026-09-24 코디네이터 지적
+#
+# 작업자 3개가 각자 독립된 rt.conn으로 next_priority_batch를 부르니, 셋 다
+# 아직 아무도 저장하기 전에 같은(등급 1위) 키워드를 동시에 집어 실제로
+# 같은 키워드를 2~3번 따로 검색하는 낭비가 있었다(예: 02:30:16/19/19 "치루수술
+# 회복기간" 3연속). 검사 시작 직전 "진행 중" 표시를 남기고, 배치에서 이미
+# 진행 중인 항목은 건너뛴다. 여러 프로세스가 동시에 파일을 읽고 쓰는 경합
+# 자체는 파일 잠금(디렉터리 생성 기반, 원자적)으로 막는다.
+# =======================================================================
+
+INFLIGHT_FILE = "exposure_inflight.json"
+#: 이 시간(초)이 지난 진행 중 표시는 죽은 작업자의 것으로 보고 무시한다
+#: (한 건 검사에 보통 10~40초, 넉넉히 잡음).
+INFLIGHT_TTL_SECONDS = 180
+
+
+def inflight_path(repo_root: str | Path) -> Path:
+    return Path(repo_root) / "data" / INFLIGHT_FILE
+
+
+def _inflight_lock_dir(repo_root: str | Path) -> Path:
+    return Path(repo_root) / "data" / (INFLIGHT_FILE + ".lock")
+
+
+def _with_inflight_lock(repo_root: str | Path, fn: Any, timeout: float = 2.0) -> Any:
+    """`os.mkdir`은 원자적이라(먼저 만든 프로세스만 성공) 여러 프로세스 간
+    간이 잠금으로 쓴다. 최대 `timeout`초 재시도, 그래도 못 잡으면(죽은 잠금
+    의심) 강제로 지우고 한 번 더 시도한다."""
+    lock_dir = _inflight_lock_dir(repo_root)
+    lock_dir.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.time() + timeout
+    while True:
+        try:
+            os.mkdir(lock_dir)
+            break
+        except FileExistsError:
+            if time.time() >= deadline:
+                try:
+                    os.rmdir(lock_dir)
+                except OSError:
+                    pass
+                continue
+            time.sleep(0.02)
+    try:
+        return fn()
+    finally:
+        try:
+            os.rmdir(lock_dir)
+        except OSError:
+            pass
+
+
+def _load_inflight(repo_root: str | Path) -> dict:
+    p = inflight_path(repo_root)
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _write_inflight(repo_root: str | Path, data: dict) -> None:
+    p = inflight_path(repo_root)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, p)
+
+
+def _inflight_key(brand: str, keyword: str) -> str:
+    return f"{brand}|{keyword}"
+
+
+def is_inflight(repo_root: str | Path, brand: str, keyword: str, now: float | None = None) -> bool:
+    now = now if now is not None else time.time()
+    entry = _load_inflight(repo_root).get(_inflight_key(brand, keyword))
+    if not entry:
+        return False
+    return (now - float(entry.get("claimed_at", 0))) < INFLIGHT_TTL_SECONDS
+
+
+def claim_inflight(
+    repo_root: str | Path, brand: str, keyword: str, worker_id: int, now: float | None = None
+) -> bool:
+    """지금부터 이 키워드를 이 작업자가 검사한다고 표시. 다른 작업자가 이미
+    (만료 전) 진행 중이면 `False`(이 작업자는 다른 후보를 골라야 함)."""
+    now = now if now is not None else time.time()
+    key = _inflight_key(brand, keyword)
+
+    def _do() -> bool:
+        data = _load_inflight(repo_root)
+        existing = data.get(key)
+        if existing and (now - float(existing.get("claimed_at", 0))) < INFLIGHT_TTL_SECONDS:
+            return False
+        data[key] = {"worker_id": worker_id, "claimed_at": now}
+        _write_inflight(repo_root, data)
+        return True
+
+    return _with_inflight_lock(repo_root, _do)
+
+
+def release_inflight(repo_root: str | Path, brand: str, keyword: str) -> None:
+    key = _inflight_key(brand, keyword)
+
+    def _do() -> None:
+        data = _load_inflight(repo_root)
+        data.pop(key, None)
+        _write_inflight(repo_root, data)
+
+    _with_inflight_lock(repo_root, _do)
+
+
 def run_worker(worker_id: int, brands: list[str] | None = None, max_iterations: int | None = None) -> None:
     """작업자 1개 메인 루프 — 브라우저 1개 상주, 브랜드를 돌며 우선순위 큐에서 계속 뽑는다."""
     from playwright.sync_api import sync_playwright
@@ -482,20 +596,34 @@ def run_worker(worker_id: int, brands: list[str] | None = None, max_iterations: 
 
                 # 밀려남 2차 확인 대기 중인 키워드가 때(5~10분) 됐으면 그걸 먼저
                 # 처리한다 — 우선순위 등급과 무관하게 시간이 생명인 재확인.
+                # 두 경로 모두 claim_inflight로 같은 키워드를 다른 작업자와
+                # 동시에 집지 않게 막는다(2026-09-24 — 작업자 3개가 저장 전에
+                # 같은 1등급 키워드를 2~3번 중복 검사하던 문제 수정).
+                brand = None
+                item = None
                 due = due_pending(rt.settings.repo_root)
-                if due:
-                    entry = due[0]
-                    brand = entry["brand"]
-                    item = entry["item"]
-                else:
+                for entry in due:
+                    if claim_inflight(rt.settings.repo_root, entry["brand"], entry["item"]["keyword"], worker_id):
+                        brand, item = entry["brand"], entry["item"]
+                        break
+                if item is None:
                     brand = brand_list[brand_idx % len(brand_list)]
                     brand_idx += 1
-                    batch = exposure_priority.next_priority_batch(rt, brand, n=1)
-                    if not batch:
+                    # n=1로는 이미 진행 중인 후보 하나뿐일 때 고를 게 없으니
+                    # 넉넉히 받아 첫 번째로 안 잡힌 후보를 고른다.
+                    batch = exposure_priority.next_priority_batch(rt, brand, n=5)
+                    for candidate in batch:
+                        if claim_inflight(rt.settings.repo_root, brand, candidate["keyword"], worker_id):
+                            item = candidate
+                            break
+                    if item is None:
                         time.sleep(2.0)
                         continue
-                    item = batch[0]
-                result = process_one(rt, context, brand, item, cfg, executor=confirm_executor)
+
+                try:
+                    result = process_one(rt, context, brand, item, cfg, executor=confirm_executor)
+                finally:
+                    release_inflight(rt.settings.repo_root, brand, item["keyword"])
                 update_worker_state(rt.settings.repo_root, worker_id, processed_delta=1, last_keyword=item["keyword"])
                 unknown_streak = unknown_streak + 1 if result["status"] == "unknown" else 0
                 if unknown_streak >= block_streak_limit:
@@ -551,6 +679,10 @@ __all__ = [
     "set_pending",
     "clear_pending",
     "due_pending",
+    "inflight_path",
+    "is_inflight",
+    "claim_inflight",
+    "release_inflight",
     "run_worker",
     "main",
 ]

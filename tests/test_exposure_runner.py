@@ -337,3 +337,35 @@ def test_recent_publish_keywords_합집합_article_index와_DB(tmp_path, monkeyp
     rt.article_index = FakeArticleIndex()
     out = exposure_priority._recent_publish_keywords(rt, "테스트브랜드", {"마이카페"}, now, [2.0, 6.0, 24.0])
     assert out == {"제목키워드", "db발행키워드"}
+
+
+# =======================================================================
+# 작업자 간 배타(중복 검사 방지) — 2026-09-24 코디네이터 지적
+# =======================================================================
+
+def test_claim_inflight_먼저_잡은쪽만_성공(tmp_path):
+    assert exposure_runner.claim_inflight(tmp_path, "브랜드", "키워드", worker_id=0) is True
+    # 만료 전에는 다른 작업자가 같은 키워드를 못 잡는다
+    assert exposure_runner.claim_inflight(tmp_path, "브랜드", "키워드", worker_id=1) is False
+    assert exposure_runner.is_inflight(tmp_path, "브랜드", "키워드") is True
+
+
+def test_claim_inflight_release후_다시_잡을수있음(tmp_path):
+    exposure_runner.claim_inflight(tmp_path, "브랜드", "키워드", worker_id=0)
+    exposure_runner.release_inflight(tmp_path, "브랜드", "키워드")
+    assert exposure_runner.is_inflight(tmp_path, "브랜드", "키워드") is False
+    assert exposure_runner.claim_inflight(tmp_path, "브랜드", "키워드", worker_id=1) is True
+
+
+def test_claim_inflight_만료되면_다시_잡을수있음(tmp_path):
+    now0 = 1_000_000.0
+    exposure_runner.claim_inflight(tmp_path, "브랜드", "키워드", worker_id=0, now=now0)
+    # TTL(180초) 전 — 여전히 막힘
+    assert exposure_runner.claim_inflight(tmp_path, "브랜드", "키워드", worker_id=1, now=now0 + 60) is False
+    # TTL 지남(죽은 작업자로 간주) — 다른 작업자가 잡을 수 있음
+    assert exposure_runner.claim_inflight(tmp_path, "브랜드", "키워드", worker_id=1, now=now0 + 200) is True
+
+
+def test_claim_inflight_다른_키워드는_서로_안막음(tmp_path):
+    assert exposure_runner.claim_inflight(tmp_path, "브랜드", "키워드A", worker_id=0) is True
+    assert exposure_runner.claim_inflight(tmp_path, "브랜드", "키워드B", worker_id=1) is True
