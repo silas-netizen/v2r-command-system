@@ -45,16 +45,21 @@ brand_sheets:
   팥순이:
     kind: affiliate
     spreadsheet_id: 1OwR_LSjO1ofOojldtSIqoxv0gieNSMx_t35_5G1VTCc
+    exposure_gid: 1325327696   # 두 번째 탭(노출 현황) — 실시간 export CSV 읽기용(2026-09-24)
     sheet: 게시글 쓰기 원본
   뉴더미스:
     kind: affiliate
     spreadsheet_id: 1mgqghfeNrSZ1bTSrfTYWojtPGMc0u-K4VXEikxrHLOw
+    exposure_gid: 1782605844   # 두 번째 탭(노출 현황) — 실시간 export CSV 읽기용(2026-09-24)
   우아덤:
     kind: affiliate
     spreadsheet_id: 1QYhQFnZznQ-NjIjwiIlmJcf6zkQlb6t3TBK-W6OwJm0
+    exposure_gid: 1454846576   # 두 번째 탭(노출 현황) — 실시간 export CSV 읽기용(2026-09-24)
   장으뜸:
     kind: affiliate
     spreadsheet_id: 1J8Nq-UQxLzrt3fOqIkZ2HRskZJTFQlOjmFjIh3wlzBs
+    exposure_gid: 295921914   # 두 번째 탭(노출 현황) — 실시간 export CSV 읽기용(2026-09-24)
   코숨핏:
     kind: affiliate
     spreadsheet_id: 1Ey_laLK5-yJx2malh8s0vbmECpVW7CZQklCGKT3x0ek
+    exposure_gid: 607459493   # 두 번째 탭(노출 현황) — 실시간 export CSV 읽기용(2026-09-24)

@@ -196,9 +196,15 @@ def _sheet_rows(brand: str, cfg: dict | None, xlsx_path: str | Path | None) -> l
     sid = _brand_spreadsheet_id(brand, cfg)
     if sid:
         try:
-            from v2r.sources.sheets_writer import _read_export_csv, _second_tab_gid
+            from v2r.sources.sheets_writer import _read_export_csv
 
-            table = _read_export_csv(sid, _second_tab_gid(sid))
+            # gid는 설정(config/sources.yaml brand_sheets.<브랜드>.exposure_gid)에서 — 탭 목록을
+            # Playwright로 여는 _second_tab_gid는 러너 스레드 안에서 충돌(asyncio loop)하므로 안 쓴다.
+            entry = ((cfg or {}).get("brand_sheets") or {}).get(brand) or {}
+            gid = entry.get("exposure_gid")
+            if gid is None:
+                raise SourceError("exposure_gid 미설정")
+            table = _read_export_csv(sid, int(gid))
             if table and len(table) > 1:
                 hdr = [str(h).strip() for h in table[0]]
                 rows = [dict(zip(hdr, r + [""] * (len(hdr) - len(r)))) for r in table[1:]]
