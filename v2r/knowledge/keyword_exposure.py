@@ -1593,6 +1593,51 @@ def article_has_identifier(text: str, identifiers: list[str]) -> bool:
     return any(ident and ident in body for ident in identifiers)
 
 
+#: 댓글 한 건의 끝을 표시하는 네이버 카페 댓글 UI 문구("답글쓰기" 버튼) — 이 마커
+#: 앞까지가 댓글 본문+작성자+날짜다. 2026-09-23 재지시: 식별어는 **댓글에서만**
+#: (본문 제외) 찾아야 하므로, 본문·댓글을 나눠 세야 한다.
+_RE_COMMENT_BLOCK = re.compile(r"(.*?)\n답글쓰기", re.S)
+#: 댓글 섹션 시작(제목 줄 "댓글 12" 류) — 이보다 앞은 본문으로 본다.
+_RE_COMMENT_SECTION_START = re.compile(r"\n\s*댓글\s*\d+\s*\n")
+
+
+def _norm_identifier_text(s: str) -> str:
+    """식별어 비교용 정규화 — 공백 제거·대소문자 무시(2026-09-23 재지시)."""
+    return re.sub(r"\s+", "", str(s or "")).casefold()
+
+
+def extract_comments(article_text: str) -> list[str]:
+    """글 상세 텍스트(`fetch_article_text` 결과)에서 **댓글만** 순서대로 뽑는다.
+
+    네이버 카페 댓글 UI는 각 댓글이 "작성자\\n\\n내용\\n\\n날짜\\n답글쓰기" 꼴로
+    끝난다(2026-09-23 실측). 본문(첫 "댓글 N" 표시줄 앞)은 제외한다. 패턴이 없는
+    글(구조가 다르거나 댓글 0개)이면 빈 목록.
+    """
+    text = article_text or ""
+    m = _RE_COMMENT_SECTION_START.search(text)
+    tail = text[m.end():] if m else text
+    # "댓글을 입력하세요" 아래는 작성창(다음 글 미리보기 등)이라 제외
+    tail = tail.split("댓글을 입력하세요", 1)[0]
+    return [blk.strip() for blk in _RE_COMMENT_BLOCK.findall(tail) if blk.strip()]
+
+
+def find_identifier_in_comments(
+    comments: list[str], identifiers: list[str]
+) -> tuple[int, str] | None:
+    """댓글 목록(1번부터)에서 식별어를 처음 찾은 (번호, 식별어) — 없으면 `None`.
+
+    공백 제거·대소문자 무시로 비교한다(2026-09-23 재지시 — "팥순ㅇㅣ" 같은
+    자모 분리 표기·띄어쓰기 차이를 놓치지 않기 위함).
+    """
+    norm_idents = [(ident, _norm_identifier_text(ident)) for ident in identifiers if ident]
+    for i, comment in enumerate(comments, start=1):
+        norm_comment = _norm_identifier_text(comment)
+        for ident, norm_ident in norm_idents:
+            if norm_ident and norm_ident in norm_comment:
+                return i, ident
+    return None
+
+
 def confirm_our_article(
     rt: Any,
     brand: str,
@@ -1624,7 +1669,10 @@ def confirm_our_article(
 
     try:
         text = fetch_article_text(url, cookies_path=cookies_path)
-        ours = article_has_identifier(text, identifiers)
+        # 2026-09-23 재지시: 식별어는 본문이 아니라 **댓글에서만** 찾는다(실제
+        # 원고 기획상 식별어는 댓글2/대댓글2/대대댓글2 계열에만 심는다).
+        comments = extract_comments(text)
+        ours = find_identifier_in_comments(comments, identifiers) is not None
     except Exception as exc:
         log.warning("글 열람 확인 실패(%s): %s", url, exc)
         return False
@@ -1755,6 +1803,8 @@ __all__ = [
     "set_cached_verdict",
     "fetch_article_text",
     "article_has_identifier",
+    "extract_comments",
+    "find_identifier_in_comments",
     "confirm_our_article",
     "judge_keyword_exposure",
     # 연결 1: 순환→시트 배칭 (2026-09-23)

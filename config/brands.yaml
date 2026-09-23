@@ -48,8 +48,9 @@ brands:
     folder: 우아덤             # 창고/인박스 폴더명
     drive_folder: 우아덤
     aliases: []
-    # 댓글 식별어(2026-09-23 사용자 지시 — 노출 확인 2차 확정용). 브랜드명·제품명.
-    identifiers: [우아덤, 그린커피 아하바하]
+    # 댓글 식별어(2026-09-23 사용자 지시 — 노출 확인 2차 확정용. 댓글에서만 검출, 공백무시·대소문자무시).
+    # 2026-09-23 재지시(교차검증 중): 실제 원고 표기 변형 추가.
+    identifiers: [우아덤, 그린커피 아하바하, 아하바하]
     placeholder_rules:
       default: {folder: '{token}', select: random}
     known_folders: [키워드]
@@ -63,7 +64,7 @@ brands:
     folder: 코숨핏
     drive_folder: 코숨핏
     aliases: []
-    # 댓글 식별어(2026-09-23 사용자 지시)
+    # 댓글 식별어(2026-09-23 사용자 지시, 댓글에서만·공백/대소문자 무시)
     identifiers: [코숨핏]
     placeholder_rules:
       default: {folder: '{token}', select: random}
@@ -96,8 +97,8 @@ brands:
     drive_folder: 뉴더미스
     # 같은 브랜드의 다른 표기. 지침(SUMMARY §8)에서는 `자연방패 항문세정제`로 부른다.
     aliases: [자연방패, 자연방패 항문세정제]
-    # 댓글 식별어(2026-09-23 사용자 지시)
-    identifiers: [뉴더미스, 자연방패]
+    # 댓글 식별어(2026-09-23 사용자 지시, 댓글에서만). 재지시(교차검증 중): 실제 원고 표기 추가.
+    identifiers: [뉴더미스, 자연방패, 자연방패 항문세정제]
     placeholder_rules:
       keyword: {folder: 키워드, select: random}   # {키워드} 또는 {A열 키워드}
       default: {folder: '{token}', select: random}
@@ -113,8 +114,8 @@ brands:
     drive_folder: 장으뜸
     gpt_generate: false   # 사용자 지시(2026-09-19): 장으뜸은 GPT 생성 없이 키워드 폴더 사진을 랜덤 선택·세탁해 사용
     aliases: [장으뜸 장어즙]
-    # 댓글 식별어(2026-09-23 사용자 지시)
-    identifiers: [장으뜸]
+    # 댓글 식별어(2026-09-23 사용자 지시, 댓글에서만). 재지시(교차검증 중): 실제 원고 표기 추가.
+    identifiers: [장으뜸, 장으뜸 장어즙]
     placeholder_rules:
       keyword: {folder: 키워드, select: random}
       default: {folder: '{token}', select: random}
@@ -129,8 +130,8 @@ brands:
     folder: 팥순이
     drive_folder: 팥순이
     aliases: [팥순추출물, 팥순ㅇㅣ]
-    # 댓글 식별어(2026-09-23 사용자 지시)
-    identifiers: [팥순이, 팥순추출물]
+    # 댓글 식별어(2026-09-23 사용자 지시, 댓글에서만). 재지시(교차검증 중): 자모 분리 표기 추가.
+    identifiers: [팥순이, 팥순추출물, 팥순ㅇㅣ]
     placeholder_rules:
       keyword:                 # {키워드} 또는 {A열 키워드와 같은 문자열}
         folder: 키워드
