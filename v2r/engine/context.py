@@ -54,11 +54,32 @@ class Runtime:
 
     # ---- 생성/정리 ----
     @classmethod
-    def open(cls, settings: Settings | None = None, conn: sqlite3.Connection | None = None) -> "Runtime":
-        """설정을 읽고 DB를 연 실행 컨텍스트를 만든다."""
+    def open(
+        cls,
+        settings: Settings | None = None,
+        conn: sqlite3.Connection | None = None,
+        *,
+        skip_schema_init: bool = False,
+    ) -> "Runtime":
+        """설정을 읽고 DB를 연 실행 컨텍스트를 만든다.
+
+        2026-09-25 9차(노출 러너 실측) — `skip_schema_init=True`면
+        `init_schema`(migrate + `executescript`)를 건너뛴다. 노출 러너의
+        백그라운드 스레드(정렬 큐 갱신·CSV 갱신, `exposure_priority.
+        _refresh_queue_in_background`/`exposure_runner.
+        _write_exposure_csv_in_background`)가 브랜드마다 60~600초 간격으로
+        `Runtime.open()`을 새로 여는데, 스키마는 메인 작업자가 시작할 때
+        이미 만들어져 있어 매번 다시 돌릴 필요가 없다 — 오히려 여러 작업자
+        프로세스가 동시에 자주 `executescript`(암묵적 트랜잭션)를 돌리면
+        다른 연결의 쓰기 트랜잭션(`claim_batch`/`mark_done` 등의
+        `BEGIN IMMEDIATE`)과 부딪혀 `sqlite3.OperationalError: database is
+        locked`(`busy_timeout` 5000ms 초과)로 작업자가 죽는 원인이 됐다
+        (실측 9차, 21시간 가동 중 6개 중 4개가 이렇게 죽어 2개만 남았다).
+        """
         st = settings or get_settings()
         connection = conn if conn is not None else connect(st.db_path)
-        init_schema(connection)
+        if not skip_schema_init:
+            init_schema(connection)
         return cls(
             settings=st,
             conn=connection,

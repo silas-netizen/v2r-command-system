@@ -405,10 +405,14 @@ def _release_refresh_lock_by_root(repo_root: str | Path, brand: str) -> None:
 def _open_refresh_runtime() -> Any:
     """`_refresh_queue_in_background` 전용 — 별도 함수로 빼서 시험에서
     (실제 프로덕션 설정 대신) 같은 임시 DB의 `rt`를 그대로 돌려주도록
-    바꿔치기할 수 있게 한다."""
+    바꿔치기할 수 있게 한다.
+
+    2026-09-25 9차 — `skip_schema_init=True`: 스키마는 메인 작업자가 이미
+    만들어 뒀다. 여기서 매번 다시 돌리면 다른 연결의 쓰기 트랜잭션과 부딪혀
+    "database is locked"로 작업자가 죽는 원인이 됐다(러너 실측)."""
     from v2r.engine.context import Runtime
 
-    return Runtime.open()
+    return Runtime.open(skip_schema_init=True)
 
 
 def _refresh_queue_in_background(repo_root: str | Path, brand: str, cfg: dict, now: datetime) -> None:

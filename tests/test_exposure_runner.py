@@ -1045,3 +1045,111 @@ def test_do_refresh_queue_last_checked_캐시_건너뜀(tmp_path, monkeypatch):
     monkeypatch.setattr(exposure_priority, "invalidate_last_checked_cache", spy_invalidate)
     exposure_priority._do_refresh_queue(rt, "테스트브랜드", dict(exposure_priority._DEFAULT_PRIORITY), datetime.now(timezone.utc))
     assert calls["n"] == 1
+
+
+# =======================================================================
+# 2026-09-25 9차 — 21시간 가동 실측: duplicate_rate(새 정의)가 작업자별
+# 0.12→0.69로 치솟은 원인 두 가지를 잡는다.
+#   (a) 백그라운드 스레드(정렬 큐 갱신·CSV 갱신)가 Runtime.open()을 열 때마다
+#       init_schema(executescript)를 다시 돌려 다른 연결의 쓰기 트랜잭션과
+#       부딪혀 "database is locked"로 작업자가 죽음(6개 중 4개 사망 확인).
+#   (b) 살아남은 두 작업자가 배치(10개)를 순서대로 처리하는 동안 뒤쪽 항목의
+#       선점이 CLAIM_TTL_SECONDS(180초)를 넘겨 다른 작업자가 재선점 —
+#       로그로 확인(두 작업자가 같은 키워드를 초 단위로 동시 검사, 209건).
+# =======================================================================
+
+
+def test_runtime_open_skip_schema_init(tmp_path, monkeypatch):
+    from v2r.engine.context import Runtime
+
+    calls = {"n": 0}
+    real_init_schema = None
+    import v2r.engine.context as context_mod
+
+    real_init_schema = context_mod.init_schema
+
+    def spy_init_schema(conn):
+        calls["n"] += 1
+        return real_init_schema(conn)
+
+    monkeypatch.setattr(context_mod, "init_schema", spy_init_schema)
+
+    settings = context_mod.Settings(
+        v2r_email="tester@example.com", v2r_password="",
+        data_dir=tmp_path / "data", warehouse_dir=tmp_path / "warehouse",
+        db_path=tmp_path / "data" / "v2r.sqlite",
+    )
+    (tmp_path / "data").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "warehouse").mkdir(parents=True, exist_ok=True)
+
+    rt1 = Runtime.open(settings)  # 스키마를 실제로 만듦
+    assert calls["n"] == 1
+    rt2 = Runtime.open(settings, skip_schema_init=True)
+    assert calls["n"] == 1, "skip_schema_init=True면 init_schema를 다시 안 불러야 한다"
+    # 그래도 정상적으로 쓸 수 있어야 한다(스키마가 이미 있으므로)
+    rt2.conn.execute("SELECT 1 FROM exposure_queue LIMIT 1")
+    rt1.close()
+    rt2.close()
+
+
+def test_renew_claim_내_선점만_시각_갱신(tmp_path):
+    rt = make_runtime(tmp_path)
+    item = {"keyword": "키워드"}
+    qstore.claim_specific(rt.conn, "브랜드", "키워드", "키워드", item, "worker0", now_epoch=1_000_000.0)
+
+    ok = qstore.renew_claim(rt.conn, "브랜드", "키워드", "worker0", now_epoch=1_000_100.0)
+    assert ok is True
+    # 갱신됐으니 TTL(180초) 기준 최신 — 만료 전 컷오프로도 여전히 내 것으로 보여야 한다
+    row = rt.conn.execute(
+        "SELECT claimed_at FROM exposure_queue WHERE brand=? AND keyword_norm=?", ("브랜드", "키워드")
+    ).fetchone()
+    assert row["claimed_at"] == 1_000_100.0
+
+
+def test_renew_claim_다른작업자_선점은_안건드림(tmp_path):
+    rt = make_runtime(tmp_path)
+    item = {"keyword": "키워드"}
+    qstore.claim_specific(rt.conn, "브랜드", "키워드", "키워드", item, "worker0", now_epoch=1_000_000.0)
+
+    ok = qstore.renew_claim(rt.conn, "브랜드", "키워드", "worker1", now_epoch=1_000_100.0)
+    assert ok is False
+    row = rt.conn.execute(
+        "SELECT claimed_at FROM exposure_queue WHERE brand=? AND keyword_norm=?", ("브랜드", "키워드")
+    ).fetchone()
+    assert row["claimed_at"] == 1_000_000.0, "다른 작업자의 갱신 시도는 반영되면 안 된다"
+
+
+def test_renew_claim_선점이_만료돼_이미_다른작업자가_가져갔으면_False(tmp_path):
+    """배치에 오래 머물다 만료된 뒤 다른 작업자가 이미 재선점한 경우 —
+    원래 작업자의 renew_claim은 실패해야 한다(선점자가 바뀌었으므로)."""
+    rt = make_runtime(tmp_path)
+    item = {"keyword": "키워드"}
+    qstore.claim_specific(rt.conn, "브랜드", "키워드", "키워드", item, "worker0", now_epoch=1_000_000.0)
+    # 180초 넘게 지나 worker1이 재선점
+    ok2 = qstore.claim_specific(rt.conn, "브랜드", "키워드", "키워드", item, "worker1", now_epoch=1_000_300.0)
+    assert ok2 is True
+    # 원래 worker0이 뒤늦게 renew를 시도해도 이제 소유자가 아니므로 실패
+    ok = qstore.renew_claim(rt.conn, "브랜드", "키워드", "worker0", now_epoch=1_000_310.0)
+    assert ok is False
+
+
+def test_worker_queue_take_배치_처리직전_선점갱신(tmp_path, monkeypatch):
+    """2026-09-25 9차 — `WorkerQueue.take()`가 항목을 돌려주기 직전에
+    `renew_claim`을 불러 선점 시각을 "지금"으로 되돌리는지 확인."""
+    rt = make_runtime(tmp_path)
+    batch = [{"keyword": "키워드", "cafe": "마이카페", "volume": 0}]
+    monkeypatch.setattr(exposure_priority, "next_priority_batch", lambda rt_, brand, n, worker_id="0", now=None: list(batch))
+
+    calls = {"args": None}
+    import v2r.store.exposure_queue_store as qstore_mod
+
+    def spy_renew(conn, brand, keyword_norm, worker_id, now_epoch=None):
+        calls["args"] = (brand, keyword_norm, worker_id)
+        return True
+
+    monkeypatch.setattr(qstore_mod, "renew_claim", spy_renew)
+
+    wq = exposure_runner.WorkerQueue(batch_size=1, ttl_sec=120.0)
+    item = wq.take(rt, "테스트브랜드", worker_id=7)
+    assert item is not None
+    assert calls["args"] == ("테스트브랜드", "키워드", "7")

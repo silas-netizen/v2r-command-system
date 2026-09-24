@@ -261,6 +261,30 @@ def release_claim(conn: sqlite3.Connection, brand: str, keyword_norm: str) -> No
     )
 
 
+def renew_claim(
+    conn: sqlite3.Connection, brand: str, keyword_norm: str, worker_id: str, now_epoch: float | None = None
+) -> bool:
+    """이 작업자가 들고 있는 선점의 `claimed_at`을 지금 시각으로 되돌린다
+    (2026-09-25 9차). `claim_batch`는 배치(기본 10개)를 한 번에 선점해 각
+    작업자 메모리에 두고 하나씩 순서대로 처리하는데, 그 사이(다른 항목 처리
+    시간 합)가 `CLAIM_TTL_SECONDS`(180초)를 넘으면 아직 처리 전인 뒤쪽
+    항목의 선점이 DB에서는 이미 "죽은 작업자 것"으로 보여 다른 작업자가
+    다시 선점해 갈 수 있다 — 실측(21시간 가동 중 209건, 두 작업자가 같은
+    키워드를 초 단위로 동시에 검사) 원인. `WorkerQueue.take()`가 항목을
+    실제로 넘기기(`process_one` 호출) 직전에 이 함수로 "지금부터 다시
+    180초"로 갱신해 그 창을 없앤다. 그 사이 다른 작업자가 이미 선점을
+    가져갔으면(이 작업자 소유가 아니면) 갱신하지 않고 `False`를 돌려준다 —
+    호출자가 `is_due_now`로 어차피 한 번 더 확인하므로 이중 검사 위험은
+    없지만, 더는 이 작업자 것이 아닌 항목을 건드리지 않기 위해서다."""
+    now_epoch = now_epoch if now_epoch is not None else time.time()
+    cur = conn.execute(
+        "UPDATE exposure_queue SET claimed_at = ? "
+        "WHERE brand = ? AND keyword_norm = ? AND claimed_by = ? AND done_at IS NULL",
+        (now_epoch, brand, keyword_norm, worker_id),
+    )
+    return cur.rowcount > 0
+
+
 def queue_counts(conn: sqlite3.Connection, brand: str, now_epoch: float | None = None) -> dict[str, int]:
     """보고서용 — 현재 이 브랜드 큐 상태(대기/선점 중/완료) 개수."""
     now_epoch = now_epoch if now_epoch is not None else time.time()
@@ -291,5 +315,6 @@ __all__ = [
     "claim_specific",
     "mark_done",
     "release_claim",
+    "renew_claim",
     "queue_counts",
 ]

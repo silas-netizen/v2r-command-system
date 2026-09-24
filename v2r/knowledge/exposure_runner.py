@@ -392,10 +392,17 @@ _CSV_LAST_WRITE_MONO: dict[str, float] = {}
 def _open_csv_runtime() -> Any:
     """`_write_exposure_csv_in_background` 전용 — 메인 스레드(작업자)의
     `rt.conn`을 다른 스레드와 공유하지 않도록 이 스레드만의 새 `Runtime`을
-    연다(`exposure_priority._refresh_queue_in_background`와 같은 패턴)."""
+    연다(`exposure_priority._refresh_queue_in_background`와 같은 패턴).
+
+    2026-09-25 9차 — `skip_schema_init=True`: 스키마는 메인 작업자가 이미
+    만들어 뒀다. 이 스레드가 브랜드마다 최대 60초에 한 번씩 새 `Runtime`을
+    여는데, 매번 `init_schema`(executescript)까지 다시 돌리면 다른 연결의
+    `BEGIN IMMEDIATE` 쓰기 트랜잭션과 부딪혀 "database is locked"(busy_timeout
+    5000ms 초과)로 작업자가 죽는 원인이 됐다 — 21시간 가동 중 6개 중 4개가
+    이렇게 죽어 2개만 남아 그 2개가 서로 중복 재검사를 냈다(실측 9차)."""
     from v2r.engine.context import Runtime
 
-    return Runtime.open()
+    return Runtime.open(skip_schema_init=True)
 
 
 def _write_exposure_csv_in_background(brand: str) -> None:
@@ -752,7 +759,16 @@ class WorkerQueue:
         `exposure_queue_store.release_claim`) 다음 항목을 시도한다. 이
         브랜드 큐가 다 비면 새로 조회하지 않고 `None`을 돌려준다 — 호출자가
         다른 브랜드로 넘어갔다가 다음에 이 브랜드로 돌아오면 그때 TTL·빈 큐
-        조건으로 재조회된다."""
+        조건으로 재조회된다.
+
+        2026-09-25 9차 — 실제로 넘기기(반환) 직전에
+        `exposure_queue_store.renew_claim`으로 선점 시각을 "지금"으로
+        되돌린다. 배치(기본 10개)를 순서대로 처리하다 보면 뒤쪽 항목은
+        선점된 지 몇 분 지나서야 처리되는데, 그게 `CLAIM_TTL_SECONDS`
+        (180초)를 넘으면 DB 쪽에서는 이미 "죽은 작업자 것"으로 보여 다른
+        작업자가 같은 키워드를 또 선점해 동시에 검사하는 사고가 났다
+        (실측 9차 — 21시간 가동 중 두 작업자가 같은 키워드를 초 단위로
+        209번 동시 검사)."""
         from v2r.knowledge import exposure_priority
         from v2r.knowledge.keyword_exposure import _norm
         from v2r.store import exposure_queue_store as qstore
@@ -761,8 +777,10 @@ class WorkerQueue:
         state = self._state(brand)
         while state.items:
             candidate = state.items.pop(0)
+            keyword_norm = _norm(candidate.get("keyword", ""))
+            qstore.renew_claim(rt.conn, brand, keyword_norm, str(worker_id))
             if not exposure_priority.is_due_now(rt, brand, candidate):
-                qstore.release_claim(rt.conn, brand, _norm(candidate.get("keyword", "")))
+                qstore.release_claim(rt.conn, brand, keyword_norm)
                 state.stale_skipped += 1
                 continue
             state.consumed += 1
