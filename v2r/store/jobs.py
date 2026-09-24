@@ -53,16 +53,29 @@ def _owner_is_dead(owner: str | None) -> bool:
     return not pid_alive(int(pid_text))
 
 
+#: `long` 줄 작업의 기본 리스 시간(초) — 발행과 무관하게 돌되, 잠깐의
+#: 재시작에 죽은 작업으로 잘못 정리되지 않도록 넉넉히 잡는다(사고 2026-09-24:
+#: keyword_relevance_rescore_legacy 가 main 줄에 서서 아침 발행을 52분 막았다).
+LONG_LEASE_SECONDS = 12 * 3600
+
+
 def _scope_for(task: str) -> str:
-    """그 작업을 어느 줄(main/light)에서 잡아야 하는가.
+    """그 작업을 어느 줄(main/light/long)에서 잡아야 하는가.
 
     가벼운 조회 작업은 긴 발행 작업 뒤에 줄 서면 안 된다(장애 2026-09-20 C).
-    사이드카 스레드가 `light` 줄만 집어간다.
+    사이드카 스레드가 `light` 줄만 집어간다. 오래 걸리는(몇 시간짜리) 배치
+    작업도 마찬가지 이유로 `long` 줄로 뺀다(장애 2026-09-24) — 별도 사이드카
+    스레드가 발행(main)과 무관하게 처리한다.
     """
     try:
-        from v2r.engine.sidecar import LIGHT_TASKS
+        from v2r.engine.sidecar import LIGHT_TASKS, LONG_TASKS
 
-        return "light" if str(task) in LIGHT_TASKS else "main"
+        text = str(task)
+        if text in LONG_TASKS:
+            return "long"
+        if text in LIGHT_TASKS:
+            return "light"
+        return "main"
     except Exception:  # noqa: BLE001 - 순환 참조·초기화 실패로 큐가 막히면 안 된다
         return "main"
 
@@ -203,19 +216,23 @@ class JobStore:
             (now_iso(), owner),
         )
 
-    def acquire_light(self, owner: str, lease_seconds: int = 300) -> sqlite3.Row | None:
-        """`light` 줄의 가장 오래된 queued 1건을 running으로.
+    def acquire_scope(
+        self, owner: str, scope: str, lease_seconds: int = 300
+    ) -> sqlite3.Row | None:
+        """`scope`(light 또는 long) 줄의 가장 오래된 queued 1건을 running으로.
 
         실행기 리스(executor_lease)를 **쓰지 않는다**. 그래야 긴 발행 작업이
-        리스를 쥐고 있는 동안에도 사이드카가 가벼운 작업을 바로 돌릴 수 있다.
+        리스를 쥐고 있는 동안에도 사이드카가 가벼운·장시간 작업을 바로 돌릴
+        수 있다(장애 2026-09-20 C, 2026-09-24).
         """
         until = (datetime.now(KST) + timedelta(seconds=lease_seconds)).isoformat(
             timespec="seconds"
         )
         ts = now_iso()
         row = self.conn.execute(
-            "SELECT id FROM jobs WHERE status = 'queued' AND lease_scope = 'light'"
-            " ORDER BY id LIMIT 1"
+            "SELECT id FROM jobs WHERE status = 'queued' AND lease_scope = ?"
+            " ORDER BY id LIMIT 1",
+            (scope,),
         ).fetchone()
         if row is None:
             return None
@@ -229,16 +246,20 @@ class JobStore:
             return None  # 그 사이 누가 집어갔다
         return self.conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
 
+    def acquire_light(self, owner: str, lease_seconds: int = 300) -> sqlite3.Row | None:
+        """`light` 줄의 가장 오래된 queued 1건을 running으로 (하위 호환 이름)."""
+        return self.acquire_scope(owner, "light", lease_seconds)
+
     def acquire(
         self, owner: str, lease_seconds: int = 900, scope: str | None = None
     ) -> sqlite3.Row | None:
         """리스를 잡고 가장 오래된 queued 1건을 running으로.
 
-        `scope="main"` 이면 사이드카 몫(`light`)은 건너뛴다. 기본값(None)은
+        `scope="main"` 이면 사이드카 몫(`light`/`long`)은 건너뛴다. 기본값(None)은
         예전처럼 줄을 가리지 않는다(사이드카 없이 도는 한 번짜리 실행용).
         """
-        if scope == "light":
-            return self.acquire_light(owner, lease_seconds)
+        if scope in ("light", "long"):
+            return self.acquire_scope(owner, scope, lease_seconds)
         if not self._take_lease(owner, lease_seconds):
             return None
         if scope is None:
@@ -361,12 +382,25 @@ class JobStore:
         return dict(row) if row else None
 
     def release_stale_lease(self) -> bool:
-        """만료된 실행기 리스를 푼다. 풀었으면 True."""
+        """만료된, 또는 소유자 프로세스가 이미 죽은 실행기 리스를 푼다.
+
+        시간만 보면 리스 시간(기본 900초)이 남아 있는 동안은 재시작 후에도
+        최대 15분을 공백으로 날린다(장애 2026-09-24) — 실행기가 재시작될 때
+        이전 소유자(``호스트:pid``)가 **같은 호스트**에서 이미 죽었으면
+        시간과 무관하게 즉시 회수한다.
+        """
         row = self.conn.execute(
             "SELECT owner, until FROM executor_lease WHERE id = 1"
         ).fetchone()
         if row is None or not row["owner"]:
             return False
+        if _owner_is_dead(row["owner"]):
+            self.conn.execute(
+                "UPDATE executor_lease SET owner = NULL, until = NULL, updated_at = ?"
+                " WHERE id = 1",
+                (now_iso(),),
+            )
+            return True
         until = _parse(row["until"])
         if until is not None and until > datetime.now(KST):
             return False

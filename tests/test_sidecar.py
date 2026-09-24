@@ -496,6 +496,88 @@ def test_실행기_재시작은_발행_중이면_미룬다(tmp_path, monkeypatch
     rt.close()
 
 
+# --------------------------------------------------------------------
+# 4. long 줄: 발행과 무관하게 돌아야 하는 장시간 배치 작업 (장애 2026-09-24)
+# --------------------------------------------------------------------
+def test_long_작업_목록은_main_줄이_아니라_long_줄에_선다():
+    for task in ("keyword_relevance_rescore_legacy", "sheet_sync_keywords"):
+        assert sidecar_mod.is_long(task)
+        assert not sidecar_mod.is_light(task)
+        assert sidecar_mod.scope_for(task) == "long"
+    # light·main 판정은 그대로 유지된다
+    assert sidecar_mod.scope_for("status") == "light"
+    assert sidecar_mod.scope_for("publish_daily") == "main"
+
+
+def test_long_작업은_light_사이드카가_안_집고_long_전용으로만_잡힌다(tmp_path):
+    rt = make_runtime(tmp_path)
+    job_id = rt.jobs.enqueue(TaskSpec(task="keyword_relevance_rescore_legacy"), "k-long")
+    assert rt.jobs.get(job_id)["lease_scope"] == "long"
+
+    assert rt.jobs.acquire_light("side") is None  # light 줄은 못 본다
+    got = rt.jobs.acquire("main:1", scope="main")  # main 줄도 못 본다
+    assert got is None
+
+    got_long = rt.jobs.acquire("side:long", scope="long")
+    assert got_long is not None and int(got_long["id"]) == job_id
+    rt.close()
+
+
+def test_long_작업은_발행이_main_리스를_쥐고_있어도_바로_잡힌다(tmp_path):
+    """리스 없이(acquire_scope) 집기 때문에 main 줄 점유와 무관하다."""
+    rt = make_runtime(tmp_path)
+    rt.jobs.enqueue(TaskSpec(task="publish_daily"), "heavy")
+    assert rt.jobs.acquire("main:1", scope="main") is not None  # main 리스 점유 중
+
+    job_id = rt.jobs.enqueue(TaskSpec(task="sheet_sync_keywords"), "k-long")
+    got = rt.jobs.acquire("side:long", scope="long")
+    assert got is not None and int(got["id"]) == job_id
+    rt.close()
+
+
+def test_long_줄_리스는_넉넉해서_실행_도중에_안_끊긴다(tmp_path):
+    from v2r.store.jobs import LONG_LEASE_SECONDS
+
+    assert LONG_LEASE_SECONDS >= 3600  # 몇 시간짜리 작업이 중간에 끊기면 안 된다
+
+    rt = make_runtime(tmp_path)
+    job_id = rt.jobs.enqueue(TaskSpec(task="keyword_relevance_rescore_legacy"), "k-long")
+    got = rt.jobs.acquire("side:long", lease_seconds=LONG_LEASE_SECONDS, scope="long")
+    assert got is not None
+    row = rt.jobs.get(job_id)
+    from datetime import datetime
+
+    from v2r.store.db import KST
+
+    until = datetime.fromisoformat(row["lease_until"])
+    remaining = (until - datetime.now(KST)).total_seconds()
+    assert remaining > 3500  # 5분 리스가 아니라 몇 시간짜리 리스다
+    rt.close()
+
+
+def test_run_once_이_long_줄을_돌리면_main_리스를_안_쓴다(tmp_path):
+    """`worker.run_once(scope='long')` 가 큰 리스로 acquire 하고, 성공 시 완료 처리한다."""
+
+    def _dummy_dispatch(rt_, job, owner_):
+        return {"ok": True, "message": "끝"}
+
+    rt = make_runtime(tmp_path)
+    job_id = rt.jobs.enqueue(TaskSpec(task="keyword_relevance_rescore_legacy"), "k-long")
+    import v2r.engine.worker as worker_mod
+
+    orig_dispatch = worker_mod.dispatch
+    worker_mod.dispatch = _dummy_dispatch
+    try:
+        out = worker.run_once(rt, "side:long", scope="long")
+    finally:
+        worker_mod.dispatch = orig_dispatch
+    assert out is not None
+    assert out["job_id"] == job_id
+    assert out["status"] == "done"
+    assert rt.jobs.lease_info() in (None, {"owner": None, "until": None})  # main 리스는 안 건드렸다
+    rt.close()
+
+
 def test_심장박동_스레드는_틱_스레드와_따로_돈다(tmp_path):
     """`_Status` 가 "지금 뭘 하는지"를 기록하고, 그 값을 심장박동 파일에 쓸 수 있다."""
     rt = make_runtime(tmp_path)

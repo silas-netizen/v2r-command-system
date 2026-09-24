@@ -65,6 +65,22 @@ LIGHT_TASKS = frozenset(
     }
 )
 
+#: 발행(main) 줄과 무관하게, 몇 시간씩 걸리는 배치 작업을 맡는 별도 줄.
+#: 장애 2026-09-24: `keyword_relevance_rescore_legacy` 가 main 줄에 서서
+#: 09:00 아침 발행(publish_daily)을 52분 막았다. 이 작업들은 공유 자원이
+#: main 줄 작업과 거의 겹치지 않는다 — 키워드 DB·시트 잠금은 발행과 별도
+#: 파일/락이고, 네이버 로그인 프로필을 쓰지 않는다(순수 계산 + 시트 API
+#: 호출) — 그래서 발행 중에도 동시에 돌려도 안전하다(docs/reports 근거 참고).
+LONG_TASKS = frozenset(
+    {
+        "keyword_relevance_rescore_legacy",
+        "sheet_sync_keywords",
+    }
+)
+
+#: `long` 줄 사이드카 스레드의 유휴 대기 간격(초) — 작업이 없을 때만 쉰다.
+LONG_TICK_SECONDS = 5
+
 #: 사이드카 심장박동 파일 이름 (data/ 아래). 본 실행기 것과 **따로** 둔다.
 HEARTBEAT_FILE = "sidecar_heartbeat.json"
 #: 이보다 오래되면 사이드카가 멈춘 것으로 본다(초)
@@ -88,9 +104,18 @@ def is_light(task: Any) -> bool:
     return str(task) in LIGHT_TASKS
 
 
+def is_long(task: Any) -> bool:
+    """발행과 무관하게 별도 줄(`long`)에서 돌아야 하는 장시간 작업인가."""
+    return str(task) in LONG_TASKS
+
+
 def scope_for(task: Any) -> str:
-    """그 작업이 들어갈 줄 이름(`light` 또는 `main`)."""
-    return "light" if is_light(task) else "main"
+    """그 작업이 들어갈 줄 이름(`light`·`long`·`main`)."""
+    if is_long(task):
+        return "long"
+    if is_light(task):
+        return "light"
+    return "main"
 
 
 def sidecar_owner() -> str:
@@ -98,6 +123,13 @@ def sidecar_owner() -> str:
     from v2r.engine.worker import default_owner
 
     return f"{default_owner()}:sidecar"
+
+
+def long_lane_owner() -> str:
+    """long 줄 전용 소유자 이름 — light 사이드카와도 구분한다."""
+    from v2r.engine.worker import default_owner
+
+    return f"{default_owner()}:sidecar-long"
 
 
 # --------------------------------------------------------------------
@@ -337,6 +369,7 @@ class SidecarThread:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._heartbeat_thread: threading.Thread | None = None
+        self._long_thread: threading.Thread | None = None
         self.ticks = 0
         self.last_error: str | None = None
         self._status = _Status()
@@ -359,6 +392,10 @@ class SidecarThread:
             target=self._run_heartbeat, name="v2r-sidecar-heartbeat", daemon=True
         )
         self._heartbeat_thread.start()
+        self._long_thread = threading.Thread(
+            target=self._run_long, name="v2r-sidecar-long", daemon=True
+        )
+        self._long_thread.start()
         return self
 
     def is_alive(self) -> bool:
@@ -376,6 +413,13 @@ class SidecarThread:
         if hb is not None and hb.is_alive():
             hb.join(timeout=timeout)
         self._heartbeat_thread = None
+        # long 줄 작업은 몇 시간씩 걸릴 수 있어 짧은 timeout 안에 안 끝날 수
+        # 있다 — 데몬 스레드이므로 join 이 끝나지 않아도 프로세스 종료는 막지
+        # 않는다. 여기서는 그냥 정지 신호만 남기고 넘어간다.
+        long_th = self._long_thread
+        if long_th is not None and long_th.is_alive():
+            long_th.join(timeout=timeout)
+        self._long_thread = None
 
     # --- 본체 ---
     def _run(self) -> None:  # pragma: no cover - 스레드 본체(내용은 tick_once 로 시험)
@@ -403,6 +447,41 @@ class SidecarThread:
                     pass
             log.info("사이드카 종료")
 
+    def _run_long(self) -> None:  # pragma: no cover - 스레드 본체(내용은 tick_once/run_once 로 시험)
+        """`long` 줄 전용: 발행(main)·light 줄과 완전히 분리된 별도 스레드.
+
+        틱 스레드(`_run`)의 LIGHT_LIMIT 루프 안에서 돌리지 않는다 — 그러면
+        장시간 작업이 끝날 때까지 그 루프가 join() 으로 막혀 사실상 사고
+        2026-09-20 을 되풀이한다. 대신 이 스레드가 통째로 작업 실행에 쓰이고,
+        예약·감시·light 작업·심장박동은 다른 스레드에서 계속 돈다.
+        """
+        rt = None
+        owner = long_lane_owner()
+        try:
+            rt = self._runtime_factory()
+            from v2r.engine import worker as worker_mod
+
+            log.info("사이드카 long 줄 시작(%s)", owner)
+            while not self._stop.is_set():
+                try:
+                    out = worker_mod.run_once(rt, owner, scope="long")
+                except Exception as exc:  # noqa: BLE001 - 스레드는 절대 죽지 않는다
+                    self.last_error = str(exc)
+                    log.exception("사이드카 long 줄 실행 실패(계속 진행): %s", exc)
+                    out = None
+                if out is None:
+                    self._stop.wait(LONG_TICK_SECONDS)
+        except BaseException as exc:  # noqa: BLE001
+            self.last_error = str(exc)
+            log.exception("사이드카 long 줄 중단: %s", exc)
+        finally:
+            if rt is not None:
+                try:
+                    rt.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            log.info("사이드카 long 줄 종료")
+
     def _run_heartbeat(self) -> None:  # pragma: no cover - 스레드 본체
         """틱 스레드와 따로 돈다. DB 는 안 건드려서(파일만) 연결이 필요 없다."""
         import types
@@ -422,6 +501,7 @@ __all__ = [
     "HEARTBEAT_FILE",
     "HEARTBEAT_STALE_SECONDS",
     "LIGHT_TASKS",
+    "LONG_TASKS",
     "SidecarThread",
     "alert_if_stale",
     "heartbeat_age_seconds",
@@ -429,6 +509,8 @@ __all__ = [
     "heartbeat_line",
     "heartbeat_path",
     "is_light",
+    "is_long",
+    "long_lane_owner",
     "scope_for",
     "sidecar_owner",
     "tick_once",

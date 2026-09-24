@@ -94,6 +94,15 @@ def _session_report(rt: Runtime) -> str:
 
 
 def _cmd_command(rt: Runtime, text: str) -> int:
+    """한 번짜리 CLI 명령: 대기열에 등록만 하고 끝난다.
+
+    예전에는 여기서 최대 20번 `run_once(rt)`(줄 구분 없음)를 돌며 큐를
+    비웠다 — 그래서 옛 OS 예약(V2R-Reconcile)이 이 경로로
+    `python -m v2r "끊긴 작업 점검"` 을 띄우면, 실행기 리스를 잡고 대기열의
+    **다른** 작업(예: 장시간 재채점)까지 집어 그 자리에서 돌렸다(장애
+    2026-09-24). 이 CLI 경로는 이제 자기 작업을 큐에 넣기만 하고 끝난다 —
+    실제 실행은 serve(본 실행기)와 사이드카(light/long 줄)가 맡는다.
+    """
     from v2r.engine import worker
 
     accepted = worker.handle_text(rt, text)
@@ -105,18 +114,7 @@ def _cmd_command(rt: Runtime, text: str) -> int:
         return 0
 
     wanted = accepted["job_id"]
-    print(f"작업 {wanted} 등록됨: {accepted['description']}")
-    for _ in range(20):
-        out = worker.run_once(rt)
-        if out is None:
-            print("실행할 작업이 없습니다.")
-            return 0
-        if out.get("job_id") != wanted:
-            print(f"이전에 남은 작업 {out.get('job_id')}을(를) 먼저 실행했습니다.")
-            _print_result(out)
-            continue
-        _print_result(out)
-        return 0
+    print(f"작업 {wanted} 등록됨: {accepted['description']} (실행기가 처리합니다)")
     return 0
 
 
