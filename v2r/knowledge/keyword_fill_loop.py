@@ -32,7 +32,7 @@ log = logging.getLogger(__name__)
 #: 브랜드당 원고 대상 목표
 DEFAULT_TARGET = 10_000
 #: 한 회차 시드 개수(부족분은 정리본 용어로 보충)
-DEFAULT_SEED_LIMIT = 50
+DEFAULT_SEED_LIMIT = 10
 #: 네이버 키워드 도구 한 번 조회 최대 씨앗 수(기존 값 그대로)
 SEED_BATCH_SIZE = 5
 #: 브랜드당 DB 총 행수 상한(무관 키워드 폭증 방지)
@@ -112,12 +112,12 @@ SOURCE_RELATED = "연관검색"
 SOURCE_TYPES = (SOURCE_ELIGIBLE, SOURCE_GUIDE, SOURCE_COMPETITOR, SOURCE_AUTOCOMPLETE, SOURCE_RELATED)
 
 #: 출처별 한 회차 시드 상한
-DEFAULT_GUIDE_SEED_N = 60
-DEFAULT_COMPETITOR_SEED_N = 20
+DEFAULT_GUIDE_SEED_N = 150
+DEFAULT_COMPETITOR_SEED_N = 60
 #: 자동완성·연관검색을 뽑을 원고 대상 키워드 수(검색량 상위)
 DEFAULT_EXPAND_TOP_N = 30
 #: 자동완성·연관검색 출처 각각의 회차당 시드 상한(조회 횟수 폭증 방지)
-DEFAULT_EXPAND_SEED_CAP = 100
+DEFAULT_EXPAND_SEED_CAP = 10
 
 _FILL_SEEDS_SCHEMA = """
 CREATE TABLE IF NOT EXISTS fill_seeds (
