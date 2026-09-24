@@ -37,7 +37,7 @@ from typing import Any
 log = logging.getLogger(__name__)
 
 #: 한 번 호출에 기다리는 최대 초
-DEFAULT_TIMEOUT = 240
+DEFAULT_TIMEOUT = 600  # 2026-09-25: 병렬 10개 채점 중 240초 초과 → API(유료) 폴백이 잦아 600초로
 
 #: 실행 파일을 찾는 곳 (윈도우 설치 경로)
 WINDOWS_INSTALL_GLOB = (
