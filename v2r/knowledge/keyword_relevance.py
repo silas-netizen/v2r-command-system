@@ -36,7 +36,8 @@ import logging
 import shutil
 import subprocess
 import sqlite3
-from datetime import datetime, timezone
+import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -89,6 +90,11 @@ MIGRATION_COLUMNS: dict[str, str] = {
     "codex_checked_at": "TEXT NOT NULL DEFAULT ''",
     #: relevance==3(당위성)일 때의 연결 논리 한 줄 (사용자 지시 2026-09-24)
     "bridge_rationale": "TEXT NOT NULL DEFAULT ''",
+    #: Codex 교차검증 묶음 선점 시각 — score-worker/codex-worker 분리(2026-09-25)에서
+    #: 같은 브랜드에 codex 워커 2개가 동시에 돌 때 같은 행을 중복 처리하지 않도록
+    #: sqlite 트랜잭션으로 선점한다. CLAIM_STALE_SEC(15분)보다 오래되면 죽은 선점으로
+    #: 보고 다시 배정한다.
+    "claimed_at": "TEXT NOT NULL DEFAULT ''",
 }
 
 
@@ -865,6 +871,324 @@ def rescore_worker_main(argv: list[str]) -> int:
     return 0
 
 
+# --- 클로드 채점 / Codex 교차검증 분리 워커 (사용자 지시 2026-09-25) ----------
+#
+# 재채점 워커(rescore_worker)는 브랜드당 1개 프로세스 안에서 클로드 채점 →
+# Codex 교차검증을 순차로 돌려, 클로드 채점 속도가 Codex 검증 속도(더 느림)에
+# 발목 잡힌다. 아래는 두 단계를 서로 다른 프로세스로 쪼갠 것:
+#   --score-worker <브랜드>       : relevance_llm 없는 행만 검색량 큰 순으로 채점
+#   --codex-worker <브랜드> [번호] : relevance_llm 0-3·relevance_codex 없는 행을
+#                                    검색량 큰 순 + 당위성(3) 후보 우선으로 교차검증
+# codex 워커는 같은 브랜드에 최대 2개까지 동시 실행을 허용하므로, 묶음을
+# sqlite 트랜잭션으로 선점(claimed_at)한다.
+
+#: 정지 파일 — data/keywords/rescore_STOP. 있으면 모든 score/codex 워커가 다음
+#: 배치 전에 멈춘다(사용자 지시: 정지 파일로만 세우고 강제 종료 금지).
+RESCORE_STOP_FILENAME = "rescore_STOP"
+
+#: codex 묶음 선점 만료(초) — 이보다 오래된 선점은 죽은 것으로 보고 다시 배정한다.
+CLAIM_STALE_SEC = 900
+
+#: 한 워커가 한 번에 처리하는 묶음 크기(사용자 지시: 50개 묶음).
+WORKER_BATCH_SIZE = 50
+
+#: 응답이 이보다 오래 걸리면(초) 한도 임박으로 보고 backoff 신호를 남긴다.
+SLOW_RESPONSE_SEC = 600
+
+
+def rescore_stop_path(data_dir: str | Path = "data") -> Path:
+    return Path(data_dir) / "keywords" / RESCORE_STOP_FILENAME
+
+
+def rescore_stop_requested(data_dir: str | Path = "data") -> bool:
+    return rescore_stop_path(data_dir).exists()
+
+
+def score_progress_path(brand: str, data_dir: str | Path = "data") -> Path:
+    return Path(data_dir) / "keywords" / f"score_progress_{brand}.json"
+
+
+def codex_progress_path(brand: str, worker_id: int, data_dir: str | Path = "data") -> Path:
+    return Path(data_dir) / "keywords" / f"codex_progress_{brand}_{worker_id}.json"
+
+
+def score_worker_lock_path(brand: str, data_dir: str | Path = "data") -> Path:
+    return Path(data_dir) / "locks" / f"score-{brand}.lock"
+
+
+def codex_worker_lock_path(brand: str, worker_id: int, data_dir: str | Path = "data") -> Path:
+    return Path(data_dir) / "locks" / f"codex-{brand}-{worker_id}.lock"
+
+
+def acquire_named_lock(path: Path) -> Path | None:
+    """잠금 파일을 얻는다. 신선한(10분 이내) 잠금이 있으면 `None`(중복 실행 거부)."""
+    import os as _os
+    import time as _time
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        age = _time.time() - path.stat().st_mtime
+        if age < LOCK_STALE_SEC:
+            return None
+        log.info("죽은 잠금(%.0f초 경과) 무시하고 이어받음: %s", age, path)
+    path.write_text(f"{_os.getpid()} {_now_iso()}", encoding="utf-8")
+    return path
+
+
+def release_named_lock(path: Path | None) -> None:
+    release_rescore_lock(path)
+
+
+def _throughput_per_hour(started_at: str, done: int) -> float:
+    try:
+        started = datetime.fromisoformat(started_at)
+    except (TypeError, ValueError):
+        return 0.0
+    elapsed = (datetime.now(timezone.utc).astimezone() - started).total_seconds()
+    if elapsed <= 0:
+        return 0.0
+    return round(done / elapsed * 3600, 1)
+
+
+def claim_codex_batch(
+    conn: sqlite3.Connection, limit: int = WORKER_BATCH_SIZE
+) -> list[tuple[str, int, str, str]]:
+    """relevance_codex가 없는 행을 검색량 큰 순 + 당위성(3) 후보 우선으로 선점한다.
+
+    sqlite 트랜잭션(BEGIN IMMEDIATE) 안에서 SELECT 후 즉시 claimed_at을 찍어,
+    같은 브랜드에서 동시에 도는 codex 워커 2개가 같은 행을 중복 처리하지 않게
+    한다. CLAIM_STALE_SEC보다 오래된 선점은 죽은 것으로 보고 다시 대상에 넣는다.
+    """
+    stale_before = (
+        datetime.now(timezone.utc).astimezone() - timedelta(seconds=CLAIM_STALE_SEC)
+    ).isoformat(timespec="seconds")
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        rows = conn.execute(
+            "SELECT keyword, relevance_llm, rationale, bridge_rationale FROM keywords"
+            " WHERE relevance_llm IS NOT NULL AND relevance_llm BETWEEN 0 AND 3"
+            " AND relevance_codex IS NULL"
+            " AND (claimed_at = '' OR claimed_at < ?)"
+            " ORDER BY (relevance_llm = 3) DESC, total DESC"
+            " LIMIT ?",
+            (stale_before, limit),
+        ).fetchall()
+        if rows:
+            stamp = _now_iso()
+            conn.executemany(
+                "UPDATE keywords SET claimed_at = ? WHERE keyword = ?",
+                [(stamp, r[0]) for r in rows],
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return rows
+
+
+def release_codex_claim(conn: sqlite3.Connection, keywords: list[str]) -> None:
+    """실패한 묶음의 선점을 즉시 풀어(claimed_at='') 다른 워커가 바로 이어받게 한다."""
+    if not keywords:
+        return
+    conn.executemany(
+        "UPDATE keywords SET claimed_at = '' WHERE keyword = ?", [(kw,) for kw in keywords]
+    )
+    conn.commit()
+
+
+def score_worker(
+    brand: str,
+    db_path: str | Path | None = None,
+    guides_dir: str | Path | None = None,
+    progress_path: str | Path | None = None,
+    router: Any | None = None,
+    repo_root: str | Path | None = None,
+    batch_size: int = WORKER_BATCH_SIZE,
+) -> dict[str, Any]:
+    """브랜드 하나의 클로드 채점만 끝까지 돌린다(Codex 교차검증은 별도 워커).
+
+    relevance_llm이 없는 행을 검색량 큰 순으로 batch_size개씩 채점한다.
+    rescore_STOP 파일이 있으면 다음 묶음 전에 멈춘다.
+    """
+    if repo_root is None:
+        from v2r.config import get_settings
+
+        repo_root = get_settings().repo_root
+    repo_root = Path(repo_root)
+    if db_path is None:
+        db_path = repo_root / "data" / "keywords" / f"{brand}.sqlite"
+    if guides_dir is None:
+        guides_dir = repo_root / "warehouse" / "guides" / "정리본"
+    if progress_path is None:
+        progress_path = score_progress_path(brand, repo_root / "data")
+
+    lock_path = acquire_named_lock(score_worker_lock_path(brand, repo_root / "data"))
+    if lock_path is None:
+        log.info("이미 같은 브랜드 score-worker가 돌고 있어 건너뜁니다: %s", brand)
+        return {"skipped": "already_running", "brand": brand}
+
+    if router is None:
+        from v2r.config import get_settings
+        from v2r.llm.router import LLMRouter
+
+        router = _PatientRouter(LLMRouter.from_settings(get_settings()))
+
+    started_at = _now_iso()
+    scored = 0
+    failed_batches = 0
+    conn = sqlite3.connect(str(db_path))
+    try:
+        migrate(conn)
+        summary = brand_summary(brand, guides_dir)
+        update_progress(progress_path, brand, status="running", scored=0, started_at=started_at)
+        while True:
+            if rescore_stop_requested(repo_root / "data"):
+                update_progress(progress_path, brand, status="정지(STOP 파일)", scored=scored)
+                log.info("score-worker 정지 파일 감지, 종료: %s", brand)
+                break
+            keywords = pending_keywords(conn, limit=batch_size)
+            if not keywords:
+                update_progress(progress_path, brand, status="done", scored=scored)
+                break
+            t0 = time.monotonic()
+            try:
+                rows = score_batch(router, brand, keywords, summary)
+            except RelevanceParseError as exc:
+                failed_batches += 1
+                log.error("score 묶음 포기(%s, %d개): %s", brand, len(keywords), exc)
+                continue
+            elapsed = time.monotonic() - t0
+            write_scores(conn, rows)
+            scored += len(rows)
+            update_progress(
+                progress_path,
+                brand,
+                status="running",
+                scored=scored,
+                failed_batches=failed_batches,
+                per_hour=_throughput_per_hour(started_at, scored),
+                last_batch_sec=round(elapsed, 1),
+                slow=elapsed > SLOW_RESPONSE_SEC,
+            )
+    finally:
+        conn.close()
+        release_named_lock(lock_path)
+    return {"scored": scored, "failed_batches": failed_batches}
+
+
+def codex_worker(
+    brand: str,
+    worker_id: int = 1,
+    db_path: str | Path | None = None,
+    guides_dir: str | Path | None = None,
+    progress_path: str | Path | None = None,
+    repo_root: str | Path | None = None,
+    batch_size: int = WORKER_BATCH_SIZE,
+    codex_exe: str = "",
+) -> dict[str, Any]:
+    """브랜드 하나의 Codex 교차검증만 끝까지 돌린다. 같은 브랜드에 2개까지 동시 실행 허용.
+
+    relevance_llm이 0-3이고 relevance_codex가 없는 행을, 당위성(3) 후보 우선 +
+    검색량 큰 순으로 claim_codex_batch가 선점해 준다.
+    """
+    if repo_root is None:
+        from v2r.config import get_settings
+
+        repo_root = get_settings().repo_root
+    repo_root = Path(repo_root)
+    if db_path is None:
+        db_path = repo_root / "data" / "keywords" / f"{brand}.sqlite"
+    if guides_dir is None:
+        guides_dir = repo_root / "warehouse" / "guides" / "정리본"
+    if progress_path is None:
+        progress_path = codex_progress_path(brand, worker_id, repo_root / "data")
+
+    lock_path = acquire_named_lock(codex_worker_lock_path(brand, worker_id, repo_root / "data"))
+    if lock_path is None:
+        log.info("이미 같은 codex-worker 번호가 돌고 있어 건너뜁니다: %s #%s", brand, worker_id)
+        return {"skipped": "already_running", "brand": brand, "worker_id": worker_id}
+
+    started_at = _now_iso()
+    checked = 0
+    failed_batches = 0
+    conn = sqlite3.connect(str(db_path))
+    try:
+        migrate(conn)
+        summary = brand_summary(brand, guides_dir)
+        update_progress(progress_path, brand, status="running", codex_checked=0, started_at=started_at)
+        while True:
+            if rescore_stop_requested(repo_root / "data"):
+                update_progress(progress_path, brand, codex_status="정지(STOP 파일)", codex_checked=checked)
+                log.info("codex-worker 정지 파일 감지, 종료: %s #%s", brand, worker_id)
+                break
+            chunk = claim_codex_batch(conn, limit=batch_size)
+            if not chunk:
+                update_progress(progress_path, brand, codex_status="done", codex_checked=checked)
+                break
+            claude_rows = [
+                {"keyword": kw, "relevance": int(rel), "rationale": ra or "", "bridge_rationale": br or ""}
+                for kw, rel, ra, br in chunk
+            ]
+            keywords = [r["keyword"] for r in claude_rows]
+            t0 = time.monotonic()
+            try:
+                codex_rows, _model = score_batch_codex(brand, keywords, summary, exe=codex_exe)
+            except RelevanceParseError as exc:
+                failed_batches += 1
+                release_codex_claim(conn, keywords)
+                log.error("codex 묶음 포기(%s #%s, %d개): %s", brand, worker_id, len(keywords), exc)
+                continue
+            elapsed = time.monotonic() - t0
+            merged = crosscheck_rows(claude_rows, codex_rows)
+            write_crosscheck(conn, merged)
+            checked += len(merged)
+            update_progress(
+                progress_path,
+                brand,
+                codex_status="running",
+                codex_checked=checked,
+                failed_batches=failed_batches,
+                per_hour=_throughput_per_hour(started_at, checked),
+                last_batch_sec=round(elapsed, 1),
+                slow=elapsed > SLOW_RESPONSE_SEC,
+            )
+    finally:
+        conn.close()
+        release_named_lock(lock_path)
+    return {"checked": checked, "failed_batches": failed_batches}
+
+
+def score_worker_main(argv: list[str]) -> int:
+    """`python -m v2r.knowledge.keyword_relevance --score-worker <브랜드>`."""
+    if not argv:
+        print("사용법: python -m v2r.knowledge.keyword_relevance --score-worker <브랜드>")
+        return 2
+    brand = argv[0]
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    try:
+        score_worker(brand)
+    except Exception as exc:  # noqa: BLE001
+        log.error("score-worker 종료(실패): brand=%s: %s", brand, exc)
+        return 1
+    return 0
+
+
+def codex_worker_main(argv: list[str]) -> int:
+    """`python -m v2r.knowledge.keyword_relevance --codex-worker <브랜드> [번호]`."""
+    if not argv:
+        print("사용법: python -m v2r.knowledge.keyword_relevance --codex-worker <브랜드> [번호]")
+        return 2
+    brand = argv[0]
+    worker_id = int(argv[1]) if len(argv) > 1 else 1
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    try:
+        codex_worker(brand, worker_id=worker_id)
+    except Exception as exc:  # noqa: BLE001
+        log.error("codex-worker 종료(실패): brand=%s #%s: %s", brand, worker_id, exc)
+        return 1
+    return 0
+
+
 # --- 브랜드 간 중복 배정 -----------------------------------------------
 
 
@@ -1273,6 +1597,24 @@ __all__ = [
     "rescore_lock_path",
     "acquire_rescore_lock",
     "release_rescore_lock",
+    "RESCORE_STOP_FILENAME",
+    "rescore_stop_path",
+    "rescore_stop_requested",
+    "CLAIM_STALE_SEC",
+    "WORKER_BATCH_SIZE",
+    "SLOW_RESPONSE_SEC",
+    "score_progress_path",
+    "codex_progress_path",
+    "score_worker_lock_path",
+    "codex_worker_lock_path",
+    "acquire_named_lock",
+    "release_named_lock",
+    "claim_codex_batch",
+    "release_codex_claim",
+    "score_worker",
+    "codex_worker",
+    "score_worker_main",
+    "codex_worker_main",
 ]
 
 
@@ -1281,5 +1623,12 @@ if __name__ == "__main__":
 
     if len(sys.argv) > 2 and sys.argv[1] == "--rescore-worker":
         raise SystemExit(rescore_worker_main(sys.argv[2:]))
-    print("사용법: python -m v2r.knowledge.keyword_relevance --rescore-worker <브랜드>")
+    if len(sys.argv) > 2 and sys.argv[1] == "--score-worker":
+        raise SystemExit(score_worker_main(sys.argv[2:]))
+    if len(sys.argv) > 2 and sys.argv[1] == "--codex-worker":
+        raise SystemExit(codex_worker_main(sys.argv[2:]))
+    print(
+        "사용법: python -m v2r.knowledge.keyword_relevance"
+        " --rescore-worker|--score-worker|--codex-worker <브랜드> [번호]"
+    )
     raise SystemExit(2)

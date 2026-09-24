@@ -679,3 +679,146 @@ def test_codex_usage_limit_detected_and_paused(tmp_path):
     assert kr.codex_paused_until(tmp_path) == "2999-01-01T00:00"
     kr._write_codex_pause(tmp_path, "2000-01-01T00:00")
     assert kr.codex_paused_until(tmp_path) == ""
+
+
+# --- score-worker / codex-worker 분리 (2026-09-25) ------------------------
+
+
+def test_migration_adds_claimed_at(tmp_path):
+    db = tmp_path / "b.sqlite"
+    _make_db(db, [("kw1", 100)])
+    added = kr.migrate_path(db)
+    assert "claimed_at" in added
+
+
+def test_claim_codex_batch_prioritizes_bridge_candidates_and_volume(tmp_path):
+    db = tmp_path / "b.sqlite"
+    _make_db(db, [("낮음", 500), ("당위성", 50), ("높음무관", 900)])
+    conn = sqlite3.connect(str(db))
+    kr.migrate(conn)
+    conn.execute(
+        "UPDATE keywords SET relevance_llm=1, scored_at='x' WHERE keyword='낮음'"
+    )
+    conn.execute(
+        "UPDATE keywords SET relevance_llm=3, scored_at='x', bridge_rationale='근거' WHERE keyword='당위성'"
+    )
+    conn.execute(
+        "UPDATE keywords SET relevance_llm=1, scored_at='x' WHERE keyword='높음무관'"
+    )
+    conn.commit()
+
+    rows = kr.claim_codex_batch(conn, limit=50)
+    keywords = [r[0] for r in rows]
+    # relevance_llm==3(당위성 후보)이 먼저, 그다음은 검색량 내림차순.
+    assert keywords == ["당위성", "높음무관", "낮음"]
+
+    # 선점된 행은 다시 claim되지 않는다(같은 브랜드 codex 워커 2개 동시 실행 대비).
+    rows2 = kr.claim_codex_batch(conn, limit=50)
+    assert rows2 == []
+    conn.close()
+
+
+def test_release_codex_claim_lets_another_worker_reclaim(tmp_path):
+    db = tmp_path / "b.sqlite"
+    _make_db(db, [("kw1", 100)])
+    conn = sqlite3.connect(str(db))
+    kr.migrate(conn)
+    conn.execute("UPDATE keywords SET relevance_llm=1, scored_at='x' WHERE keyword='kw1'")
+    conn.commit()
+
+    rows = kr.claim_codex_batch(conn, limit=50)
+    assert len(rows) == 1
+    kr.release_codex_claim(conn, ["kw1"])
+    rows2 = kr.claim_codex_batch(conn, limit=50)
+    assert len(rows2) == 1
+    conn.close()
+
+
+def test_score_worker_skips_when_lock_held(tmp_path):
+    repo = tmp_path
+    (repo / "data" / "keywords").mkdir(parents=True)
+    kr.acquire_named_lock(kr.score_worker_lock_path("우아덤", repo / "data"))
+    out = kr.score_worker("우아덤", repo_root=repo, router=object())
+    assert out == {"skipped": "already_running", "brand": "우아덤"}
+
+
+def test_score_worker_scores_until_pending_empty(tmp_path, monkeypatch):
+    repo = tmp_path
+    (repo / "data" / "keywords").mkdir(parents=True)
+    (repo / "warehouse" / "guides" / "정리본").mkdir(parents=True)
+    (repo / "warehouse" / "guides" / "정리본" / "우아덤.md").write_text("# 우아덤\n", encoding="utf-8")
+    db = repo / "data" / "keywords" / "우아덤.sqlite"
+    _make_db(db, [("kw1", 100), ("kw2", 50)])
+
+    def _fake_score_batch(router, brand, keywords, summary):
+        return [
+            {"keyword": kw, "relevance": 1, "rationale": "r", "bridge_rationale": ""}
+            for kw in keywords
+        ]
+
+    monkeypatch.setattr(kr, "score_batch", _fake_score_batch)
+    out = kr.score_worker("우아덤", repo_root=repo, router=object(), batch_size=50)
+    assert out["scored"] == 2
+
+    progress = json.loads(kr.score_progress_path("우아덤", repo / "data").read_text(encoding="utf-8"))
+    assert progress["우아덤"]["status"] == "done"
+    assert progress["우아덤"]["scored"] == 2
+    assert not kr.score_worker_lock_path("우아덤", repo / "data").exists()
+
+
+def test_score_worker_stops_on_stop_file(tmp_path, monkeypatch):
+    repo = tmp_path
+    (repo / "data" / "keywords").mkdir(parents=True)
+    (repo / "warehouse" / "guides" / "정리본").mkdir(parents=True)
+    (repo / "warehouse" / "guides" / "정리본" / "우아덤.md").write_text("# 우아덤\n", encoding="utf-8")
+    db = repo / "data" / "keywords" / "우아덤.sqlite"
+    _make_db(db, [("kw1", 100)])
+    kr.rescore_stop_path(repo / "data").write_text("stop", encoding="utf-8")
+
+    def _boom(*a, **kw):
+        raise AssertionError("정지 파일이 있으면 채점을 시작하면 안 된다")
+
+    monkeypatch.setattr(kr, "score_batch", _boom)
+    out = kr.score_worker("우아덤", repo_root=repo, router=object())
+    assert out["scored"] == 0
+
+
+def test_codex_worker_checks_claimed_rows_and_writes_progress(tmp_path, monkeypatch):
+    repo = tmp_path
+    (repo / "data" / "keywords").mkdir(parents=True)
+    (repo / "warehouse" / "guides" / "정리본").mkdir(parents=True)
+    (repo / "warehouse" / "guides" / "정리본" / "우아덤.md").write_text("# 우아덤\n", encoding="utf-8")
+    db = repo / "data" / "keywords" / "우아덤.sqlite"
+    _make_db(db, [("kw1", 100)])
+    conn = sqlite3.connect(str(db))
+    kr.migrate(conn)
+    conn.execute("UPDATE keywords SET relevance_llm=1, scored_at='x' WHERE keyword='kw1'")
+    conn.commit()
+    conn.close()
+
+    def _fake_score_batch_codex(brand, keywords, summary, exe=""):
+        return [{"keyword": kw, "relevance": 1, "rationale": "codex"} for kw in keywords], "fake"
+
+    monkeypatch.setattr(kr, "score_batch_codex", _fake_score_batch_codex)
+    out = kr.codex_worker("우아덤", worker_id=1, repo_root=repo)
+    assert out["checked"] == 1
+
+    progress = json.loads(
+        kr.codex_progress_path("우아덤", 1, repo / "data").read_text(encoding="utf-8")
+    )
+    assert progress["우아덤"]["codex_status"] == "done"
+    assert not kr.codex_worker_lock_path("우아덤", 1, repo / "data").exists()
+
+
+def test_codex_worker_two_ids_have_independent_locks(tmp_path):
+    repo = tmp_path
+    (repo / "data" / "keywords").mkdir(parents=True)
+    lock1 = kr.acquire_named_lock(kr.codex_worker_lock_path("우아덤", 1, repo / "data"))
+    lock2 = kr.acquire_named_lock(kr.codex_worker_lock_path("우아덤", 2, repo / "data"))
+    assert lock1 is not None and lock2 is not None
+    assert lock1 != lock2
+
+
+def test_score_worker_main_and_codex_worker_main_require_brand_arg():
+    assert kr.score_worker_main([]) == 2
+    assert kr.codex_worker_main([]) == 2

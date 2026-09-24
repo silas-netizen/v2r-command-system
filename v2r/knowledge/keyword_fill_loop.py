@@ -48,6 +48,13 @@ PROGRESS_FILENAME = "fill_progress.json"
 #: 순환 정지 파일 — 이 파일이 있으면(`data/keywords/fill_STOP`) 모든 브랜드 워커가
 #: 현재 묶음을 마치는 대로 스스로 멈춘다(강제 종료 대신 쓰는 정지 수단, 2026-09-24).
 STOP_FILENAME = "fill_STOP"
+
+#: 채우기 순환 자체 채점/교차검증 끄기(사용자 지시 2026-09-25) — 클로드 채점 워커
+#: (`keyword_relevance.score_worker`)와 Codex 교차검증 워커(`codex_worker`)를 브랜드별로
+#: 분리해 병렬로 돌리는 구조로 바꾸면서, 채우기 순환 안의 자체 채점 호출은 새로 수집한
+#: 행이 score_worker/codex_worker의 대상(미채점 행)으로 자연히 잡히도록 끈다. 채우기
+#: 순환은 수집·저장만 한다. True로 되돌리면 예전처럼 자체 채점을 한다.
+AUTO_SCORE_IN_FILL_LOOP = False
 #: 다른 프로세스(실행기 재채점·시트 반영)가 같은 sqlite를 쓰는 동안 "database is locked"가
 #: 나면 이만큼 기다렸다 다시 시도한다(실측 2026-09-24 03:35: 장으뜸·팥순이 워커가 이 예외로 죽음).
 DB_LOCK_RETRY = 20
@@ -732,7 +739,7 @@ def run_cycle(
 
     score_result = {"scored": 0, "failed_batches": 0}
     cross_result = {"checked": 0, "failed_batches": 0}
-    if new_saved:
+    if new_saved and AUTO_SCORE_IN_FILL_LOOP:
         data_dir_guess = Path(db_path).resolve().parent.parent
         if not stop_requested(data_dir_guess):
             score_result = _retry_db_locked(
@@ -1012,6 +1019,7 @@ __all__ = [
     "fill_until_target",
     "worker_main",
     "STOP_FILENAME",
+    "AUTO_SCORE_IN_FILL_LOOP",
     "stop_path",
     "stop_requested",
     "FillStopped",

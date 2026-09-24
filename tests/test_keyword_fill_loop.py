@@ -88,7 +88,38 @@ def test_select_seed_keywords_excludes_already_seeded(tmp_path):
     conn.close()
 
 
-def test_run_cycle_new_relevant_keywords_raise_eligible(tmp_path):
+def test_auto_score_in_fill_loop_defaults_off():
+    # 사용자 지시 2026-09-25: score-worker/codex-worker 분리 구조로 바뀌면서
+    # 채우기 순환의 자체 채점은 기본적으로 꺼져 있어야 한다(수집·저장만).
+    assert fill.AUTO_SCORE_IN_FILL_LOOP is False
+
+
+def test_run_cycle_does_not_self_score_by_default(tmp_path):
+    db = tmp_path / "b.sqlite"
+    guides_dir = tmp_path / "guides"
+    guides_dir.mkdir()
+    (guides_dir / "브랜드.md").write_text("- 브랜드/제품: 테스트제품\n", encoding="utf-8")
+    _seed_db(db, extra_eligible=0)
+
+    def fake_fetch(seeds, depth):
+        return [{"keyword": f"{seeds[0]}-연관1", "pc": 10, "mobile": 5}]
+
+    def _boom(*a, **kw):
+        raise AssertionError("AUTO_SCORE_IN_FILL_LOOP=False면 채점을 부르면 안 된다")
+
+    router = FakeRouter(relevance=0)
+    router.complete = _boom  # 채점 호출이 있으면 여기서 터진다
+    result = fill.run_cycle("브랜드", db, guides_dir, router, fake_fetch, seed_limit=50)
+
+    assert result["new_collected"] == 2
+    assert result["adopted"] == 0  # 채점 안 했으니 원고대상으로 올라가지 않는다
+
+
+def test_run_cycle_new_relevant_keywords_raise_eligible(tmp_path, monkeypatch):
+    # 2026-09-25부터 채우기 순환은 기본적으로 자체 채점을 끄고(score_worker/codex_worker가
+    # 별도로 처리) 수집만 한다(AUTO_SCORE_IN_FILL_LOOP=False). 이 시험은 자체 채점 경로
+    # 자체는 여전히 지원돼야 하므로 그 경로를 켜서 확인한다.
+    monkeypatch.setattr(fill, "AUTO_SCORE_IN_FILL_LOOP", True)
     db = tmp_path / "b.sqlite"
     guides_dir = tmp_path / "guides"
     guides_dir.mkdir()
