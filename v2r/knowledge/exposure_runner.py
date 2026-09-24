@@ -339,10 +339,80 @@ def judge_once(
     )
 
 
+# =======================================================================
+# 2026-09-24 6차 — `write_exposure_csv` 스로틀·백그라운드화.
+#
+# 실측(08:13 재시작 후, 시트가 우아덤 4,959→12,549행·코숨핏 254→4,854행으로
+# 커진 뒤): 작업자당 52건/시(실측 11의 560건/시 대비 급락), 같은 작업자의
+# 연속 검사 사이 간격 중앙값이 90~120초였다 — 실제 검색+판정(자동완성+
+# 스크롤+확인)은 여전히 평균 9~10초였는데도. 원인은 `_finalize_row`가 검사
+# **1건마다 동기로** `write_exposure_csv`(keyword_universe 전체 재순회 +
+# `store.latest_by_keyword` 전체 이력 + 1만 행 정렬 + CSV 전량 재작성)를
+# 불렀기 때문 — 시트가 작을 때는 안 보이던 비용이 브랜드당 1만 행대에서
+# 메인 검사 루프를 초 단위로 막는 병목이 됐다(가설 중 "시트 쓰기 잠금
+# 대기"·"네이버 응답"은 로그로 배제 — `_enqueue_sheet_row`의 시트 배치
+# 반영은 원래 별도 스레드라 안 막았고, 자동완성·스크롤·확인 각 구간 평균도
+# 크게 안 늘었다). 브랜드당 이 초(기본 60초)에 한 번만, 그것도 전용
+# Runtime을 연 별도 스레드에서 갱신하도록 바꿨다(정렬 큐 백그라운드 갱신,
+# b393cd4와 같은 패턴).
+# =======================================================================
+
+CSV_WRITE_MIN_INTERVAL_SEC = 60.0
+
+_CSV_WRITE_LOCK = threading.Lock()
+#: 브랜드 -> 마지막으로 백그라운드 CSV 갱신을 "시작한" monotonic 시각.
+_CSV_LAST_WRITE_MONO: dict[str, float] = {}
+
+
+def _open_csv_runtime() -> Any:
+    """`_write_exposure_csv_in_background` 전용 — 메인 스레드(작업자)의
+    `rt.conn`을 다른 스레드와 공유하지 않도록 이 스레드만의 새 `Runtime`을
+    연다(`exposure_priority._refresh_queue_in_background`와 같은 패턴)."""
+    from v2r.engine.context import Runtime
+
+    return Runtime.open()
+
+
+def _write_exposure_csv_in_background(brand: str) -> None:
+    from v2r.knowledge.keyword_exposure import write_exposure_csv
+
+    thread_rt = None
+    try:
+        thread_rt = _open_csv_runtime()
+        write_exposure_csv(thread_rt, brand)
+    except Exception as exc:  # pragma: no cover - 방어용(백그라운드라 예외를 삼킴)
+        log.warning("노출 CSV 갱신 실패(%s): %s", brand, exc)
+    finally:
+        if thread_rt is not None:
+            try:
+                thread_rt.close()
+            except Exception:
+                pass
+
+
+def maybe_write_exposure_csv(brand: str, min_interval_sec: float = CSV_WRITE_MIN_INTERVAL_SEC) -> bool:
+    """브랜드당 `min_interval_sec` 안에 이미 갱신을 시작했으면 건너뛰고,
+    아니면 백그라운드 스레드에서 `write_exposure_csv`를 돌린다. 시작했으면
+    `True`(시험용 — 실제 완료 여부는 보장 안 함)."""
+    now = time.monotonic()
+    with _CSV_WRITE_LOCK:
+        last = _CSV_LAST_WRITE_MONO.get(brand, 0.0)
+        if now - last < min_interval_sec:
+            return False
+        _CSV_LAST_WRITE_MONO[brand] = now
+    threading.Thread(
+        target=_write_exposure_csv_in_background,
+        args=(brand,),
+        daemon=True,
+        name=f"exposure-csv-{brand}",
+    ).start()
+    return True
+
+
 def _finalize_row(rt: Any, brand: str, item: dict, row: Any) -> None:
     """판정을 확정해 DB append + 시트 배치 큐(기존 함수 호출만)."""
     from v2r.knowledge.exposure_priority import mark_checked
-    from v2r.knowledge.keyword_exposure import _enqueue_sheet_row, write_exposure_csv
+    from v2r.knowledge.keyword_exposure import _enqueue_sheet_row
     from v2r.store import keyword_exposure_store as store
 
     store.save(rt.conn, row.as_row())
@@ -350,15 +420,13 @@ def _finalize_row(rt: Any, brand: str, item: dict, row: Any) -> None:
     # 직후 `mark_checked`로 이 키워드만 즉시 갱신해, 캐시가 아직 안 지났어도
     # 같은 키워드가 연속으로 다시 뽑히지 않게 한다(단위 시험
     # `test_next_priority_batch_같은_키워드_연속_두번_안뽑힘` 참고).
-    # universe·정렬 캐시(시트·발굴 CSV, `invalidate_universe_cache`/
-    # `invalidate_sorted_cache`)는 검사 결과와 무관해 여기서 비우지 않는다 —
-    # 매 건 저장마다 비우면 배치 캐시 효과가 사라진다.
+    # universe·정렬 캐시(시트·발굴 CSV, `invalidate_universe_cache`)는 검사
+    # 결과와 무관해 여기서 비우지 않는다 — 매 건 저장마다 비우면 배치 캐시
+    # 효과가 사라진다.
     mark_checked(rt, brand, item["keyword"], row.status, row.checked_at)
     _enqueue_sheet_row(rt, brand, item, row)
-    try:
-        write_exposure_csv(rt, brand)
-    except Exception as exc:  # pragma: no cover - 방어용
-        log.warning("노출 CSV 갱신 실패(%s): %s", brand, exc)
+    # 2026-09-24 6차 — 매 건 동기 호출을 스로틀 + 백그라운드로(위 참고).
+    maybe_write_exposure_csv(brand)
 
 
 def _latest_status(conn: Any, brand: str, keyword: str) -> str:
@@ -795,6 +863,8 @@ __all__ = [
     "set_pending",
     "clear_pending",
     "due_pending",
+    "CSV_WRITE_MIN_INTERVAL_SEC",
+    "maybe_write_exposure_csv",
     "WorkerQueue",
     "run_worker",
     "main",

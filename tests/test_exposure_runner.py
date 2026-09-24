@@ -776,3 +776,94 @@ def test_universe_bundle_파일캐시로_프로세스간_공유(tmp_path, monkey
 def test_universe_cache_sec_기본값_600(tmp_path):
     cfg = exposure_priority.load_config(tmp_path)
     assert cfg["priority"]["universe_cache_sec"] == 600
+
+
+# =======================================================================
+# 2026-09-24 6차 — write_exposure_csv 스로틀·백그라운드화,
+# exposure_queue 갱신 청크·워터마크 삭제(시트 1만 행대 실측 후)
+# =======================================================================
+
+
+def test_maybe_write_exposure_csv_스로틀(monkeypatch):
+    calls = {"n": 0}
+    monkeypatch.setattr(
+        exposure_runner, "_write_exposure_csv_in_background", lambda brand: calls.__setitem__("n", calls["n"] + 1)
+    )
+    exposure_runner._CSV_LAST_WRITE_MONO.clear()
+
+    started1 = exposure_runner.maybe_write_exposure_csv("테스트브랜드", min_interval_sec=60.0)
+    started2 = exposure_runner.maybe_write_exposure_csv("테스트브랜드", min_interval_sec=60.0)
+    assert started1 is True
+    assert started2 is False, "60초 안에 다시 부르면 스레드를 또 띄우면 안 된다"
+
+
+def test_maybe_write_exposure_csv_브랜드마다_따로(monkeypatch):
+    monkeypatch.setattr(exposure_runner, "_write_exposure_csv_in_background", lambda brand: None)
+    exposure_runner._CSV_LAST_WRITE_MONO.clear()
+
+    assert exposure_runner.maybe_write_exposure_csv("브랜드A", min_interval_sec=60.0) is True
+    assert exposure_runner.maybe_write_exposure_csv("브랜드B", min_interval_sec=60.0) is True
+
+
+def test_upsert_candidates_청크로_나눠도_전부_들어감(tmp_path):
+    """2026-09-24 6차 — 큰 브랜드(1만 행대)를 흉내내 청크 크기(여기선 3)보다
+    많은 후보를 넣어도 전부 반영돼야 한다."""
+    rt = make_runtime(tmp_path)
+    candidates = [
+        (3, float(-i), f"키워드{i}", f"키워드{i}", {"keyword": f"키워드{i}", "volume": i})
+        for i in range(10)
+    ]
+    qstore.upsert_candidates(rt.conn, "테스트브랜드", candidates, chunk_size=3)
+    counts = qstore.queue_counts(rt.conn, "테스트브랜드")
+    assert counts["waiting"] == 10
+
+
+def test_upsert_candidates_워터마크로_안쓰인_행_삭제(tmp_path):
+    """진행 중인 선점이 아닌, 이번 갱신에 없는 키워드는 지워진다(워터마크
+    삭제 — NOT IN 나열 없이 enqueued_at 기준)."""
+    rt = make_runtime(tmp_path)
+    first = [(3, -1.0, "옛키워드", "옛키워드", {"keyword": "옛키워드"})]
+    qstore.upsert_candidates(rt.conn, "테스트브랜드", first, now_epoch=1_000_000.0)
+
+    second = [(3, -1.0, "새키워드", "새키워드", {"keyword": "새키워드"})]
+    qstore.upsert_candidates(rt.conn, "테스트브랜드", second, now_epoch=1_000_100.0)
+
+    counts = qstore.queue_counts(rt.conn, "테스트브랜드")
+    assert counts["total"] == 1, "이번 갱신에 없는 옛 행은 지워져야 한다"
+    picked = qstore.claim_batch(rt.conn, "테스트브랜드", "worker0", 1, now_epoch=1_000_100.0)
+    assert picked[0]["keyword"] == "새키워드"
+
+
+def test_upsert_candidates_워터마크가_진행중인_선점은_안지움(tmp_path):
+    """갱신 시점에 다른 작업자가 아직 검사 중인(선점, 미완료) 키워드는,
+    이번 후보 목록에 없어도(예: 그 사이 시트에서 빠짐) 지워지면 안 된다 —
+    검사 결과를 저장할 곳이 없어지기 때문."""
+    rt = make_runtime(tmp_path)
+    first = [(3, -1.0, "검사중", "검사중", {"keyword": "검사중"})]
+    qstore.upsert_candidates(rt.conn, "테스트브랜드", first, now_epoch=2_000_000.0)
+    qstore.claim_batch(rt.conn, "테스트브랜드", "worker0", 1, now_epoch=2_000_000.0)
+
+    # 다음 갱신에는 "검사중"이 후보에 없다(등급이 바뀌었다고 흉내) —
+    # 하지만 아직 완료(done_at) 전이고 선점 TTL(180초) 안이므로 지워지면 안 된다.
+    qstore.upsert_candidates(rt.conn, "테스트브랜드", [], now_epoch=2_000_010.0)
+    counts = qstore.queue_counts(rt.conn, "테스트브랜드")
+    assert counts["claimed"] == 1, "진행 중인 선점은 갱신에도 살아 있어야 한다"
+
+
+def test_do_refresh_queue_last_checked_캐시_건너뜀(tmp_path, monkeypatch):
+    """2026-09-24 6차 — `_do_refresh_queue`는 매번 last_checked 캐시를
+    무효화하고 새로 읽는다(방금 완료된 검사가 갱신에 안 보이는 걸 막기 위해)."""
+    rt = make_runtime(tmp_path)
+    item = {"keyword": "키워드", "cafe": "마이카페", "t0_status": "", "volume": 0}
+    monkeypatch.setattr(ke, "keyword_universe", lambda rt_, brand: [item])
+
+    calls = {"n": 0}
+    real_invalidate = exposure_priority.invalidate_last_checked_cache
+
+    def spy_invalidate(rt_, brand=None):
+        calls["n"] += 1
+        return real_invalidate(rt_, brand)
+
+    monkeypatch.setattr(exposure_priority, "invalidate_last_checked_cache", spy_invalidate)
+    exposure_priority._do_refresh_queue(rt, "테스트브랜드", dict(exposure_priority._DEFAULT_PRIORITY), datetime.now(timezone.utc))
+    assert calls["n"] == 1

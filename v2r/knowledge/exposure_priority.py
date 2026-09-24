@@ -315,7 +315,14 @@ def _do_refresh_queue(rt: Any, brand: str, cfg: dict, now: datetime) -> int:
     등급 규칙(`priority_tier`)은 그대로 재사용 — 이 함수는 그 결과를 어디에
     보관하느냐만 바꾼다(프로세스 메모리 → 공유 표). universe·최근 발행
     집합은 여전히 `_universe_bundle`(프로세스+파일 캐시, 4차)에서 가져와
-    시트 CSV 재읽기를 줄인다."""
+    시트 CSV 재읽기를 줄인다.
+
+    2026-09-24 6차(코디네이터 지시 — "done 항목이 다시 미완료로 되살아나는지"
+    확인) — `last_checked`는 여기서 캐시를 건너뛰고 항상 방금 커밋된 값을
+    읽는다. 갱신은 드물게(기본 600초마다) 일어나므로 `last_checked_cache_sec`
+    (기본 20초) 캐시를 그대로 쓰면 이론상 아주 좁은 창에서 "방금 완료됐는데
+    아직 캐시에 안 보여" 상태로 등급을 잘못 계산할 여지가 있다 — 갱신
+    빈도가 낮아 매번 새로 읽어도 비용이 크지 않으므로 정확성을 우선한다."""
     from v2r.knowledge.keyword_exposure import _norm
     from v2r.store import exposure_queue_store as qstore
 
@@ -323,6 +330,7 @@ def _do_refresh_queue(rt: Any, brand: str, cfg: dict, now: datetime) -> int:
     universe = bundle["universe"]
     if not universe:
         return 0
+    invalidate_last_checked_cache(rt, brand)
     last_checked = _last_checked_map(rt, brand, cfg)
     recent_norm = bundle["recent_norm"]
     vol_threshold = bundle["vol_threshold"]

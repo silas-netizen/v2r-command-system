@@ -34,12 +34,22 @@ def _item_json(item: dict) -> str:
     return json.dumps(item, ensure_ascii=False)
 
 
+#: 2026-09-24 6차 — 시트가 브랜드당 1만 행대(우아덤 12,549행)까지 커진 뒤,
+#: `upsert_candidates`를 한 트랜잭션으로 몰아 하면 그 하나의 sqlite 쓰기
+#: 트랜잭션이 (WAL이라도 쓰기는 직렬화되므로) 다른 작업자 프로세스의
+#: `claim_batch`/`mark_done`/`release_claim`을 오래 막는다. 후보를 이 개수
+#: 단위로 나눠 여러 개의 짧은 트랜잭션으로 커밋해, 그 사이사이 다른
+#: 프로세스가 끼어들 수 있게 한다.
+UPSERT_CHUNK_SIZE = 500
+
+
 def upsert_candidates(
     conn: sqlite3.Connection,
     brand: str,
     candidates: list[tuple[int, float, str, str, dict]],
     now_epoch: float | None = None,
     claim_ttl_sec: float = CLAIM_TTL_SECONDS,
+    chunk_size: int = UPSERT_CHUNK_SIZE,
 ) -> None:
     """브랜드의 정렬된 후보 목록을 표에 통째로 갱신한다.
 
@@ -53,63 +63,66 @@ def upsert_candidates(
     그 외(완료됐거나, 선점이 만료됐거나, 아예 새 항목)는 `tier`·`sort_key`를
     새로 쓰면서 선점 상태를 비워(다시 뽑힐 수 있게) 갱신한다. 이번에
     후보가 아닌(등급이 다시 밀려난) 기존 행은, 진행 중인 선점이 아니면
-    지운다.
+    지운다 — 2026-09-24 6차부터는 "이번 후보 목록에 없는 키워드"를 일일이
+    나열(`NOT IN (수천 개)`)하지 않고, `enqueued_at`이 이번 갱신 시작
+    시각(`now_epoch`)보다 오래된 행(=이번에 갱신되지 않은 행)을 지우는
+    워터마크 방식을 쓴다 — SQL 크기가 후보 수와 무관하게 일정해 1만 개
+    대에서도 빠르다.
     """
     now_epoch = now_epoch if now_epoch is not None else time.time()
     cutoff = now_epoch - claim_ttl_sec
 
+    rows = [
+        (brand, keyword_norm, keyword, _item_json(item), tier, sort_key, now_epoch)
+        for tier, sort_key, keyword_norm, keyword, item in candidates
+    ]
+    for start in range(0, len(rows), max(1, chunk_size)) if rows else [0]:
+        chunk = rows[start : start + max(1, chunk_size)] if rows else []
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            if chunk:
+                conn.executemany(
+                    """
+                    INSERT INTO exposure_queue
+                        (brand, keyword_norm, keyword, item_json, tier, sort_key, enqueued_at,
+                         claimed_by, claimed_at, done_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)
+                    ON CONFLICT(brand, keyword_norm) DO UPDATE SET
+                        keyword = excluded.keyword,
+                        item_json = excluded.item_json,
+                        tier = excluded.tier,
+                        sort_key = excluded.sort_key,
+                        enqueued_at = excluded.enqueued_at,
+                        claimed_by = CASE
+                            WHEN done_at IS NULL AND claimed_by IS NOT NULL AND claimed_at >= ?
+                            THEN claimed_by ELSE NULL END,
+                        claimed_at = CASE
+                            WHEN done_at IS NULL AND claimed_by IS NOT NULL AND claimed_at >= ?
+                            THEN claimed_at ELSE NULL END,
+                        done_at = CASE
+                            WHEN done_at IS NULL AND claimed_by IS NOT NULL AND claimed_at >= ?
+                            THEN done_at ELSE NULL END
+                    """,
+                    [(*r, cutoff, cutoff, cutoff) for r in chunk],
+                )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+    # 워터마크 삭제 — 이번 갱신에서 손 안 댄(그래서 enqueued_at이 예전 그대로인)
+    # 행 중, 진행 중인 선점이 아닌 것만 지운다. 후보가 하나도 없었으면(빈
+    # universe) 이 브랜드의 대기 중인 모든 행을 지운다(진행 중인 선점 제외).
     conn.execute("BEGIN IMMEDIATE")
     try:
-        rows = [
-            (brand, keyword_norm, keyword, _item_json(item), tier, sort_key, now_epoch)
-            for tier, sort_key, keyword_norm, keyword, item in candidates
-        ]
-        if rows:
-            conn.executemany(
-                """
-                INSERT INTO exposure_queue
-                    (brand, keyword_norm, keyword, item_json, tier, sort_key, enqueued_at,
-                     claimed_by, claimed_at, done_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)
-                ON CONFLICT(brand, keyword_norm) DO UPDATE SET
-                    keyword = excluded.keyword,
-                    item_json = excluded.item_json,
-                    tier = excluded.tier,
-                    sort_key = excluded.sort_key,
-                    enqueued_at = excluded.enqueued_at,
-                    claimed_by = CASE
-                        WHEN done_at IS NULL AND claimed_by IS NOT NULL AND claimed_at >= ?
-                        THEN claimed_by ELSE NULL END,
-                    claimed_at = CASE
-                        WHEN done_at IS NULL AND claimed_by IS NOT NULL AND claimed_at >= ?
-                        THEN claimed_at ELSE NULL END,
-                    done_at = CASE
-                        WHEN done_at IS NULL AND claimed_by IS NOT NULL AND claimed_at >= ?
-                        THEN done_at ELSE NULL END
-                """,
-                [(*r, cutoff, cutoff, cutoff) for r in rows],
-            )
-
-        keyword_norms = [c[2] for c in candidates]
-        if keyword_norms:
-            placeholders = ", ".join("?" for _ in keyword_norms)
-            conn.execute(
-                f"""
-                DELETE FROM exposure_queue
-                WHERE brand = ? AND keyword_norm NOT IN ({placeholders})
-                  AND NOT (done_at IS NULL AND claimed_by IS NOT NULL AND claimed_at >= ?)
-                """,
-                (brand, *keyword_norms, cutoff),
-            )
-        else:
-            conn.execute(
-                """
-                DELETE FROM exposure_queue
-                WHERE brand = ?
-                  AND NOT (done_at IS NULL AND claimed_by IS NOT NULL AND claimed_at >= ?)
-                """,
-                (brand, cutoff),
-            )
+        conn.execute(
+            """
+            DELETE FROM exposure_queue
+            WHERE brand = ? AND enqueued_at < ?
+              AND NOT (done_at IS NULL AND claimed_by IS NOT NULL AND claimed_at >= ?)
+            """,
+            (brand, now_epoch, cutoff),
+        )
         conn.execute("COMMIT")
     except Exception:
         conn.execute("ROLLBACK")
