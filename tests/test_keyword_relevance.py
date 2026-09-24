@@ -666,3 +666,16 @@ def test_rescore_worker_runs_and_writes_progress(tmp_path, monkeypatch):
 
 def test_rescore_worker_main_requires_brand_arg():
     assert kr.rescore_worker_main([]) == 2
+
+
+def test_codex_usage_limit_detected_and_paused(tmp_path):
+    from v2r.knowledge import keyword_relevance as kr
+
+    msg = "ERROR: You've hit your usage limit. Visit x or try again at Sep 29th, 2026 10:57 PM."
+    until = kr._detect_usage_limit(msg)
+    assert until.startswith("2026-09-29T22:57")
+    assert kr._detect_usage_limit("빈 응답") == ""
+    kr._write_codex_pause(tmp_path, "2999-01-01T00:00")
+    assert kr.codex_paused_until(tmp_path) == "2999-01-01T00:00"
+    kr._write_codex_pause(tmp_path, "2000-01-01T00:00")
+    assert kr.codex_paused_until(tmp_path) == ""

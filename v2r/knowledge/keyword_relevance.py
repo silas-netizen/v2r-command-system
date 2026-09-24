@@ -1001,6 +1001,61 @@ def run_codex(
     return out, ""
 
 
+CODEX_PAUSE_FILE = "data/codex_pause_until.json"
+
+
+def _detect_usage_limit(err: str) -> str:
+    """codex 오류 문구에서 사용량 한도(재개 시각)를 찾는다. 없으면 빈 문자열.
+
+    실측 2026-09-24: "You've hit your usage limit. ... try again at Sep 29th, 2026 10:57 PM."
+    """
+    import re as _re
+    from datetime import datetime as _dt, timedelta as _td
+
+    text = str(err or "")
+    low = text.lower()
+    if "usage limit" not in low and "hit your" not in low:
+        return ""
+    m = _re.search(r"try again at ([A-Za-z]{3}) (\d{1,2})(?:st|nd|rd|th)?,? (\d{4}) (\d{1,2}:\d{2} [AP]M)", text)
+    if m:
+        try:
+            when = _dt.strptime(f"{m.group(1)} {m.group(2)} {m.group(3)} {m.group(4)}", "%b %d %Y %I:%M %p")
+            return when.isoformat(timespec="minutes")
+        except Exception:  # noqa: BLE001
+            pass
+    return (_dt.now() + _td(hours=6)).isoformat(timespec="minutes")
+
+
+def _pause_path(cwd: str | Path | None) -> Path:
+    return Path(cwd or ".") / CODEX_PAUSE_FILE
+
+
+def _write_codex_pause(cwd: str | Path | None, until: str) -> None:
+    try:
+        p = _pause_path(cwd)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({"until": until}, ensure_ascii=False), encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def codex_paused_until(cwd: str | Path | None = None) -> str:
+    """사용량 한도로 codex 를 쉬는 중이면 재개 시각(ISO), 아니면 빈 문자열."""
+    from datetime import datetime as _dt
+
+    try:
+        p = _pause_path(cwd)
+        if not p.exists():
+            return ""
+        until = str(json.loads(p.read_text(encoding="utf-8")).get("until") or "")
+        if until and _dt.fromisoformat(until) > _dt.now():
+            return until
+        p.unlink(missing_ok=True)
+    except Exception:  # noqa: BLE001
+        return ""
+    return ""
+
+
 def score_batch_codex(
     brand: str,
     keywords: list[str],
@@ -1015,10 +1070,18 @@ def score_batch_codex(
     prompt = build_system_prompt(brand, summary) + "\n\n" + build_user_prompt(keywords)
     exe = exe or find_codex()
     last_error = ""
+    paused_until = codex_paused_until(cwd)
+    if paused_until:
+        raise RelevanceParseError(f"codex 교차 검증 보류({brand}): 사용량 한도 — {paused_until}까지 쉼")
     for model in (CODEX_DEFAULT_MODEL, CODEX_FALLBACK_MODEL):
         out, err = run_codex(prompt, exe=exe, model=model, cwd=cwd)
         if err:
             last_error = f"{model}: {err}"
+            until = _detect_usage_limit(err)
+            if until:
+                _write_codex_pause(cwd, until)
+                log.warning("codex 사용량 한도 — %s까지 교차 검증 보류(호출 낭비 방지)", until)
+                raise RelevanceParseError(f"codex 교차 검증 보류({brand}): 사용량 한도 — {until}까지 쉼")
             log.warning("codex 모델 %s 실패 — 다음 모델로: %s", model, err)
             continue
         try:
