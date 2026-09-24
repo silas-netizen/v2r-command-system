@@ -303,3 +303,43 @@ def test_eligible_follows_is_manuscript_target(tmp_path):
     assert fill.eligible_count(conn) == sum(expected) == 2
     assert fill.manuscript_max_relevance() == kr.MANUSCRIPT_MAX_RELEVANCE == 3
     conn.close()
+
+
+def test_stop_file_halts_loop_before_next_round(tmp_path):
+    db = tmp_path / "b.sqlite"
+    guides_dir = tmp_path / "guides"
+    guides_dir.mkdir()
+    (guides_dir / "브랜드.md").write_text("- 브랜드/제품: 테스트제품\n", encoding="utf-8")
+    _seed_db(db, extra_eligible=0)
+    data_dir = tmp_path / "data"
+    fill.stop_path(data_dir).parent.mkdir(parents=True, exist_ok=True)
+    fill.stop_path(data_dir).write_text("stop", encoding="utf-8")
+
+    def fake_fetch(seeds, depth):
+        raise AssertionError("정지 파일이 있으면 조회하면 안 된다")
+
+    fill.fill_until_target("브랜드", db, guides_dir, FakeRouter(), fake_fetch, data_dir=data_dir, max_rounds=3)
+    data = fill.load_progress(fill.progress_path(data_dir))
+    assert data["브랜드"]["status"] == "정지(STOP 파일)"
+
+
+def test_retry_db_locked_retries_then_succeeds():
+    calls = {"n": 0}
+    waits = []
+
+    def fn():
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise sqlite3.OperationalError("database is locked")
+        return "ok"
+
+    assert fill._retry_db_locked(fn, "테스트", sleep_fn=waits.append) == "ok"
+    assert calls["n"] == 3 and len(waits) == 2
+
+
+def test_retry_db_locked_reraises_other_errors():
+    def fn():
+        raise sqlite3.OperationalError("no such table")
+
+    with pytest.raises(sqlite3.OperationalError):
+        fill._retry_db_locked(fn, "테스트", sleep_fn=lambda s: None)

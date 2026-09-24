@@ -43,6 +43,40 @@ LOW_ADOPTION_STREAK_LIMIT = 3
 LOW_ADOPTION_THRESHOLD = 0.05
 
 PROGRESS_FILENAME = "fill_progress.json"
+#: 순환 정지 파일 — 이 파일이 있으면(`data/keywords/fill_STOP`) 모든 브랜드 워커가
+#: 현재 묶음을 마치는 대로 스스로 멈춘다(강제 종료 대신 쓰는 정지 수단, 2026-09-24).
+STOP_FILENAME = "fill_STOP"
+#: 다른 프로세스(실행기 재채점·시트 반영)가 같은 sqlite를 쓰는 동안 "database is locked"가
+#: 나면 이만큼 기다렸다 다시 시도한다(실측 2026-09-24 03:35: 장으뜸·팥순이 워커가 이 예외로 죽음).
+DB_LOCK_RETRY = 20
+DB_LOCK_WAIT_SEC = 60.0
+
+
+class FillStopped(RuntimeError):
+    """정지 파일이 감지돼 순환을 멈춘다."""
+
+
+def stop_path(data_dir: str | Path = "data") -> Path:
+    return Path(data_dir) / "keywords" / STOP_FILENAME
+
+
+def stop_requested(data_dir: str | Path = "data") -> bool:
+    return stop_path(data_dir).exists()
+
+
+def _retry_db_locked(fn: Callable[[], Any], what: str, sleep_fn: Callable[[float], None] | None = None) -> Any:
+    import time as _time
+
+    sleep = sleep_fn or _time.sleep
+    for attempt in range(1, DB_LOCK_RETRY + 1):
+        try:
+            return fn()
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower() or attempt >= DB_LOCK_RETRY:
+                raise
+            log.warning("%s: DB 잠김(%d/%d) — %.0f초 뒤 재시도: %s", what, attempt, DB_LOCK_RETRY, DB_LOCK_WAIT_SEC, exc)
+            sleep(DB_LOCK_WAIT_SEC)
+    return None
 
 
 def _now_iso() -> str:
@@ -534,8 +568,15 @@ def run_cycle(
     score_result = {"scored": 0, "failed_batches": 0}
     cross_result = {"checked": 0, "failed_batches": 0}
     if new_saved:
-        score_result = kr.score_brand(router, brand, db_path, guides_dir)
-        cross_result = kr.crosscheck_brand(brand, db_path, guides_dir, codex_exe=codex_exe)
+        data_dir_guess = Path(db_path).resolve().parent.parent
+        if not stop_requested(data_dir_guess):
+            score_result = _retry_db_locked(
+                lambda: kr.score_brand(router, brand, db_path, guides_dir), f"{brand} 채점"
+            )
+        if not stop_requested(data_dir_guess):
+            cross_result = _retry_db_locked(
+                lambda: kr.crosscheck_brand(brand, db_path, guides_dir, codex_exe=codex_exe), f"{brand} 교차검증"
+            )
 
     conn = kd_store.open_db(db_path)
     try:
@@ -581,6 +622,10 @@ def fill_until_target(
     rounds = 0
     last: dict[str, Any] = {}
     while rounds < max_rounds:
+        if stop_requested(data_dir):
+            update_fill_progress(ppath, brand, status="정지(STOP 파일)", eligible=last.get("eligible"))
+            log.info("%s: 정지 파일 감지 — 순환을 멈춥니다", brand)
+            break
         rounds += 1
         result = run_cycle(
             brand, db_path, guides_dir, router, fetch_fn,
@@ -641,6 +686,8 @@ def _real_fetch_fn(page: Any, account_id: str, download_dir: Path) -> Callable[[
     url = kt.KEYWORD_PLANNER_URL.format(account_id=account_id)
 
     def _fetch(seeds: list[str], depth: int) -> list[Any]:
+        if stop_requested(download_dir.parent.parent):
+            raise FillStopped("정지 파일 감지")
         try:
             return kt.fetch_related_keywords(page, seeds, account_id, download_dir=download_dir)
         except RuntimeError as exc:
@@ -686,12 +733,55 @@ def worker_main(argv: list[str]) -> int:
         kdp.clone_all_profiles(data_dir, [brand])
 
     kt = _kt_mod()
-    playwright, context, page, logged_in = kt.open_keyword_tool_page(profile_dir=profile_dir, headless=True)
+    import time as _time
+
+    from v2r.warehouse.naver_session import ProfileLockTimeout
+
+    stop_file = stop_path(data_dir)
+    if stop_file.exists():
+        log.info("%s: 시작 전에 정지 파일이 있어 시작하지 않습니다(%s)", brand, stop_file)
+        return 0
+    #: 같은 브랜드의 옛 워커가 아직 프로필 잠금을 쥐고 있으면 끝날 때까지 기다린다(최대 24시간).
+    wait_deadline = _time.monotonic() + 24 * 3600
+    while True:
+        try:
+            playwright, context, page, logged_in = kt.open_keyword_tool_page(profile_dir=profile_dir, headless=True)
+            break
+        except ProfileLockTimeout as exc:
+            if stop_file.exists() or _time.monotonic() >= wait_deadline:
+                log.error("%s: 프로필 잠금 대기 중단: %s", brand, exc)
+                return 1
+            log.info("%s: 옛 워커가 프로필을 쓰는 중 — 120초 뒤 다시 시도(%s)", brand, exc)
+            _time.sleep(120)
+
+    class _StoppableRouter:
+        """정지 파일이 생기면 채점 호출을 즉시 실패시켜 묶음 반복을 빨리 빠져나오게 한다."""
+
+        def __init__(self, inner: Any) -> None:
+            self._inner = inner
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._inner, name)
+
+        def complete(self, *args: Any, **kwargs: Any) -> str:
+            if stop_file.exists():
+                raise FillStopped("정지 파일 감지")
+            return self._inner.complete(*args, **kwargs)
+
+    kr = _kr_mod()
+    _orig_codex = kr.score_batch_codex
+
+    def _stoppable_codex(*args: Any, **kwargs: Any) -> Any:
+        if stop_file.exists():
+            raise kr.RelevanceParseError("정지 파일 감지")
+        return _orig_codex(*args, **kwargs)
+
+    kr.score_batch_codex = _stoppable_codex  # 이 워커 프로세스 안에서만
     try:
         if not logged_in:
             log.error("%s: 네이버 로그인이 풀려 있어 채우기를 시작하지 않습니다", brand)
             return 1
-        router = LLMRouter.from_settings(settings)
+        router = _StoppableRouter(LLMRouter.from_settings(settings))
         fetch_fn = _real_fetch_fn(page, account_id="685753", download_dir=data_dir / "keywords" / "_tmp")
         guides_dir = repo / "warehouse" / "guides" / "정리본"
         db_path = _kt_mod().db_path_for_brand(brand, data_dir)
@@ -741,6 +831,10 @@ __all__ = [
     "run_cycle",
     "fill_until_target",
     "worker_main",
+    "STOP_FILENAME",
+    "stop_path",
+    "stop_requested",
+    "FillStopped",
     "SOURCE_TYPES",
     "gather_seeds",
     "expand_seed_terms",
