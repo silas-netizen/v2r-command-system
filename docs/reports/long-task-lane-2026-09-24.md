@@ -42,7 +42,9 @@
 
 - `pytest tests/test_sidecar.py -q` → 24 passed (1회 타이밍성 실패가 있었으나 재실행 시 24 passed, 기존에도 시간 기반이라 흔들리는 시험이었음 — 이번 변경과 무관).
 - `pytest tests/test_schedule.py tests/test_engine.py -q` → 87 passed.
-- 전체 `pytest -q`는 이 PC에서 실제로 돌고 있는 실행기(serve)·러너 프로세스와 파일 잠금이 겹쳐 응답이 없었다(CPU 사용량 0에 가깝게 멈춤) — 지시대로 실행기·러너 프로세스는 건드리지 않고, 관련 시험 파일만 개별 실행해 확인했다. 참고: 전체 스위트를 다시 돌리려면 실행기를 잠깐 멈추거나 격리된 별도 환경에서 실행해야 한다.
+- 전체 `pytest -q`(1525건, 51분 55초 소요 — 처음엔 진행 표시가 없어 잠긴 것으로 오판했으나 실제로는 정상 진행 중이었다) → **1523 passed, 2 failed**. 두 실패는 이번 변경과 무관한 기존 결함이다(`v2r/store/jobs.py`, `v2r/engine/sidecar.py`, `v2r/engine/worker.py`, `v2r/__main__.py` 어느 것도 아래 두 시험이 건드리는 코드를 손대지 않았다):
+  - `tests/test_parser.py::test_all_tasks_covered_by_tests` — `ALLOWED_TASKS` 개수가 60을 기대하는데 61개(사이드 기능 추가로 등록 작업 종류가 하나 더 늘어난 것으로 보이며, 명령 파서 쪽 시험 갱신 누락).
+  - `tests/test_sheets_writer.py::test_sync_keywords_to_sheet_picks_only_target_rows` — `sync_keywords_to_sheet`의 `picked` 개수가 3을 기대하는데 2(시트 반영 대상 필터링 로직, `v2r/sources/sheets_writer.py` 쪽 기존 결함으로 보임 — 이번 작업에서는 건드리지 않았다).
 
 ## 커밋한 파일
 
