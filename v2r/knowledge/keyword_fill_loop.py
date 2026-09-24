@@ -35,8 +35,10 @@ DEFAULT_TARGET = 10_000
 DEFAULT_SEED_LIMIT = 10
 #: 네이버 키워드 도구 한 번 조회 최대 씨앗 수(기존 값 그대로)
 SEED_BATCH_SIZE = 5
-#: 브랜드당 DB 총 행수 상한(무관 키워드 폭증 방지)
-DEFAULT_CAP = 50_000
+#: 브랜드당 DB 총 행수 상한(무관 키워드 폭증 방지) — 2026-09-24 사용자 지시(공급원 확대)로
+#: 50,000 -> 200,000 상향. 확정 무관(둘 다 4) 행은 회차 종료 시 정리하므로 실제로는
+#: 이 상한까지 안 차는 게 보통이다.
+DEFAULT_CAP = 200_000
 #: 이 회차 수만큼 연속 채택률이 문턱 아래면 "시드 고갈"로 멈춘다
 LOW_ADOPTION_STREAK_LIMIT = 3
 #: 채택률 문턱(이 미만이면 그 회차는 "낮음"으로 센다)
@@ -109,7 +111,12 @@ SOURCE_GUIDE = "정리본"
 SOURCE_COMPETITOR = "경쟁"
 SOURCE_AUTOCOMPLETE = "자동완성"
 SOURCE_RELATED = "연관검색"
-SOURCE_TYPES = (SOURCE_ELIGIBLE, SOURCE_GUIDE, SOURCE_COMPETITOR, SOURCE_AUTOCOMPLETE, SOURCE_RELATED)
+#: (6) 파생 검색어 — 확정 원고 대상(검색량 큰 순) + 정리본을 입력으로 클로드(요금제
+#: 라우터)가 만드는 "네이버에서 실제로 검색할 법한" 파생·연관 검색어(2026-09-24 사용자 지시).
+SOURCE_DERIVED = "파생"
+SOURCE_TYPES = (
+    SOURCE_ELIGIBLE, SOURCE_GUIDE, SOURCE_COMPETITOR, SOURCE_AUTOCOMPLETE, SOURCE_RELATED, SOURCE_DERIVED,
+)
 
 #: 출처별 한 회차 시드 상한
 DEFAULT_GUIDE_SEED_N = 150
@@ -118,6 +125,10 @@ DEFAULT_COMPETITOR_SEED_N = 60
 DEFAULT_EXPAND_TOP_N = 30
 #: 자동완성·연관검색 출처 각각의 회차당 시드 상한(조회 횟수 폭증 방지)
 DEFAULT_EXPAND_SEED_CAP = 10
+#: 파생 검색어 — 입력 기준 키워드 수, 기준 하나당 요청할 파생어 수, 회차당 상한
+DEFAULT_DERIVED_BASE_N = 20
+DEFAULT_DERIVED_PER_BASE = 30
+DEFAULT_DERIVED_CAP = 200
 
 _FILL_SEEDS_SCHEMA = """
 CREATE TABLE IF NOT EXISTS fill_seeds (
@@ -125,12 +136,24 @@ CREATE TABLE IF NOT EXISTS fill_seeds (
     source_type TEXT NOT NULL DEFAULT '',
     used_at TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS rejected_keywords (
+    keyword_norm TEXT PRIMARY KEY,
+    keyword TEXT NOT NULL DEFAULT '',
+    brand TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL DEFAULT '',
+    at TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS expand_cursor (
+    kind TEXT PRIMARY KEY,
+    offset_n INTEGER NOT NULL DEFAULT 0
+);
 """
 
 
 def migrate_fill_columns(conn: sqlite3.Connection) -> list[str]:
     """`keywords`에 `seeded_at`(시드로 쓴 시각)·`seed_source_type`(어느 출처 시드에서
-    수집됐는지)을 더하고 `fill_seeds`(시드 사용 기록) 표를 만든다."""
+    수집됐는지)을 더하고 `fill_seeds`(시드 사용 기록)·`rejected_keywords`(확정 무관 정리
+    기록)·`expand_cursor`(자동완성/연관검색 회전 위치) 표를 만든다."""
     existing = {row[1] for row in conn.execute("PRAGMA table_info(keywords)")}
     added: list[str] = []
     if "seeded_at" not in existing:
@@ -142,6 +165,65 @@ def migrate_fill_columns(conn: sqlite3.Connection) -> list[str]:
     conn.executescript(_FILL_SEEDS_SCHEMA)
     conn.commit()
     return added
+
+
+def normalize_keyword(keyword: str) -> str:
+    """공백 축약·소문자화만 하는 가벼운 정규화(재수집·재채점 방지 비교용)."""
+    return re.sub(r"\s+", " ", str(keyword or "").strip()).lower()
+
+
+# --- 확정 무관 정리(비용 절약) ---------------------------------------------
+
+
+def rejected_keyword_norms(conn: sqlite3.Connection) -> set[str]:
+    return {row[0] for row in conn.execute("SELECT keyword_norm FROM rejected_keywords")}
+
+
+def purge_confirmed_irrelevant(conn: sqlite3.Connection, brand: str, reason: str = "확정무관(4/4)") -> int:
+    """클로드·Codex 둘 다 4(무관)로 확정한 행을 지우고 `rejected_keywords`에 남긴다.
+
+    같은 키워드를 다음 회차에 다시 수집·재채점하지 않도록 막는 게 목적이다
+    (2026-09-24 사용자 지시 — 공급원 확대 시 비용 절약).
+    """
+    rows = conn.execute(
+        "SELECT keyword FROM keywords WHERE scored_at != '' AND scored_at IS NOT NULL"
+        " AND relevance_llm = 4 AND relevance_codex = 4"
+    ).fetchall()
+    if not rows:
+        return 0
+    stamp = _now_iso()
+    conn.executemany(
+        "INSERT OR IGNORE INTO rejected_keywords (keyword_norm, keyword, brand, reason, at)"
+        " VALUES (?, ?, ?, ?, ?)",
+        [(normalize_keyword(r[0]), r[0], brand, reason, stamp) for r in rows],
+    )
+    conn.executemany("DELETE FROM keywords WHERE keyword = ?", [(r[0],) for r in rows])
+    conn.commit()
+    return len(rows)
+
+
+# --- 자동완성/연관검색 회전 구간(전체 원고 대상을 회차마다 다른 구간으로) ------
+
+
+def rotate_eligible_keywords(conn: sqlite3.Connection, kind: str, n: int) -> list[str]:
+    """`kind`(예: "자동완성"/"연관검색") 회전 커서를 기준으로 원고 대상 전체를 검색량
+    순으로 정렬해 `n`개씩 순환 반환한다(상위 30개 고정이 아니라 전체를 회차마다 다른
+    구간으로 다룬다, 2026-09-24 사용자 지시)."""
+    all_kw = [row[0] for row in conn.execute(f"SELECT keyword FROM keywords WHERE {eligible_sql()} ORDER BY total DESC")]
+    if not all_kw:
+        return []
+    row = conn.execute("SELECT offset_n FROM expand_cursor WHERE kind = ?", (kind,)).fetchone()
+    offset = int(row[0]) if row else 0
+    offset = offset % len(all_kw)
+    picked = (all_kw[offset:] + all_kw[:offset])[: max(1, n)]
+    new_offset = (offset + len(picked)) % len(all_kw)
+    conn.execute(
+        "INSERT INTO expand_cursor (kind, offset_n) VALUES (?, ?)"
+        " ON CONFLICT(kind) DO UPDATE SET offset_n = excluded.offset_n",
+        (kind, new_offset),
+    )
+    conn.commit()
+    return picked
 
 
 # --- 원고 대상 판정 -------------------------------------------------------
@@ -329,6 +411,47 @@ def competitor_seed_terms(
         return []
 
 
+#: (6) 파생 검색어 — 확정 원고 대상 키워드(검색량 큰 순)를 보고 네이버에서 실제로
+#: 검색할 법한 파생·연관 표현을 뽑는다(제품명 나열이 아니라 실제 검색 문장/구).
+_DERIVED_SEED_PROMPT = (
+    "아래는 이 브랜드에서 이미 원고 대상으로 확정된 키워드(검색량 큰 순)다. 이 키워드들을 검색한"
+    " 사람이 네이버에서 **추가로/이어서 검색할 법한** 파생·연관 검색어를 최대 {n}개 뽑아라."
+    " 단순 동의어 나열이 아니라 실제 사람들의 검색 행태(증상 심화, 비교, 부작용, 가격, 사용법,"
+    " 다른 타깃 등)를 반영해라. 2에서 15자, 중복·설명 금지.\n"
+    "출력은 오직 JSON 배열: [\"검색어1\", \"검색어2\", ...].\n\n기준 키워드:\n{keywords}\n\n정리본:\n{guide}"
+)
+
+
+def derived_seed_terms(
+    brand: str,
+    guides_dir: str | Path,
+    router: Any,
+    base_keywords: list[str],
+    n: int = DEFAULT_DERIVED_CAP,
+    per_call_base_n: int = DEFAULT_DERIVED_BASE_N,
+    per_base: int = DEFAULT_DERIVED_PER_BASE,
+    purpose: str = "keyword_fill_seed_derived",
+) -> list[str]:
+    """(6) 확정 원고 대상 키워드(검색량 큰 순)를 입력으로 파생 검색어를 최대 `n`개 뽑는다.
+
+    라우터 없거나 기준 키워드가 없으면 빈 목록. 실패해도 회차 전체를 막지 않는다.
+    """
+    if router is None or not base_keywords:
+        return []
+    base = base_keywords[:per_call_base_n]
+    try:
+        guide = _guide_text(brand, guides_dir)
+        ask_n = min(n, len(base) * per_base) or per_base
+        terms = _llm_string_list(
+            router, purpose, "네이버 실제 검색 파생어를 뽑는 도우미다.",
+            _DERIVED_SEED_PROMPT.format(n=ask_n, keywords=", ".join(base), guide=guide), ask_n,
+        )
+        return terms[:n]
+    except Exception as exc:  # noqa: BLE001
+        log.warning("파생 검색어 LLM 생성 실패(%s): %s", brand, exc)
+        return []
+
+
 def expand_seed_terms(
     base_keywords: list[str],
     expand_fn: Callable[[str], list[str]],
@@ -360,6 +483,22 @@ def expand_seed_terms(
     return out
 
 
+#: 채택률 문턱값에 따라 다음 회차 출처별 시드 상한을 늘리거나 줄이는 배율 범위
+#: (채택률 높은 출처에 시드를 더 배분 — 2026-09-24 사용자 지시 "채택률로 자동 비중 조절").
+_WEIGHT_MIN_MULT = 0.4
+_WEIGHT_MAX_MULT = 2.5
+
+
+def weighted_cap(base_cap: int, source: str, adoption_weights: dict[str, float] | None) -> int:
+    """직전 회차 출처별 채택률로 `base_cap`을 늘리거나 줄인다(가짜 실측 없으면 그대로)."""
+    if not adoption_weights or source not in adoption_weights:
+        return base_cap
+    rate = max(0.0, min(1.0, float(adoption_weights[source])))
+    # 채택률 0 -> 0.4배, 0.5 -> ~1.45배, 1.0 -> 2.5배(선형 보간)
+    mult = _WEIGHT_MIN_MULT + rate * (_WEIGHT_MAX_MULT - _WEIGHT_MIN_MULT)
+    return max(1, round(base_cap * mult))
+
+
 def gather_seeds(
     conn: sqlite3.Connection,
     brand: str,
@@ -372,10 +511,15 @@ def gather_seeds(
     competitor_seed_n: int = DEFAULT_COMPETITOR_SEED_N,
     expand_top_n: int = DEFAULT_EXPAND_TOP_N,
     expand_cap: int = DEFAULT_EXPAND_SEED_CAP,
+    derived_cap: int = DEFAULT_DERIVED_CAP,
+    adoption_weights: dict[str, float] | None = None,
 ) -> list[tuple[str, str]]:
-    """이번 회차 시드 `[(seed, source_type)]` — 5가지 출처, 중복·DB 기존 키워드·이미 쓴 시드 제외."""
+    """이번 회차 시드 `[(seed, source_type)]` — 6가지 출처, 중복·DB 기존 키워드·이미 쓴 시드·
+    확정 무관(rejected_keywords) 제외. `adoption_weights`(출처->직전 채택률)가 있으면
+    자동완성·연관검색·파생·경쟁 상한을 채택률에 비례해 조절한다."""
     already_kw = {row[0] for row in conn.execute("SELECT keyword FROM keywords")}
     used = used_seeds(conn)
+    rejected = rejected_keyword_norms(conn)
     picked: list[tuple[str, str]] = []
     seen: set[str] = set()
 
@@ -383,6 +527,8 @@ def gather_seeds(
         for t in terms:
             t = str(t or "").strip()
             if not t or t in seen or t in used:
+                continue
+            if normalize_keyword(t) in rejected:
                 continue
             if not allow_in_db and t in already_kw:
                 continue
@@ -392,11 +538,25 @@ def gather_seeds(
     _add(select_seed_keywords(conn, seed_limit), SOURCE_ELIGIBLE, allow_in_db=True)
     _add(guide_seed_terms(brand, guides_dir, router, guide_seed_n), SOURCE_GUIDE)
     top = top_eligible_keywords(conn, expand_top_n)
-    _add(competitor_seed_terms(brand, guides_dir, router, top, competitor_seed_n), SOURCE_COMPETITOR)
-    if autocomplete_fn is not None and top:
-        _add(expand_seed_terms(top, autocomplete_fn, expand_cap), SOURCE_AUTOCOMPLETE)
-    if related_fn is not None and top:
-        _add(expand_seed_terms(top, related_fn, expand_cap), SOURCE_RELATED)
+
+    comp_cap = weighted_cap(competitor_seed_n, SOURCE_COMPETITOR, adoption_weights)
+    _add(competitor_seed_terms(brand, guides_dir, router, top, comp_cap), SOURCE_COMPETITOR)
+
+    ac_cap = weighted_cap(expand_cap, SOURCE_AUTOCOMPLETE, adoption_weights)
+    re_cap = weighted_cap(expand_cap, SOURCE_RELATED, adoption_weights)
+    if autocomplete_fn is not None:
+        # 상위 검색량 고정이 아니라 원고 대상 전체를 회차마다 다른 구간으로 순환(사용자 지시).
+        ac_base = rotate_eligible_keywords(conn, SOURCE_AUTOCOMPLETE, expand_top_n) or top
+        if ac_base:
+            _add(expand_seed_terms(ac_base, autocomplete_fn, ac_cap), SOURCE_AUTOCOMPLETE)
+    if related_fn is not None:
+        re_base = rotate_eligible_keywords(conn, SOURCE_RELATED, expand_top_n) or top
+        if re_base:
+            _add(expand_seed_terms(re_base, related_fn, re_cap), SOURCE_RELATED)
+
+    der_cap = weighted_cap(derived_cap, SOURCE_DERIVED, adoption_weights)
+    _add(derived_seed_terms(brand, guides_dir, router, top, der_cap), SOURCE_DERIVED)
+
     counts: dict[str, int] = {}
     for _s, t in picked:
         counts[t] = counts.get(t, 0) + 1
@@ -483,11 +643,15 @@ def run_cycle(
     competitor_seed_n: int = DEFAULT_COMPETITOR_SEED_N,
     expand_top_n: int = DEFAULT_EXPAND_TOP_N,
     expand_cap: int = DEFAULT_EXPAND_SEED_CAP,
+    derived_cap: int = DEFAULT_DERIVED_CAP,
+    adoption_weights: dict[str, float] | None = None,
 ) -> dict[str, Any]:
-    """시드 수집(5출처) → 조회 → 새 키워드 채점/교차검증 → 출처별 채택률까지 한 회차.
+    """시드 수집(6출처) → 조회 → 새 키워드 채점/교차검증 → 확정 무관 정리 → 출처별
+    채택률까지 한 회차.
 
     `fetch_fn(seeds, depth) -> list[KeywordRow-like]`; `autocomplete_fn`/`related_fn`
-    (키워드 → 후보 목록)은 없으면 그 출처를 건너뛴다(테스트·오프라인).
+    (키워드 → 후보 목록)은 없으면 그 출처를 건너뛴다(테스트·오프라인). `adoption_weights`는
+    직전 회차 `by_source`에서 뽑은 출처별 채택률(있으면 다음 시드 상한을 자동 조절).
     """
     kd_store = _kd_store()
     kr = _kr_mod()
@@ -511,6 +675,7 @@ def run_cycle(
             conn, brand, guides_dir, router, autocomplete_fn, related_fn,
             seed_limit=seed_limit, guide_seed_n=guide_seed_n,
             competitor_seed_n=competitor_seed_n, expand_top_n=expand_top_n, expand_cap=expand_cap,
+            derived_cap=derived_cap, adoption_weights=adoption_weights,
         )
         seed_counts: dict[str, int] = {}
         for _s, t in seeds:
@@ -581,8 +746,9 @@ def run_cycle(
     conn = kd_store.open_db(db_path)
     try:
         eligible_after = eligible_count(conn)
-        total_after = kd_store.count(conn)
         by_source = source_stats(conn, round_start)
+        purged = purge_confirmed_irrelevant(conn, brand)
+        total_after = kd_store.count(conn)
     finally:
         conn.close()
 
@@ -594,6 +760,7 @@ def run_cycle(
         "new_collected": new_saved, "adopted": adopted, "adoption_rate": adoption_rate,
         "seed_exhausted": seed_exhausted, "seeds_used": len(seeds), "seed_counts": seed_counts,
         "by_source": by_source, "score_result": score_result, "cross_result": cross_result,
+        "purged_irrelevant": purged,
     }
 
 
@@ -627,10 +794,12 @@ def fill_until_target(
             log.info("%s: 정지 파일 감지 — 순환을 멈춥니다", brand)
             break
         rounds += 1
+        prev_by_source = (last or {}).get("by_source") or {}
+        adoption_weights = {src: v.get("adoption_rate", 0.0) for src, v in prev_by_source.items()}
         result = run_cycle(
             brand, db_path, guides_dir, router, fetch_fn,
             codex_exe=codex_exe, seed_limit=seed_limit, guide_seed_n=guide_seed_n, cap=cap,
-            autocomplete_fn=autocomplete_fn, related_fn=related_fn,
+            autocomplete_fn=autocomplete_fn, related_fn=related_fn, adoption_weights=adoption_weights,
         )
         last = result
         eligible = result["eligible"]
@@ -843,4 +1012,14 @@ __all__ = [
     "record_seeds",
     "used_seeds",
     "top_eligible_keywords",
+    "SOURCE_DERIVED",
+    "DEFAULT_DERIVED_BASE_N",
+    "DEFAULT_DERIVED_PER_BASE",
+    "DEFAULT_DERIVED_CAP",
+    "derived_seed_terms",
+    "normalize_keyword",
+    "rejected_keyword_norms",
+    "purge_confirmed_irrelevant",
+    "rotate_eligible_keywords",
+    "weighted_cap",
 ]

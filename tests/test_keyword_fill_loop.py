@@ -343,3 +343,120 @@ def test_retry_db_locked_reraises_other_errors():
 
     with pytest.raises(sqlite3.OperationalError):
         fill._retry_db_locked(fn, "테스트", sleep_fn=lambda s: None)
+
+
+def test_default_cap_raised_to_200000():
+    assert fill.DEFAULT_CAP == 200_000
+
+
+def test_purge_confirmed_irrelevant_removes_and_records(tmp_path):
+    db = tmp_path / "b.sqlite"
+    conn = kd_store.open_db(db)
+    kr.migrate(conn)
+    fill.migrate_fill_columns(conn)
+    kd_store.save_many(conn, [
+        {"keyword": "무관1", "pc": 1, "mobile": 0}, {"keyword": "대상1", "pc": 1, "mobile": 0},
+    ])
+    conn.execute(
+        "UPDATE keywords SET relevance_llm=4, relevance_codex=4, needs_review=0, scored_at='x'"
+        " WHERE keyword='무관1'"
+    )
+    conn.execute(
+        "UPDATE keywords SET relevance_llm=0, relevance_codex=0, needs_review=0, scored_at='x'"
+        " WHERE keyword='대상1'"
+    )
+    conn.commit()
+
+    purged = fill.purge_confirmed_irrelevant(conn, "브랜드")
+    assert purged == 1
+    remaining = {row[0] for row in conn.execute("SELECT keyword FROM keywords")}
+    assert remaining == {"대상1"}
+    norms = fill.rejected_keyword_norms(conn)
+    assert fill.normalize_keyword("무관1") in norms
+    conn.close()
+
+
+def test_gather_seeds_skips_rejected_keywords(tmp_path):
+    db = tmp_path / "b.sqlite"
+    guides_dir = tmp_path / "guides"
+    guides_dir.mkdir()
+    (guides_dir / "브랜드.md").write_text("- 브랜드/제품: 테스트제품\n", encoding="utf-8")
+    _seed_db(db, extra_eligible=0)
+    conn = kd_store.open_db(db)
+    kr.migrate(conn)
+    fill.migrate_fill_columns(conn)
+    conn.execute(
+        "INSERT INTO rejected_keywords (keyword_norm, keyword, brand, reason, at)"
+        " VALUES (?, ?, ?, ?, ?)",
+        (fill.normalize_keyword("테스트제품"), "테스트제품", "브랜드", "무관", "x"),
+    )
+    conn.commit()
+
+    seeds = fill.gather_seeds(conn, "브랜드", guides_dir, router=None, seed_limit=2)
+    terms = [s for s, _ in seeds]
+    assert "테스트제품" not in terms
+    conn.close()
+
+
+def test_rotate_eligible_keywords_advances_cursor(tmp_path):
+    db = tmp_path / "b.sqlite"
+    _seed_db(db, extra_eligible=3)  # 기존키워드, 기존키워드0..2 -> 4개 원고 대상
+    conn = kd_store.open_db(db)
+    kr.migrate(conn)
+    fill.migrate_fill_columns(conn)
+
+    first = fill.rotate_eligible_keywords(conn, "자동완성", 2)
+    second = fill.rotate_eligible_keywords(conn, "자동완성", 2)
+    assert len(first) == 2 and len(second) == 2
+    assert first != second  # 다음 회차는 다른 구간
+    conn.close()
+
+
+def test_derived_seed_terms_uses_router(tmp_path):
+    guides_dir = tmp_path / "guides"
+    guides_dir.mkdir()
+    (guides_dir / "브랜드.md").write_text("정리본 내용", encoding="utf-8")
+
+    class FakeDerivedRouter:
+        def complete(self, purpose, system, user, max_tokens=1500):
+            return json.dumps(["파생어1", "파생어2"], ensure_ascii=False)
+
+    terms = fill.derived_seed_terms("브랜드", guides_dir, FakeDerivedRouter(), ["기존키워드"], n=10)
+    assert terms == ["파생어1", "파생어2"]
+
+
+def test_derived_seed_terms_empty_without_router_or_base():
+    assert fill.derived_seed_terms("브랜드", ".", None, ["a"]) == []
+    assert fill.derived_seed_terms("브랜드", ".", object(), []) == []
+
+
+def test_weighted_cap_scales_with_adoption_rate():
+    base = 10
+    assert fill.weighted_cap(base, "자동완성", None) == base
+    low = fill.weighted_cap(base, "자동완성", {"자동완성": 0.0})
+    high = fill.weighted_cap(base, "자동완성", {"자동완성": 1.0})
+    assert low < base < high
+
+
+def test_gather_seeds_includes_derived_source(tmp_path):
+    db = tmp_path / "b.sqlite"
+    guides_dir = tmp_path / "guides"
+    guides_dir.mkdir()
+    (guides_dir / "브랜드.md").write_text("- 브랜드/제품: 테스트제품\n", encoding="utf-8")
+    _seed_db(db, extra_eligible=0)
+    conn = kd_store.open_db(db)
+    kr.migrate(conn)
+    fill.migrate_fill_columns(conn)
+
+    class FakeDerivedRouter:
+        def complete(self, purpose, system, user, max_tokens=1500):
+            if purpose == "keyword_fill_seed_derived":
+                return json.dumps(["파생후보1"], ensure_ascii=False)
+            return json.dumps([], ensure_ascii=False)
+
+    seeds = fill.gather_seeds(conn, "브랜드", guides_dir, FakeDerivedRouter(), seed_limit=1)
+    by = {}
+    for s, t in seeds:
+        by.setdefault(t, []).append(s)
+    assert "파생후보1" in by.get(fill.SOURCE_DERIVED, [])
+    conn.close()
