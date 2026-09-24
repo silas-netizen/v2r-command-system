@@ -624,6 +624,247 @@ def rescore_legacy_unrelated_brand(
     )
 
 
+# --- 브랜드별 재채점 CLI 진입점(병렬 실행용, 2026-09-24) -----------------------
+#
+# `키워드 연관도 재채점 재산정` 실행기 작업(v2r.engine.worker._keyword_relevance_rescore_legacy)이
+# 5개 브랜드를 실행기 프로세스 안에서 순차로 돌리면 메인 줄을 몇 시간 막는다
+# (2026-09-24 장애). 대신 `scripts/rescore-hidden.vbs`가 이 진입점을 브랜드별로
+# 5개 숨김 프로세스로 동시에 띄운다.
+
+#: 요금제 한도로 보이는 오류 문구(요금제 길 전체가 막혔을 때 router.complete가
+#: 결국 던지는 LLMDisabled 메시지, 또는 PlanLimit/PlanError 원문에 남는 조각).
+QUOTA_MARKERS = (
+    "한도",
+    "quota",
+    "길이 없습니다",
+    "usage limit",
+    "rate limit",
+    "rate_limit",
+    "limit reached",
+    "too many requests",
+    "overloaded",
+)
+
+#: 요금제 한도에 걸렸을 때 쉬었다 재개하는 간격(초) — 사용자 지시 2026-09-24: 10분.
+RESCORE_QUOTA_WAIT_SEC = 600
+
+
+def _looks_like_quota_error(exc: BaseException) -> bool:
+    msg = str(exc)
+    return any(marker in msg for marker in QUOTA_MARKERS)
+
+
+class _PatientRouter:
+    """요금제 한도 오류(plan_quota)가 나면 `wait_seconds`만큼 쉬고 자동으로 재시도한다.
+
+    `LLMRouter.complete`은 요금제 길이 5시간 잠기면 다른 길이 없을 때
+    `LLMDisabled`를 던진다(0원 원칙상 API 길을 안 씀). 이 래퍼는 그 오류(및
+    한도로 보이는 다른 오류)를 잡아 `sleep_fn`으로 쉰 뒤 같은 호출을 다시
+    시도한다 — 예약 신뢰성 원칙(틀어지면 즉시 감지·자동 복구)을 재채점에도
+    적용한 것. 한도가 아닌 오류(파싱 실패 등)는 그대로 올려보내
+    `score_batch`의 기존 재시도·실패 처리가 맡는다.
+    """
+
+    def __init__(self, inner: Any, wait_seconds: float = RESCORE_QUOTA_WAIT_SEC, sleep_fn: Any | None = None) -> None:
+        import time as _time
+
+        self._inner = inner
+        self._wait = wait_seconds
+        self._sleep = sleep_fn or _time.sleep
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    def complete(self, *args: Any, **kwargs: Any) -> str:
+        while True:
+            try:
+                return self._inner.complete(*args, **kwargs)
+            except Exception as exc:  # noqa: BLE001 - 한도인지 먼저 보고, 아니면 그대로 올린다
+                if _looks_like_quota_error(exc):
+                    log.warning(
+                        "요금제 한도로 보이는 오류 — %.0f초 쉬고 자동 재개: %s", self._wait, exc
+                    )
+                    self._sleep(self._wait)
+                    continue
+                raise
+
+
+def rescore_progress_path(brand: str, data_dir: str | Path = "data") -> Path:
+    return Path(data_dir) / "keywords" / f"rescore_progress_{brand}.json"
+
+
+#: 같은 브랜드 재채점 프로세스가 이미 돌고 있으면 중복 실행하지 않는다(사용자 지시
+#: 2026-09-24). 잠금은 mtime로만 판단한다 — 이 파일을 살아있는 동안 주기적으로
+#: 만져(touch) 신선하게 유지하고, 이만큼(초) 오래되면 "죽은 잠금"으로 보고 무시한다.
+LOCK_STALE_SEC = 600
+#: 살아있는 재채점 워커가 잠금을 다시 touch하는 주기(초). 죽은 잠금 판정 문턱보다
+#: 충분히 짧아야 정상 실행 중에 죽은 잠금으로 오판되지 않는다.
+LOCK_TOUCH_INTERVAL_SEC = 120
+
+
+def rescore_lock_path(brand: str, data_dir: str | Path = "data") -> Path:
+    return Path(data_dir) / "locks" / f"rescore-{brand}.lock"
+
+
+def acquire_rescore_lock(brand: str, data_dir: str | Path = "data") -> Path | None:
+    """잠금 파일을 얻는다. 이미 신선한(10분 이내) 잠금이 있으면 `None`(중복 실행 거부)."""
+    import os as _os
+    import time as _time
+
+    path = rescore_lock_path(brand, data_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        age = _time.time() - path.stat().st_mtime
+        if age < LOCK_STALE_SEC:
+            return None
+        log.info("죽은 잠금(%.0f초 경과) 무시하고 이어받음: %s", age, path)
+    path.write_text(f"{_os.getpid()} {_now_iso()}", encoding="utf-8")
+    return path
+
+
+def release_rescore_lock(path: Path | None) -> None:
+    if path is None:
+        return
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
+def rescore_worker(
+    brand: str,
+    db_path: str | Path | None = None,
+    guides_dir: str | Path | None = None,
+    progress_path: str | Path | None = None,
+    log_path: str | Path | None = None,
+    codex_exe: str = "",
+    router: Any | None = None,
+    repo_root: str | Path | None = None,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+) -> dict[str, Any]:
+    """브랜드 하나의 구 척도(3=무관) 재채점을 끝까지 돌린다(진입점 본체).
+
+    `python -m v2r.knowledge.keyword_relevance --rescore-worker <브랜드>`가
+    이 함수를 부른다. 경로를 안 주면 저장소 기본 위치(`data/keywords/...`,
+    `logs/rescore-<브랜드>.log`)를 쓴다. `router`를 안 주면 실행기·채우기
+    순환과 같은 방식(`LLMRouter.from_settings`)으로 얻어 `_PatientRouter`로
+    감싼다(요금제 한도 10분 대기 자동 재개).
+
+    끝난 뒤에는 이 브랜드의 GPT(Codex) 미검증분(`pending_codex_rows`) 전체를
+    이어서 교차검증한다(재채점 대상이 아니었던 것도 포함 — 사용자 지시).
+    """
+    if repo_root is None:
+        from v2r.config import get_settings
+
+        repo_root = get_settings().repo_root
+    repo_root = Path(repo_root)
+    if db_path is None:
+        db_path = repo_root / "data" / "keywords" / f"{brand}.sqlite"
+    if guides_dir is None:
+        guides_dir = repo_root / "warehouse" / "guides" / "정리본"
+    if progress_path is None:
+        progress_path = rescore_progress_path(brand, repo_root / "data")
+    if log_path is None:
+        log_path = repo_root / "logs" / f"rescore-{brand}.log"
+
+    log_path = Path(log_path)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    file_handler = logging.FileHandler(str(log_path), encoding="utf-8")
+    file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    root_log = logging.getLogger()
+    root_log.addHandler(file_handler)
+    if root_log.level > logging.INFO or root_log.level == logging.NOTSET:
+        root_log.setLevel(logging.INFO)
+
+    lock_path = acquire_rescore_lock(brand, repo_root / "data")
+    if lock_path is None:
+        log.info("이미 같은 브랜드 재채점이 돌고 있어 건너뜁니다: %s", brand)
+        root_log.removeHandler(file_handler)
+        file_handler.close()
+        return {"skipped": "already_running", "brand": brand}
+
+    import threading as _threading
+
+    _stop_heartbeat = _threading.Event()
+
+    def _touch_loop() -> None:
+        while not _stop_heartbeat.wait(LOCK_TOUCH_INTERVAL_SEC):
+            try:
+                lock_path.touch()
+            except OSError:
+                pass
+
+    _heartbeat_th = _threading.Thread(target=_touch_loop, name=f"rescore-lock-{brand}", daemon=True)
+    _heartbeat_th.start()
+
+    try:
+        if router is None:
+            from v2r.config import get_settings
+            from v2r.llm.router import LLMRouter
+
+            router = _PatientRouter(LLMRouter.from_settings(get_settings()))
+
+        update_progress(progress_path, brand, status="running", scored=0, pending=0, codex_checked=0)
+        log.info("재채점 시작: brand=%s db=%s", brand, db_path)
+
+        result = rescore_legacy_unrelated_brand(
+            router, brand, db_path, guides_dir, batch_size=batch_size,
+            progress_path=progress_path, codex_exe=codex_exe,
+        )
+        log.info("재채점(구 3→3/4 분리) 완료: %s", result)
+
+        # 재채점 대상이 아니었어도 GPT 교차검증이 안 된 키워드가 있으면 이어서 처리한다.
+        extra = crosscheck_brand(
+            brand, db_path, guides_dir, batch_size=batch_size,
+            progress_path=progress_path, codex_exe=codex_exe,
+        )
+        log.info("이어서 GPT 교차검증 완료: %s", extra)
+
+        conn = sqlite3.connect(str(db_path))
+        try:
+            pending = len(pending_legacy_unrelated_rows(conn))
+            pending_codex = len(pending_codex_rows(conn))
+        finally:
+            conn.close()
+
+        update_progress(
+            progress_path,
+            brand,
+            status="done",
+            scored=result.get("scored", 0),
+            pending=pending,
+            codex_checked=result.get("checked", 0) + extra.get("checked", 0),
+            pending_codex=pending_codex,
+        )
+        summary = {**result, "extra_codex_checked": extra.get("checked", 0), "pending": pending}
+        log.info("재채점 전체 종료: %s", summary)
+        return summary
+    except Exception as exc:  # noqa: BLE001 - 진행 파일에 실패를 남기고 올려보낸다
+        update_progress(progress_path, brand, status="failed", error=f"{exc.__class__.__name__}: {exc}")
+        log.exception("재채점 실패: brand=%s", brand)
+        raise
+    finally:
+        _stop_heartbeat.set()
+        release_rescore_lock(lock_path)
+        root_log.removeHandler(file_handler)
+        file_handler.close()
+
+
+def rescore_worker_main(argv: list[str]) -> int:
+    """`python -m v2r.knowledge.keyword_relevance --rescore-worker <브랜드>`."""
+    if not argv:
+        print("사용법: python -m v2r.knowledge.keyword_relevance --rescore-worker <브랜드>")
+        return 2
+    brand = argv[0]
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    try:
+        rescore_worker(brand)
+    except Exception as exc:  # noqa: BLE001 - 종료 코드로만 실패를 알린다(로그에 상세)
+        log.error("재채점 워커 종료(실패): brand=%s: %s", brand, exc)
+        return 1
+    return 0
+
+
 # --- 브랜드 간 중복 배정 -----------------------------------------------
 
 
@@ -959,4 +1200,23 @@ __all__ = [
     "pending_codex_rows",
     "crosscheck_brand",
     "score_and_crosscheck_brand",
+    "QUOTA_MARKERS",
+    "RESCORE_QUOTA_WAIT_SEC",
+    "rescore_progress_path",
+    "rescore_worker",
+    "rescore_worker_main",
+    "LOCK_STALE_SEC",
+    "LOCK_TOUCH_INTERVAL_SEC",
+    "rescore_lock_path",
+    "acquire_rescore_lock",
+    "release_rescore_lock",
 ]
+
+
+if __name__ == "__main__":
+    import sys
+
+    if len(sys.argv) > 2 and sys.argv[1] == "--rescore-worker":
+        raise SystemExit(rescore_worker_main(sys.argv[2:]))
+    print("사용법: python -m v2r.knowledge.keyword_relevance --rescore-worker <브랜드>")
+    raise SystemExit(2)

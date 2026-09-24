@@ -1269,3 +1269,33 @@ def test_sheet_sync_keywords_dispatch_all(tmp_path, monkeypatch):
     assert len(calls) == 1
     assert "우아덤" in out["per_brand"]
     rt.close()
+
+
+def test_키워드_연관도_재채점_작업은_순차실행_대신_숨김스크립트를_띄우고_바로끝난다(tmp_path, monkeypatch):
+    """2026-09-24: 실행기 줄을 몇 시간 잡던 순차 재채점을 rescore-hidden.vbs 실행으로 바꿨다.
+
+    dispatch가 브랜드 5개를 순차로 돌지 않고, cscript로 vbs를 한 번 띄운 뒤
+    즉시 반환하는지 확인한다(subprocess.Popen을 가짜로 바꿔 실제 프로세스는
+    띄우지 않는다).
+    """
+    rt = make_runtime(tmp_path)
+    (tmp_path / "scripts").mkdir(exist_ok=True)
+    (tmp_path / "scripts" / "rescore-hidden.vbs").write_text("' stub", encoding="utf-8")
+
+    calls = []
+
+    class _FakePopen:
+        def __init__(self, cmd, **kwargs):
+            calls.append((cmd, kwargs))
+
+    monkeypatch.setattr(worker.subprocess, "Popen", _FakePopen)
+
+    spec = TaskSpec(task="keyword_relevance_rescore_legacy")
+    out = worker._keyword_relevance_rescore_legacy(rt, spec)
+
+    assert out["ok"] is True
+    assert len(calls) == 1
+    cmd, kwargs = calls[0]
+    assert cmd[0] == "cscript"
+    assert cmd[1] == "//nologo"
+    assert cmd[2].endswith("rescore-hidden.vbs")

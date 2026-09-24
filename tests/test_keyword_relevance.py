@@ -543,3 +543,126 @@ def test_brand_status_distribution(tmp_path):
     assert status["distribution"][0] == 1
     assert status["distribution"][3] == 1
     assert status["distribution"][1] == 0
+
+
+# --- 브랜드별 재채점 CLI 진입점(병렬 실행, 2026-09-24) -----------------------
+
+
+def test_patient_router_waits_out_quota_then_succeeds(monkeypatch):
+    calls = {"n": 0}
+
+    class _Inner:
+        def complete(self, purpose, system, user, max_tokens=1200):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("모델을 부를 수 있는 길이 없습니다 (사용 한도)")
+            return "ok"
+
+    slept = []
+    router = kr._PatientRouter(_Inner(), wait_seconds=1, sleep_fn=slept.append)
+    out = router.complete("purpose", "sys", "user")
+    assert out == "ok"
+    assert calls["n"] == 2
+    assert slept == [1]
+
+
+def test_patient_router_reraises_non_quota_error(monkeypatch):
+    class _Inner:
+        def complete(self, purpose, system, user, max_tokens=1200):
+            raise kr.RelevanceParseError("응답이 JSON 배열이 아닙니다")
+
+    router = kr._PatientRouter(_Inner(), wait_seconds=1, sleep_fn=lambda s: None)
+    with pytest.raises(kr.RelevanceParseError):
+        router.complete("purpose", "sys", "user")
+
+
+def test_looks_like_quota_error_matches_known_markers():
+    assert kr._looks_like_quota_error(RuntimeError("usage limit 도달"))
+    assert kr._looks_like_quota_error(RuntimeError("한도에 걸렸습니다"))
+    assert not kr._looks_like_quota_error(RuntimeError("JSON이 아닙니다"))
+
+
+def test_acquire_rescore_lock_blocks_duplicate_then_allows_after_stale(tmp_path, monkeypatch):
+    data_dir = tmp_path / "data"
+    lock1 = kr.acquire_rescore_lock("우아덤", data_dir)
+    assert lock1 is not None
+    assert lock1.exists()
+
+    # 신선한 잠금이 있으면 두 번째 시도는 거부된다.
+    lock2 = kr.acquire_rescore_lock("우아덤", data_dir)
+    assert lock2 is None
+
+    # 죽은(오래된) 잠금은 무시하고 다시 얻는다.
+    import os
+    import time
+
+    old = time.time() - kr.LOCK_STALE_SEC - 5
+    os.utime(lock1, (old, old))
+    lock3 = kr.acquire_rescore_lock("우아덤", data_dir)
+    assert lock3 is not None
+
+    kr.release_rescore_lock(lock3)
+    assert not lock3.exists()
+
+
+def test_acquire_rescore_lock_is_per_brand(tmp_path):
+    data_dir = tmp_path / "data"
+    lock_a = kr.acquire_rescore_lock("우아덤", data_dir)
+    lock_b = kr.acquire_rescore_lock("코숨핏", data_dir)
+    assert lock_a is not None and lock_b is not None
+    assert lock_a != lock_b
+
+
+def test_rescore_worker_skips_when_lock_held(tmp_path, monkeypatch):
+    repo = tmp_path
+    (repo / "data" / "keywords").mkdir(parents=True)
+    (repo / "logs").mkdir()
+    kr.acquire_rescore_lock("우아덤", repo / "data")
+
+    def _boom(*a, **kw):
+        raise AssertionError("잠금이 있으면 채점을 시작하면 안 된다")
+
+    monkeypatch.setattr(kr, "rescore_legacy_unrelated_brand", _boom)
+    out = kr.rescore_worker("우아덤", repo_root=repo, router=object())
+    assert out == {"skipped": "already_running", "brand": "우아덤"}
+
+
+def test_rescore_worker_runs_and_writes_progress(tmp_path, monkeypatch):
+    repo = tmp_path
+    (repo / "data" / "keywords").mkdir(parents=True)
+    (repo / "warehouse" / "guides" / "정리본").mkdir(parents=True)
+    (repo / "logs").mkdir()
+    db = repo / "data" / "keywords" / "우아덤.sqlite"
+    _make_db(db, [])
+    kr.migrate_path(db)
+
+    monkeypatch.setattr(
+        kr, "rescore_legacy_unrelated_brand",
+        lambda router, brand, db_path, guides_dir, **kw: {
+            "scored": 3, "score_failed_batches": 0, "checked": 3, "codex_failed_batches": 0,
+        },
+    )
+    monkeypatch.setattr(
+        kr, "crosscheck_brand",
+        lambda brand, db_path, guides_dir, **kw: {"checked": 1, "failed_batches": 0},
+    )
+
+    out = kr.rescore_worker("우아덤", repo_root=repo, router=object())
+    assert out["scored"] == 3
+    assert out["extra_codex_checked"] == 1
+    assert out["pending"] == 0
+
+    progress_path = kr.rescore_progress_path("우아덤", repo / "data")
+    data = json.loads(progress_path.read_text(encoding="utf-8"))
+    assert data["우아덤"]["status"] == "done"
+    assert data["우아덤"]["scored"] == 3
+
+    log_path = repo / "logs" / "rescore-우아덤.log"
+    assert log_path.exists()
+
+    lock_path = kr.rescore_lock_path("우아덤", repo / "data")
+    assert not lock_path.exists()  # 끝나면 잠금을 놓는다
+
+
+def test_rescore_worker_main_requires_brand_arg():
+    assert kr.rescore_worker_main([]) == 2

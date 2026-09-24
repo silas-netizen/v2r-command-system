@@ -9,6 +9,7 @@ import os
 import random
 import re
 import socket
+import subprocess
 import threading
 import time
 import uuid
@@ -2410,76 +2411,40 @@ def _keyword_relevance_rescore_legacy(
     """`키워드 연관도 재채점 <브랜드|전체>` — 구 척도 3(무관)이던 키워드만
 
     새 척도(0에서 4, 3=당위성/4=무관)로 다시 채점한다(사용자 지시 2026-09-24).
-    브랜드가 없으면 발굴이 끝난 브랜드 전부를 돈다. 실제 대량 실행(5개 브랜드
-    약 3만 7천개)은 이 명령을 브랜드별로 명시적으로 호출해야 한다 — 이 함수
-    자체가 "전체"를 자동으로 한꺼번에 돌리진 않게 브랜드별로 순차 처리한다.
+
+    2026-09-24 변경(사용자 지시): 예전에는 이 작업이 실행기 프로세스 안에서
+    5개 브랜드를 순차로 몇 시간 돌려 메인 줄을 막았다. 이제는
+    `scripts/rescore-hidden.vbs`(→ `scripts/rescore.cmd`)를 창 없이 띄우기만
+    하고 곧바로 끝난다 — 5개 브랜드는 각자 숨김 프로세스로 병렬로 돌며,
+    브랜드별 진행은 `data/keywords/rescore_progress_<브랜드>.json`,
+    로그는 `logs/rescore-<브랜드>.log`에 남는다(브랜드 하나만 지정해도 그
+    브랜드만 도는 게 아니라 5개 다 띄운다 — vbs가 브랜드별 워커 자체이므로
+    개별 브랜드만 골라 띄우는 기능은 없다. 이미 도는 브랜드는 잠금 파일로
+    스스로 건너뛴다).
     """
-    from v2r.command.parser import BRAND_NAMES
-    from v2r.knowledge import keyword_relevance as kr_mod
-
     repo = Path(rt.settings.repo_root)
-    data_dir = repo / "data" / "keywords"
-    guides_dir = repo / "warehouse" / "guides" / "정리본"
-    progress_path = data_dir / "relevance_rescore_progress.json"
-
-    brand = (spec.brand or "").strip()
-    brands = [brand] if brand else [b for b in BRAND_NAMES if (data_dir / f"{b}.sqlite").exists()]
-
-    # 2026-09-24 사고: 재채점은 몇 시간짜리 작업인데 진행 표시(리스 연장·이벤트)가 없어
-    # 감시기가 "30분 멈춤"으로 실패 처리·재큐잉했다(작업 180→181). 5분마다 리스를 연장하고
-    # 진행 파일의 숫자를 이벤트로 남겨 감시기가 "움직이는 작업"으로 보게 한다.
-    import json as _json
-    import threading as _threading
-
-    stop = _threading.Event()
-
-    def _beat_loop() -> None:
-        while not stop.wait(300):
-            try:
-                touch_heartbeat(rt)
-                if owner and job_id is not None:
-                    rt.jobs.heartbeat(job_id, owner)
-                    prog = {}
-                    if progress_path.exists():
-                        prog = _json.loads(progress_path.read_text(encoding="utf-8")) or {}
-                    summary = ", ".join(
-                        f"{k} {v.get('scored', 0)}/{v.get('total_pending_at_start', '?')}"
-                        for k, v in prog.items() if isinstance(v, dict)
-                    )
-                    rt.events.log(job_id, "info", f"재채점 진행: {summary or '시작'}")
-            except Exception as exc:  # noqa: BLE001
-                log.warning("재채점 진행 표시 실패: %s", exc)
-
-    beat_th = _threading.Thread(target=_beat_loop, name="v2r-rescore-beat", daemon=True)
-    beat_th.start()
-
-    results: dict[str, dict] = {}
-    for b in brands:
-        db_path = data_dir / f"{b}.sqlite"
-        if not db_path.exists():
-            results[b] = {"ok": False, "error": "키워드 DB가 없습니다(발굴 먼저 필요)"}
-            continue
+    vbs_path = repo / "scripts" / "rescore-hidden.vbs"
+    try:
+        subprocess.Popen(
+            ["cscript", "//nologo", str(vbs_path)],
+            cwd=str(repo),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        msg = "키워드 연관도 재채점: 5개 브랜드 숨김 프로세스로 띄웠습니다(진행은 진행 파일 참고)"
+    except Exception as exc:  # noqa: BLE001
+        msg = f"키워드 연관도 재채점 시작 실패: {exc.__class__.__name__}: {exc}"
         try:
-            out = kr_mod.rescore_legacy_unrelated_brand(
-                rt.llm, b, db_path, guides_dir, progress_path=progress_path
-            )
-            results[b] = {"ok": True, **out}
-        except Exception as exc:  # noqa: BLE001
-            results[b] = {"ok": False, "error": f"{exc.__class__.__name__}: {exc}"}
+            notify_all(rt.channels, msg)
+        except Exception:  # noqa: BLE001
+            pass
+        return {"ok": False, "message": msg}
 
-    stop.set()
-    lines = []
-    for b, out in results.items():
-        if out.get("ok"):
-            lines.append(f"{b} 재채점 {out.get('scored', 0)}개/검증 {out.get('checked', 0)}개")
-        else:
-            lines.append(f"{b} 실패: {out.get('error')}")
-    msg = "키워드 연관도 재채점(당위성/무관 분리): " + " / ".join(lines)
     try:
         notify_all(rt.channels, msg)
     except Exception:  # noqa: BLE001
         pass
-    return {"ok": True, "message": msg, "per_brand": results}
+    return {"ok": True, "message": msg}
 
 
 def _keyword_relevance_status(rt: Runtime, spec: TaskSpec) -> dict:
