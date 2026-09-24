@@ -685,25 +685,100 @@ def test_update_worker_state_중복률_집계(tmp_path):
     assert round(totals["duplicate_rate"], 4) == round(1 / 3, 4)
 
 
-def test_process_one_최소간격안_재검사는_duplicate_True(tmp_path, monkeypatch):
+def test_update_worker_state_min_gap_violation_집계_분모공유(tmp_path):
+    """2026-09-24 7차 — `duplicate`·`min_gap_violation`을 같은 호출에 함께
+    넘기면 `checked_count`(분모)를 이중으로 세지 않는다."""
+    exposure_runner.update_worker_state(tmp_path, 0, processed_delta=1, duplicate=False, min_gap_violation=True)
+    exposure_runner.update_worker_state(tmp_path, 0, processed_delta=1, duplicate=True, min_gap_violation=False)
+
+    state = exposure_runner._load_state(tmp_path)
+    w0 = state["workers"]["0"]
+    assert w0["checked_count"] == 2, "duplicate·min_gap_violation을 같이 넘겨도 분모는 한 번만 는다"
+    assert w0["duplicate_count"] == 1
+    assert w0["min_gap_violation_count"] == 1
+    assert w0["min_gap_violation_rate"] == 0.5
+
+    totals = state["duplicate_totals"]
+    assert totals["checked_count"] == 2
+    assert totals["min_gap_violation_count"] == 1
+
+
+def test_process_one_최소간격안_재검사는_min_gap_violation_True(tmp_path, monkeypatch):
+    """2026-09-24 7차 — 옛 `duplicate`(최소 간격 문턱값)는 이제
+    `min_gap_violation`으로 이름이 바뀌었다. 등급 규칙 재사용
+    (`priority_tier`)으로 판정하므로 `keyword_universe`를 몽키패치해
+    "최근 발행" 예외가 아닌 평범한 3등급 키워드로 만든다."""
     rt = make_runtime(tmp_path)
     brand, keyword = "테스트브랜드", "키워드"
     store.save(rt.conn, ke.ExposureRow(brand, keyword, "마이카페", "", None, "pushed", now_iso()).as_row())
     item = {"keyword": keyword, "cafe": "마이카페", "t0_status": "", "volume": 0}
+    monkeypatch.setattr(ke, "keyword_universe", lambda rt_, brand_: [item])
 
     monkeypatch.setattr(exposure_runner, "judge_once", lambda rt_, ctx, b, i, cfg, **kw: _fake_row(b, i["keyword"], "pushed"))
     result = exposure_runner.process_one(rt, object(), brand, item, {})
-    assert result["duplicate"] is True
+    assert result["min_gap_violation"] is True
 
 
-def test_process_one_주기지난_재검사는_duplicate_False(tmp_path, monkeypatch):
+def test_process_one_주기지난_재검사는_min_gap_violation_False(tmp_path, monkeypatch):
     rt = make_runtime(tmp_path)
     brand, keyword = "테스트브랜드", "키워드"
     old_checked = (datetime.now(timezone.utc) - timedelta(hours=20)).isoformat()
     store.save(rt.conn, ke.ExposureRow(brand, keyword, "마이카페", "", None, "pushed", old_checked).as_row())
     item = {"keyword": keyword, "cafe": "마이카페", "t0_status": "", "volume": 0}
+    monkeypatch.setattr(ke, "keyword_universe", lambda rt_, brand_: [item])
 
     monkeypatch.setattr(exposure_runner, "judge_once", lambda rt_, ctx, b, i, cfg, **kw: _fake_row(b, i["keyword"], "pushed"))
+    result = exposure_runner.process_one(rt, object(), brand, item, {})
+    assert result["min_gap_violation"] is False
+
+
+def test_process_one_최근발행_키워드는_최소간격_안지켜도_위반아님(tmp_path, monkeypatch):
+    """2026-09-24 7차 실측(10:20 이후 창) — 중복의 대부분이 "최근 발행"
+    (2등급, 원래 재검사 간격이 없음) 키워드였다. `min_gap_violation`은 이
+    설계를 그대로 반영해 거짓이어야 한다."""
+    rt = make_runtime(tmp_path)
+    brand, keyword = "테스트브랜드", "키워드"
+    store.save(rt.conn, ke.ExposureRow(brand, keyword, "마이카페", "", None, "pushed", now_iso()).as_row())
+    item = {"keyword": keyword, "cafe": "마이카페", "t0_status": "", "volume": 0}
+    monkeypatch.setattr(ke, "keyword_universe", lambda rt_, brand_: [item])
+    # "최근 발행" 집합에 이 키워드가 들어 있는 것처럼 흉내낸다
+    monkeypatch.setattr(exposure_priority, "_recent_publish_keywords", lambda *a, **kw: {"키워드"})
+
+    monkeypatch.setattr(exposure_runner, "judge_once", lambda rt_, ctx, b, i, cfg, **kw: _fake_row(b, i["keyword"], "pushed"))
+    result = exposure_runner.process_one(rt, object(), brand, item, {})
+    assert result["min_gap_violation"] is False
+
+
+def test_process_one_duplicate는_이번실행_시작시각_이후만(tmp_path, monkeypatch):
+    """2026-09-24 7차 — `duplicate`는 이제 "이 러너 실행(run_started_at
+    이후) 안에서 두 번째 이상 검사"만 뜻한다. 재시작 전(run_started_at
+    이전) 검사는 아무리 직전이어도 중복으로 안 센다."""
+    rt = make_runtime(tmp_path)
+    brand, keyword = "테스트브랜드", "키워드"
+    item = {"keyword": keyword, "cafe": "마이카페", "t0_status": "", "volume": 0}
+    monkeypatch.setattr(ke, "keyword_universe", lambda rt_, brand_: [item])
+    monkeypatch.setattr(exposure_runner, "judge_once", lambda rt_, ctx, b, i, cfg, **kw: _fake_row(b, i["keyword"], "pushed"))
+
+    # 재시작 전 검사 하나만 있음 — run_started_at을 그 이후로 잡으면 중복 아님
+    old_checked = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    store.save(rt.conn, ke.ExposureRow(brand, keyword, "마이카페", "", None, "pushed", old_checked).as_row())
+    run_started_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+    result = exposure_runner.process_one(rt, object(), brand, item, {}, run_started_at=run_started_at)
+    assert result["duplicate"] is False, "재시작 이전 검사는 이번 실행의 중복이 아니다"
+
+    # 이번 실행 안에서 방금 또 검사됨 — 이제는 중복
+    result2 = exposure_runner.process_one(rt, object(), brand, item, {}, run_started_at=run_started_at)
+    assert result2["duplicate"] is True, "이번 실행 시작 이후 검사가 있으면 다음 검사는 중복이다"
+
+
+def test_process_one_run_started_at_없으면_duplicate_항상_False(tmp_path, monkeypatch):
+    rt = make_runtime(tmp_path)
+    brand, keyword = "테스트브랜드", "키워드"
+    item = {"keyword": keyword, "cafe": "마이카페", "t0_status": "", "volume": 0}
+    monkeypatch.setattr(ke, "keyword_universe", lambda rt_, brand_: [item])
+    monkeypatch.setattr(exposure_runner, "judge_once", lambda rt_, ctx, b, i, cfg, **kw: _fake_row(b, i["keyword"], "pushed"))
+    store.save(rt.conn, ke.ExposureRow(brand, keyword, "마이카페", "", None, "pushed", now_iso()).as_row())
+
     result = exposure_runner.process_one(rt, object(), brand, item, {})
     assert result["duplicate"] is False
 

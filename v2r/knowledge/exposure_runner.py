@@ -163,14 +163,24 @@ def update_worker_state(
     resting_until: float | None = None,
     started_at: str | None = None,
     duplicate: bool | None = None,
+    min_gap_violation: bool | None = None,
 ) -> dict:
     """작업자 상태 갱신(다른 프로세스와 동시에 써도 마지막 쓰기가 이긴다 —
     작업자별 키가 나뉘어 있어 충돌해도 서로 덮어쓰지 않는다).
 
     2026-09-24 3차 — `duplicate`(이번 처리 건이 중복 재검사였는지, `True`/
     `False`)를 넘기면 작업자별·전체 중복률(`duplicate_rate`)을 같이 집계해
-    `data/exposure_runner_state.json`에 남긴다(`exposure_runner.process_one`의
-    `_is_duplicate_recheck` 판정 결과)."""
+    `data/exposure_runner_state.json`에 남긴다.
+
+    2026-09-24 7차(코디네이터 지시) — `duplicate`의 뜻이 바뀌었다: 재시작
+    이전 검사까지 세던 옛 정의(53%까지 나와 운영 지표로 못 썼다, 6-5절) 대신
+    "이 러너 실행 안에서 같은 (브랜드,키워드)를 두 번 이상 검사했는가"만
+    센다(`process_one._is_duplicate_since_run_start`). 별도로
+    `min_gap_violation`(그 순간 등급 규칙상 아직 재검사 대상이 아니었는지,
+    `process_one._min_gap_violation`)도 넘기면 같은 방식으로
+    `min_gap_violation_count`/`min_gap_violation_rate`를 집계한다 — 둘 다
+    같은 `checked_count` 분모를 공유한다(한 번의 처리 건에 대해 두 지표를
+    같이 넘기므로 분모를 이중으로 세지 않는다)."""
     state = _load_state(repo_root)
     workers = state.setdefault("workers", {})
     w = workers.setdefault(str(worker_id), {"processed": 0, "started_at": started_at or now_iso_utc()})
@@ -181,20 +191,35 @@ def update_worker_state(
         w["last_at"] = now_iso_utc()
     if resting_until is not None:
         w["resting_until"] = resting_until
-    if duplicate is not None:
-        w["duplicate_count"] = int(w.get("duplicate_count", 0)) + (1 if duplicate else 0)
+    if duplicate is not None or min_gap_violation is not None:
         w["checked_count"] = int(w.get("checked_count", 0)) + 1
-        w["duplicate_rate"] = round(w["duplicate_count"] / max(1, w["checked_count"]), 4)
+        if duplicate is not None:
+            w["duplicate_count"] = int(w.get("duplicate_count", 0)) + (1 if duplicate else 0)
+            w["duplicate_rate"] = round(w["duplicate_count"] / max(1, w["checked_count"]), 4)
+        if min_gap_violation is not None:
+            w["min_gap_violation_count"] = int(w.get("min_gap_violation_count", 0)) + (1 if min_gap_violation else 0)
+            w["min_gap_violation_rate"] = round(w["min_gap_violation_count"] / max(1, w["checked_count"]), 4)
     elapsed_h = max(
         1e-6,
         (time.time() - _to_epoch(w.get("started_at", now_iso_utc()))) / 3600.0,
     )
     w["rate_per_hour"] = round(int(w.get("processed", 0)) / elapsed_h, 1)
-    if duplicate is not None:
-        totals = state.setdefault("duplicate_totals", {"duplicate_count": 0, "checked_count": 0})
-        totals["duplicate_count"] = int(totals.get("duplicate_count", 0)) + (1 if duplicate else 0)
+    if duplicate is not None or min_gap_violation is not None:
+        totals = state.setdefault(
+            "duplicate_totals",
+            {"duplicate_count": 0, "min_gap_violation_count": 0, "checked_count": 0},
+        )
         totals["checked_count"] = int(totals.get("checked_count", 0)) + 1
-        totals["duplicate_rate"] = round(totals["duplicate_count"] / max(1, totals["checked_count"]), 4)
+        if duplicate is not None:
+            totals["duplicate_count"] = int(totals.get("duplicate_count", 0)) + (1 if duplicate else 0)
+            totals["duplicate_rate"] = round(totals["duplicate_count"] / max(1, totals["checked_count"]), 4)
+        if min_gap_violation is not None:
+            totals["min_gap_violation_count"] = int(totals.get("min_gap_violation_count", 0)) + (
+                1 if min_gap_violation else 0
+            )
+            totals["min_gap_violation_rate"] = round(
+                totals["min_gap_violation_count"] / max(1, totals["checked_count"]), 4
+            )
     state["updated_at"] = now_iso_utc()
     _write_state(repo_root, state)
     return w
@@ -440,31 +465,65 @@ def _latest_status(conn: Any, brand: str, keyword: str) -> str:
     return str(row["status"]) if row else ""
 
 
-def _is_duplicate_recheck(prev_row: Any, row: Any, cfg: dict, *, exempt: bool) -> bool:
-    """2026-09-24 3차 — 이번 검사가 최소 간격 규칙(노출완 6시간, 밀려남·미확인
-    12시간)보다 먼저 같은 키워드를 다시 본 "중복 재검사"인지 판정한다(통계용,
-    `exposure_priority.is_due_now`가 미리 걸렀어야 정상적으로는 거의 안 남아야
-    한다). `exempt=True`(2단계 확인 대기 재확인)면 의도된 재검사이므로 중복이
-    아니다."""
-    if exempt or prev_row is None:
+def _is_duplicate_since_run_start(prev_row: Any, run_started_at: "datetime | None", *, exempt: bool) -> bool:
+    """2026-09-24 7차 — 코디네이터 지시로 `duplicate`의 정의를 바꿨다.
+
+    옛 정의(3~6차, `_is_duplicate_recheck`)는 "직전 검사로부터 최소 간격
+    규칙보다 일찍 다시 봤는지"였는데, 이게 **재시작 전에 본 적 있는 키워드**
+    까지 중복으로 셌다 — 오늘 하루 여러 번 재시작해 실측한 세션에서는
+    `duplicate_rate`가 53%까지 나와(6-5절) 운영 지표로 못 썼다.
+
+    새 정의: "이 러너 실행(작업자 프로세스가 시작된 시각 이후) 안에서 같은
+    (브랜드, 키워드)를 두 번 이상 검사했는가" — `prev_row`(직전 검사 행)가
+    있고 그 `checked_at`이 이 실행의 시작 시각(`run_started_at`) 이후면
+    참이다. 재시작 이전 검사는 `prev_row`가 있어도 `checked_at`이
+    `run_started_at`보다 이르므로 중복으로 안 센다. `exempt=True`(2단계
+    확인 대기 재확인)면 의도된 재검사이므로 항상 거짓."""
+    if exempt or prev_row is None or run_started_at is None:
         return False
     from v2r.knowledge.exposure_priority import _parse_iso
 
     prev_dt = _parse_iso(str(prev_row["checked_at"] or ""))
-    row_dt = _parse_iso(row.checked_at)
-    if prev_dt is None or row_dt is None:
+    if prev_dt is None:
         return False
-    age_h = (row_dt - prev_dt).total_seconds() / 3600.0
+    return prev_dt >= run_started_at
+
+
+def _min_gap_violation(rt: Any, brand: str, item: dict, prev_row: Any, now: "datetime", cfg: dict, *, exempt: bool) -> bool:
+    """2026-09-24 7차 — "최소 간격(6시간/12시간) 안 재검사" 지표. 옛
+    `_is_duplicate_recheck`처럼 문턱값만 보지 않고, **같은 우선순위 규칙
+    (`exposure_priority.priority_tier`)을 그대로 재사용**해 "이번 검사가
+    그 순간의 등급 규칙상 실제로 대상이었는지"를 판정한다 — 2등급(최근
+    발행)은 규칙상 원래 최소 간격이 없으므로(설계 그대로, 7차에서도 안
+    바꿈) 몇 분 만에 다시 봐도 위반이 아니다. `prev_row`가 없거나(첫 검사)
+    2단계 확인 대기 재확인(`exempt`)이면 위반이 아니다."""
+    if exempt or prev_row is None:
+        return False
+    from v2r.knowledge.exposure_priority import _universe_bundle, priority_tier
+    from v2r.knowledge.keyword_exposure import _norm
+
     priority_cfg = cfg.get("priority", {}) if isinstance(cfg.get("priority"), dict) else {}
-    prev_status = str(prev_row["status"] or "")
-    due = float(priority_cfg.get("exposed_recheck_hours", 6)) if prev_status == "exposed" else float(
-        priority_cfg.get("pushed_min_gap_hours", 12)
-    )
-    return age_h < due
+    last_checked = {
+        _norm(item.get("keyword", "")): {
+            "checked_at": str(prev_row["checked_at"] or ""), "status": str(prev_row["status"] or "")
+        }
+    }
+    try:
+        bundle = _universe_bundle(rt, brand, priority_cfg, now)
+    except Exception:  # pragma: no cover - 방어용(시트 조회 실패 시 위반 아님으로)
+        return False
+    tier, _age = priority_tier(item, last_checked, bundle["recent_norm"], priority_cfg, bundle["vol_threshold"], now)
+    return tier >= 99
 
 
 def process_one(
-    rt: Any, context: Any, brand: str, item: dict, cfg: dict, executor: "concurrent.futures.ThreadPoolExecutor | None" = None
+    rt: Any,
+    context: Any,
+    brand: str,
+    item: dict,
+    cfg: dict,
+    executor: "concurrent.futures.ThreadPoolExecutor | None" = None,
+    run_started_at: "datetime | None" = None,
 ) -> dict:
     """키워드 하나 검사 + 노출완→밀려남 2단계 확인(아래 참고) + DB/시트 반영.
 
@@ -477,11 +536,12 @@ def process_one(
     지우고 아무 것도 바꾸지 않는다 — 직전 `exposed` 행이 이미 최신이라 그대로
     유지된다. 판정 규칙 자체(`judge_keyword_exposure`)는 그대로 호출만 한다.
 
-    2026-09-24 3차 — 반환 딕셔너리에 `duplicate`(bool)를 추가한다 — 이번
-    검사가 최소 간격 규칙보다 먼저 같은 키워드를 다시 본 것인지(중복
-    재검사)를, 검사 시작 전 읽어 둔 직전 행(`prev_row`)과 이번 결과의
-    시간 차로 판정한다(`_is_duplicate_recheck`). 상태 파일에 집계된다
-    (`update_worker_state`의 `duplicate` 인자, `run_worker` 참고).
+    2026-09-24 7차 — 반환 딕셔너리의 `duplicate`는 이제 "이 러너 실행 안에서
+    두 번째 이상 검사"만 뜻한다(`_is_duplicate_since_run_start`, `run_started_at`
+    필요 — 안 주면 항상 `False`). 별도 필드 `min_gap_violation`을 추가해
+    "그 순간 등급 규칙상 아직 대상이 아니었는지"를 따로 판정한다
+    (`_min_gap_violation`, 등급 2/최근 발행은 원래 간격이 없어 위반이 아님).
+    상태 파일에 각각 집계된다(`update_worker_state`, `run_worker` 참고).
     """
     from v2r.store import keyword_exposure_store as store
 
@@ -489,19 +549,29 @@ def process_one(
     prev_row = store.latest_for_keyword(rt.conn, brand, keyword)
     prev_status = str(prev_row["status"]) if prev_row is not None else ""
     pending = get_pending(rt.settings.repo_root, brand, keyword)
+    exempt = pending is not None
 
     row = judge_once(rt, context, brand, item, cfg, executor=executor)
-    duplicate = _is_duplicate_recheck(prev_row, row, cfg, exempt=pending is not None)
+    duplicate = _is_duplicate_since_run_start(prev_row, run_started_at, exempt=exempt)
+    min_gap_violation = _min_gap_violation(
+        rt, brand, item, prev_row, datetime.now(timezone.utc), cfg, exempt=exempt
+    )
 
     if row.status == "pushed" and (prev_status == "exposed" or pending is not None):
         if pending is None:
             # 노출완 → 밀려남 첫 관측 — 바로 확정하지 않고 대기만 남긴다(DB 미기록).
             set_pending(rt.settings.repo_root, brand, item, cfg)
-            return {"status": "pending_confirm", "keyword": keyword, "duplicate": duplicate}
+            return {
+                "status": "pending_confirm", "keyword": keyword,
+                "duplicate": duplicate, "min_gap_violation": min_gap_violation,
+            }
         # 대기 중이던 키워드의 재확인 — 이번에도 밀려남이면 확정.
         clear_pending(rt.settings.repo_root, brand, keyword)
         _finalize_row(rt, brand, item, row)
-        return {"status": row.status, "keyword": keyword, "rank": row.rank, "confirmed": True, "duplicate": duplicate}
+        return {
+            "status": row.status, "keyword": keyword, "rank": row.rank, "confirmed": True,
+            "duplicate": duplicate, "min_gap_violation": min_gap_violation,
+        }
 
     if pending is not None:
         # 대기 중이었는데 이번엔 밀려남이 아님(exposed로 되돌아옴) — 일시 변동,
@@ -509,10 +579,16 @@ def process_one(
         clear_pending(rt.settings.repo_root, brand, keyword)
         if row.status != "exposed":
             _finalize_row(rt, brand, item, row)
-        return {"status": row.status, "keyword": keyword, "rank": row.rank, "false_alarm_cleared": True, "duplicate": duplicate}
+        return {
+            "status": row.status, "keyword": keyword, "rank": row.rank, "false_alarm_cleared": True,
+            "duplicate": duplicate, "min_gap_violation": min_gap_violation,
+        }
 
     _finalize_row(rt, brand, item, row)
-    return {"status": row.status, "keyword": keyword, "rank": row.rank, "duplicate": duplicate}
+    return {
+        "status": row.status, "keyword": keyword, "rank": row.rank,
+        "duplicate": duplicate, "min_gap_violation": min_gap_violation,
+    }
 
 
 # =======================================================================
@@ -721,6 +797,12 @@ def run_worker(worker_id: int, brands: list[str] | None = None, max_iterations: 
 
     update_worker_state(rt.settings.repo_root, worker_id, processed_delta=0)
 
+    # 2026-09-24 7차 — "이 러너 실행 안에서 중복"을 재기 위한 기준 시각.
+    # 프로세스가 실제로 시작된 순간(재시작 시각)이며, 상태 파일에 남아 있을
+    # 수 있는 예전 `started_at`(재사용될 수 있음)과는 별개로 항상 지금
+    # 새로 잰다.
+    run_started_at = datetime.now(timezone.utc)
+
     priority_cfg = cfg.get("priority", {}) if isinstance(cfg.get("priority"), dict) else {}
     worker_queue = WorkerQueue(
         batch_size=int(priority_cfg.get("batch_size", 10)),
@@ -793,7 +875,9 @@ def run_worker(worker_id: int, brands: list[str] | None = None, max_iterations: 
                         continue
 
                 try:
-                    result = process_one(rt, context, brand, item, cfg, executor=confirm_executor)
+                    result = process_one(
+                        rt, context, brand, item, cfg, executor=confirm_executor, run_started_at=run_started_at
+                    )
                 except Exception:
                     # 검사 자체가 실패(예외)했으면 선점을 완전히 풀어 다른
                     # 작업자가 바로 다시 집을 수 있게 한다 — "완료" 표시를
@@ -808,6 +892,7 @@ def run_worker(worker_id: int, brands: list[str] | None = None, max_iterations: 
                 update_worker_state(
                     rt.settings.repo_root, worker_id, processed_delta=1, last_keyword=item["keyword"],
                     duplicate=bool(result.get("duplicate")),
+                    min_gap_violation=bool(result.get("min_gap_violation")),
                 )
                 unknown_streak = unknown_streak + 1 if result["status"] == "unknown" else 0
                 if unknown_streak >= block_streak_limit:

@@ -563,10 +563,88 @@ Thread`)라 이 경고 자체는 메인 검사 루프를 막지 않는다 — "�
   동시에 수정 중이라(git status로 확인) 이번 커밋에 포함하지 않았다 —
   지시대로 `jobs` 표는 건드리지 않았다.
 
+## 7차 — `duplicate_rate` 정의 수정 + 10:20 이후 창 실제 중복률 실측
+
+배경: 10:20 재시작(6차 반영, `write_exposure_csv` 스로틀 등) 후 30분 —
+작업자당 90~135건/시(합 약 630건/시), 큐 조회 0.18초로 크게 좋아졌다. 그런데
+상태 파일 `duplicate_rate`가 29%(68/234)로 여전히 높게 나왔다 — 이 지표가
+"오늘 앞선 라운드(여러 번 재시작한 실측 세션)에서 본 키워드"까지 중복으로
+세는 정의였기 때문에(6-5절에서 이미 지적) 운영 지표로 못 쓴다는 문제가
+그대로 남아 있었다.
+
+### (1) `duplicate_rate` 정의 수정
+
+- **`duplicate`(운영 지표)** — "이 러너 실행(작업자 프로세스가 실제로
+  시작된 시각 `run_started_at` 이후) 안에서 같은 (브랜드, 키워드)를 두 번
+  이상 검사했는가"로 다시 정의했다. `run_worker`가 시작할 때
+  `run_started_at = datetime.now(timezone.utc)`를 한 번 재고(상태 파일에
+  남아 있을 수 있는 예전 `started_at`은 재사용 안 함), `process_one`에
+  넘긴다. 직전 검사 행(`prev_row`)이 있고 그 `checked_at`이
+  `run_started_at` 이후면 중복(`_is_duplicate_since_run_start`) —
+  재시작 이전 검사는 `prev_row`가 있어도 안 센다. `run_started_at`을 안
+  주면(옛 호출 경로 호환) 항상 `False`.
+- **`min_gap_violation`(새 지표, 별도)** — "그 순간 등급 규칙상 실제로
+  재검사 대상이었는지"를 `exposure_priority.priority_tier`를 그대로
+  재사용해 판정한다(`_min_gap_violation`). 옛 `_is_duplicate_recheck`처럼
+  문턱값(6시간/12시간)만 비교하지 않고, **2등급(최근 발행)은 설계상
+  원래 최소 간격이 없다는 것까지 반영**한다 — 안 그러면 이 지표도
+  똑같이 부풀려진다(아래 실측 참고). `update_worker_state`가
+  `duplicate`·`min_gap_violation`을 같은 호출에서 받아 같은
+  `checked_count`(분모)를 공유해 집계한다(`data/exposure_runner_state.json`
+  `workers.<n>.min_gap_violation_rate`, `duplicate_totals.
+  min_gap_violation_rate`).
+
+### (2) 10:20 이후 창 기준 실제 중복 — DB로 직접 셈
+
+`data/v2r.sqlite`의 `keyword_exposure`를 `checked_at >= '2026-09-24T10:20:00'`
+으로 직접 집계했다(별도 스크립트, 커밋 안 함):
+
+| 지표 | 값 |
+|---|---:|
+| 이 창의 총 검사 | 357건 |
+| 고유 (브랜드,키워드) | 333쌍 |
+| 2번 이상 검사된 쌍 | 21쌍 |
+| 중복(초과) 검사 수 | 24건 |
+| **`duplicate`(새 정의) 비율** | **6.72%**(24/357) |
+
+**3%를 넘어 원인을 추적했다.** 중복된 21쌍의 상세(정확히 같은 키워드
+텍스트, 상태는 전부 `pushed`, 재검사 간격은 20~50분)를 실제로
+`exposure_priority.priority_tier`(그 순간 실제 `recent_norm`·`last_checked`
+포함)에 다시 넣어 등급을 재계산했다:
+
+| 원인 후보 | 확인 결과 |
+|---|---|
+| claim TTL(180초) 만료로 재선점 | **기각** — 재검사 간격이 20~50분으로 180초보다 훨씬 길다(6차로 처리 속도가 정상화돼 더는 근접 안 함) |
+| 큐 갱신 시 done이 잘못 리셋됨 | **기각** — 리셋은 `priority_tier`가 실제로 tier<99(재검사 대상)를 준 경우에만 일어나고, 그 계산 자체는 정확했다 |
+| **2등급(최근 발행) 키워드는 설계상 재검사 간격이 없음** | **확인됨 — 31건의 "추가 검사" 중 27건(87%)이 `recent_norm`에 포함된 2등급 키워드였다.** 나머지 4건만 등급상 실제로 아직 대상이 아니었는데 재검사된 진짜 `min_gap_violation`(장으뜸 "배란점액 임신"·"화학적유산 시기", 코숨핏 "역류성식도염약"·"캠핑매트") |
+
+→ **`min_gap_violation` 비율은 4/357 = 1.12%로 3% 미만.** 즉 겉보기
+`duplicate_rate`(6.72%)가 높아 보였던 진짜 이유는 코드 버그가 아니라
+**"최근 발행 키워드는 빠르게 반복 확인"이라는 우선순위 규칙 2등급 자체가
+원래 최소 간격 없이 자주 재검사하도록 설계돼 있기 때문**이었다(1절
+설계 문서 그대로, 이번에도 안 바꿨다). `duplicate`(엄격한 "이 실행 안에서
+두 번째냐"는 정의)는 이 정상 동작까지 세므로 6.72%로 나오지만,
+등급 규칙을 반영한 `min_gap_violation`은 진짜 이상만 걸러 1.12%로
+나온다 — **3% 밑이라 추가 코드 수정은 필요 없다는 결론.** 나머지 4건
+(1.12%)은 발생 빈도가 낮아(각 1회) 개별 조사 없이 지켜보기로 한다.
+
+### 시험 결과(7차)
+
+- `tests/test_exposure_runner.py` 57개, `tests/test_keyword_exposure.py` +
+  `tests/test_keyword_exposure_cycle.py` + `tests/test_dashboard.py` 합쳐
+  99개 — **156개 전부 통과**. 옛 `_is_duplicate_recheck`/`duplicate` 관련
+  시험 2개를 `min_gap_violation` 기준으로 다시 썼고, 새로 추가:
+  `run_started_at` 이전/이후 경계로 `duplicate` 판정이 갈리는지, 2등급
+  (최근 발행) 키워드는 `min_gap_violation`이 거짓인지, `update_worker_state`가
+  `duplicate`·`min_gap_violation`을 같이 넘겨도 분모(`checked_count`)를
+  이중으로 안 세는지.
+- 전체 `pytest` 스위트는 **미실행**(다른 일꾼이 동시에 돌리고 있어 관련
+  시험만 통과 확인).
+
 ## 러너 재시작 필요
 
-1~6차 변경(캐시·배치 큐·last_checked 캐시·DB 직전 확인·브랜드별 큐·TTL
+1~7차 변경(캐시·배치 큐·last_checked 캐시·DB 직전 확인·브랜드별 큐·TTL
 600초·작업자 간 공유 파일 캐시·공유 큐(`exposure_queue` 표)·원자적 선점·
 파일 기반 claim_inflight 제거·백그라운드 정렬 갱신·CSV 스로틀·청크·워터마크
-삭제) 모두 코드에만 반영됐고 현재 돌고 있는 러너 프로세스에는 적용되지
-않았다 — 러너 재시작 필요.
+삭제·`duplicate`/`min_gap_violation` 지표 재정의) 모두 코드에만 반영됐고
+현재 돌고 있는 러너 프로세스에는 적용되지 않았다 — 러너 재시작 필요.
