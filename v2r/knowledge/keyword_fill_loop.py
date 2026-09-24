@@ -896,10 +896,22 @@ def worker_main(argv: list[str]) -> int:
     _logging.basicConfig(filename=str(log_file), level=_logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     data_dir = repo / "data"
-    profile_dir = data_dir / kdp.clone_profile_name(brand)
+    # 2026-09-24: 옛 워커가 브랜드 복제 프로필의 OS 잠금을 회차 내내 쥐고 있어 새 워커가
+    # 못 뜨는 문제 → 환경변수 V2R_PROFILE_SUFFIX(예: "b")가 있으면 별도 복제본을 쓴다.
+    import os as _os
+
+    suffix = (_os.environ.get("V2R_PROFILE_SUFFIX") or "").strip()
+    profile_dir = data_dir / (kdp.clone_profile_name(brand) + (f"-{suffix}" if suffix else ""))
     if not profile_dir.is_dir():
         # 발굴 병렬 실행에서 만든 복제 프로필을 그대로 쓴다(없으면 새로 복제).
-        kdp.clone_all_profiles(data_dir, [brand])
+        if suffix:
+            from v2r.warehouse import naver_session as _ns
+
+            src = _ns.default_profile_dir()
+            base = data_dir / kdp.clone_profile_name(brand)
+            kdp.clone_profile_to(base if base.is_dir() else src, profile_dir)
+        else:
+            kdp.clone_all_profiles(data_dir, [brand])
 
     kt = _kt_mod()
     import time as _time

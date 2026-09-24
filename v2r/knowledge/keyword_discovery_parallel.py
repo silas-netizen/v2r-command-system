@@ -74,6 +74,16 @@ def clone_profile(brand: str, src: Path, data_dir: Path) -> Path:
     return dst
 
 
+def clone_profile_to(src: Path, dst: Path) -> Path:
+    """`src` 프로필을 `dst`로 복사(잠금 파일류 제외). 원본은 읽기만. 재로그인 없음."""
+    src = Path(src)
+    dst = Path(dst)
+    if dst.exists():
+        shutil.rmtree(dst, ignore_errors=True)
+    shutil.copytree(src, dst, ignore=_ignore_locks, dirs_exist_ok=True)
+    return dst
+
+
 def clone_all_profiles(data_dir: Path | str = "data", brands: list[str] | None = None) -> dict[str, Path]:
     """5개(또는 지정한) 브랜드 복제 프로필을 만든다. 원본은 먼저 백업만 한다."""
     from v2r.warehouse import naver_session
