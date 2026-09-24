@@ -93,40 +93,91 @@ def _cfg():
 def test_priority_tier_노출완_주기지나면_1순위():
     now = datetime(2026, 9, 24, 12, 0, tzinfo=timezone.utc)
     last_checked = {"키워드": {"checked_at": "2026-09-24T02:00:00+00:00", "status": "exposed"}}
-    tier, _ = exposure_priority.priority_tier({"keyword": "키워드"}, last_checked, set(), _cfg(), 10.0, now)
+    tier, _ = exposure_priority.priority_tier({"keyword": "키워드"}, last_checked, {}, _cfg(), 10.0, now)
     assert tier == 1
 
 
 def test_priority_tier_노출완_주기전이면_제외():
     now = datetime(2026, 9, 24, 12, 0, tzinfo=timezone.utc)
     last_checked = {"키워드": {"checked_at": "2026-09-24T10:00:00+00:00", "status": "exposed"}}
-    tier, _ = exposure_priority.priority_tier({"keyword": "키워드"}, last_checked, set(), _cfg(), 10.0, now)
+    tier, _ = exposure_priority.priority_tier({"keyword": "키워드"}, last_checked, {}, _cfg(), 10.0, now)
     assert tier == 99
 
 
 def test_priority_tier_시트G열_노출완은_미검사여도_1순위():
     now = datetime(2026, 9, 24, 12, 0, tzinfo=timezone.utc)
-    tier, _ = exposure_priority.priority_tier({"keyword": "시트노출완", "sheet_status": "노출완"}, {}, set(), _cfg(), 10.0, now)
+    tier, _ = exposure_priority.priority_tier({"keyword": "시트노출완", "sheet_status": "노출완"}, {}, {}, _cfg(), 10.0, now)
     assert tier == 1
     fresh = {"시트노출완": {"checked_at": "2026-09-24T11:00:00+00:00", "status": "pushed"}}
-    tier, _ = exposure_priority.priority_tier({"keyword": "시트노출완", "sheet_status": "노출완"}, fresh, set(), _cfg(), 10.0, now)
+    tier, _ = exposure_priority.priority_tier({"keyword": "시트노출완", "sheet_status": "노출완"}, fresh, {}, _cfg(), 10.0, now)
     assert tier == 99
 
 
 def test_priority_tier_최근발행이_2순위():
+    """2026-09-24 8차부터 `recent_publish_norm`은 {키워드: 발행시각} 매핑.
+    발행 6시간 근방(±2시간) 창 안에서, 최소 간격(90분)도 지나고 이 창에서는
+    아직 안 봤으면 2등급이다."""
     now = datetime(2026, 9, 24, 12, 0, tzinfo=timezone.utc)
+    pub_dt = now - timedelta(hours=6)  # 발행 6시간 전 — 6시간 창 활성
     last_checked = {"키워드": {"checked_at": "2026-09-23T00:00:00+00:00", "status": "pushed"}}
-    tier, _ = exposure_priority.priority_tier({"keyword": "키워드"}, last_checked, {"키워드"}, _cfg(), 10.0, now)
+    recent = {"키워드": pub_dt}
+    tier, _ = exposure_priority.priority_tier({"keyword": "키워드"}, last_checked, recent, _cfg(), 10.0, now)
     assert tier == 2
+
+
+def test_priority_tier_최근발행_최소간격90분_안이면_제외():
+    now = datetime(2026, 9, 24, 12, 0, tzinfo=timezone.utc)
+    pub_dt = now - timedelta(hours=6)
+    last_checked = {"키워드": {"checked_at": (now - timedelta(minutes=30)).isoformat(), "status": "pushed"}}
+    recent = {"키워드": pub_dt}
+    tier, _ = exposure_priority.priority_tier({"keyword": "키워드"}, last_checked, recent, _cfg(), 10.0, now)
+    assert tier == 99, "최소 간격(90분) 안이면 창이 활성이어도 대상이 아니다"
+
+
+def test_priority_tier_최근발행_같은창에서_이미검사했으면_제외():
+    """8차 — 같은 키워드는 각 창(2h/6h/24h)에서 최대 1회만. 6시간 창이 활성인
+    지금, 직전 검사도 그 6시간 창 범위(발행 후 4~8시간) 안이었으면 다시
+    안 뽑힌다(다음 창인 24시간까지는 대상 아님)."""
+    now = datetime(2026, 9, 24, 12, 0, tzinfo=timezone.utc)
+    pub_dt = now - timedelta(hours=6)
+    # 직전 검사가 발행 5시간 뒤(같은 6시간 창 범위 안)였고, 최소 간격(90분)도 지남
+    last_checked_at = pub_dt + timedelta(hours=5)
+    last_checked = {"키워드": {"checked_at": last_checked_at.isoformat(), "status": "pushed"}}
+    recent = {"키워드": pub_dt}
+    tier, _ = exposure_priority.priority_tier({"keyword": "키워드"}, last_checked, recent, _cfg(), 10.0, now)
+    assert tier == 99, "같은 창(6시간 근방)에서는 최대 1회만 검사해야 한다"
+
+
+def test_priority_tier_최근발행_다른창이면_다시대상():
+    """직전 검사가 2시간 창(발행 후 2시간 근방)에서 있었고, 지금은 6시간
+    창이 활성이면(서로 다른 창) 다시 대상이어야 한다."""
+    now = datetime(2026, 9, 24, 12, 0, tzinfo=timezone.utc)
+    pub_dt = now - timedelta(hours=6)
+    last_checked_at = pub_dt + timedelta(hours=2)  # 2시간 창에서 검사됨
+    last_checked = {"키워드": {"checked_at": last_checked_at.isoformat(), "status": "pushed"}}
+    recent = {"키워드": pub_dt}
+    tier, _ = exposure_priority.priority_tier({"keyword": "키워드"}, last_checked, recent, _cfg(), 10.0, now)
+    assert tier == 2
+
+
+def test_priority_tier_최근발행_창밖이면_2등급아님():
+    """발행 후 12시간(2h/6h/24h 어느 창에도 안 걸침) — 2등급이 아니라
+    3등급(밀려남·미확인) 규칙으로 넘어가야 한다."""
+    now = datetime(2026, 9, 24, 12, 0, tzinfo=timezone.utc)
+    pub_dt = now - timedelta(hours=12)
+    last_checked = {"키워드": {"checked_at": "2026-09-23T00:00:00+00:00", "status": "pushed"}}
+    recent = {"키워드": pub_dt}
+    tier, _ = exposure_priority.priority_tier({"keyword": "키워드"}, last_checked, recent, _cfg(), 10.0, now)
+    assert tier == 3
 
 
 def test_priority_tier_미확인과_밀려남은_3순위_최소간격():
     now = datetime(2026, 9, 24, 12, 0, tzinfo=timezone.utc)
-    assert exposure_priority.priority_tier({"keyword": "새키워드"}, {}, set(), _cfg(), 10.0, now)[0] == 3
+    assert exposure_priority.priority_tier({"keyword": "새키워드"}, {}, {}, _cfg(), 10.0, now)[0] == 3
     old = {"오래": {"checked_at": "2026-09-23T00:00:00+00:00", "status": "pushed"}}
     fresh = {"방금": {"checked_at": "2026-09-24T11:00:00+00:00", "status": "pushed"}}
-    assert exposure_priority.priority_tier({"keyword": "오래"}, old, set(), _cfg(), 10.0, now)[0] == 3
-    assert exposure_priority.priority_tier({"keyword": "방금"}, fresh, set(), _cfg(), 10.0, now)[0] == 99
+    assert exposure_priority.priority_tier({"keyword": "오래"}, old, {}, _cfg(), 10.0, now)[0] == 3
+    assert exposure_priority.priority_tier({"keyword": "방금"}, fresh, {}, _cfg(), 10.0, now)[0] == 99
 
 
 def test_next_priority_batch_같은_키워드_연속_두번_안뽑힘(tmp_path, monkeypatch):
@@ -235,46 +286,65 @@ def test_due_pending_시간지나야만_뽑힘(tmp_path):
 # 최근 발행 키워드 — DB publications × 시트 F열(발행 URL) URL 대조 (2026-09-24)
 # =======================================================================
 
-def _insert_publication(conn, url, created_at, status="done"):
+def _insert_publication(conn, url, created_at, status="done", source_key="테스트브랜드"):
     from v2r.store.db import now_iso as _now_iso
 
     conn.execute(
         "INSERT INTO publications (source_key, row_number, content_hash, status, stage,"
         " source_id, url, account, cafe, menu_id, scheduled_at, created_at, updated_at, board)"
         " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        ("소스", 1, url, status, None, "s1", url, "acc", "마이카페", "", "", created_at, _now_iso(), ""),
+        (source_key, 1, url, status, None, "s1", url, "acc", "마이카페", "", "", created_at, _now_iso(), ""),
     )
 
 
-def test_publications_recent_article_ids_창안이면_포함(tmp_path):
+def test_publications_recent_pub_times_창안이면_포함(tmp_path):
+    """2026-09-24 8차 — `_publications_recent_article_ids`는
+    `_publications_recent_pub_times`로 바뀌었다(브랜드 필터 추가, 반환값도
+    글 번호 집합 -> {글 번호: 발행 시각} 매핑). 창(2h/6h/24h) 판정은 더 이상
+    여기서 하지 않는다 — `max_age_hours` 안의 모든 발행을 넓게 돌려주고,
+    창 활성 여부는 `priority_tier`가 매번 새로 계산한다."""
     rt = make_runtime(tmp_path)
     now = datetime(2026, 9, 24, 12, 0, tzinfo=timezone.utc)
-    # 2시간 전(정확히 창 중앙) — 포함
     _insert_publication(
         rt.conn,
         "https://cafe.naver.com/ca-fe/cafes/111/articles/222?query=1",
         "2026-09-24T10:00:00+00:00",
     )
-    ids = exposure_priority._publications_recent_article_ids(rt.conn, now, [2.0, 6.0, 24.0])
-    assert ids == {"222"}
+    pub_times = exposure_priority._publications_recent_pub_times(rt.conn, "테스트브랜드", now, 26.0)
+    assert set(pub_times) == {"222"}
+    assert pub_times["222"] == datetime(2026, 9, 24, 10, 0, tzinfo=timezone.utc)
 
 
-def test_publications_recent_article_ids_창밖이면_제외(tmp_path):
+def test_publications_recent_pub_times_범위밖이면_제외(tmp_path):
     rt = make_runtime(tmp_path)
     now = datetime(2026, 9, 24, 12, 0, tzinfo=timezone.utc)
-    _insert_publication(rt.conn, "https://cafe.naver.com/ca-fe/cafes/111/articles/333", "2026-09-24T00:00:00+00:00")
-    ids = exposure_priority._publications_recent_article_ids(rt.conn, now, [2.0, 6.0, 24.0])
-    assert ids == set()
+    _insert_publication(rt.conn, "https://cafe.naver.com/ca-fe/cafes/111/articles/333", "2026-09-20T00:00:00+00:00")
+    pub_times = exposure_priority._publications_recent_pub_times(rt.conn, "테스트브랜드", now, 26.0)
+    assert pub_times == {}
 
 
-def test_publications_recent_article_ids_실패상태는_제외(tmp_path):
+def test_publications_recent_pub_times_실패상태는_제외(tmp_path):
     rt = make_runtime(tmp_path)
     now = datetime(2026, 9, 24, 12, 0, tzinfo=timezone.utc)
     _insert_publication(
         rt.conn, "https://cafe.naver.com/ca-fe/cafes/111/articles/444", "2026-09-24T10:00:00+00:00", status="failed"
     )
-    ids = exposure_priority._publications_recent_article_ids(rt.conn, now, [2.0, 6.0, 24.0])
-    assert ids == set()
+    pub_times = exposure_priority._publications_recent_pub_times(rt.conn, "테스트브랜드", now, 26.0)
+    assert pub_times == {}
+
+
+def test_publications_recent_pub_times_다른브랜드는_제외(tmp_path):
+    """2026-09-24 8차 — 오탐 원인 수정: 다른 브랜드(또는 일상 글 —
+    `v2r.engine.publish.brand_source_keys`가 정의하는 "브랜드 시트 이름이
+    아닌 source_key")의 발행은 이 브랜드의 "최근 발행"에 안 섞인다."""
+    rt = make_runtime(tmp_path)
+    now = datetime(2026, 9, 24, 12, 0, tzinfo=timezone.utc)
+    _insert_publication(
+        rt.conn, "https://cafe.naver.com/ca-fe/cafes/111/articles/555", "2026-09-24T10:00:00+00:00",
+        source_key="다른브랜드",
+    )
+    pub_times = exposure_priority._publications_recent_pub_times(rt.conn, "테스트브랜드", now, 26.0)
+    assert pub_times == {}
 
 
 def test_recent_publish_keywords_from_db_시트F열_URL대조로_H열키워드(tmp_path, monkeypatch):
@@ -303,7 +373,8 @@ def test_recent_publish_keywords_from_db_시트F열_URL대조로_H열키워드(t
         "v2r.knowledge.keyword_exposure._sheet_rows", lambda brand, cfg, xlsx_path: fake_sheet_rows
     )
     out = exposure_priority._recent_publish_keywords_from_db(rt, "테스트브랜드", now, [2.0, 6.0, 24.0])
-    assert out == {"다이어트보조제"}
+    assert set(out) == {"다이어트보조제"}
+    assert out["다이어트보조제"] == datetime(2026, 9, 24, 10, 0, tzinfo=timezone.utc)
 
 
 def test_recent_publish_keywords_from_db_대조안되면_빈집합(tmp_path, monkeypatch):
@@ -318,11 +389,20 @@ def test_recent_publish_keywords_from_db_대조안되면_빈집합(tmp_path, mon
 
     monkeypatch.setattr("v2r.knowledge.keyword_exposure._sheet_rows", _boom)
     out = exposure_priority._recent_publish_keywords_from_db(rt, "테스트브랜드", now, [2.0, 6.0, 24.0])
-    assert out == set()
+    assert out == {}
     assert called["n"] == 0
 
 
-def test_recent_publish_keywords_합집합_article_index와_DB(tmp_path, monkeypatch):
+def test_recent_publish_keywords_article_index_휴리스틱_제거됨(tmp_path, monkeypatch):
+    """2026-09-24 8차(코디네이터 지시, 7차 실측 후속) — `article_index`
+    "제목 맨 앞 낱말" 휴리스틱을 완전히 제거했다. `article_index`는 카페의
+    모든 글(V2R 발행이든 자사 카페 일상 글이든 브랜드 구분 없이)을 담고
+    있어(`v2r/store/article_index.py`), 오늘 발행된 일상 글의 제목 앞
+    낱말이 우연히 universe 키워드와 겹치면 그 키워드가 잘못 "최근 발행"
+    으로 잡혔다(7차 실측: 초과 검사 31건 중 27건이 이 경로의 2등급
+    오탐). `article_index`에 그럴듯한 매치가 있어도(`FakeArticleIndex`)
+    이제 결과에 안 섞이고, DB `publications`(source_key=브랜드) × 시트
+    F열 URL 대조 결과만 남아야 한다."""
     rt = make_runtime(tmp_path)
     now = datetime(2026, 9, 24, 12, 0, tzinfo=timezone.utc)
     _insert_publication(
@@ -341,7 +421,7 @@ def test_recent_publish_keywords_합집합_article_index와_DB(tmp_path, monkeyp
 
     rt.article_index = FakeArticleIndex()
     out = exposure_priority._recent_publish_keywords(rt, "테스트브랜드", {"마이카페"}, now, [2.0, 6.0, 24.0])
-    assert out == {"제목키워드", "db발행키워드"}
+    assert set(out) == {"db발행키워드"}, "article_index 휴리스틱 결과(제목키워드)는 더 이상 섞이면 안 된다"
 
 
 # =======================================================================
@@ -732,21 +812,44 @@ def test_process_one_주기지난_재검사는_min_gap_violation_False(tmp_path,
     assert result["min_gap_violation"] is False
 
 
-def test_process_one_최근발행_키워드는_최소간격_안지켜도_위반아님(tmp_path, monkeypatch):
-    """2026-09-24 7차 실측(10:20 이후 창) — 중복의 대부분이 "최근 발행"
-    (2등급, 원래 재검사 간격이 없음) 키워드였다. `min_gap_violation`은 이
-    설계를 그대로 반영해 거짓이어야 한다."""
+def test_process_one_최근발행_다른창이고_최소간격지나면_위반아님(tmp_path, monkeypatch):
+    """2026-09-24 8차 — 7차 실측(10:20 이후 창)에서 중복 초과 검사 31건 중
+    27건이 "최근 발행"(2등급) 경로였는데, 그중 대부분은 `article_index`
+    오탐(위 `test_recent_publish_keywords_article_index_휴리스틱_제거됨`)
+    이었다. 8차부터는 2등급도 (a) 창(2h/6h/24h)마다 최대 1회, (b) 최소
+    90분 간격을 지킨다 — 직전 검사가 **다른 창**이었고 90분도 지났으면
+    위반이 아니다."""
     rt = make_runtime(tmp_path)
     brand, keyword = "테스트브랜드", "키워드"
-    store.save(rt.conn, ke.ExposureRow(brand, keyword, "마이카페", "", None, "pushed", now_iso()).as_row())
+    now = datetime.now(timezone.utc)
+    pub_dt = now - timedelta(hours=6)  # 지금은 6시간 창이 활성
+    prev_checked_at = pub_dt + timedelta(hours=2)  # 직전 검사는 2시간 창(다른 창)이었음
+    store.save(rt.conn, ke.ExposureRow(brand, keyword, "마이카페", "", None, "pushed", prev_checked_at.isoformat()).as_row())
     item = {"keyword": keyword, "cafe": "마이카페", "t0_status": "", "volume": 0}
     monkeypatch.setattr(ke, "keyword_universe", lambda rt_, brand_: [item])
-    # "최근 발행" 집합에 이 키워드가 들어 있는 것처럼 흉내낸다
-    monkeypatch.setattr(exposure_priority, "_recent_publish_keywords", lambda *a, **kw: {"키워드"})
+    monkeypatch.setattr(exposure_priority, "_recent_publish_keywords", lambda *a, **kw: {"키워드": pub_dt})
 
     monkeypatch.setattr(exposure_runner, "judge_once", lambda rt_, ctx, b, i, cfg, **kw: _fake_row(b, i["keyword"], "pushed"))
     result = exposure_runner.process_one(rt, object(), brand, item, {})
     assert result["min_gap_violation"] is False
+
+
+def test_process_one_최근발행_같은창이면_위반(tmp_path, monkeypatch):
+    """8차 — 직전 검사가 지금과 **같은 창**(6시간 근방)이었으면, 최소 간격
+    (90분)을 지켰어도 `min_gap_violation`이어야 한다(같은 창 최대 1회)."""
+    rt = make_runtime(tmp_path)
+    brand, keyword = "테스트브랜드", "키워드"
+    now = datetime.now(timezone.utc)
+    pub_dt = now - timedelta(hours=6)
+    prev_checked_at = pub_dt + timedelta(hours=5)  # 같은 6시간 창 범위(4~8시간) 안
+    store.save(rt.conn, ke.ExposureRow(brand, keyword, "마이카페", "", None, "pushed", prev_checked_at.isoformat()).as_row())
+    item = {"keyword": keyword, "cafe": "마이카페", "t0_status": "", "volume": 0}
+    monkeypatch.setattr(ke, "keyword_universe", lambda rt_, brand_: [item])
+    monkeypatch.setattr(exposure_priority, "_recent_publish_keywords", lambda *a, **kw: {"키워드": pub_dt})
+
+    monkeypatch.setattr(exposure_runner, "judge_once", lambda rt_, ctx, b, i, cfg, **kw: _fake_row(b, i["keyword"], "pushed"))
+    result = exposure_runner.process_one(rt, object(), brand, item, {})
+    assert result["min_gap_violation"] is True
 
 
 def test_process_one_duplicate는_이번실행_시작시각_이후만(tmp_path, monkeypatch):

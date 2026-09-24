@@ -641,10 +641,97 @@ Thread`)라 이 경고 자체는 메인 검사 루프를 막지 않는다 — "�
 - 전체 `pytest` 스위트는 **미실행**(다른 일꾼이 동시에 돌리고 있어 관련
   시험만 통과 확인).
 
+## 8차 — 2등급(최근 발행) 재검사 간격 도입 + 오탐 원천 제거
+
+배경: 7차 실측(10:20 이후 창) — 초과 검사 31건 중 27건(87%)이 2등급(최근
+발행) 키워드였다. 코디네이터 지시: (1) 2등급도 창(2h/6h/24h)마다 최대
+1회·최소 간격 90분을 두고, (2) "최근 발행" 판정이 오늘 발행된 **자사 카페
+일상 글**(브랜드 키워드와 무관)까지 잘못 잡는지 원천을 밝혀 오탐이면
+브랜드 태그·시트 F열 일치만 인정하도록 고치라는 지시.
+
+### (2) 먼저 원천 확인 — 오탐 2건 확인
+
+`_recent_publish_keywords`(당시)는 두 경로의 합집합이었다:
+
+- **(a) `article_index` "제목 맨 앞 낱말" 휴리스틱.** `article_index`
+  (`v2r/store/article_index.py`)는 "그 카페에 올라간 모든 글"을 담는
+  중복 방지용 색인 — V2R이 발행한 글이든, **자사 카페 일상 글**이든, 이
+  시스템 이전에 수동으로 올린 글이든 **브랜드 태그가 전혀 없이** 섞여
+  있다. 오늘 발행된 일상 글의 제목 맨 앞 낱말이 우연히 universe의 어떤
+  키워드와 겹치면 그 키워드가 그대로 "최근 발행"으로 잡혔다 — **구조적
+  오탐 경로**, 코드로 브랜드 여부를 가릴 방법 자체가 없었다.
+- **(b) `publications` 표 × 시트 F열 URL 대조.** 이 경로는 시트 F열과
+  대조하니 브랜드 키워드 매칭 자체는 맞았지만, **DB 조회에 브랜드 필터가
+  없었다**(`_publications_recent_article_ids`가 `WHERE status IN (...)`만
+  걸고 `source_key` 조건이 없음) — 다른 브랜드의 발행은 물론, 자사 카페
+  일상 글(`v2r.engine.publish.brand_source_keys`가 이미 "브랜드 시트
+  이름이 아닌 `source_key`"로 정의해 둔, 카페 활성화용 필러 글) 발행
+  기록까지 전부 후보에 들어갔다가, F열 URL이 우연히 안 겹쳐서 대부분
+  걸러졌을 뿐 — 그래도 **잠재적 오탐 경로**였다.
+
+**둘 다 고쳤다:**
+
+1. **(a) 완전 제거.** `article_index` "제목 맨 앞 낱말" 휴리스틱을
+   `_recent_publish_keywords`에서 뺐다 — 이제 (b) 경로(브랜드 태그 +
+   시트 F열 일치)만 쓴다.
+2. **(b) 브랜드 필터 추가.** `_publications_recent_article_ids`를
+   `_publications_recent_pub_times`로 바꾸며 `WHERE source_key = ?`(이
+   브랜드)를 추가했다 — `source_key`는 브랜드 키워드 원고를 발행할 때만
+   브랜드 이름 그 자체를 쓴다(`brand_source_keys`가 이미 이 기준으로
+   "일상 글이 아닌 것"을 정의해 뒀다, `v2r/engine/publish.py`). 이제 이
+   브랜드의 실제 키워드 원고 발행만 "최근 발행"의 씨앗이 된다.
+
+### (1) 2등급 재검사 간격 도입
+
+`priority_tier`의 2등급 분기를 다시 짰다(등급 규칙 파일 자체,
+`v2r/knowledge/exposure_priority.py`는 손대도 되는 이 모듈이 맞다 — 판정
+규칙 원본인 `keyword_exposure.py`는 여전히 안 건드렸다):
+
+- `recent_publish_norm`이 이제 `{정규화 키워드: 발행 시각}` 매핑이다
+  (예전엔 `set[str]`) — "지금이 어느 창인지"·"그 창에서 이미 봤는지"를
+  판정 시점(`now`)마다 새로 계산하기 위해서다. 수집 함수
+  (`_recent_publish_keywords_from_db`)는 창 판정을 안 하고 발행 시각만
+  넉넉히(가장 긴 창+여유) 모아 돌려준다 — 창 로직은 전부
+  `priority_tier` 한 곳에만 있다.
+- 발행 시각 기준 지금 경과 시간이 2h/6h/24h(설정
+  `priority.recent_publish_hours`) 중 하나의 ±2시간(`priority.
+  recent_publish_window_hours`, 기본 기존과 동일) 안이면 "활성 창".
+  활성 창이 없으면 2등급이 아니라 3등급(밀려남·미확인) 규칙으로 넘어간다.
+- 활성 창이 있어도 **최소 간격 90분**(`priority.
+  recent_publish_min_gap_hours`, 기본 1.5시간)이 안 지났으면 99등급(제외).
+- 90분은 지났어도, **직전 검사가 같은 창 범위 안**(예: 지금 6시간 창이면
+  직전 검사도 발행 후 4~8시간 사이)이었으면 그 창은 이미 썼으므로
+  99등급 — 다음 창(또는 3등급 규칙)까지 기다린다.
+- `queue_refresh_sec` 갱신 시 계산되는 것도, `is_due_now`(검사 직전 DB
+  단건 확인)에서 계산되는 것도 같은 `priority_tier` 한 함수라 규칙이
+  어긋날 일이 없다.
+
+### 바뀌지 않은 것
+
+우선순위 등급 순서(1 노출완 → 2 최근 발행 → 3 밀려남·미확인) 자체, 등급
+1·3의 재검사 규칙(6시간/12시간), 브랜드 순환, 공유 큐 원자적 선점(5차)은
+이번에도 그대로다. `keyword_exposure.py`(판정 규칙 원본)도 호출만 했다.
+
+### 시험 결과(8차)
+
+- `tests/test_exposure_runner.py` 63개, `tests/test_keyword_exposure.py` +
+  `tests/test_keyword_exposure_cycle.py` + `tests/test_dashboard.py` 합쳐
+  99개 — **162개 전부 통과**. `_publications_recent_article_ids`/
+  `_recent_publish_keywords_from_db`/`_recent_publish_keywords` 관련 옛
+  시험을 새 반환 타입(딕셔너리)·브랜드 필터에 맞춰 다시 썼고, 새로 추가:
+  최근 발행 창 활성 시 2등급(`test_priority_tier_최근발행이_2순위`), 최소
+  간격 90분 안 제외, 같은 창에서 이미 검사했으면 제외, 다른 창이면 다시
+  대상, 창 밖이면 2등급이 아니라 3등급으로 넘어가는지, `article_index`
+  휴리스틱이 결과에 더는 안 섞이는지(오탐 2건 확인용), 다른
+  브랜드(source_key)의 발행은 "최근 발행"에 안 섞이는지.
+- 전체 `pytest` 스위트는 **미실행**(다른 일꾼이 동시에 돌리고 있어 관련
+  시험만 통과 확인).
+
 ## 러너 재시작 필요
 
-1~7차 변경(캐시·배치 큐·last_checked 캐시·DB 직전 확인·브랜드별 큐·TTL
+1~8차 변경(캐시·배치 큐·last_checked 캐시·DB 직전 확인·브랜드별 큐·TTL
 600초·작업자 간 공유 파일 캐시·공유 큐(`exposure_queue` 표)·원자적 선점·
 파일 기반 claim_inflight 제거·백그라운드 정렬 갱신·CSV 스로틀·청크·워터마크
-삭제·`duplicate`/`min_gap_violation` 지표 재정의) 모두 코드에만 반영됐고
-현재 돌고 있는 러너 프로세스에는 적용되지 않았다 — 러너 재시작 필요.
+삭제·`duplicate`/`min_gap_violation` 지표 재정의·2등급 재검사 간격·최근
+발행 오탐 제거) 모두 코드에만 반영됐고 현재 돌고 있는 러너 프로세스에는
+적용되지 않았다 — 러너 재시작 필요.

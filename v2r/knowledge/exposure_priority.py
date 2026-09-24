@@ -132,10 +132,20 @@ def _read_universe_file_cache(rt: Any, brand: str, ttl: float) -> dict[str, Any]
         if age > ttl:
             return None
         data = json.loads(p.read_text(encoding="utf-8"))
+        # 2026-09-24 8차 — recent_norm이 집합(set[str])에서 매핑
+        # (dict[키워드, 발행시각]) 으로 바뀌었다. 옛 파일 캐시(리스트 형태)가
+        # 남아 있어도 조용히 빈 매핑으로 취급한다(다음 갱신이 채운다).
+        raw_recent = data.get("recent_norm")
+        recent_norm: dict[str, datetime] = {}
+        if isinstance(raw_recent, dict):
+            for k, v in raw_recent.items():
+                dt = _parse_iso(str(v or ""))
+                if dt is not None:
+                    recent_norm[k] = dt
         return {
             "universe": data.get("universe") or [],
             "cafes": set(data.get("cafes") or []),
-            "recent_norm": set(data.get("recent_norm") or []),
+            "recent_norm": recent_norm,
             "vol_threshold": float(data.get("vol_threshold") or 0.0),
         }
     except Exception as exc:  # pragma: no cover - 방어용
@@ -150,7 +160,7 @@ def _write_universe_file_cache(rt: Any, brand: str, bundle: dict[str, Any]) -> N
         payload = {
             "universe": bundle["universe"],
             "cafes": sorted(bundle["cafes"]),
-            "recent_norm": sorted(bundle["recent_norm"]),
+            "recent_norm": {k: v.isoformat() for k, v in bundle["recent_norm"].items()},
             "vol_threshold": bundle["vol_threshold"],
         }
         # 여러 작업자 프로세스가 동시에 쓸 수 있으니 pid로 고유한 임시 이름을
@@ -507,62 +517,59 @@ def _hours_since(checked_at: str, now: datetime) -> float | None:
     return (now - dt).total_seconds() / 3600.0
 
 
-def _recent_publish_keywords(rt: Any, brand: str, cafes: set[str], now: datetime, window_hours: list[float]) -> set[str]:
-    """최근(설정한 시각 근방) 발행된 우리 글의 키워드 — 두 갈래의 합집합.
+def _recent_publish_keywords(
+    rt: Any, brand: str, cafes: set[str], now: datetime, window_hours: list[float]
+) -> dict[str, datetime]:
+    """최근 발행된 **브랜드 원고**의 키워드 -> 발행 시각(`publications.
+    created_at`) 매핑.
 
-    (a) `article_index`에서 제목 맨 앞 키워드(기존 방식).
-    (b) `publications` 표(DB)에서 성공(uncertain/done) 발행의 URL·시각을 읽어,
-        같은 창 안이면 그 URL을 브랜드 시트 F열(발행 URL)과 글 번호로 대조해
-        같은 행 H열(키워드)을 더한다(`_recent_publish_keywords_from_db`).
+    2026-09-24 8차(코디네이터 지시, 7차 실측 후속) — 예전엔 여기서
+    (a) `article_index`(카페의 모든 글 — V2R이 발행한 것이든 자사 카페
+    일상 글이든, 심지어 이 시스템이 생기기 전 수동 글까지 전부 섞여
+    있고 브랜드 태그가 아예 없다, `v2r/store/article_index.py` 참고)에서
+    "제목 맨 앞 낱말"을 키워드로 간주하는 휴리스틱도 같이 합쳤는데, 이게
+    바로 오탐 원천이었다 — 오늘 발행된 자사 카페 일상 글(브랜드 키워드와
+    무관)의 제목 앞 낱말이 우연히 브랜드 universe의 어떤 키워드와 겹치면
+    그 키워드가 "최근 발행"으로 잘못 잡혀 2등급(원래 재검사 간격 없음)으로
+    분류됐다. 실측(7차): 초과 검사 31건 중 27건이 2등급이었는데, 대조해보니
+    이 article_index 휴리스틱이 `article_index`에 브랜드 구분이 아예 없어
+    발행 종류를 못 가려 생긴 오탐이었다.
+
+    이제 **`publications` 표(source_key=이 브랜드)의 실제 발행 기록을 브랜드
+    시트 F열(발행 URL)과 대조한 결과만** 쓴다 — `_recent_publish_keywords_from_db`.
+    "제목 앞 낱말" 휴리스틱은 완전히 제거했다.
     """
-    from v2r.knowledge.keyword_exposure import _title_lead_keyword, _norm
-
-    out: set[str] = set()
-
-    article_index = getattr(rt, "article_index", None)
-    if article_index is not None and cafes:
-        for cafe in cafes:
-            try:
-                rows = article_index.rows_for_cafe(cafe)
-            except Exception:
-                rows = []
-            for row in rows or []:
-                ts = row.get("published_at") or row.get("synced_at") or ""
-                dt = _parse_iso(str(ts))
-                if dt is None:
-                    continue
-                age_h = (now - dt).total_seconds() / 3600.0
-                if age_h < 0:
-                    continue
-                for target in window_hours:
-                    if abs(age_h - float(target)) <= _RECENT_PUBLISH_WINDOW_HOURS:
-                        kw = _title_lead_keyword(row.get("title") or "")
-                        if kw:
-                            out.add(_norm(kw))
-                        break
-
-    out |= _recent_publish_keywords_from_db(rt, brand, now, window_hours)
-    return out
+    return _recent_publish_keywords_from_db(rt, brand, now, window_hours)
 
 
-def _publications_recent_article_ids(conn: Any, now: datetime, window_hours: list[float]) -> set[str]:
-    """`publications` 표에서 성공(uncertain/done) 발행 중 `created_at`이 각
-    `window_hours` 시점 ±2시간 창 안인 행의 글 번호(정규화) 집합.
+def _publications_recent_pub_times(
+    conn: Any, brand: str, now: datetime, max_age_hours: float
+) -> dict[str, datetime]:
+    """이 **브랜드**(`source_key = brand`)의 성공(uncertain/done) 발행 중
+    `created_at`이 지금부터 `max_age_hours` 안인 행의 글 번호(정규화) ->
+    발행 시각 매핑.
+
+    2026-09-24 8차 — `source_key = ?`(브랜드) 조건을 추가했다. 예전엔 이
+    조건이 없어 **다른 브랜드는 물론 자사 카페 일상 글(`source_key`가
+    브랜드 시트 이름이 아닌 발행 — `v2r.engine.publish.brand_source_keys`가
+    "일상 글이 아닌 source_key 집합"으로 이미 정의해 둔 구분과 같은 기준)
+    까지 전부 "최근 발행"으로 셌다** — 오탐의 또 다른 경로. 이제 이 브랜드
+    이름과 정확히 같은 `source_key`(브랜드 키워드 원고 발행만 이 값을
+    쓴다)만 본다.
 
     URL의 쿼리스트링·끝 슬래시 차이는 `_article_id`(글 번호만 뽑음)가 이미
-    무시한다. E열(비밀번호)은 이 표에 없으므로 접근하지 않는다.
-    """
+    무시한다. E열(비밀번호)은 이 표에 없으므로 접근하지 않는다."""
     from v2r.knowledge.keyword_exposure import _article_id
     from v2r.store.publications import BLOCKING_STATUSES
 
-    out: set[str] = set()
+    out: dict[str, datetime] = {}
     if conn is None:
         return out
     try:
         placeholders = ", ".join("?" for _ in BLOCKING_STATUSES)
         rows = conn.execute(
-            f"SELECT url, created_at FROM publications WHERE status IN ({placeholders})",
-            tuple(BLOCKING_STATUSES),
+            f"SELECT url, created_at FROM publications WHERE source_key = ? AND status IN ({placeholders})",
+            (brand, *BLOCKING_STATUSES),
         ).fetchall()
     except Exception:
         return out
@@ -576,14 +583,15 @@ def _publications_recent_article_ids(conn: Any, now: datetime, window_hours: lis
         if dt is None:
             continue
         age_h = (now - dt).total_seconds() / 3600.0
-        if age_h < 0:
+        if age_h < 0 or age_h > max_age_hours:
             continue
-        for target in window_hours:
-            if abs(age_h - float(target)) <= _RECENT_PUBLISH_WINDOW_HOURS:
-                aid = _article_id(str(url or ""))
-                if aid:
-                    out.add(aid)
-                break
+        aid = _article_id(str(url or ""))
+        if not aid:
+            continue
+        # 같은 글 번호가 여러 행으로(재시도 등) 있으면 가장 최근 발행 시각을 쓴다.
+        prev = out.get(aid)
+        if prev is None or dt > prev:
+            out[aid] = dt
     return out
 
 
@@ -591,44 +599,55 @@ def _publications_recent_article_ids(conn: Any, now: datetime, window_hours: lis
 _PUBLISH_URL_HEADERS = ("발행url", "발행 url")
 
 
-def _recent_publish_keywords_from_db(rt: Any, brand: str, now: datetime, window_hours: list[float]) -> set[str]:
-    """DB `publications` 최근 발행 URL을 시트 F열(발행 URL)과 글 번호로 대조해
-    같은 행 H열(키워드)을 뽑는다. F열 값은 대조에만 쓰고 어디에도 기록하지
-    않는다 — E열(비밀번호)은 `_sheet_rows`가 이미 버린 뒤라 아예 접근하지 못한다.
-    """
+def _recent_publish_keywords_from_db(rt: Any, brand: str, now: datetime, window_hours: list[float]) -> dict[str, datetime]:
+    """이 브랜드의 DB `publications` 최근 발행 URL(`source_key = brand`)을
+    시트 F열(발행 URL)과 글 번호로 대조해 같은 행 H열(키워드) -> 발행 시각을
+    뽑는다. F열 값은 대조에만 쓰고 어디에도 기록하지 않는다 — E열(비밀번호)은
+    `_sheet_rows`가 이미 버린 뒤라 아예 접근하지 못한다.
+
+    창(2h/6h/24h) 판정 자체는 여기서 하지 않는다 — 발행 시각만 돌려주고,
+    "지금 어느 창이 활성인지·그 창에서 이미 검사했는지·최소 간격(90분)"은
+    `priority_tier`가 호출 시점의 `now`로 매번 새로 계산한다(2026-09-24
+    8차). 그래서 넉넉히(가장 긴 창 + 여유) 훑는다."""
     from v2r.knowledge.keyword_exposure import _article_id, _sheet_rows
     from v2r.sources.keyword_list import _norm as _norm_kw
     from v2r.sources.keyword_list import _pick
 
-    article_ids = _publications_recent_article_ids(getattr(rt, "conn", None), now, window_hours)
-    if not article_ids:
-        return set()
+    max_age_hours = (max(window_hours) if window_hours else 24.0) + _RECENT_PUBLISH_WINDOW_HOURS
+    pub_times = _publications_recent_pub_times(getattr(rt, "conn", None), brand, now, max_age_hours)
+    if not pub_times:
+        return {}
 
     try:
         cfg = getattr(rt, "sources_cfg", None)
         xlsx = Path(rt.settings.repo_root) / "data" / f"brand_sheet_{brand}.xlsx"
         rows = _sheet_rows(brand, cfg, str(xlsx) if xlsx.exists() else None)
     except Exception:
-        return set()
+        return {}
 
-    out: set[str] = set()
+    out: dict[str, datetime] = {}
     for row in rows or []:
         url = _pick(row, _PUBLISH_URL_HEADERS)
         if not url:
             continue
         aid = _article_id(url)
-        if not aid or aid not in article_ids:
+        if not aid or aid not in pub_times:
             continue
         kw = _pick(row, ("키워드",))
         if kw:
-            out.add(_norm_kw(kw))
+            out[_norm_kw(kw)] = pub_times[aid]
     return out
+
+
+#: 2026-09-24 8차(코디네이터 지시) — 2등급(최근 발행)도 최소 간격을 둔다.
+#: 창(2h/6h/24h)과 무관하게 이보다 자주는 절대 재검사하지 않는다.
+_RECENT_PUBLISH_MIN_GAP_HOURS = 1.5
 
 
 def priority_tier(
     item: dict,
     last_checked: dict[str, dict],
-    recent_publish_norm: set[str],
+    recent_publish_norm: dict[str, datetime],
     cfg: dict,
     volume_threshold: float,
     now: datetime,
@@ -637,6 +656,10 @@ def priority_tier(
 
     반환하는 두 번째 값은 "마지막 검사 이후 경과 시간(시간)" — 미확인은 무한대로
     취급해 항상 그 등급 안에서 맨 앞에 온다.
+
+    `recent_publish_norm`은 2026-09-24 8차부터 `{정규화 키워드: 발행 시각}`
+    매핑이다(예전엔 단순 `set[str]`) — 2등급 판정에 "지금이 몇 번째 창인지",
+    "그 창에서 이미 검사했는지"를 매번 `now` 기준으로 새로 계산하기 위해서다.
     """
     from v2r.knowledge.keyword_exposure import _norm
 
@@ -662,8 +685,31 @@ def priority_tier(
         due = float(cfg.get("exposed_recheck_hours", 6))
         return (1, age_h) if age_h >= due else (99, age_h)
 
-    if key in recent_publish_norm:
-        return (2, age_h)
+    pub_dt = recent_publish_norm.get(key)
+    if pub_dt is not None:
+        # 2026-09-24 8차 — "발행 후 2·6·24시간 근방에 한 번씩"이 취지였는데,
+        # 예전엔 창 안이면 재검사 간격 없이 매번 대상이었다(실측 7차: 초과
+        # 검사의 87%가 이 경로). 이제 (a) 같은 창에서는 최대 1회만
+        # (last가 이미 같은 창 범위에 들어 있으면 99등급), (b) 어떤 경우든
+        # 최소 90분은 지나야 한다.
+        window_targets = [float(h) for h in cfg.get("recent_publish_hours", [2, 6, 24])]
+        window = float(cfg.get("recent_publish_window_hours", _RECENT_PUBLISH_WINDOW_HOURS))
+        age_since_pub_h = (now - pub_dt).total_seconds() / 3600.0
+        active_target = next(
+            (t for t in window_targets if abs(age_since_pub_h - t) <= window), None
+        )
+        if active_target is not None:
+            min_gap = float(cfg.get("recent_publish_min_gap_hours", _RECENT_PUBLISH_MIN_GAP_HOURS))
+            if age_h < min_gap:
+                return (99, age_h)
+            last_dt = _parse_iso(str(last.get("checked_at", "")))
+            if last_dt is not None:
+                last_age_since_pub_h = (last_dt - pub_dt).total_seconds() / 3600.0
+                if abs(last_age_since_pub_h - active_target) <= window:
+                    # 이 창에서는 이미 한 번 검사했다 — 다음 창(또는 3등급
+                    # 규칙)까지는 다시 안 뽑는다.
+                    return (99, age_h)
+            return (2, age_h)
 
     # 밀려남·미확인·unknown — 최소 간격만 지나면 대상(검색량 순 정렬은 배치 쪽)
     due = float(cfg.get("pushed_min_gap_hours", 12))
