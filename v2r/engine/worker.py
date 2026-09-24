@@ -2627,10 +2627,15 @@ def run_once(
     막히지 않는다.
     """
     owner = owner or default_owner()
-    if scope != "light":
+    if scope not in ("light", "long"):
         reaped = rt.jobs.reap_stale_running()  # 죽은 실행기의 고아 작업 정리 (M-5)
         _log_reaped(rt, reaped)
-    job = rt.jobs.acquire(owner, scope=scope)
+    if scope == "long":
+        from v2r.store.jobs import LONG_LEASE_SECONDS
+
+        job = rt.jobs.acquire(owner, lease_seconds=LONG_LEASE_SECONDS, scope=scope)
+    else:
+        job = rt.jobs.acquire(owner, scope=scope)
     if job is None:
         return None
 
@@ -2844,7 +2849,7 @@ def _daily_start_board(rt: Runtime, job_id: int, spec: Any, slots: list) -> str:
     all_accts = sorted({a for s_ in accts.values() for a in s_})
     now = datetime.now(KST).strftime("%m-%d %H:%M")
     lines = [
-        f"일상 글 시작 현황판 ({now}, 작업 {job_id})",
+        f"일상 글 시작 현황판 ({now})",  # 내부 작업 번호는 사용자에게 의미 없어 표기하지 않음(2026-09-24)
         f"총 {len(slots)}건 · 카페 {len(by_cafe)}곳 · 계정 {len(all_accts)}개 · 간격 {spec.interval_min}~{spec.interval_max}분",
     ]
     for cafe, n in sorted(by_cafe.items(), key=lambda kv: (-kv[1], kv[0])):
@@ -2957,7 +2962,19 @@ SECOND_SERVE_MSG = (
 
 
 def ensure_single_serve(rt: Runtime) -> Any:
-    """실행기 잠금을 잡는다. 두 번째면 안내를 남기고 None."""
+    """실행기 잠금을 잡는다. 두 번째면 안내를 남기고 None.
+
+    잠금을 잡기 전에, 이전 실행기가 남긴 executor_lease 의 소유자 pid가
+    같은 호스트에서 이미 죽었으면 즉시 회수한다 — 리스 시간(기본 900초)이
+    남아 있다는 이유만으로 재시작 후 최대 15분을 작업 없이 흘려보내던
+    공백을 없앤다(장애 2026-09-24).
+    """
+    try:
+        if rt.jobs.release_stale_lease():
+            log.info("재시작: 죽은 실행기의 executor_lease 를 즉시 회수했습니다")
+    except Exception as exc:  # noqa: BLE001 - 회수 실패로 시작을 막지 않는다
+        log.warning("executor_lease 회수 확인 실패(계속 진행): %s", exc)
+
     from v2r.engine import lock as lock_mod
 
     held = lock_mod.acquire_serve_lock(rt)
