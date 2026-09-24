@@ -907,9 +907,8 @@ def worker_main(argv: list[str]) -> int:
         if suffix:
             from v2r.warehouse import naver_session as _ns
 
-            src = _ns.default_profile_dir()
-            base = data_dir / kdp.clone_profile_name(brand)
-            kdp.clone_profile_to(base if base.is_dir() else src, profile_dir)
+            # 기본 복제본은 옛 워커가 열고 있어 파일이 잠겨 복사가 실패한다 → 원본(읽기만)에서 복사
+            kdp.clone_profile_to(_ns.default_profile_dir(), profile_dir)
         else:
             kdp.clone_all_profiles(data_dir, [brand])
 
