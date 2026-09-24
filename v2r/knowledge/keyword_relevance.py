@@ -863,14 +863,28 @@ def manuscript_eligible(row: dict[str, Any]) -> bool:
 
 
 def is_manuscript_target(row: Any) -> bool:
-    """원고(콘텐츠) 대상인가: relevance_llm·relevance_codex가 둘 다 0에서 3이고,
-    needs_review가 아니면 True (사용자 지시 2026-09-24).
+    """원고(콘텐츠) 대상인가 (사용자 지시 2026-09-24, 엄격판).
+
+    규칙: relevance_llm·relevance_codex 둘 다 **채점 완료**(None 아님)이고,
+    needs_review가 아니며, 각각 0에서 3 범위 안이되 **3은 bridge_rationale이
+    채워져 있을 때만** 인정한다(당위성 논리 없는 3은 무관 취급).
+
+    - relevance_llm이 None이면 즉시 탈락(과거에는 여기서 `relevance`로
+      대체하거나 relevance_codex가 None이면 그냥 통과시켰는데, 그 틈으로
+      GPT 미검증·재채점 전 키워드가 시트에 섞여 들어갔다 — 2026-09-24 사고).
+    - relevance_codex가 None이어도 즉시 탈락(교차 검증 전이면 원고 대상 아님).
+    - relevance_codex == 3인 경우, 이 값이 구 척도(재채점 전, 논리 없는 "3=무관")가
+      아니라 새 척도(당위성)에서 나온 값인지는 이 스키마에 별도 열
+      (crosscheck_at/rescored_at 같은)이 없어 직접 구분할 수 없다. 대신
+      `rescore_legacy_unrelated_brand`가 재채점 시 `relevance_codex`를 NULL로
+      되돌려 교차 검증을 다시 받게 만들어 두었으므로, relevance_codex 값이
+      존재한다는 사실 자체가 "그 재채점 이후에 다시 채점됐다"는 증거가 된다.
+      즉 bridge_rationale 유무 검사와 결합하면 구 3(논리 없음)은 이 함수를
+      통과하지 못한다.
 
     `row`는 dict 또는 sqlite3.Row(둘 다 매핑처럼 `row["key"]`로 접근 가능)다.
-    `relevance_llm`이 없으면 `relevance` 키도 함께 본다(스코어링 직후의 임시
-    dict — DB 열 이름과 다를 수 있음).
-    이것이 sheets_writer.py/brand_queue.py/exposure_priority.py/
-    keyword_exposure.py가 공통으로 써야 하는 원고 대상 판정 함수다.
+    이것이 sheets_writer.py/keyword_fill_loop.py/keyword_exposure.py/
+    brand_queue.py가 공통으로 써야 하는 원고 대상 판정 함수다(우회 SQL 조건 금지).
     """
 
     def _get(key: str) -> Any:
@@ -880,14 +894,24 @@ def is_manuscript_target(row: Any) -> bool:
             return None
         return val
 
+    def _rel_ok(rel: Any) -> bool:
+        if rel is None:
+            return False
+        rel = int(rel)
+        if rel < 0 or rel > MANUSCRIPT_MAX_RELEVANCE:
+            return False
+        if rel == RELEVANCE_BRIDGE:
+            bridge = str(_get("bridge_rationale") or "").strip()
+            if not bridge:
+                return False
+        return True
+
     llm_rel = _get("relevance_llm")
-    if llm_rel is None:
-        llm_rel = _get("relevance")
-    if llm_rel is None or int(llm_rel) > MANUSCRIPT_MAX_RELEVANCE:
+    if not _rel_ok(llm_rel):
         return False
 
     codex_rel = _get("relevance_codex")
-    if codex_rel is not None and int(codex_rel) > MANUSCRIPT_MAX_RELEVANCE:
+    if not _rel_ok(codex_rel):
         return False
 
     needs_review = _get("needs_review")

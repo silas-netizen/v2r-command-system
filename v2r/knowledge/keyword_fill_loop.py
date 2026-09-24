@@ -125,14 +125,20 @@ def manuscript_max_relevance() -> int:
 
 def eligible_sql() -> str:
     mx = manuscript_max_relevance()
+    bridge = int(getattr(_kr_mod(), "RELEVANCE_BRIDGE", 3))
+    # is_manuscript_target과 정확히 동일해야 한다(2026-09-24 엄격화 — 우회 SQL 금지 지시):
+    # 클로드·Codex 둘 다 채점 완료(NULL 아님), 0에서 mx, 단 mx(=당위성 3)이면
+    # bridge_rationale이 채워져 있을 때만 인정. relevance_codex IS NULL을 통과시키던
+    # 옛 조건이 GPT 미검증 키워드를 시트로 새게 한 사고 원인이었다(작업 186).
+    # scored_at이 비어 있으면(예: 옛 3=무관 점수를 재채점 대기로 돌려놓은 행) 아직
+    # 판정이 확정되지 않은 것이므로 세지 않는다 — 실측(01:15): 이 행이 브랜드당 약
+    # 6,000개라 그대로 세면 원고 대상이 9,000대로 부풀려진다.
     return (
-        # is_manuscript_target과 동일: 클로드 0에서 mx, Codex는 값이 있으면 0에서 mx, needs_review 아님
-        # scored_at이 비어 있으면(예: 옛 3=무관 점수를 재채점 대기로 돌려놓은 행) 아직
-        # 판정이 확정되지 않은 것이므로 세지 않는다 — 실측(01:15): 이 행이 브랜드당 약
-        # 6,000개라 그대로 세면 원고 대상이 9,000대로 부풀려진다.
         "scored_at != '' AND scored_at IS NOT NULL"
-        f" AND relevance_llm IS NOT NULL AND relevance_llm <= {mx}"
-        f" AND (relevance_codex IS NULL OR relevance_codex <= {mx})"
+        f" AND relevance_llm IS NOT NULL AND relevance_llm >= 0 AND relevance_llm <= {mx}"
+        f" AND relevance_codex IS NOT NULL AND relevance_codex >= 0 AND relevance_codex <= {mx}"
+        f" AND (relevance_llm != {bridge} OR (bridge_rationale IS NOT NULL AND bridge_rationale != ''))"
+        f" AND (relevance_codex != {bridge} OR (bridge_rationale IS NOT NULL AND bridge_rationale != ''))"
         " AND (needs_review = 0 OR needs_review IS NULL)"
     )
 

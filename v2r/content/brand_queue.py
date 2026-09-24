@@ -74,10 +74,13 @@ def _volume_map(brand: str, data_dir: Path) -> dict[str, tuple[float, int, float
         try:
             cols = {row[1] for row in conn.execute("PRAGMA table_info(keywords)")}
             has_llm_cols = {"relevance_llm", "relevance_codex", "needs_review"}.issubset(cols)
+            has_bridge_col = "bridge_rationale" in cols
             if has_llm_cols:
                 rows = conn.execute(
-                    "SELECT keyword, total, relevance, relevance_llm, relevance_codex, needs_review"
-                    " FROM keywords"
+                    "SELECT keyword, total, relevance, relevance_llm, relevance_codex, needs_review{bridge_col}"
+                    " FROM keywords".format(
+                        bridge_col=", bridge_rationale" if has_bridge_col else ", '' as bridge_rationale"
+                    )
                 ).fetchall()
             else:
                 rows = conn.execute("SELECT keyword, total, relevance FROM keywords").fetchall()

@@ -268,22 +268,38 @@ def test_parse_autocomplete_and_related():
 
 
 def test_eligible_follows_is_manuscript_target(tmp_path):
-    """원고 대상 판정은 keyword_relevance.is_manuscript_target(둘 다 0에서 3)과 같아야 한다."""
+    """원고 대상 판정은 keyword_relevance.is_manuscript_target(엄격판, 2026-09-24)과 같아야 한다.
+
+    - k0: 0/0, needs_review 없음 -> 대상
+    - k1: 3/3, bridge_rationale 있음 -> 대상(당위성 논리 있는 3)
+    - k2: 3/4 -> codex 범위 밖 -> 제외
+    - k3: 4/3 -> llm 범위 밖 -> 제외
+    - k4: 2/2, needs_review -> 제외
+    - k5: 1/None -> codex 교차 검증 전 -> 제외(2026-09-24 엄격화: 예전엔 통과)
+    """
     db = tmp_path / "b.sqlite"
     conn = kd_store.open_db(db)
     kr.migrate(conn)
     fill.migrate_fill_columns(conn)
     kd_store.save_many(conn, [{"keyword": f"k{i}", "pc": 1, "mobile": 0} for i in range(6)])
-    cases = [("k0", 0, 0, 0), ("k1", 3, 3, 0), ("k2", 3, 4, 0), ("k3", 4, 3, 0), ("k4", 2, 2, 1), ("k5", 1, None, 0)]
-    for kw, llm, codex, review in cases:
+    cases = [
+        ("k0", 0, 0, 0, ""),
+        ("k1", 3, 3, 0, "다리 논리 한 줄"),
+        ("k2", 3, 4, 0, "다리 논리 한 줄"),
+        ("k3", 4, 3, 0, "다리 논리 한 줄"),
+        ("k4", 2, 2, 1, ""),
+        ("k5", 1, None, 0, ""),
+    ]
+    for kw, llm, codex, review, bridge in cases:
         conn.execute(
-            "UPDATE keywords SET relevance_llm=?, relevance_codex=?, needs_review=?, scored_at='x' WHERE keyword=?",
-            (llm, codex, review, kw),
+            "UPDATE keywords SET relevance_llm=?, relevance_codex=?, needs_review=?,"
+            " bridge_rationale=?, scored_at='x' WHERE keyword=?",
+            (llm, codex, review, bridge, kw),
         )
     conn.commit()
     rows = conn.execute("SELECT * FROM keywords ORDER BY keyword").fetchall()
     expected = [bool(kr.is_manuscript_target(r)) for r in rows]
     assert [fill.is_eligible_row(r) for r in rows] == expected
-    assert fill.eligible_count(conn) == sum(expected) == 3
+    assert fill.eligible_count(conn) == sum(expected) == 2
     assert fill.manuscript_max_relevance() == kr.MANUSCRIPT_MAX_RELEVANCE == 3
     conn.close()

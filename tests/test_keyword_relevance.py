@@ -377,9 +377,15 @@ def test_manuscript_eligible_requires_both_models_within_range():
 
 
 def test_is_manuscript_target_excludes_unrelated_and_needs_review():
-    # 0에서 3(당위성 포함)이고 needs_review가 아니면 원고 대상.
+    # 2026-09-24 엄격화: 클로드·Codex 둘 다 채점 완료·0에서 3이고, 3이면
+    # bridge_rationale이 있어야 하며, needs_review가 아니면 원고 대상.
     assert kr.is_manuscript_target(
-        {"relevance_llm": 3, "relevance_codex": 3, "needs_review": 0}
+        {
+            "relevance_llm": 3,
+            "relevance_codex": 3,
+            "needs_review": 0,
+            "bridge_rationale": "독감으로 면역이 떨어지면 여성 건강 관리가 중요해진다",
+        }
     ) is True
     assert kr.is_manuscript_target(
         {"relevance_llm": 4, "relevance_codex": 3, "needs_review": 0}
@@ -390,13 +396,50 @@ def test_is_manuscript_target_excludes_unrelated_and_needs_review():
     assert kr.is_manuscript_target(
         {"relevance_llm": 2, "relevance_codex": 2, "needs_review": 1}
     ) is False
+
+
+def test_is_manuscript_target_rejects_none_codex():
+    # (a) relevance_codex가 None(교차 검증 전)이면 불통과 — 예전엔 통과시켜
+    # GPT 미검증 키워드가 시트로 샜다(작업 186 사고).
     assert kr.is_manuscript_target(
         {"relevance_llm": 0, "relevance_codex": None, "needs_review": 0}
-    ) is True
-    # sqlite3.Row처럼 매핑 접근만 지원하는 대상에도 동작해야 한다
+    ) is False
     assert kr.is_manuscript_target(
-        {"relevance": 1, "relevance_codex": None, "needs_review": 0}
-    ) is True  # relevance_llm이 없으면 relevance로 대체
+        {"relevance_llm": None, "relevance_codex": 0, "needs_review": 0}
+    ) is False
+
+
+def test_is_manuscript_target_rejects_bridge_without_rationale():
+    # (b) relevance가 3(당위성)인데 bridge_rationale이 비어 있으면(재채점 전 옛
+    # "3=무관") 불통과 — 논리 없는 3은 무관 취급.
+    assert kr.is_manuscript_target(
+        {
+            "relevance_llm": 3,
+            "relevance_codex": 2,
+            "needs_review": 0,
+            "bridge_rationale": "",
+        }
+    ) is False
+    assert kr.is_manuscript_target(
+        {
+            "relevance_llm": 2,
+            "relevance_codex": 3,
+            "needs_review": 0,
+            "bridge_rationale": "   ",
+        }
+    ) is False
+
+
+def test_is_manuscript_target_accepts_bridge_with_rationale():
+    # (c) 논리(bridge_rationale)가 채워진 3은 통과.
+    assert kr.is_manuscript_target(
+        {
+            "relevance_llm": 3,
+            "relevance_codex": 2,
+            "needs_review": 0,
+            "bridge_rationale": "다리 논리 한 줄",
+        }
+    ) is True
 
 
 def test_write_crosscheck_persists_final_scores(tmp_path):

@@ -1077,9 +1077,12 @@ def _relevance_eligible_keywords(rt: Any, brand: str) -> list[dict]:
             required = {"relevance_llm", "relevance_codex", "needs_review"}
             if not required.issubset(cols):
                 return []
+            has_bridge = "bridge_rationale" in cols
             rows = con.execute(
-                "select keyword, total, relevance_llm, relevance_codex, needs_review"
-                " from keywords where relevance_llm is not null"
+                "select keyword, total, relevance_llm, relevance_codex, needs_review{bridge_col}"
+                " from keywords where relevance_llm is not null".format(
+                    bridge_col=", bridge_rationale" if has_bridge else ", '' as bridge_rationale"
+                )
             ).fetchall()
         finally:
             con.close()
@@ -1136,10 +1139,11 @@ def keyword_universe(rt: Any, brand: str) -> list[dict]:
     for t in targets:
         out[_norm(t["keyword"])] = {**t, "volume": 0}
 
-    # 2026-09-23 사용자 지시(연결 3) — DB 원고 대상(relevance_llm·relevance_codex
-    # 둘 다 0~2, needs_review 아님)도 순환 대상에 합친다. 무관(3)은 여기서 아예
-    # 안 뽑히므로 자연히 순환에서 제외된다. `keyword_relevance.py`는 다른 일꾼이
-    # 전량 재산정 중이라 이 모듈은 그 sqlite를 읽기만 한다(쓰지 않음).
+    # 2026-09-23 사용자 지시(연결 3), 2026-09-24 엄격화 — DB 원고 대상
+    # (`is_manuscript_target`: relevance_llm·relevance_codex 둘 다 채점 완료,
+    # 0~2이거나 3은 bridge_rationale 있을 때만, needs_review 아님)도 순환
+    # 대상에 합친다. `keyword_relevance.py`는 다른 일꾼이 전량 재산정 중이라
+    # 이 모듈은 그 sqlite를 읽기만 한다(쓰지 않음).
     for item in _relevance_eligible_keywords(rt, brand):
         key = _norm(item["keyword"])
         if key in out:
