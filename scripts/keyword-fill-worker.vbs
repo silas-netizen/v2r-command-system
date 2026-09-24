@@ -9,5 +9,8 @@ brand = WScript.Arguments(0)
 target = "10000"
 stamp = Replace(CStr(Timer), ".", "")
 If WScript.Arguments.Count > 1 Then target = WScript.Arguments(1)
-cmd = "cmd.exe /c chcp 65001 > nul & cd /d """ & root & """ & set ""PYTHONUTF8=1"" & set ""PYTHONIOENCODING=utf-8"" & set ""PLAYWRIGHT_BROWSERS_PATH=" & root & "\.pw-browsers"" & "".venv\Scripts\python.exe"" -m v2r.knowledge.keyword_fill_loop --worker " & brand & " " & target & " >> ""logs\keyword-fill-" & brand & "." & stamp & ".out.log"" 2>&1"
+' 세 번째 인자 = 프로필 접미사(예: b) — 옛 워커가 기본 복제 프로필 잠금을 쥐고 있을 때 우회(2026-09-24)
+suffix = ""
+If WScript.Arguments.Count > 2 Then suffix = WScript.Arguments(2)
+cmd = "cmd.exe /c chcp 65001 > nul & cd /d """ & root & """ & set ""PYTHONUTF8=1"" & set ""PYTHONIOENCODING=utf-8"" & set ""V2R_PROFILE_SUFFIX=" & suffix & """ & set ""PLAYWRIGHT_BROWSERS_PATH=" & root & "\.pw-browsers"" & "".venv\Scripts\python.exe"" -m v2r.knowledge.keyword_fill_loop --worker " & brand & " " & target & " >> ""logs\keyword-fill-" & brand & "." & stamp & ".out.log"" 2>&1"
 sh.Run cmd, 0, False
