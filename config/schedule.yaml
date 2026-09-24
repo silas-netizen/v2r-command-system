@@ -18,22 +18,22 @@ entries:
   - name: 시트 키워드 반영(자동)
     time: "05:30"
     days: daily
-    enabled: false   # 2026-09-24 10:15 엄격 판정(57ceb0b) 실행기 반영 전까지 잠시 끔
+    enabled: true
     command: 시트 키워드 반영 전체
   - name: 시트 키워드 반영(자동, 낮)
     time: "11:30"
     days: daily
-    enabled: false   # 2026-09-24 10:15 엄격 판정(57ceb0b) 실행기 반영 전까지 잠시 끔
+    enabled: true
     command: 시트 키워드 반영 전체
   - name: 시트 키워드 반영(자동, 저녁)
     time: "17:30"
     days: daily
-    enabled: false   # 2026-09-24 10:15 엄격 판정(57ceb0b) 실행기 반영 전까지 잠시 끔
+    enabled: true
     command: 시트 키워드 반영 전체
   - name: 시트 키워드 반영(자동, 밤)
     time: "23:30"
     days: daily
-    enabled: false   # 2026-09-24 10:15 엄격 판정(57ceb0b) 실행기 반영 전까지 잠시 끔
+    enabled: true
     command: 시트 키워드 반영 전체
   - name: 키워드 발굴 전체
     time: "01:00"
