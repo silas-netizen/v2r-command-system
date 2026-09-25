@@ -1148,6 +1148,8 @@ def pick_images(rt: Runtime, m: Manuscript, spec: TaskSpec, need: int) -> list[P
     """
     if need <= 0:
         return []
+    import random
+
     from v2r.warehouse import store as wh_store
 
     brand = spec.brand or m.brand or m.source or ""
@@ -1157,6 +1159,14 @@ def pick_images(rt: Runtime, m: Manuscript, spec: TaskSpec, need: int) -> list[P
     cfg = wh_store.load_brands_config()
     tokens = placeholder_tokens(m.body)[:need]
     used = used_variants(rt)
+    # 원본 sha 단위로 "이번 실행에서 이미 쓴 원본"을 추적한다(브랜드별).
+    # 세탁본이 여러 개 캐시돼 있으면 같은 원본이 pick_variant를 계속 통과해
+    # 버려, 실행 한 번(=여러 건 연속 발행)에 같은 사진이 반복되는 문제가
+    # 있었다(실측 2026-09-25, 뉴더미스·우아덤·장으뜸 각 5건이 같은 원본 1장으로
+    # 몰림). 원본이 `need`건보다 적으면 다 쓴 뒤 자연히 재사용으로 넘어간다.
+    used_originals_this_run: set[str] = rt.scratch.setdefault(
+        "used_original_sha", {}
+    ).setdefault(brand, set())
     out: list[Path] = []
 
     for token in tokens:
@@ -1166,20 +1176,36 @@ def pick_images(rt: Runtime, m: Manuscript, spec: TaskSpec, need: int) -> list[P
         if wh_store.token_select_mode(brand, token, m.keyword, cfg) == "filename_match":
             matched = _match_by_filename(originals, m.keyword or token)
             originals = matched or originals
+        # 폴더 순서(정렬)에 고정되지 않도록 매번 섞는다. 이번 실행에서 아직
+        # 안 쓴 원본을 먼저 시도하고, 다 떨어지면 이미 쓴 원본으로 넘어간다.
+        shuffled = list(originals)
+        random.shuffle(shuffled)
+        fresh = [p for p in shuffled if wh.sha256(p) not in used_originals_this_run]
+        reuse = [p for p in shuffled if wh.sha256(p) in used_originals_this_run]
         picked: Path | None = None
-        for original in originals:
+        picked_sha: str | None = None
+        for original in fresh + reuse:
             sha = wh.sha256(original)
             if not wh.washed_variants(sha):
-                wh.ensure_keyword_pool(
-                    brand, m.keyword or token, min_variants=1, token=token, cfg=cfg
-                )
+                # `ensure_keyword_pool`은 폴더 전체 세탁본 수(`min_variants`)만
+                # 보므로, 다른 원본이 이미 채워놨으면 이 원본은 영영 안 세탁된다
+                # (실측 2026-09-25). 이 원본이 비어 있으면 바로 세탁한다.
+                from v2r.warehouse import photo_washer
+
+                try:
+                    photo_washer.make_variants(original, 1, wh.washed_folder(sha))
+                except Exception:
+                    continue
             variant = wh.pick_variant(sha, used)
             if variant is None:
                 continue
             used.add(str(variant))
             rt.scratch.setdefault("variant_sha", {})[str(variant)] = sha
             picked = variant
+            picked_sha = sha
             break
+        if picked_sha:
+            used_originals_this_run.add(picked_sha)
         if picked is None:
             folder = wh.keyword_folder(brand, m.keyword or token, cfg=cfg, token=token)
             notify_photo_shortage(rt, spec, brand, folder.name, need, len(out))
