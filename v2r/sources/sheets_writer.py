@@ -1353,7 +1353,7 @@ def apply_exposure(
                 updates_list.append({"keyword": str(kw), **fields})
 
         # 러너 갱신 → update_by_key 묶음 50개씩(2026-09-25 지시).
-        BATCH = 50
+        BATCH = 20  # 50이면 우아덤에서 Apps Script가 HTML 오류를 돌려줌(실측 2026-09-25 21:59, 10·20은 정상)
         with _BrandLock(sid, repo_root):
             for i in range(0, len(updates_list), BATCH):
                 part = updates_list[i : i + BATCH]

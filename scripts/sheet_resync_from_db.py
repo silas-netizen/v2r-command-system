@@ -83,11 +83,12 @@ def main(argv: list[str]) -> int:
         out = {"brand": brand, "sheet_rows": len(rows), "to_update": len(updates), "exposed_with_cafe": sum(1 for u in updates if u.get("A"))}
         if not dry:
             done, missing = 0, 0
-            for i in range(0, len(updates), 50):
+            BATCH = int(next((a.split("=")[1] for a in argv if a.startswith("--batch=")), "20"))
+            for i in range(0, len(updates), BATCH):
                 # 러너 작업자 6개와 같은 웹앱을 나눠 쓰므로 잠금 대기 초과(HTML 오류)가 날 수 있다 → 묶음마다 최대 6회, 10초 간격 재시도
                 for attempt in range(6):
                     try:
-                        res = api.api_update_by_key(sid, updates[i : i + 50], repo_root=ROOT, config=cfg)
+                        res = api.api_update_by_key(sid, updates[i : i + BATCH], repo_root=ROOT, config=cfg)
                         break
                     except api.SheetsApiError:
                         if attempt == 5:
