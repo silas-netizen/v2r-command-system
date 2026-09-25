@@ -1348,6 +1348,11 @@ def run_codex(
     out = done.stdout or ""
     err = (done.stderr or "").strip()
     if not out.strip():
+        # 한도 문구("usage limit … try again at …")는 stderr 뒤쪽에 오므로 잘라내지 않고
+        # 그 줄을 앞으로 끌어와 호출측 감지(_detect_usage_limit)가 놓치지 않게 한다(2026-09-25)
+        limit_line = next((ln for ln in err.splitlines() if "usage limit" in ln.lower()), "")
+        if limit_line:
+            return "", limit_line[:400]
         return "", err[:300] or "빈 응답"
     return out, ""
 
