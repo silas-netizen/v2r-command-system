@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>V2R 현황판 — 2026-09-23 18:00 기준 · 중간 보고</title><style>
+:root{color-scheme:light dark;--bg:#f6f7f9;--card:#fff;--ink:#1c2430;--mute:#6b7683;
+--line:#e3e7ec;--head:#f0f3f7;--sum:#fafbfc;--ok:#1a9c5b;--warn:#d9890b;--bad:#d43f3f;
+--bar:#2f6fed;--bar2:#c9d6f5;--off:#9aa4b0}
+@media (prefers-color-scheme: dark){:root{--bg:#12151a;--card:#191d24;--ink:#e8ecf2;
+--mute:#9aa4b2;--line:#2a303a;--head:#20252e;--sum:#1e232b;--ok:#57c78c;--warn:#e2b155;
+--bad:#f18a8f;--bar:#6ea8fe;--bar2:#2f3a4d;--off:#6b7683}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:"Malgun Gothic",
+"Apple SD Gothic Neo",system-ui,sans-serif;padding:20px 16px 40px;font-size:14px;
+line-height:1.55;-webkit-text-size-adjust:100%}
+.wrap{max-width:1100px;margin:0 auto}
+h1{font-size:20px;margin:0 0 4px}
+.sub{color:var(--mute);margin-bottom:18px}
+h2{font-size:15px;margin:26px 0 10px;padding-left:10px;border-left:4px solid var(--bar)}
+.grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(180px,1fr))}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px}
+.card .k{color:var(--mute);font-size:12px}
+.card .v{font-size:26px;font-weight:700;margin:4px 0 2px;font-variant-numeric:tabular-nums}
+.card .d{font-size:12px;color:var(--mute)}
+.ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}.off{color:var(--off)}
+.pill{display:inline-block;padding:2px 9px;border-radius:999px;font-size:12px;
+font-weight:600;color:#fff;white-space:nowrap}
+.pill.ok{background:var(--ok)}.pill.warn{background:var(--warn)}
+.pill.bad{background:var(--bad)}.pill.off{background:var(--off)}
+table{width:100%;border-collapse:collapse;background:var(--card);border:1px solid var(--line);
+border-radius:10px;overflow:hidden}
+th,td{padding:9px 12px;border-bottom:1px solid var(--line);text-align:left;
+font-variant-numeric:tabular-nums}
+th{background:var(--head);color:var(--mute);font-weight:600;font-size:12px}
+td.n,th.n{text-align:right}
+tr:last-child td{border-bottom:0}
+tr.sum td{font-weight:700;background:var(--sum)}
+.bar{display:flex;align-items:flex-end;gap:4px;height:120px;background:var(--card);
+border:1px solid var(--line);border-radius:10px;padding:18px 12px 26px;position:relative}
+.bar div{flex:1;background:var(--bar);border-radius:3px 3px 0 0;position:relative;min-width:8px}
+.bar div span{position:absolute;bottom:-20px;left:0;right:0;text-align:center;
+font-size:10px;color:var(--mute)}
+.bar div b{position:absolute;top:-16px;left:0;right:0;text-align:center;font-size:10px;
+font-weight:600}
+.bar div.low{background:var(--bar2)}
+ul{margin:6px 0 0 18px;padding:0}li{margin:4px 0}
+.tbl{overflow-x:auto}
+.empty{color:var(--mute);margin:4px 0 0}
+footer{color:var(--mute);font-size:12px;text-align:center;padding:16px 0 0}
+</style></head><body><div class="wrap">
+<h1>V2R 현황판 — 2026-09-23 18:00 기준 · 중간 보고</h1>
+<div class="sub">작성 2026-09-23 18:00 KST 실측 · 자사 카페 일상 글 · 브랜드 원고 · 로그인 · 비용</div>
+<h2>한눈에</h2><div class="grid">
+<div class="card"><div class="k">발행 성공</div><div class="v ok">500</div><div class="d">목표 - · 실패 0 · 제한 글 0</div></div>
+<div class="card"><div class="k">사용 계정</div><div class="v ok">10<span style="font-size:13px">/카페</span></div><div class="d">그날 쓴 계정 전체 10개</div></div>
+<div class="card"><div class="k">같은 게시판 연속</div><div class="v ok">0</div><div class="d">연속 0이 규칙</div></div>
+<div class="card"><div class="k">V2R 로그인</div><div class="v ok">유지</div><div class="d">09-19 12:35 이후 4일 5시간 · 로그인 기록 1회</div></div>
+<div class="card"><div class="k">원고 비용</div><div class="v warn">유료 27건</div><div class="d">요금제 1084회 · 캐시 28%</div></div>
+<div class="card"><div class="k">실행기</div><div class="v ok">정상</div><div class="d">심장박동 3초 전 · 예약 16/19 발사</div></div>
+<div class="card"><div class="k">목표 대비 진행률</div><div class="v off">-</div><div class="d">500/-건 · 남은 0건</div></div>
+</div>
+<h2>발행 · 카페별</h2>
+<div class="tbl"><table><tr><th>카페</th><th class="n">성공</th><th class="n">실패</th><th class="n">제한 글</th><th class="n">미확정</th><th class="n">계정 수</th><th class="n">게시판 수</th><th class="n">게시판 연속</th><th class="n">남은 건수</th><th>예상 종료</th><th>상태</th></tr><tr><td>고요한 아침</td><td class="n">100</td><td class="n">0</td><td class="n">0</td><td class="n">0</td><td class="n">10</td><td class="n">22</td><td class="n">0</td><td class="n">0</td><td>-</td><td><span class="pill ok">완료</span></td></tr><tr><td>글로시 마이</td><td class="n">100</td><td class="n">0</td><td class="n">0</td><td class="n">0</td><td class="n">10</td><td class="n">18</td><td class="n">0</td><td class="n">0</td><td>-</td><td><span class="pill ok">완료</span></td></tr><tr><td>러브 인썸</td><td class="n">100</td><td class="n">0</td><td class="n">0</td><td class="n">0</td><td class="n">10</td><td class="n">19</td><td class="n">0</td><td class="n">0</td><td>-</td><td><span class="pill ok">완료</span></td></tr><tr><td>마이 웨딩 드림</td><td class="n">100</td><td class="n">0</td><td class="n">0</td><td class="n">0</td><td class="n">10</td><td class="n">19</td><td class="n">0</td><td class="n">0</td><td>-</td><td><span class="pill ok">완료</span></td></tr><tr><td>송도포털</td><td class="n">100</td><td class="n">0</td><td class="n">0</td><td class="n">0</td><td class="n">10</td><td class="n">18</td><td class="n">0</td><td class="n">0</td><td>-</td><td><span class="pill ok">완료</span></td></tr><tr class="sum"><td>합계</td><td class="n">500</td><td class="n">0</td><td class="n">0</td><td class="n">0</td><td></td><td></td><td class="n">0</td><td class="n">0</td><td></td><td></td></tr></table></div>
+<h2>시간대별 발행 (건)</h2><div class="bar">
+<div class="low" style="height:2%"><span>00</span></div>
+<div class="low" style="height:2%"><span>01</span></div>
+<div class="low" style="height:2%"><span>02</span></div>
+<div class="low" style="height:2%"><span>03</span></div>
+<div class="low" style="height:2%"><span>04</span></div>
+<div class="low" style="height:2%"><span>05</span></div>
+<div class="low" style="height:2%"><span>06</span></div>
+<div class="low" style="height:2%"><span>07</span></div>
+<div class="low" style="height:2%"><span>08</span></div>
+<div style="height:76%"><b>52</b><span>09</span></div>
+<div style="height:97%"><b>66</b><span>10</span></div>
+<div style="height:68%"><b>46</b><span>11</span></div>
+<div style="height:91%"><b>62</b><span>12</span></div>
+<div style="height:96%"><b>65</b><span>13</span></div>
+<div style="height:91%"><b>62</b><span>14</span></div>
+<div style="height:100%"><b>68</b><span>15</span></div>
+<div style="height:96%"><b>65</b><span>16</span></div>
+<div style="height:21%"><b>14</b><span>17</span></div>
+<div class="low" style="height:2%"><span>18</span></div>
+<div class="low" style="height:2%"><span>19</span></div>
+<div class="low" style="height:2%"><span>20</span></div>
+<div class="low" style="height:2%"><span>21</span></div>
+<div class="low" style="height:2%"><span>22</span></div>
+<div class="low" style="height:2%"><span>23</span></div>
+</div>
+<ul><li>그날 성공 발행 500건 · 가장 많은 시간대 15시 68건</li></ul>
+<h2>브랜드 원고 · LLM</h2><div class="tbl"><table>
+<tr><th>항목</th><th>값</th><th>상태</th></tr>
+<tr><td>요금제 호출</td><td>1084회</td><td><span class="pill ok">0원</span></td></tr>
+<tr><td>캐시율</td><td>28.2% (캐시 읽기 963,617 토큰)</td><td><span class="pill warn">낮음</span></td></tr>
+<tr><td>유료 건수</td><td>27건</td><td><span class="pill warn">유료 사용</span></td></tr>
+<tr><td>브랜드 원고 호출</td><td>62회</td><td><span class="pill ok">가동</span></td></tr>
+<tr><td>토큰</td><td>새 입력 2,309,494 · 출력 15,009,894</td><td><span class="pill off">실측</span></td></tr>
+</table></div>
+<h2>로그인 · 세션 유지</h2><div class="tbl"><table>
+<tr><th>서비스</th><th>유지 방식</th><th>마지막 확인</th><th>상태</th></tr>
+<tr><td>V2R</td><td>API 세션 자동 갱신</td><td>09-23 17:31</td><td><span class="pill ok">유지</span></td></tr>
+<tr><td>네이버</td><td>영속 프로필 · 하루 4회 방문</td><td>09-23 15:11</td><td><span class="pill ok">유지</span></td></tr>
+<tr><td>Claude 플랫폼</td><td>크롬 프로필 점검</td><td>09-23 09:20</td><td><span class="pill bad">풀림</span></td></tr>
+<tr><td>Claude Code CLI(요금제)</td><td>자격증명 백업 · 복원</td><td>09-23 09:25</td><td><span class="pill ok">유지</span></td></tr>
+<tr><td>ChatGPT / Codex</td><td>앱 로그인</td><td>09-23 09:02</td><td><span class="pill ok">유지</span></td></tr>
+<tr><td>Make</td><td>크롬 프로필 점검</td><td>09-23 09:20</td><td><span class="pill off">대기</span></td></tr>
+</table></div>
+<h2>브랜드 키워드 노출</h2>
+<div class="tbl"><table>
+<tr><th>브랜드</th><th>노출</th><th>밀려남</th><th>미발행</th><th>미확인</th><th>새로 밀려난 키워드</th></tr>
+<tr><td>뉴더미스</td><td class="n">18</td><td class="n">43</td><td class="n">1</td><td class="n">0</td><td>내치핵、똥꼬 가려움、먹는 치질약、변비에 좋은 음식、사타구니 가려움、사타구니 백선、사타구니 습진、사타구니 종기、엉덩이 두드러기、엉덩이 뾰루지、엉덩이 종기、여의사 항문외과、외치핵、임산부 변비、좌욕 방법、치루、치루 증상、치루수술、치센 효과、치열、치열 증상、치질、치질방석、치질병원、치질수술、치질수술 가격、치질수술 회복기간、치질약、치질연고、치질증상、치핵、치핵 수술、치핵 증상、항문 가려움、항문 가려움 연고、항문 통증、항문 피、항문농양、항문소양증、혈변、혈변 원인、회음부 가려움</td></tr>
+<tr><td>우아덤</td><td class="n">1</td><td class="n">29</td><td class="n">3</td><td class="n">0</td><td>겨드랑이、기미、기미앰플、기미크림、나이아신아마이드、등드름、리팟레이저、모공、미백、미백앰플、미백크림、비타민C、선스틱、선크림、여드름、여드름피부과、여드름흉터、인디언주름、자외선、주근깨、탄력크림、토닝、톤업선크림、톤업크림、트러블、티타늄리프팅、피코토닝、흉터치료</td></tr>
+<tr><td>장으뜸</td><td class="n">5</td><td class="n">45</td><td class="n">0</td><td class="n">6</td><td>e보건소 산전검사、nk세포、가임기、가임기 계산、강남산부인과、강남역산부인과、경주 대추밭백한의원、경주 대추밭한의원、계류유산、나팔관조영술、남자 성병 증상、대상포진 주사 가격、린 여성병원、배란일、배란테스트기、배란통、배란통 증상、보건소 산전검사、분쇄골절、산전검사、생리 늦어질때、생리전 증후군、수원국가유산야행、시험관 시술과정、얼리 임테기、얼리임테기 시기、여성질유산균、이상근증후군、임산부 비타민D、임신 기간、임신 주차 계산기、임신사전건강관리、임신주수계산、임신주수계산기、임테기 사용시기、자궁근종、자궁내막암、자궁내막증、자궁외임신 증상、착상혈、착상혈 시기、척추전방전위증、최상산부인과、출산휴가</td></tr>
+<tr><td>코숨핏</td><td class="n">0</td><td class="n">1</td><td class="n">0</td><td class="n">0</td><td>-</td></tr>
+<tr><td>팥순이</td><td class="n">8</td><td class="n">52</td><td class="n">0</td><td class="n">0</td><td>bnr17 유산균、ems、공복혈당수치、그래놀라、김민하 다이어트、남재현 다이어트、다이어트 식단、다이어트음식、단백질 많은 음식、단백질쉐이크、단호박 샐러드、닭가슴살 요리、당뇨에좋은음식、덴마크 유산균、디다샷、락토핏 유산균、마운자로、마운자로 가격、마운자로 처방、맥스컷、발사믹식초、뱃살빼는법、베르베린、비만도 계산기、비에날17유산균、비에날씬、비피더스 유산균、스위치온 다이어트、스텝퍼、식후 2시간 혈당、실내자전거、알파cd、애사비、올록담 올리브3、올리브오일 효능、요즘 그릭요거트、위고비、이노시톨、저당밥솥、차전자피、천국의계단、카무트、카무트효소、카무트효소 효능、콜레스테롤수치、콤부차、콤부차 효능、파라다이스 그레인 효능、한끼통살、혈당스파이크、효소</td></tr>
+</table></div>
+<h2>오늘 진행 · 결정 대기</h2>
+<ul><li>13:27 완료(08:00 재개 후 약 5.5시간, 카페별 병렬 2~5분). 하루 10개 계정 공용 규칙 적용됨. 카페탭 검색 노출 검사는 10:59 이후 글부터 &#x27;사용&#x27;.</li><li>미확정 3건(어제)은 끊긴 작업 점검이 재조회했으나 아직 확정 안 됨(서버 목록에 안 보임 → 다음 점검에서 실패로 정리 예정).</li><li>오늘 발행이 끝난 14:27에 최신 코드로 창 없이 재시작(검은 창 이제 없음). 새 명령 확인: `요금제 세션 점검` OK(로그인 유지), `웹 세션 점검` Claude 플랫폼 OK.</li><li>내일 자동: 03:10/09:10/15:10/21:10 네이버 연장, 07:30 색인 동기화, 08:30 끊긴 작업 점검, 09:00 카페별 100건, 09:00 GPT 점검, 09:10~09:25 세션 점검 3종, 미처리 알림 5회.</li><li>계정 규칙(하루 10개 공용·시트 기준 스탭), 검색 노출 검사 &#x27;사용&#x27; 고정, 네이버·Claude 플랫폼 로그인 유지 장치, insane-search + web-crawler 설치, Make 지침 정리본 6개, 브랜드 원고 생성기 재설계(지침 전문·예시·검증·부분 재시도), 요금제 실행 길(0원) + 6건 검증 통과, API 사용량 분석.</li><li>비교 보고서 보고 브랜드별 &quot;발행 가능/수정 포인트&quot; 한 줄 → 새벽 02:10 묶음 생성 켜기.</li><li>정리본 공통 결정: 본문 키워드 횟수(3회 권장), 댓글 글자 수 기준.</li><li>기존 발행글 996건 검색 노출 검사 &#x27;사용&#x27;으로 일괄 변경 여부. &quot;이글에 댓글 AI&quot; 옵션(현재 사용) 유지 여부.</li><li>Make 로그인(급하지 않음), 웨딩 노트·헬씨 트리 합류, 팥순이 24행, 09:00 수량.</li></ul>
+<footer>V2R 운영 현황판 — 자동 생성</footer></div></body></html>
