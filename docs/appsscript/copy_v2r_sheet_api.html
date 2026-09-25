@@ -1,6 +1,6 @@
 <!doctype html><html lang="ko"><head><meta charset="utf-8"><title>Apps Script 코드 복사</title>
 <style>body{font-family:Segoe UI,sans-serif;margin:24px;background:#f6f7f9}button{font-size:20px;padding:14px 28px;background:#1a73e8;color:#fff;border:0;border-radius:8px;cursor:pointer}#msg{margin-left:16px;font-size:18px;color:#0b8043}textarea{width:100%;height:70vh;margin-top:16px;font-family:Consolas,monospace;font-size:13px}</style></head>
-<body><h2>V2R 시트 API — Apps Script 최종 코드 (221줄)</h2>
+<body><h2>V2R 시트 API — Apps Script 최종 코드 (239줄)</h2>
 <p>아래 버튼을 누르면 코드 전체가 복사됩니다. Apps Script 편집창에서 Ctrl+A → Delete 후 Ctrl+V 하세요.</p>
 <button onclick="copyAll()">코드 전체 복사</button><span id="msg"></span>
 <textarea id="code" readonly>/**
@@ -140,8 +140,19 @@ function reapplyFormat(sh){
     if (!src) { fixed[name] = &quot;드롭다운 원본 없음&quot;; continue; }
     var rule = src.getDataValidation();
     var arr = []; for (var r=0;r&lt;last-1;r++) arr.push([rule]);
-    sh.getRange(2, cols[name], last-1, 1).setDataValidations(arr);
-    fixed[name] = last-1;
+    try {
+      sh.getRange(2, cols[name], last-1, 1).setDataValidations(arr);
+      fixed[name] = last-1;
+    } catch (e) {
+      // 기존 규칙이 다른 파일의 범위를 가리켜 다시 못 거는 경우(코숨핏 실측 2026-09-25:
+      // &#x27;_드롭다운&#x27;!B2:B3). G는 고정 목록, A는 열에 이미 있는 카페명 목록으로 새 규칙을 건다.
+      var list = name === &quot;G&quot; ? [&quot;노출완&quot;, &quot;밀려남&quot;, &quot;미확인&quot;] : distinctValues(sh, cols[name], last);
+      if (!list.length) { fixed[name] = &quot;실패: &quot; + String(e); continue; }
+      var nr = SpreadsheetApp.newDataValidation().requireValueInList(list, true).setAllowInvalid(true).build();
+      var arr2 = []; for (var r2=0;r2&lt;last-1;r2++) arr2.push([nr]);
+      sh.getRange(2, cols[name], last-1, 1).setDataValidations(arr2);
+      fixed[name] = (last-1) + &quot;(목록 &quot; + list.length + &quot;)&quot;;
+    }
   }
   return {rows: last-2 &gt; 0 ? last-2 : 0, dropdown: fixed};
 }
@@ -221,6 +232,13 @@ function info(sh){
     var keys = sh.getRange(2, KEY_COL, last-1, 1).getValues();
     for (var i2=0;i2&lt;keys.length;i2++) if (!norm(keys[i2][0])) out.blank_key_rows++;
   }
+  return out;
+}
+
+// 열의 비어 있지 않은 값 목록(중복 제거, 최대 200개).
+function distinctValues(sh, col, last){
+  var v = sh.getRange(2, col, last-1, 1).getValues(); var seen = {}, out = [];
+  for (var i=0;i&lt;v.length &amp;&amp; out.length&lt;200;i++){ var x = String(v[i][0]||&quot;&quot;).trim(); if (x &amp;&amp; !seen[x]) { seen[x] = true; out.push(x); } }
   return out;
 }
 </textarea>
