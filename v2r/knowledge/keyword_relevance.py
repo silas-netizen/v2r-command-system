@@ -1031,6 +1031,10 @@ def codex_progress_path(brand: str, worker_id: int, data_dir: str | Path = "data
     return Path(data_dir) / "keywords" / f"codex_progress_{brand}_{worker_id}.json"
 
 
+#: 상주 워커가 일이 없을 때 쉬는 간격(초)
+IDLE_SLEEP_SEC = 60
+
+
 def score_worker_lock_path(brand: str, data_dir: str | Path = "data") -> Path:
     return Path(data_dir) / "locks" / f"score-{brand}.lock"
 
@@ -1187,23 +1191,41 @@ def score_worker(
         summary = brand_summary(brand, guides_dir)
         update_progress(progress_path, brand, status="running", scored=0, started_at=started_at)
         while True:
+            try:
+                lock_path.touch()  # 상주 중에도 잠금이 신선해야 감시가 중복 워커를 띄우지 않는다(2026-09-26)
+            except OSError:
+                pass
             if rescore_stop_requested(repo_root / "data"):
                 update_progress(progress_path, brand, status="정지(STOP 파일)", scored=scored)
                 log.info("score-worker 정지 파일 감지, 종료: %s", brand)
                 break
-            keywords = pending_keywords(conn, limit=batch_size)
+            try:
+                keywords = pending_keywords(conn, limit=batch_size)
+            except sqlite3.OperationalError as exc:
+                log.warning("score-worker DB 오류, 30초 뒤 재시도(%s): %s", brand, exc)
+                time.sleep(30)
+                continue
             if not keywords:
-                update_progress(progress_path, brand, status="done", scored=scored)
-                break
+                # 2026-09-26 재발 방지: 미채점이 없다고 종료하면 채우기 순환이 나중에 모은 후보가
+                # 채점 없이 쌓인다(어제 저녁 27,592개). 종료하지 않고 상주하며 60초마다 다시 본다.
+                update_progress(progress_path, brand, status="idle", scored=scored)
+                time.sleep(IDLE_SLEEP_SEC)
+                continue
             t0 = time.monotonic()
             try:
                 rows = score_batch(router, brand, keywords, summary)
             except RelevanceParseError as exc:
                 failed_batches += 1
                 log.error("score 묶음 포기(%s, %d개): %s", brand, len(keywords), exc)
+                time.sleep(5)
                 continue
             elapsed = time.monotonic() - t0
-            write_scores(conn, rows)
+            try:
+                write_scores(conn, rows)
+            except sqlite3.OperationalError as exc:
+                log.warning("score-worker 저장 실패, 30초 뒤 재시도(%s): %s", brand, exc)
+                time.sleep(30)
+                continue
             scored += len(rows)
             update_progress(
                 progress_path,
@@ -1278,14 +1300,25 @@ def codex_worker(
         )
         update_progress(progress_path, brand, status="running", codex_checked=0, started_at=started_at)
         while True:
+            try:
+                lock_path.touch()
+            except OSError:
+                pass
             if rescore_stop_requested(repo_root / "data"):
                 update_progress(progress_path, brand, codex_status="정지(STOP 파일)", codex_checked=checked)
                 log.info("codex-worker 정지 파일 감지, 종료: %s #%s", brand, worker_id)
                 break
-            chunk = claim_codex_batch(conn, limit=batch_size)
+            try:
+                chunk = claim_codex_batch(conn, limit=batch_size)
+            except sqlite3.OperationalError as exc:
+                log.warning("codex-worker DB 오류, 30초 뒤 재시도(%s #%s): %s", brand, worker_id, exc)
+                time.sleep(30)
+                continue
             if not chunk:
-                update_progress(progress_path, brand, codex_status="done", codex_checked=checked)
-                break
+                # 상주(2026-09-26 재발 방지): 검증할 것이 없어도 종료하지 않고 60초마다 다시 본다.
+                update_progress(progress_path, brand, codex_status="idle", codex_checked=checked)
+                time.sleep(IDLE_SLEEP_SEC)
+                continue
             claude_rows = [
                 {"keyword": kw, "relevance": int(rel), "rationale": ra or "", "bridge_rationale": br or ""}
                 for kw, rel, ra, br in chunk
@@ -1335,12 +1368,16 @@ def score_worker_main(argv: list[str]) -> int:
         return 2
     brand = argv[0]
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    try:
-        score_worker(brand)
-    except Exception as exc:  # noqa: BLE001
-        log.error("score-worker 종료(실패): brand=%s: %s", brand, exc)
-        return 1
-    return 0
+    while True:
+        try:
+            score_worker(brand)
+            return 0
+        except Exception as exc:  # noqa: BLE001
+            # 2026-09-26 재발 방지: DB 잠김·열 중복 같은 일시 오류로 프로세스가 죽지 않게 60초 뒤 재진입
+            log.error("score-worker 오류, 60초 뒤 재진입: brand=%s: %s", brand, exc)
+            if rescore_stop_requested(Path("data")):
+                return 1
+            time.sleep(60)
 
 
 def codex_worker_main(argv: list[str]) -> int:
@@ -1351,12 +1388,15 @@ def codex_worker_main(argv: list[str]) -> int:
     brand = argv[0]
     worker_id = int(argv[1]) if len(argv) > 1 else 1
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    try:
-        codex_worker(brand, worker_id=worker_id)
-    except Exception as exc:  # noqa: BLE001
-        log.error("codex-worker 종료(실패): brand=%s #%s: %s", brand, worker_id, exc)
-        return 1
-    return 0
+    while True:
+        try:
+            codex_worker(brand, worker_id=worker_id)
+            return 0
+        except Exception as exc:  # noqa: BLE001
+            log.error("codex-worker 오류, 60초 뒤 재진입: brand=%s #%s: %s", brand, worker_id, exc)
+            if rescore_stop_requested(Path("data")):
+                return 1
+            time.sleep(60)
 
 
 # --- 브랜드 간 중복 배정 -----------------------------------------------
