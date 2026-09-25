@@ -52,6 +52,15 @@ _LOCK_DIR = "data/locks"
 _LOCK_TIMEOUT = 60.0  # 초 — 다른 프로세스가 같은 브랜드 시트를 쓰고 있으면 대기
 _LOCK_STALE = 300.0  # 초 — 이보다 오래된 잠금 파일은 죽은 프로세스로 보고 지운다
 
+#: 2026-09-25 사고(실행기 재시작 중 5개 브랜드 시트 2탭 훼손) 재발 방지 가드.
+#: A1(첫 열 헤더)이 이 문자열이 아니면 그 탭은 우리가 아는 "노출 현황" 탭이
+#: 아니거나 이미 훼손된 상태이므로 어떤 쓰기도 하지 않는다.
+_EXPECTED_A1 = "카페"
+#: 한 번의 `시트 키워드 반영` 실행에서 붙일 수 있는 최대 행 수(브랜드 무관 상한).
+MAX_ROWS_PER_SYNC = 1000
+#: 시트 백업 디렉터리(동기화 시작 전 항상 전체 export를 여기 저장한다).
+SHEET_BACKUP_DIR = "data/sheet_backups"
+
 
 class SheetsWriteError(RuntimeError):
     """시트 쓰기 실패."""
@@ -166,7 +175,14 @@ def _dismiss_modal(page: Any) -> str:
 
 
 def _nav_to(page: Any, cell: str) -> str:
-    """이름 상자로 `cell`에 이동하고, 이동 뒤 이름 상자 값을 돌려준다(모달이 뜨면 닫는다)."""
+    """이름 상자로 `cell`에 이동하고, 이동 뒤 이름 상자 값을 돌려준다(모달이 뜨면 닫는다).
+
+    2026-09-25 사고: 이름 상자에 초점이 없는 채로 타이핑이 시작되면(그리드가 다른
+    동시 작업으로 바쁠 때 재현) 키 입력이 그대로 활성 셀에 리터럴 텍스트로
+    들어간다(A1에 "A1265" 문자열이 박힌 사고). 타이핑 전 Escape로 어떤 편집
+    상태도 확실히 비운 뒤에만 이름 상자를 클릭·입력한다.
+    """
+    page.keyboard.press("Escape")
     page.click("#t-name-box")
     page.keyboard.press("Control+A")
     page.keyboard.type(cell)
@@ -214,6 +230,18 @@ def _ensure_grid_rows(page: Any, last_row: int, max_loops: int = 12) -> None:
         return
     current = _grid_row_count(page, last_row)
     for _ in range(max_loops):
+        # 2026-09-25 사고 가드(i): `current`(격자 마지막 행이라고 믿는 값)이 실제로
+        # 격자 끝인지 삽입 직전에 다시 확인한다 — A{current}는 되고 A{current+1}은
+        # 안 되어야(모달) 진짜 끝이다. 동시 작업 등으로 이진 탐색이 실제보다 작은
+        # 값에 잘못 수렴하면(2026-09-25 뉴더미스 865행부터 빈 행 1,465개 삽입 사고의
+        # 원인으로 의심) 여기서 즉시 중단하고 절대 삽입하지 않는다.
+        if _nav_to(page, f"A{current}") != f"A{current}":
+            raise SheetsWriteError(f"행 늘리기 중단: 격자 끝 재확인 실패(A{current})")
+        if _nav_to(page, f"A{current + 1}") == f"A{current + 1}":
+            raise SheetsWriteError(
+                f"행 늘리기 중단: {current}행이 격자 끝이 아님(A{current + 1} 이동이 성공함) — "
+                "이진 탐색 결과를 신뢰할 수 없어 삽입하지 않음"
+            )
         n = max(1, min(current, 1000, last_row - current))
         sel = f"{current - n + 1}:{current}"
         if _nav_to(page, sel) != sel.upper():
@@ -476,6 +504,41 @@ def _last_data_row(table: list[list[str]]) -> int:
     return last
 
 
+def _check_a1_ok(table: list[list[str]]) -> str:
+    """A1이 `_EXPECTED_A1`("카페")이 아니면 빈 문자열이 아닌 오류 메시지를 돌려준다.
+
+    2026-09-25 사고: 이름 상자 이동이 씹혀 A1에 셀 주소 문자열("A1265")이
+    그대로 들어간 채로 다음 붙여넣기가 계속 진행됐다. 모든 쓰기 진입점은 쓰기
+    전에 이걸 먼저 확인하고, 실패하면 아무 것도 쓰지 않고 즉시 중단한다.
+    """
+    if not table or not table[0]:
+        return "시트가 비어 있음(A1 확인 불가)"
+    a1 = str(table[0][0]).strip()
+    if a1 != _EXPECTED_A1:
+        return f"A1 훼손 의심 — 예상 {_EXPECTED_A1!r}, 실제 {a1!r}(이 탭은 쓰기 금지, 복구 필요)"
+    return ""
+
+
+def _backup_sheet_csv(
+    brand: str, table: list[list[str]], *, repo_root: str | Path = ".", tag: str = "before_sync"
+) -> Path:
+    """전체 export CSV를 타임스탬프 파일로 저장한다(동기화 시작 전 항상 호출).
+
+    2026-09-25 사고 이후 지시(v) — 되돌릴 수 있어야 하므로 쓰기 시작 전 백업은
+    선택이 아니라 필수다.
+    """
+    from datetime import datetime
+
+    out_dir = Path(repo_root) / SHEET_BACKUP_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    path = out_dir / f"{brand}_노출현황_{tag}_{ts}.csv"
+    with open(path, "w", encoding="utf-8-sig", newline="") as f:
+        w = csv.writer(f)
+        w.writerows(table)
+    return path
+
+
 _DATE_RE = re.compile(r"^(\d{4})-(\d{1,2})-(\d{1,2})[ T](\d{1,2}):(\d{2}):(\d{2})")
 
 
@@ -621,6 +684,9 @@ def append_rows(
         table = _read_export_csv(spreadsheet_id, gid)
     except Exception as exc:
         return {"written": 0, "mode": "csv_only", "error": str(exc)}
+    a1_err = _check_a1_ok(table)
+    if a1_err:
+        return {"written": 0, "mode": "csv_only", "error": a1_err}
     hdr = header or (table[0] if table else [])
     value_rows: list[list[str]] = []
     for row in rows:
@@ -647,6 +713,12 @@ def append_rows(
         written += res.get("written", 0)
         if res.get("error"):
             errors.append(res["error"])
+        if res.get("mode") != "sheets":
+            # 2026-09-25 사고 가드(ii): 검증 불일치(붙인 행 수와 실제 반영이 다름)가
+            # 나면 다음 chunk로 넘어가지 말고 즉시 멈춘다 — 이전에는 계속 진행해
+            # 어긋난 자리 위에 chunk가 계속 쌓이며 훼손이 커졌다.
+            errors.append(f"{cell} 이후 chunk 중단(검증 실패)")
+            break
     out: dict[str, Any] = {"written": written, "mode": "sheets" if written == len(value_rows) else "csv_only"}
     if errors:
         out["error"] = "; ".join(errors)
@@ -971,6 +1043,11 @@ def sync_keywords_to_sheet(
         table = _read_export_csv(sid, gid)
     except Exception as exc:
         return {"brand": brand, "skipped": True, "reason": f"시트 읽기 실패: {exc}"}
+    a1_err = _check_a1_ok(table)
+    if a1_err:
+        return {"brand": brand, "skipped": True, "reason": a1_err}
+    # 2026-09-25 사고 가드(v): 쓰기 시작 전 전체 export를 항상 백업한다.
+    _backup_sheet_csv(brand, table, repo_root=repo_root, tag="before_sync")
     header = table[0][:15] if table else [
         "카페", "url", "발행시간", "작성자 아이디", "작성자 비밀번호", "발행 URL",
         "노출 상태", "키워드", "통합검색", "최종 편집 일시", "키워드 검색량",
@@ -1002,8 +1079,16 @@ def sync_keywords_to_sheet(
     if not out_rows:
         return {"brand": brand, "skipped": False, "picked": len(rows), "appended": 0, "reason": "이미 시트에 있음"}
 
+    # 2026-09-25 사고 가드(vi): "확정분 - 시트 보유분"을 넘겨 붙이지 않는다(그날
+    # 사고에서 확정분보다 훨씬 많은 행이 붙었다). 브랜드별 상한 = 이번에 새로
+    # 붙일 후보 수(out_rows, 이미 정규화 중복 제거됨)이고, 그와 별개로 한 번의
+    # 실행에서 MAX_ROWS_PER_SYNC(기본 1,000)행을 넘지 않는다.
+    cap = min(len(out_rows), MAX_ROWS_PER_SYNC)
+    capped = len(out_rows) > cap
+    out_rows = out_rows[:cap]
+
     res = append_rows(sid, EXPOSURE_TAB_NAME, out_rows, header=header, gid=gid, repo_root=repo_root)
-    return {
+    out = {
         "brand": brand,
         "skipped": False,
         "picked": len(rows),
@@ -1011,6 +1096,9 @@ def sync_keywords_to_sheet(
         "mode": res.get("mode"),
         **({"error": res["error"]} if res.get("error") else {}),
     }
+    if capped:
+        out["capped_at"] = cap
+    return out
 
 
 def sync_keywords_all(
@@ -1071,6 +1159,9 @@ def apply_exposure(
         table = _read_export_csv(sid, gid)
     except Exception as exc:
         return {"brand": brand, "written": 0, "rows": len(rows), "error": f"시트 읽기 실패: {exc}"}
+    a1_err = _check_a1_ok(table)
+    if a1_err:
+        return {"brand": brand, "written": 0, "rows": len(rows), "error": a1_err}
     # I(통합검색, 인덱스 8)이 이미 있는지만 본다 — B~F(인덱스 1~5, E=비밀번호 포함)는
     # 이 딕셔너리에 담기지만 아래에서 절대 인덱스로 꺼내 쓰지 않는다(로그·기록 없음).
     by_keyword_i = {_norm(r[7]): (r[8] if len(r) > 8 else "") for r in table[1:] if len(r) > 7 and r[7]}

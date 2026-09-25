@@ -154,7 +154,7 @@ def test_update_by_key_finds_row_and_writes(monkeypatch, tmp_path):
 
 
 def test_append_rows_starts_after_last_row(monkeypatch, tmp_path):
-    table = [["H", "I"], ["kw1", "url1"]]
+    table = [["카페", "I"], ["kw1", "url1"]]
 
     def fake_read(sid, gid, timeout=15.0):
         return table
@@ -184,7 +184,7 @@ def test_append_rows_starts_after_last_row(monkeypatch, tmp_path):
 
 
 def test_append_rows_skips_format_copy_when_disabled(monkeypatch, tmp_path):
-    table = [["H", "I"], ["kw1", "url1"]]
+    table = [["카페", "I"], ["kw1", "url1"]]
     monkeypatch.setattr(sw, "_read_export_csv", lambda sid, gid, timeout=15.0: table)
     monkeypatch.setattr(
         sw, "_write_verified", lambda sid, gid, cell, rows, repo_root=".": {"written": len(rows), "mode": "sheets", "cell": cell}
@@ -341,7 +341,7 @@ def test_sync_keywords_to_sheet_picks_only_target_rows(tmp_path, monkeypatch):
     con.commit()
     con.close()
 
-    header_row = ["A", "B", "C", "D", "E", "F", "G", "H"]
+    header_row = ["카페", "B", "C", "D", "E", "F", "G", "H"]
     existing_row = ["", "", "", "", "", "", "", "이미시트에있음"]
     monkeypatch.setattr(sw, "_second_tab_gid", lambda sid: 999)
     monkeypatch.setattr(
@@ -649,7 +649,7 @@ def test_sync_keywords_to_sheet_dedupes_space_case_variants(tmp_path, monkeypatc
     con.commit()
     con.close()
 
-    header_row = ["A", "B", "C", "D", "E", "F", "G", "H"]
+    header_row = ["카페", "B", "C", "D", "E", "F", "G", "H"]
     existing_row = ["", "", "", "", "", "", "", "수면 테이프"]
     monkeypatch.setattr(sw, "_second_tab_gid", lambda sid: 999)
     monkeypatch.setattr(
@@ -666,3 +666,218 @@ def test_sync_keywords_to_sheet_dedupes_space_case_variants(tmp_path, monkeypatc
     res = sw.sync_keywords_to_sheet("테스트브랜드", repo_root=tmp_path)
     assert res["appended"] == 1
     assert [r["키워드"] for r in captured["rows"]] == ["코숨 편해요"]
+
+
+# --------------------------------------------------------------------------
+# 2026-09-25 사고(실행기 재시작 중 시트 훼손) 재발 방지 가드 시험
+# --------------------------------------------------------------------------
+
+
+def test_check_a1_ok_accepts_expected_header():
+    assert sw._check_a1_ok([["카페", "url"], ["", ""]]) == ""
+
+
+def test_check_a1_ok_rejects_corrupted_a1():
+    # 2026-09-25 실측: 이름 상자 이동이 씹혀 A1에 "A1265" 같은 셀 주소 문자열이 박혔다.
+    err = sw._check_a1_ok([["A1265", "url"], ["", ""]])
+    assert "A1265" in err
+    assert "카페" in err
+
+
+def test_check_a1_ok_rejects_empty_table():
+    assert sw._check_a1_ok([]) != ""
+    assert sw._check_a1_ok([[]]) != ""
+
+
+def test_append_rows_refuses_to_write_when_a1_corrupted(monkeypatch, tmp_path):
+    """A1이 "카페"가 아니면 append_rows는 아무 것도 쓰지 않고 즉시 중단한다."""
+    table = [["A1265", "I"], ["kw1", "url1"]]
+    monkeypatch.setattr(sw, "_read_export_csv", lambda sid, gid, timeout=15.0: table)
+    write_calls = []
+    monkeypatch.setattr(
+        sw, "_write_verified",
+        lambda sid, gid, cell, rows, repo_root=".": write_calls.append(cell) or {"written": 0, "mode": "sheets"},
+    )
+    result = sw.append_rows(
+        "sid", "탭", [{"H": "kw2", "I": "url2"}], header=["H", "I"], repo_root=tmp_path
+    )
+    assert result["mode"] == "csv_only"
+    assert result["written"] == 0
+    assert "카페" in result["error"]
+    assert write_calls == []  # 어떤 셀에도 쓰기 시도조차 하지 않는다
+
+
+def test_apply_exposure_refuses_to_write_when_a1_corrupted(tmp_path, monkeypatch):
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    (cfg / "brands.yaml").write_text(
+        "brands:\n  테스트브랜드:\n    spreadsheet_id: sid1\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(sw, "_second_tab_gid", lambda sid: 999)
+    monkeypatch.setattr(
+        sw, "_read_export_csv",
+        lambda sid, gid: [["A1265", "url", "", "", "", "", "G", "H", "I"], ["", "", "", "", "", "", "미확인", "kw1", ""]],
+    )
+    calls = []
+    monkeypatch.setattr(
+        sw, "update_by_key",
+        lambda *a, **k: calls.append(a) or {"written": 1, "mode": "sheets"},
+    )
+    res = sw.apply_exposure("테스트브랜드", [{"keyword": "kw1", "status": "노출완"}], repo_root=tmp_path)
+    assert res["written"] == 0
+    assert "카페" in res["error"]
+    assert calls == []
+
+
+def test_sync_keywords_to_sheet_refuses_when_a1_corrupted(tmp_path, monkeypatch):
+    import sqlite3
+
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    (cfg / "brands.yaml").write_text(
+        "brands:\n  테스트브랜드:\n    spreadsheet_id: sid1\n", encoding="utf-8"
+    )
+    kw_dir = tmp_path / "data" / "keywords"
+    kw_dir.mkdir(parents=True)
+    con = sqlite3.connect(str(kw_dir / "테스트브랜드.sqlite"))
+    con.execute(
+        "create table keywords (keyword text, total integer, rationale text, "
+        "relevance_llm integer, relevance_codex integer, needs_review integer)"
+    )
+    con.execute("insert into keywords values ('키워드1', 10, '', 0, 0, 0)")
+    con.commit()
+    con.close()
+
+    monkeypatch.setattr(sw, "_second_tab_gid", lambda sid: 999)
+    monkeypatch.setattr(
+        sw, "_read_export_csv", lambda sid, gid, timeout=15.0: [["A1265"] + [""] * 7]
+    )
+    append_calls = []
+    monkeypatch.setattr(sw, "append_rows", lambda *a, **k: append_calls.append(1))
+
+    res = sw.sync_keywords_to_sheet("테스트브랜드", repo_root=tmp_path)
+    assert res["skipped"] is True
+    assert "카페" in res["reason"]
+    assert append_calls == []
+
+
+def test_append_rows_stops_chunk_loop_on_first_verify_failure(monkeypatch, tmp_path):
+    """200행씩 나눠 붙이다 한 chunk가 검증 실패하면 다음 chunk를 진행하지 않는다
+    (2026-09-25 사고: 계속 진행해 어긋난 자리 위에 훼손이 쌓였다)."""
+    table = [["카페"] + [""] * 7] + [[""] * 8 for _ in range(1)]
+    monkeypatch.setattr(sw, "_read_export_csv", lambda sid, gid, timeout=15.0: table)
+    calls = []
+
+    def fake_write_verified(sid, gid, cell, rows, repo_root="."):
+        calls.append(cell)
+        if len(calls) == 1:
+            return {"written": 0, "mode": "csv_only", "error": "검증 불일치"}
+        return {"written": len(rows), "mode": "sheets"}
+
+    monkeypatch.setattr(sw, "_write_verified", fake_write_verified)
+    monkeypatch.setattr(sw, "copy_row_format", lambda *a, **k: None)
+
+    rows = [["kw%d" % i] + [""] * 7 for i in range(250)]  # CHUNK=200 -> 2 chunks
+    result = sw.append_rows("sid", "탭", rows, header=["H"] + [""] * 7, repo_root=tmp_path, copy_format=False)
+    assert calls == ["A2"]  # 두 번째 chunk("A202")는 시도조차 안 함
+    assert result["mode"] == "csv_only"
+    assert "중단" in result["error"]
+
+
+def test_ensure_grid_rows_aborts_when_boundary_reverify_fails(monkeypatch):
+    """`current`(격자 끝으로 믿은 값)를 삽입 직전 다시 확인했을 때 실제로 끝이
+    아니면(A{current+1} 이동도 성공함) 삽입하지 않고 즉시 중단한다.
+
+    2026-09-25 사고 의심 경로: 이진 탐색(`_grid_row_count`)이 실제보다 훨씬
+    작은 값에 잘못 수렴하면 그 값 아래에 빈 행이 삽입된다(뉴더미스 865행부터
+    빈 행 1,465개). 이 가드는 삽입 직전 `current`가 진짜 격자 끝인지
+    A{current+1} 이동이 실패(모달)하는지로 재확인한다.
+    """
+    page = object()  # _nav_to를 완전히 대체하므로 page 속성은 쓰이지 않는다
+
+    def fake_nav_to(pg, cell):
+        # A{last_row}(=A10, probe)만 실패시켜 이진 탐색 경로로 들어가게 하고,
+        # 그 밖의 모든 이동(A{current}, A{current+1} 포함)은 "성공"으로 응답해
+        # 경계 오판(사실은 끝이 아닌데 끝이라고 믿음)을 흉내낸다.
+        if cell == "A10":
+            return ""
+        return cell.upper()
+
+    monkeypatch.setattr(sw, "_nav_to", fake_nav_to)
+    monkeypatch.setattr(sw, "_grid_row_count", lambda pg, hi_hint=1000: 5)
+
+    with pytest.raises(sw.SheetsWriteError, match="격자 끝이 아님"):
+        sw._ensure_grid_rows(page, 10)
+
+
+def test_sync_keywords_to_sheet_backs_up_before_writing(tmp_path, monkeypatch):
+    import sqlite3
+
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    (cfg / "brands.yaml").write_text(
+        "brands:\n  테스트브랜드:\n    spreadsheet_id: sid1\n", encoding="utf-8"
+    )
+    kw_dir = tmp_path / "data" / "keywords"
+    kw_dir.mkdir(parents=True)
+    con = sqlite3.connect(str(kw_dir / "테스트브랜드.sqlite"))
+    con.execute(
+        "create table keywords (keyword text, total integer, rationale text, "
+        "relevance_llm integer, relevance_codex integer, needs_review integer)"
+    )
+    con.execute("insert into keywords values ('키워드1', 10, '', 0, 0, 0)")
+    con.commit()
+    con.close()
+
+    header_row = ["카페", "B", "C", "D", "E", "F", "G", "키워드"]
+    monkeypatch.setattr(sw, "_second_tab_gid", lambda sid: 999)
+    monkeypatch.setattr(sw, "_read_export_csv", lambda sid, gid, timeout=15.0: [header_row])
+    monkeypatch.setattr(sw, "append_rows", lambda *a, **k: {"written": 1, "mode": "sheets"})
+
+    res = sw.sync_keywords_to_sheet("테스트브랜드", repo_root=tmp_path)
+    assert res["appended"] == 1
+    backups = list((tmp_path / "data" / "sheet_backups").glob("테스트브랜드_노출현황_before_sync_*.csv"))
+    assert len(backups) == 1
+    with open(backups[0], encoding="utf-8-sig") as f:
+        content = f.read()
+    assert "카페" in content
+
+
+def test_sync_keywords_to_sheet_caps_rows_per_run(tmp_path, monkeypatch):
+    import sqlite3
+
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    (cfg / "brands.yaml").write_text(
+        "brands:\n  테스트브랜드:\n    spreadsheet_id: sid1\n", encoding="utf-8"
+    )
+    kw_dir = tmp_path / "data" / "keywords"
+    kw_dir.mkdir(parents=True)
+    con = sqlite3.connect(str(kw_dir / "테스트브랜드.sqlite"))
+    con.execute(
+        "create table keywords (keyword text, total integer, rationale text, "
+        "relevance_llm integer, relevance_codex integer, needs_review integer)"
+    )
+    con.executemany(
+        "insert into keywords values (?, ?, '', 0, 0, 0)",
+        [(f"키워드{i}", 10, ) for i in range(5)],
+    )
+    con.commit()
+    con.close()
+
+    header_row = ["카페", "B", "C", "D", "E", "F", "G", "키워드"]
+    monkeypatch.setattr(sw, "_second_tab_gid", lambda sid: 999)
+    monkeypatch.setattr(sw, "_read_export_csv", lambda sid, gid, timeout=15.0: [header_row])
+    monkeypatch.setattr(sw, "MAX_ROWS_PER_SYNC", 3)
+    captured = {}
+
+    def fake_append_rows(sid, sheet, rows, *, header=None, gid=0, repo_root="."):
+        captured["rows"] = rows
+        return {"written": len(rows), "mode": "sheets"}
+
+    monkeypatch.setattr(sw, "append_rows", fake_append_rows)
+
+    res = sw.sync_keywords_to_sheet("테스트브랜드", repo_root=tmp_path)
+    assert res["appended"] == 3
+    assert res["capped_at"] == 3
+    assert len(captured["rows"]) == 3
