@@ -33,9 +33,14 @@ from typing import Any
 import httpx
 
 from v2r.knowledge import keyword_relevance as _kr_mod
+from v2r.sources import sheets_api as _sheets_api
 from v2r.sources.keyword_list import _norm
 
 log = logging.getLogger(__name__)
+
+#: Apps Script 웹앱이 실제로 쓰는 열(WRITABLE, v2r_sheet_api.gs와 동일해야 함).
+#: H(키워드)는 API 요청에서 별도 "keyword" 필드로 다룬다(WRITABLE에 없음).
+API_WRITABLE_LETTERS = {"A", "G", "I", "J", "K", "L", "M", "N"}
 
 #: 구 인터페이스 호환용(더 이상 실제로 쓰이지 않는다 — OAuth 불필요)
 DEFAULT_TOKEN_PATH = "data/google-oauth/token.json"
@@ -463,6 +468,111 @@ def _paste_special(page: Any, menu_text: str, *, fallback_keys: str | None = Non
     raise SheetsWriteError(f"'{menu_text}' 클릭이 반영되지 않음(메뉴가 안 닫힘)")
 
 
+def _row_to_api_fields(values: list[str], header: list[str] | None) -> dict[str, str]:
+    """값 리스트(헤더 순서, A열부터)를 API "append" 행 하나({keyword, A?, G?, ...})로 바꾼다.
+
+    실제 열 이름이 아니라 **열 위치**(0=A, 6=G, 7=H, ...)로 매핑한다 —
+    `docs/appsscript/v2r_sheet_api.gs`의 `WRITABLE`/`KEY_COL`과 같은 고정
+    스키마 전제(5개 브랜드 시트 모두 같은 열 순서).
+    """
+    fields: dict[str, str] = {}
+    for i, val in enumerate(values):
+        if i >= 14:  # Apps Script width=14(A~N)를 넘는 값은 API로 못 보낸다
+            break
+        letter = _col_letter(i)
+        s = str(val) if val is not None else ""
+        if letter == "H":
+            fields["keyword"] = s
+        elif letter in API_WRITABLE_LETTERS and s.strip() != "":
+            fields[letter] = s
+    return fields
+
+
+def _append_rows_api(
+    spreadsheet_id: str,
+    rows: list[list[str]] | list[dict[str, Any]],
+    *,
+    header: list[str] | None = None,
+    repo_root: str | Path = ".",
+    config: "_sheets_api.SheetsApiConfig | None" = None,
+) -> dict[str, Any]:
+    """`append_rows`의 API 경로. 행 삽입(_ensure_grid_rows)은 절대 호출하지 않는다."""
+    hdr = header or []
+    value_rows: list[list[str]] = []
+    for row in rows:
+        if isinstance(row, dict):
+            value_rows.append([str(row.get(h, "")) for h in hdr])
+        else:
+            value_rows.append([str(v) for v in row])
+    if not value_rows:
+        return {"written": 0, "mode": "sheets"}
+
+    api_rows: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for values in value_rows:
+        fields = _row_to_api_fields(values, hdr)
+        kw = fields.get("keyword", "").strip()
+        if not kw:
+            continue
+        nk = _norm(kw)
+        if nk in seen:
+            continue
+        seen.add(nk)
+        api_rows.append(fields)
+    if not api_rows:
+        return {"written": 0, "mode": "sheets"}
+
+    with _BrandLock(spreadsheet_id, repo_root):
+        CHUNK = 300
+        added_total = 0
+        skipped_total = 0
+        errors: list[str] = []
+        inconsistent = False
+        for i in range(0, len(api_rows), CHUNK):
+            chunk = api_rows[i : i + CHUNK]
+            try:
+                snap_before = _sheets_api.api_snapshot(spreadsheet_id, repo_root=repo_root, config=config)
+            except _sheets_api.SheetsApiError as exc:
+                errors.append(f"append 전 스냅샷 실패: {exc}")
+                break
+            rows_before = snap_before.get("rows") or []
+            if not rows_before or str(rows_before[0][0]).strip() != _EXPECTED_A1:
+                errors.append(
+                    f"append 중단: A1 확인 실패(스냅샷) — 예상 {_EXPECTED_A1!r}, "
+                    f"실제 {(str(rows_before[0][0]).strip() if rows_before else '')!r}"
+                )
+                break
+            n_before = len(rows_before)
+            try:
+                res = _sheets_api.api_append(spreadsheet_id, chunk, repo_root=repo_root, config=config)
+            except _sheets_api.SheetsApiError as exc:
+                errors.append(f"append 실패: {exc}")
+                break
+            added = res.get("added", 0)
+            skipped_total += res.get("skipped", 0)
+            added_total += added
+            try:
+                snap_after = _sheets_api.api_snapshot(spreadsheet_id, repo_root=repo_root, config=config)
+                n_after = len(snap_after.get("rows") or [])
+            except _sheets_api.SheetsApiError as exc:
+                errors.append(f"append 후 검증 스냅샷 실패: {exc}")
+                break
+            if n_after - n_before != added:
+                errors.append(f"append 불일치(행 증가 {n_after - n_before} != added {added}) — 중단")
+                inconsistent = True
+                break
+
+    out: dict[str, Any] = {
+        "written": added_total,
+        "mode": "sheets" if (added_total or skipped_total) and not inconsistent else "csv_only",
+    }
+    if skipped_total:
+        out["skipped"] = skipped_total
+    if errors:
+        out["error"] = "; ".join(errors)
+    return out
+
+
 def _write_with_retry(spreadsheet_id: str, gid: str | int, cell: str, tsv: str) -> None:
     last_exc: Exception | None = None
     for attempt in range(1, _RETRIES + 1):
@@ -679,7 +789,16 @@ def append_rows(
     받는다. 200행 단위로 나눠 paste한다. `copy_format`(기본 True)이면 값을 쓴
     뒤 `format_src_row`(기본 2행 — 드롭다운이 확인된 기존 행)의 서식·데이터
     확인 규칙을 새로 추가된 행 범위에 복사한다(값은 그대로 유지).
+
+    `config/sheets_api.yaml`의 `enabled`이면 Apps Script 웹앱 API로 쓴다(행
+    삽입 없이 서버가 바로 끝에 추가 + 정규화 중복 스킵 + 서식·데이터 확인
+    자동 복사) — 이 경우 `copy_row_format` 등 아래 브라우저 로직은 전혀
+    실행되지 않는다.
     """
+    _api_cfg = _sheets_api.load_sheets_api_config(repo_root)
+    if _api_cfg.enabled:
+        return _append_rows_api(spreadsheet_id, rows, header=header, repo_root=repo_root, config=_api_cfg)
+
     try:
         table = _read_export_csv(spreadsheet_id, gid)
     except Exception as exc:
@@ -750,7 +869,29 @@ def update_by_key(
     (열 문자 -> 값, 예 `{"G": "확인", "I": "..."}`)를 그 행에 반영한다.
 
     노출 순환용: H열 키워드로 행을 찾아 G/I/J/L/O 등을 갱신하는 용도.
+
+    `config/sheets_api.yaml`의 `enabled`이고 `key_column`이 H(Apps Script
+    전제)이면 API로 쓴다. 여러 행을 한 번에 갱신하고 싶으면(러너 노출 순환처럼
+    묶음이 필요하면) 이 함수를 반복 호출하지 말고 `apply_exposure`처럼
+    `v2r.sources.sheets_api.api_update_by_key`를 직접 배치로 부르는 쪽을 쓴다.
     """
+    _api_cfg = _sheets_api.load_sheets_api_config(repo_root)
+    if _api_cfg.enabled and key_column.upper() == "H":
+        fields = {k.upper(): str(v) for k, v in updates.items() if k.upper() in API_WRITABLE_LETTERS}
+        if not fields:
+            return {"written": 0, "mode": "sheets"}
+        try:
+            res = _sheets_api.api_update_by_key(
+                spreadsheet_id, [{"keyword": key_value, **fields}], repo_root=repo_root, config=_api_cfg
+            )
+        except _sheets_api.SheetsApiError as exc:
+            return {"written": 0, "mode": "csv_only", "error": str(exc)}
+        missing = res.get("missing") or []
+        updated = res.get("updated", 0)
+        if updated == 0 or key_value in missing:
+            return {"written": 0, "mode": "csv_only", "error": f"키를 찾지 못함: {key_value}"}
+        return {"written": len(fields), "mode": "sheets", "row": None, "rows": []}
+
     try:
         table = _read_export_csv(spreadsheet_id, gid)
     except Exception as exc:
@@ -1038,11 +1179,20 @@ def sync_keywords_to_sheet(
     if not rows:
         return {"brand": brand, "skipped": False, "picked": 0, "appended": 0}
 
-    gid = _second_tab_gid(sid)
-    try:
-        table = _read_export_csv(sid, gid)
-    except Exception as exc:
-        return {"brand": brand, "skipped": True, "reason": f"시트 읽기 실패: {exc}"}
+    _api_cfg = _sheets_api.load_sheets_api_config(repo_root)
+    gid = 0 if _api_cfg.enabled else _second_tab_gid(sid)
+    if _api_cfg.enabled:
+        # API 모드: 브라우저로 시트를 열지 않고 스냅샷(API)으로 A1·기존 키워드를 본다.
+        try:
+            snap = _sheets_api.api_snapshot(sid, repo_root=repo_root, config=_api_cfg)
+        except _sheets_api.SheetsApiError as exc:
+            return {"brand": brand, "skipped": True, "reason": f"시트 스냅샷 실패: {exc}"}
+        table = snap.get("rows") or []
+    else:
+        try:
+            table = _read_export_csv(sid, gid)
+        except Exception as exc:
+            return {"brand": brand, "skipped": True, "reason": f"시트 읽기 실패: {exc}"}
     a1_err = _check_a1_ok(table)
     if a1_err:
         return {"brand": brand, "skipped": True, "reason": a1_err}
@@ -1056,7 +1206,7 @@ def sync_keywords_to_sheet(
     # 2026-09-24: 공백·대소문자 차이로 같은 키워드가 중복 행으로 붙던 사고 방지 —
     # 이미 있는지 판정은 항상 `_norm` 정규화로 하고, append 목록 안에서도 정규화
     # 중복을 제거한다.
-    existing = {_norm(r[7]) for r in table[1:] if len(r) > 7 and r[7].strip()}
+    existing = {_norm(r[7]) for r in table[1:] if len(r) > 7 and str(r[7]).strip()}
 
     out_rows: list[dict[str, Any]] = []
     seen_new: set[str] = set()
@@ -1149,64 +1299,151 @@ def apply_exposure(
     더 안전하다(보고서 "시트 갱신 규칙" 절 비교 참고).
 
     `totals`(선택)는 `{"P1": ..., "Q1": ...}` 형태로 시트 1행 합계 셀에 쓴다.
+    P2 합계 표는 API에 해당 작업이 없어 항상 기존 브라우저 경로로 쓰고,
+    거기서 실패해도(Playwright 문제 등) 위의 키워드별 A/G/J/K/L 갱신 결과는
+    무효화하지 않는다.
     """
     sid = get_spreadsheet_id(brand, repo_root, config_path)
     if not sid:
         return {"brand": brand, "skipped": True, "reason": "config/brands.yaml에 spreadsheet_id 없음"}
-    gid = _second_tab_gid(sid)
 
-    try:
-        table = _read_export_csv(sid, gid)
-    except Exception as exc:
-        return {"brand": brand, "written": 0, "rows": len(rows), "error": f"시트 읽기 실패: {exc}"}
-    a1_err = _check_a1_ok(table)
-    if a1_err:
-        return {"brand": brand, "written": 0, "rows": len(rows), "error": a1_err}
-    # I(통합검색, 인덱스 8)이 이미 있는지만 본다 — B~F(인덱스 1~5, E=비밀번호 포함)는
-    # 이 딕셔너리에 담기지만 아래에서 절대 인덱스로 꺼내 쓰지 않는다(로그·기록 없음).
-    by_keyword_i = {_norm(r[7]): (r[8] if len(r) > 8 else "") for r in table[1:] if len(r) > 7 and r[7]}
-
+    _api_cfg = _sheets_api.load_sheets_api_config(repo_root)
     written = 0
     errors: list[str] = []
-    for row in rows:
-        kw = row.get("keyword")
-        if not kw:
-            continue
-        status = row.get("status", "")
-        if status in KOREAN_STATUS_TO_CODE:
-            status = KOREAN_STATUS_TO_CODE[status]
-        updates = build_exposure_column_updates(
-            status=status,
-            checked_at_kst=row.get("edited_at", ""),
-            cafe=row.get("cafe") or None,
-            volume=row.get("volume"),
-            existing_i=by_keyword_i.get(_norm(kw), ""),
-            integrated_search_url_fn=lambda k: row.get("final_url") or "",
-            keyword=str(kw),
-        )
-        res = update_by_key(sid, EXPOSURE_TAB_NAME, str(kw), updates, key_column="H", gid=gid, repo_root=repo_root)
-        written += res.get("written", 0)
-        if res.get("error"):
-            errors.append(f"{kw}: {res['error']}")
+
+    if _api_cfg.enabled:
+        # I(통합검색)이 이미 있는지는 스냅샷으로 본다(브라우저·CSV export 안 씀).
+        try:
+            snap = _sheets_api.api_snapshot(sid, repo_root=repo_root, config=_api_cfg)
+        except _sheets_api.SheetsApiError as exc:
+            return {"brand": brand, "written": 0, "rows": len(rows), "error": f"시트 스냅샷 실패: {exc}"}
+        snap_rows = snap.get("rows") or []
+        a1_err = _check_a1_ok(snap_rows)
+        if a1_err:
+            return {"brand": brand, "written": 0, "rows": len(rows), "error": a1_err}
+        by_keyword_i = {
+            _norm(r[7]): (r[8] if len(r) > 8 else "") for r in snap_rows[1:] if len(r) > 7 and str(r[7]).strip()
+        }
+
+        updates_list: list[dict[str, Any]] = []
+        for row in rows:
+            kw = row.get("keyword")
+            if not kw:
+                continue
+            status = row.get("status", "")
+            if status in KOREAN_STATUS_TO_CODE:
+                status = KOREAN_STATUS_TO_CODE[status]
+            col_updates = build_exposure_column_updates(
+                status=status,
+                checked_at_kst=row.get("edited_at", ""),
+                cafe=row.get("cafe") or None,
+                volume=row.get("volume"),
+                existing_i=by_keyword_i.get(_norm(kw), ""),
+                integrated_search_url_fn=lambda k: row.get("final_url") or "",
+                keyword=str(kw),
+            )
+            fields = {k.upper(): str(v) for k, v in col_updates.items() if k.upper() in API_WRITABLE_LETTERS}
+            if fields:
+                updates_list.append({"keyword": str(kw), **fields})
+
+        # 러너 갱신 → update_by_key 묶음 50개씩(2026-09-25 지시).
+        BATCH = 50
+        with _BrandLock(sid, repo_root):
+            for i in range(0, len(updates_list), BATCH):
+                part = updates_list[i : i + BATCH]
+                try:
+                    res = _sheets_api.api_update_by_key(sid, part, repo_root=repo_root, config=_api_cfg)
+                except _sheets_api.SheetsApiError as exc:
+                    errors.append(f"묶음 갱신 실패({i}~{i + len(part)}): {exc}")
+                    continue
+                written += res.get("updated", 0)
+                missing = res.get("missing") or []
+                if missing:
+                    shown = ", ".join(missing[:20]) + (" ..." if len(missing) > 20 else "")
+                    errors.append(f"키를 찾지 못함: {shown}")
+    else:
+        gid = _second_tab_gid(sid)
+        try:
+            table = _read_export_csv(sid, gid)
+        except Exception as exc:
+            return {"brand": brand, "written": 0, "rows": len(rows), "error": f"시트 읽기 실패: {exc}"}
+        a1_err = _check_a1_ok(table)
+        if a1_err:
+            return {"brand": brand, "written": 0, "rows": len(rows), "error": a1_err}
+        # I(통합검색, 인덱스 8)이 이미 있는지만 본다 — B~F(인덱스 1~5, E=비밀번호 포함)는
+        # 이 딕셔너리에 담기지만 아래에서 절대 인덱스로 꺼내 쓰지 않는다(로그·기록 없음).
+        by_keyword_i = {_norm(r[7]): (r[8] if len(r) > 8 else "") for r in table[1:] if len(r) > 7 and r[7]}
+
+        for row in rows:
+            kw = row.get("keyword")
+            if not kw:
+                continue
+            status = row.get("status", "")
+            if status in KOREAN_STATUS_TO_CODE:
+                status = KOREAN_STATUS_TO_CODE[status]
+            updates = build_exposure_column_updates(
+                status=status,
+                checked_at_kst=row.get("edited_at", ""),
+                cafe=row.get("cafe") or None,
+                volume=row.get("volume"),
+                existing_i=by_keyword_i.get(_norm(kw), ""),
+                integrated_search_url_fn=lambda k: row.get("final_url") or "",
+                keyword=str(kw),
+            )
+            res = update_by_key(sid, EXPOSURE_TAB_NAME, str(kw), updates, key_column="H", gid=gid, repo_root=repo_root)
+            written += res.get("written", 0)
+            if res.get("error"):
+                errors.append(f"{kw}: {res['error']}")
 
     if totals:
-        block = totals.get("block") if isinstance(totals, dict) else None
-        if isinstance(block, dict) and block.get("rows"):
-            # 이름 붙은 합계 표(P2:Q3 등)를 한 번에 쓴다 (사용자 지시 2026-09-23)
-            res = _write_verified(sid, gid, str(block.get("cell") or "P2"), [[str(v) for v in r] for r in block["rows"]], repo_root)
-            if res.get("mode") != "sheets":
-                errors.append(f"{block.get('cell', 'P2')} 표: {res.get('error', '실패')}")
-        for cell, value in totals.items():
-            if cell == "block":
-                continue
-            res = set_cell(sid, EXPOSURE_TAB_NAME, cell, value, gid=gid, repo_root=repo_root)
-            if not res.get("written"):
-                errors.append(f"{cell}: {res.get('error', '실패')}")
+        # P2 합계 표는 API에 없는 작업 — 항상 기존 브라우저 경로. 실패해도(예:
+        # Playwright 문제) 위 키워드별 갱신 결과(written)는 그대로 돌려준다.
+        try:
+            gid = _second_tab_gid(sid)
+            block = totals.get("block") if isinstance(totals, dict) else None
+            if isinstance(block, dict) and block.get("rows"):
+                # 이름 붙은 합계 표(P2:Q3 등)를 한 번에 쓴다 (사용자 지시 2026-09-23)
+                res = _write_verified(
+                    sid, gid, str(block.get("cell") or "P2"), [[str(v) for v in r] for r in block["rows"]], repo_root
+                )
+                if res.get("mode") != "sheets":
+                    errors.append(f"{block.get('cell', 'P2')} 표: {res.get('error', '실패')}")
+            for cell, value in totals.items():
+                if cell == "block":
+                    continue
+                res = set_cell(sid, EXPOSURE_TAB_NAME, cell, value, gid=gid, repo_root=repo_root)
+                if not res.get("written"):
+                    errors.append(f"{cell}: {res.get('error', '실패')}")
+        except Exception as exc:  # noqa: BLE001 — 합계 표 실패가 키워드별 갱신 결과를 막지 않는다
+            errors.append(f"합계 표 갱신 실패(브라우저 경로): {exc}")
 
     out = {"brand": brand, "written": written, "rows": len(rows)}
     if errors:
         out["error"] = "; ".join(errors)
     return out
+
+
+def delete_rows_by_key(
+    spreadsheet_id: str,
+    keywords: list[str],
+    *,
+    repo_root: str | Path = ".",
+) -> dict[str, Any]:
+    """정규화 키(H열)로 시트 행을 삭제한다(정리 — 비대상·중복 삭제 용도).
+
+    **API 전용 기능**이다 — 이 모듈에는 원래 브라우저(Playwright)로 행을
+    지우는 함수가 없었으므로(행 삽입만 있었다) API가 비활성이면 아무 것도
+    하지 않고 오류를 돌려준다. 브랜드 잠금(`_BrandLock`)을 잡고 실행한다.
+    """
+    _api_cfg = _sheets_api.load_sheets_api_config(repo_root)
+    if not _api_cfg.enabled:
+        return {"deleted": 0, "mode": "csv_only", "error": "시트 API 비활성 — 삭제는 API 전용 기능(브라우저 경로 없음)"}
+    with _BrandLock(spreadsheet_id, repo_root):
+        try:
+            res = _sheets_api.api_delete_by_key(spreadsheet_id, keywords, repo_root=repo_root, config=_api_cfg)
+        except _sheets_api.SheetsApiError as exc:
+            return {"deleted": 0, "mode": "csv_only", "error": str(exc)}
+    return {"deleted": res.get("deleted", 0), "mode": "sheets"}
 
 
 __all__ = [
@@ -1226,6 +1463,7 @@ __all__ = [
     "sync_keywords_to_sheet",
     "sync_keywords_all",
     "apply_exposure",
+    "delete_rows_by_key",
 ]
 
 

@@ -479,9 +479,10 @@ def test_last_data_row_ignores_trailing_blank_rows():
     assert _last_data_row([]) == 0
 
 
-def test_append_rows_starts_after_last_data_row_not_grid_end(monkeypatch):
+def test_append_rows_starts_after_last_data_row_not_grid_end(monkeypatch, tmp_path):
     from v2r.sources import sheets_writer as sw
 
+    # 시트 API가 비활성(기본 config가 없는 tmp_path)일 때만 이 브라우저 경로가 쓰인다.
     table = [["카페"] + [""] * 7 + ["키워드"]] + [[""] * 7 + ["k%d" % i] for i in range(3)] + [[""] * 12] * 50
     monkeypatch.setattr(sw, "_read_export_csv", lambda *a, **k: table)
     calls = []
@@ -492,7 +493,9 @@ def test_append_rows_starts_after_last_data_row_not_grid_end(monkeypatch):
 
     monkeypatch.setattr(sw, "_write_verified", fake_write)
     monkeypatch.setattr(sw, "copy_row_format", lambda *a, **k: {"ok": True}, raising=False)
-    sw.append_rows("sid", "노출 현황", [["", "", "", "", "", "", "", "new"]], gid="1", copy_format=False)
+    sw.append_rows(
+        "sid", "노출 현황", [["", "", "", "", "", "", "", "new"]], gid="1", copy_format=False, repo_root=tmp_path
+    )
     assert calls == ["A5"]
 
 
@@ -881,3 +884,192 @@ def test_sync_keywords_to_sheet_caps_rows_per_run(tmp_path, monkeypatch):
     assert res["appended"] == 3
     assert res["capped_at"] == 3
     assert len(captured["rows"]) == 3
+
+
+# --------------------------------------------------------------------------
+# 시트 API(config/sheets_api.yaml enabled=true) 경로 — 브라우저 경로가 전혀
+# 호출되지 않는지, snapshot 가드가 작동하는지 검증한다(2026-09-25).
+# --------------------------------------------------------------------------
+
+
+def _enable_sheets_api(tmp_path, *, retries=3):
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    (cfg_dir / "sheets_api.yaml").write_text(
+        f"enabled: true\nurl: https://example.invalid/exec\ntimeout_sec: 30\nretries: {retries}\n",
+        encoding="utf-8",
+    )
+
+
+def _forbid_browser_paths(monkeypatch, sw):
+    def _boom(*a, **k):
+        raise AssertionError("브라우저 경로가 호출됨(API 모드에서는 안 됨)")
+
+    monkeypatch.setattr(sw, "_write_tsv_at", _boom)
+    monkeypatch.setattr(sw, "_ensure_grid_rows", _boom)
+    monkeypatch.setattr(sw, "_read_export_csv", _boom)
+    monkeypatch.setattr(sw, "_second_tab_gid", _boom)
+
+
+def test_append_rows_uses_api_and_skips_browser(monkeypatch, tmp_path):
+    _enable_sheets_api(tmp_path)
+    _forbid_browser_paths(monkeypatch, sw)
+
+    calls = []
+
+    def fake_post(url, json, timeout, follow_redirects=True):
+        calls.append(json["action"])
+        if json["action"] == "snapshot":
+            n = 1 if len(calls) == 1 else 3  # append 전 1행(헤더), append 후 3행
+            rows = [["카페"] + [""] * 13] + [[""] * 14] * (n - 1)
+            return _FakeHttpResp({"ok": True, "result": {"rows": rows, "last_row": n}})
+        if json["action"] == "append":
+            return _FakeHttpResp({"ok": True, "result": {"added": 2, "skipped": 0, "first_row": 2, "last_row": 3}})
+        raise AssertionError(f"예상 못한 action: {json['action']}")
+
+    monkeypatch.setattr(sw._sheets_api.httpx, "post", fake_post)
+
+    # 실제 시트 스키마처럼 위치로 열을 맞춘다(0=A=카페 ... 7=H=키워드, 8=I=통합검색).
+    hdr = ["카페", "B", "C", "D", "E", "F", "G", "키워드", "통합검색"]
+    res = sw.append_rows(
+        "sid1",
+        "탭",
+        [{"키워드": "kw1", "통합검색": "url1"}, {"키워드": "kw2", "통합검색": "url2"}],
+        header=hdr,
+        repo_root=tmp_path,
+    )
+    assert res["mode"] == "sheets"
+    assert res["written"] == 2
+    assert calls == ["snapshot", "append", "snapshot"]
+
+
+def test_append_rows_api_aborts_when_a1_not_cafe(monkeypatch, tmp_path):
+    _enable_sheets_api(tmp_path)
+    _forbid_browser_paths(monkeypatch, sw)
+
+    def fake_post(url, json, timeout, follow_redirects=True):
+        assert json["action"] == "snapshot"
+        rows = [["A1265"] + [""] * 13]
+        return _FakeHttpResp({"ok": True, "result": {"rows": rows, "last_row": 1}})
+
+    monkeypatch.setattr(sw._sheets_api.httpx, "post", fake_post)
+
+    hdr = ["카페", "B", "C", "D", "E", "F", "G", "키워드"]
+    res = sw.append_rows("sid1", "탭", [{"키워드": "kw1"}], header=hdr, repo_root=tmp_path)
+    assert res["written"] == 0
+    assert res["mode"] == "csv_only"
+    assert "A1" in res["error"]
+
+
+def test_append_rows_api_aborts_on_row_count_mismatch(monkeypatch, tmp_path):
+    _enable_sheets_api(tmp_path)
+    _forbid_browser_paths(monkeypatch, sw)
+    calls = []
+
+    def fake_post(url, json, timeout, follow_redirects=True):
+        calls.append(json["action"])
+        if json["action"] == "snapshot":
+            n = 1 if calls.count("snapshot") == 1 else 2  # added=2라고 응답했는데 실제로는 1행만 늚
+            rows = [["카페"] + [""] * 13] + [[""] * 14] * (n - 1)
+            return _FakeHttpResp({"ok": True, "result": {"rows": rows, "last_row": n}})
+        return _FakeHttpResp({"ok": True, "result": {"added": 2, "skipped": 0}})
+
+    monkeypatch.setattr(sw._sheets_api.httpx, "post", fake_post)
+
+    hdr = ["카페", "B", "C", "D", "E", "F", "G", "키워드"]
+    res = sw.append_rows("sid1", "탭", [{"키워드": "kw1"}, {"키워드": "kw2"}], header=hdr, repo_root=tmp_path)
+    assert res["mode"] == "csv_only"
+    assert "불일치" in res["error"]
+
+
+def test_update_by_key_uses_api_when_enabled(monkeypatch, tmp_path):
+    _enable_sheets_api(tmp_path)
+    _forbid_browser_paths(monkeypatch, sw)
+    captured = {}
+
+    def fake_post(url, json, timeout, follow_redirects=True):
+        assert json["action"] == "update_by_key"
+        captured["updates"] = json["updates"]
+        return _FakeHttpResp({"ok": True, "result": {"updated": 1, "missing": []}})
+
+    monkeypatch.setattr(sw._sheets_api.httpx, "post", fake_post)
+
+    res = sw.update_by_key("sid1", "탭", "수면테이프", {"G": "확인", "J": "2026-09-25 10:00:00"}, key_column="H", repo_root=tmp_path)
+    assert res["mode"] == "sheets"
+    assert captured["updates"] == [{"keyword": "수면테이프", "G": "확인", "J": "2026-09-25 10:00:00"}]
+
+
+def test_update_by_key_api_missing_key_returns_error(monkeypatch, tmp_path):
+    _enable_sheets_api(tmp_path)
+    _forbid_browser_paths(monkeypatch, sw)
+
+    def fake_post(url, json, timeout, follow_redirects=True):
+        return _FakeHttpResp({"ok": True, "result": {"updated": 0, "missing": ["없는키워드"]}})
+
+    monkeypatch.setattr(sw._sheets_api.httpx, "post", fake_post)
+    res = sw.update_by_key("sid1", "탭", "없는키워드", {"G": "확인"}, key_column="H", repo_root=tmp_path)
+    assert res["mode"] == "csv_only"
+    assert "찾지 못함" in res["error"]
+
+
+def test_apply_exposure_batches_updates_via_api(monkeypatch, tmp_path):
+    """러너 노출 순환 갱신은 API 모드에서 50개씩 묶어 update_by_key를 부른다."""
+    _enable_sheets_api(tmp_path)
+    cfg_dir = tmp_path / "config"
+    (cfg_dir / "brands.yaml").write_text(
+        "brands:\n  테스트브랜드:\n    spreadsheet_id: sid1\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(sw, "_write_tsv_at", lambda *a, **k: (_ for _ in ()).throw(AssertionError("browser 호출됨")))
+    monkeypatch.setattr(sw, "_read_export_csv", lambda *a, **k: (_ for _ in ()).throw(AssertionError("csv 호출됨")))
+
+    calls = []
+
+    def fake_post(url, json, timeout, follow_redirects=True):
+        calls.append(json["action"])
+        if json["action"] == "snapshot":
+            rows = [["카페"] + [""] * 13, [""] * 7 + ["kw1"] + [""] * 6]
+            return _FakeHttpResp({"ok": True, "result": {"rows": rows, "last_row": 2}})
+        if json["action"] == "update_by_key":
+            return _FakeHttpResp({"ok": True, "result": {"updated": len(json["updates"]), "missing": []}})
+        raise AssertionError(json["action"])
+
+    monkeypatch.setattr(sw._sheets_api.httpx, "post", fake_post)
+
+    rows = [{"keyword": f"kw{i}", "status": "노출완", "edited_at": "2026-09-25 10:00:00", "volume": 10, "cafe": "카페A"} for i in range(120)]
+    res = sw.apply_exposure("테스트브랜드", rows, repo_root=tmp_path, config_path="config/brands.yaml")
+    assert res["written"] == 120
+    # 120개를 50개씩 3묶음(50+50+20)으로 나눠 보냈는지
+    assert calls.count("update_by_key") == 3
+
+
+def test_delete_rows_by_key_requires_api(tmp_path):
+    res = sw.delete_rows_by_key("sid1", ["kw1"], repo_root=tmp_path)
+    assert res["mode"] == "csv_only"
+    assert "API" in res["error"]
+    assert res["deleted"] == 0
+
+
+def test_delete_rows_by_key_uses_api(monkeypatch, tmp_path):
+    _enable_sheets_api(tmp_path)
+    captured = {}
+
+    def fake_post(url, json, timeout, follow_redirects=True):
+        assert json["action"] == "delete_by_key"
+        captured["keywords"] = json["keywords"]
+        return _FakeHttpResp({"ok": True, "result": {"deleted": 2}})
+
+    monkeypatch.setattr(sw._sheets_api.httpx, "post", fake_post)
+    res = sw.delete_rows_by_key("sid1", ["kw1", "kw2"], repo_root=tmp_path)
+    assert res == {"deleted": 2, "mode": "sheets"}
+    assert captured["keywords"] == ["kw1", "kw2"]
+
+
+class _FakeHttpResp:
+    def __init__(self, json_data):
+        self._json = json_data
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return self._json
