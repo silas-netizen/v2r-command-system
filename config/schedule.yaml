@@ -18,22 +18,22 @@ entries:
   - name: 시트 키워드 반영(자동)
     time: "05:30"
     days: daily
-    enabled: true
+    enabled: false   # 2026-09-25 11:20 시트 반영이 중간 빈 행·과다 추가 사고 → 원인 수정 전까지 끔
     command: 시트 키워드 반영 전체
   - name: 시트 키워드 반영(자동, 낮)
     time: "11:30"
     days: daily
-    enabled: true
+    enabled: false   # 2026-09-25 11:20 시트 반영이 중간 빈 행·과다 추가 사고 → 원인 수정 전까지 끔
     command: 시트 키워드 반영 전체
   - name: 시트 키워드 반영(자동, 저녁)
     time: "17:30"
     days: daily
-    enabled: true
+    enabled: false   # 2026-09-25 11:20 시트 반영이 중간 빈 행·과다 추가 사고 → 원인 수정 전까지 끔
     command: 시트 키워드 반영 전체
   - name: 시트 키워드 반영(자동, 밤)
     time: "23:30"
     days: daily
-    enabled: true
+    enabled: false   # 2026-09-25 11:20 시트 반영이 중간 빈 행·과다 추가 사고 → 원인 수정 전까지 끔
     command: 시트 키워드 반영 전체
   - name: 키워드 발굴 전체
     time: "01:00"
