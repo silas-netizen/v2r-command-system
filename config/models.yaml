@@ -34,3 +34,18 @@ crosscheck:
   model: gpt-5.6-sol
   effort: medium
   timeout_sec: 300
+
+# 키워드-브랜드 연관도 교차 검증 엔진 (사용자 지시 2026-09-25).
+# Codex(ChatGPT) 계정이 한도(2026-10-02까지)에 걸려, 같은 프롬프트를
+# 클로드 요금제 길로 돌린다. `relevance_codex` 열 이름은 그대로 두고
+# (마이그레이션 비용 회피), 어떤 엔진·모델이 검증했는지는
+# `crosscheck_engine`/`crosscheck_model` 열에 남긴다.
+#
+# engine: claude | codex — claude면 v2r/llm/router.py(요금제 길)로,
+# codex면 기존 Codex CLI 교차검증으로 간다.
+# model: engine=claude일 때 쓸 모델. 1차 채점(keyword_relevance, haiku)과
+# 반드시 달라야 한다 — 코드가 시작할 때 확인하고 같으면 멈춘다.
+keyword_crosscheck:
+  engine: claude
+  model: claude-opus-5
+  effort: low

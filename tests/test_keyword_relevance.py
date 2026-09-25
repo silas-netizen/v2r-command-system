@@ -39,8 +39,10 @@ class FakeRouter:
         self._responses = list(responses)
         self.calls = 0
 
-    def complete(self, purpose, system, user, max_tokens=1200):
+    def complete(self, purpose, system, user, max_tokens=1200, model=""):
         self.calls += 1
+        self.last_purpose = purpose
+        self.last_model = model
         item = self._responses.pop(0)
         if isinstance(item, Exception):
             raise item
@@ -463,8 +465,10 @@ def test_crosscheck_brand_processes_already_scored_keywords(tmp_path, monkeypatc
     _make_db(db, [("k1", 10), ("k2", 5)])
     kr.migrate_path(db)
     conn = sqlite3.connect(str(db))
-    conn.execute("UPDATE keywords SET relevance_llm=0, rationale='직접', scored_at='x' WHERE keyword='k1'")
-    conn.execute("UPDATE keywords SET relevance_llm=1, rationale='근접', scored_at='x' WHERE keyword='k2'")
+    # 0-2는 auto_confirm_low_relevance가 검증 없이 확정하므로, crosscheck_brand의
+    # score_batch_crosscheck 경로를 시험하려면 3(당위성)을 써야 한다(2026-09-25 재설계).
+    conn.execute("UPDATE keywords SET relevance_llm=3, rationale='당위성', scored_at='x' WHERE keyword='k1'")
+    conn.execute("UPDATE keywords SET relevance_llm=3, rationale='당위성', scored_at='x' WHERE keyword='k2'")
     conn.commit()
     conn.close()
 
@@ -472,13 +476,14 @@ def test_crosscheck_brand_processes_already_scored_keywords(tmp_path, monkeypatc
     guides.mkdir()
     (guides / "브랜드.md").write_text("- 브랜드/제품: 테스트", encoding="utf-8")
 
-    def fake_score_batch_codex(brand, keywords, summary, exe=""):
+    def fake_score_batch_crosscheck(brand, keywords, summary, router=None, codex_exe="", cwd=None, cfg=None, fewshot_block=""):
         return (
             [{"keyword": kw, "relevance": 0, "rationale": "동의"} for kw in keywords],
             "gpt-6-astra",
+            "codex",
         )
 
-    monkeypatch.setattr(kr, "score_batch_codex", fake_score_batch_codex)
+    monkeypatch.setattr(kr, "score_batch_crosscheck", fake_score_batch_crosscheck)
     result = kr.crosscheck_brand("브랜드", db, guides, batch_size=100)
     assert result == {"checked": 2, "failed_batches": 0}
 
@@ -697,13 +702,13 @@ def test_claim_codex_batch_prioritizes_bridge_candidates_and_volume(tmp_path):
     conn = sqlite3.connect(str(db))
     kr.migrate(conn)
     conn.execute(
-        "UPDATE keywords SET relevance_llm=1, scored_at='x' WHERE keyword='낮음'"
+        "UPDATE keywords SET relevance_llm=4, scored_at='x' WHERE keyword='낮음'"
     )
     conn.execute(
         "UPDATE keywords SET relevance_llm=3, scored_at='x', bridge_rationale='근거' WHERE keyword='당위성'"
     )
     conn.execute(
-        "UPDATE keywords SET relevance_llm=1, scored_at='x' WHERE keyword='높음무관'"
+        "UPDATE keywords SET relevance_llm=4, scored_at='x' WHERE keyword='높음무관'"
     )
     conn.commit()
 
@@ -723,7 +728,7 @@ def test_release_codex_claim_lets_another_worker_reclaim(tmp_path):
     _make_db(db, [("kw1", 100)])
     conn = sqlite3.connect(str(db))
     kr.migrate(conn)
-    conn.execute("UPDATE keywords SET relevance_llm=1, scored_at='x' WHERE keyword='kw1'")
+    conn.execute("UPDATE keywords SET relevance_llm=3, scored_at='x' WHERE keyword='kw1'")
     conn.commit()
 
     rows = kr.claim_codex_batch(conn, limit=50)
@@ -792,14 +797,18 @@ def test_codex_worker_checks_claimed_rows_and_writes_progress(tmp_path, monkeypa
     _make_db(db, [("kw1", 100)])
     conn = sqlite3.connect(str(db))
     kr.migrate(conn)
-    conn.execute("UPDATE keywords SET relevance_llm=1, scored_at='x' WHERE keyword='kw1'")
+    conn.execute("UPDATE keywords SET relevance_llm=3, scored_at='x' WHERE keyword='kw1'")
     conn.commit()
     conn.close()
 
-    def _fake_score_batch_codex(brand, keywords, summary, exe=""):
-        return [{"keyword": kw, "relevance": 1, "rationale": "codex"} for kw in keywords], "fake"
+    def _fake_score_batch_crosscheck(brand, keywords, summary, router=None, codex_exe="", cwd=None, cfg=None, fewshot_block=""):
+        return (
+            [{"keyword": kw, "relevance": 1, "rationale": "codex"} for kw in keywords],
+            "fake",
+            "codex",
+        )
 
-    monkeypatch.setattr(kr, "score_batch_codex", _fake_score_batch_codex)
+    monkeypatch.setattr(kr, "score_batch_crosscheck", _fake_score_batch_crosscheck)
     out = kr.codex_worker("우아덤", worker_id=1, repo_root=repo)
     assert out["checked"] == 1
 
@@ -822,3 +831,259 @@ def test_codex_worker_two_ids_have_independent_locks(tmp_path):
 def test_score_worker_main_and_codex_worker_main_require_brand_arg():
     assert kr.score_worker_main([]) == 2
     assert kr.codex_worker_main([]) == 2
+
+
+# --- 클로드 교차 검증(2026-09-25) --------------------------------------
+
+
+def test_load_crosscheck_config_reads_models_yaml():
+    cfg = kr.load_crosscheck_config()
+    # config/models.yaml keyword_crosscheck.engine: claude, model: claude-opus-5
+    assert cfg["engine"] == "claude"
+    assert cfg["model"] == "claude-opus-5"
+
+
+def test_score_batch_claude_uses_crosscheck_purpose_and_model():
+    router = FakeRouter(
+        [json.dumps([{"keyword": "a", "relevance": 0, "rationale": "직접"}])]
+    )
+    rows, model_used = kr.score_batch_claude(router, "브랜드", ["a"], "요약", model="claude-opus-5")
+    assert rows[0]["relevance"] == 0
+    assert model_used == "claude-opus-5"
+    assert router.last_purpose == kr.CROSSCHECK_PURPOSE
+    assert router.last_model == "claude-opus-5"
+
+
+def test_score_batch_claude_refuses_same_model_as_first_pass(monkeypatch):
+    from v2r.llm.router import MODELS as ROUTER_MODELS
+
+    router = FakeRouter([json.dumps([{"keyword": "a", "relevance": 0, "rationale": "x"}])])
+    scoring_model = ROUTER_MODELS[kr.PURPOSE]
+    with pytest.raises(kr.RelevanceParseError):
+        kr.score_batch_claude(router, "브랜드", ["a"], "요약", model=scoring_model)
+
+
+def test_score_batch_crosscheck_dispatches_to_claude_engine():
+    router = FakeRouter(
+        [json.dumps([{"keyword": "a", "relevance": 1, "rationale": "근접"}])]
+    )
+    rows, model_used, engine = kr.score_batch_crosscheck(
+        "브랜드",
+        ["a"],
+        "요약",
+        router=router,
+        cfg={"engine": "claude", "model": "claude-opus-5", "effort": "low"},
+    )
+    assert engine == "claude"
+    assert model_used == "claude-opus-5"
+    assert rows[0]["relevance"] == 1
+
+
+def test_score_batch_crosscheck_dispatches_to_codex_engine(monkeypatch):
+    def fake_score_batch_codex(brand, keywords, summary, exe="", cwd=None):
+        return [{"keyword": kw, "relevance": 2, "rationale": "codex"} for kw in keywords], "gpt-6-astra"
+
+    monkeypatch.setattr(kr, "score_batch_codex", fake_score_batch_codex)
+    rows, model_used, engine = kr.score_batch_crosscheck(
+        "브랜드", ["a"], "요약", cfg={"engine": "codex", "model": "", "effort": ""}
+    )
+    assert engine == "codex"
+    assert model_used == "gpt-6-astra"
+    assert rows[0]["relevance"] == 2
+
+
+def test_write_crosscheck_records_engine_and_model(tmp_path):
+    db = tmp_path / "브랜드.sqlite"
+    _make_db(db, [("k1", 1)])
+    kr.migrate_path(db)
+    merged = [
+        {"keyword": "k1", "relevance": 0, "relevance_codex": 0, "needs_review": False, "final_relevance": 0}
+    ]
+    conn = sqlite3.connect(str(db))
+    kr.write_crosscheck(conn, merged, engine="claude", model="claude-opus-5")
+    row = conn.execute(
+        "SELECT crosscheck_engine, crosscheck_model FROM keywords WHERE keyword='k1'"
+    ).fetchone()
+    conn.close()
+    assert row == ("claude", "claude-opus-5")
+
+
+def test_migration_adds_crosscheck_engine_and_model_columns(tmp_path):
+    db = tmp_path / "브랜드.sqlite"
+    _make_db(db, [("k1", 1)])
+    added = kr.migrate_path(db)
+    assert "crosscheck_engine" in added
+    assert "crosscheck_model" in added
+    added_again = kr.migrate_path(db)
+    assert added_again == []
+
+
+def test_codex_worker_uses_claude_engine_via_config(tmp_path, monkeypatch):
+    """codex_worker(=--verify-worker)가 engine=claude일 때 클로드 라우터를 부르고
+    Codex 보류 파일과 무관하게 동작하는지 확인한다."""
+    repo = tmp_path
+    (repo / "data" / "keywords").mkdir(parents=True)
+    (repo / "warehouse" / "guides" / "정리본").mkdir(parents=True)
+    (repo / "warehouse" / "guides" / "정리본" / "우아덤.md").write_text("# 우아덤\n", encoding="utf-8")
+    db = repo / "data" / "keywords" / "우아덤.sqlite"
+    _make_db(db, [("kw1", 100)])
+    conn = sqlite3.connect(str(db))
+    kr.migrate(conn)
+    conn.execute("UPDATE keywords SET relevance_llm=3, scored_at='x' WHERE keyword='kw1'")
+    conn.commit()
+    conn.close()
+
+    # codex 보류 파일을 심어도(=Codex라면 막혔을 상황) claude 엔진은 영향받지 않아야 한다
+    kr._write_codex_pause(repo, "2099-01-01T00:00")
+
+    router = FakeRouter([json.dumps([{"keyword": "kw1", "relevance": 1, "rationale": "동의"}])])
+    monkeypatch.setattr(
+        kr, "load_crosscheck_config", lambda: {"engine": "claude", "model": "claude-opus-5", "effort": "low"}
+    )
+    out = kr.codex_worker("우아덤", worker_id=1, repo_root=repo, router=router)
+    assert out["checked"] == 1
+
+    row = sqlite3.connect(str(db)).execute(
+        "SELECT crosscheck_engine, crosscheck_model FROM keywords WHERE keyword='kw1'"
+    ).fetchone()
+    assert row == ("claude", "claude-opus-5")
+
+
+# --- 재설계(2026-09-25): 0-2 자동확정 + 3/4상위30% Opus5 검증 + few-shot -------
+
+
+def test_auto_confirm_low_relevance_fills_0_to_2_without_llm(tmp_path):
+    db = tmp_path / "브랜드.sqlite"
+    _make_db(db, [("k0", 10), ("k1", 20), ("k2", 30), ("k3", 40), ("k4", 50)])
+    conn = sqlite3.connect(str(db))
+    kr.migrate(conn)
+    for kw, rel in [("k0", 0), ("k1", 1), ("k2", 2), ("k3", 3), ("k4", 4)]:
+        conn.execute(
+            "UPDATE keywords SET relevance_llm=?, scored_at='x' WHERE keyword=?", (rel, kw)
+        )
+    conn.commit()
+
+    confirmed = kr.auto_confirm_low_relevance(conn)
+    assert confirmed == 3
+
+    rows = {
+        r[0]: (r[1], r[2])
+        for r in conn.execute("SELECT keyword, relevance_codex, crosscheck_engine FROM keywords")
+    }
+    assert rows["k0"] == (0, "auto-confirm")
+    assert rows["k1"] == (1, "auto-confirm")
+    assert rows["k2"] == (2, "auto-confirm")
+    assert rows["k3"] == (None, "")
+    assert rows["k4"] == (None, "")
+    conn.close()
+
+    # 두 번째 호출은 이미 확정된 행을 다시 건드리지 않는다(idempotent)
+    conn = sqlite3.connect(str(db))
+    assert kr.auto_confirm_low_relevance(conn) == 0
+    conn.close()
+
+
+def test_build_fewshot_examples_pulls_unrelated_and_bridge_cases(tmp_path):
+    db = tmp_path / "브랜드.sqlite"
+    _make_db(db, [("kw_unrelated", 100), ("kw_bridge", 90)])
+    conn = sqlite3.connect(str(db))
+    kr.migrate(conn)
+    conn.execute(
+        "UPDATE keywords SET relevance_llm=3, relevance_codex=4, rationale='r1',"
+        " bridge_rationale='무관으로 정정' WHERE keyword='kw_unrelated'"
+    )
+    conn.execute(
+        "UPDATE keywords SET relevance_llm=3, relevance_codex=3, rationale='r2',"
+        " bridge_rationale='당위성 유지' WHERE keyword='kw_bridge'"
+    )
+    conn.commit()
+
+    fewshot = kr.build_fewshot_examples(conn)
+    assert fewshot["unrelated_examples"][0]["keyword"] == "kw_unrelated"
+    assert fewshot["bridge_examples"][0]["keyword"] == "kw_bridge"
+    conn.close()
+
+    block = kr.render_fewshot_block(fewshot)
+    assert "kw_unrelated" in block
+    assert "kw_bridge" in block
+    assert "학습 예시" in block
+
+
+def test_render_fewshot_block_empty_when_no_history():
+    assert kr.render_fewshot_block({"unrelated_examples": [], "bridge_examples": []}) == ""
+    assert kr.render_fewshot_block(None) == ""
+
+
+def test_score_batch_claude_appends_fewshot_block_to_system_prompt():
+    captured = {}
+
+    class CapturingRouter:
+        def complete(self, purpose, system, user, max_tokens=1200, model=""):
+            captured["system"] = system
+            return json.dumps([{"keyword": "a", "relevance": 3, "rationale": "당위성", "bridge": "다리"}])
+
+    kr.score_batch_claude(
+        CapturingRouter(),
+        "브랜드",
+        ["a"],
+        "요약",
+        model="claude-opus-5",
+        fewshot_block="\n\n## 학습 예시\n\n- 예시1",
+    )
+    assert "학습 예시" in captured["system"]
+    assert "예시1" in captured["system"]
+
+
+def test_claim_codex_batch_restricts_relevance_4_to_top_30_percent(tmp_path):
+    db = tmp_path / "브랜드.sqlite"
+    rows = [(f"kw4_{i}", (10 - i) * 100) for i in range(10)]  # 검색량 1000..100
+    rows += [("kw3_a", 500)]
+    _make_db(db, rows)
+    conn = sqlite3.connect(str(db))
+    kr.migrate(conn)
+    for kw, _total in rows:
+        rel = 3 if kw == "kw3_a" else 4
+        conn.execute("UPDATE keywords SET relevance_llm=? WHERE keyword=?", (rel, kw))
+    conn.commit()
+
+    claimed = kr.claim_codex_batch(conn, limit=50)
+    claimed_kw = {r[0] for r in claimed}
+    # kw3_a(당위성)는 항상 포함
+    assert "kw3_a" in claimed_kw
+    # relevance=4는 검색량 상위 30%(10개 중 상위 3개, kw4_0..kw4_2)만 포함
+    top4 = {"kw4_0", "kw4_1", "kw4_2"}
+    bottom4 = {"kw4_7", "kw4_8", "kw4_9"}
+    assert top4 <= claimed_kw
+    assert not (bottom4 & claimed_kw)
+    conn.close()
+
+
+def test_codex_worker_auto_confirms_before_claiming(tmp_path, monkeypatch):
+    repo = tmp_path
+    (repo / "data" / "keywords").mkdir(parents=True)
+    (repo / "warehouse" / "guides" / "정리본").mkdir(parents=True)
+    (repo / "warehouse" / "guides" / "정리본" / "우아덤.md").write_text("# 우아덤\n", encoding="utf-8")
+    db = repo / "data" / "keywords" / "우아덤.sqlite"
+    _make_db(db, [("k_low", 10), ("k_high", 20)])
+    conn = sqlite3.connect(str(db))
+    kr.migrate(conn)
+    conn.execute("UPDATE keywords SET relevance_llm=1, scored_at='x' WHERE keyword='k_low'")
+    conn.execute("UPDATE keywords SET relevance_llm=3, scored_at='x' WHERE keyword='k_high'")
+    conn.commit()
+    conn.close()
+
+    def _fake_score_batch_crosscheck(brand, keywords, summary, router=None, codex_exe="", cwd=None, cfg=None, fewshot_block=""):
+        return (
+            [{"keyword": kw, "relevance": 3, "rationale": "동의"} for kw in keywords],
+            "claude-opus-5",
+            "claude",
+        )
+
+    monkeypatch.setattr(kr, "score_batch_crosscheck", _fake_score_batch_crosscheck)
+    out = kr.codex_worker("우아덤", worker_id=1, repo_root=repo)
+    assert out["checked"] == 1  # k_high(3)만 검증 대상, k_low(1)는 자동확정
+
+    row = sqlite3.connect(str(db)).execute(
+        "SELECT relevance_codex, crosscheck_engine FROM keywords WHERE keyword='k_low'"
+    ).fetchone()
+    assert row == (1, "auto-confirm")

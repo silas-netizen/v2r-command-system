@@ -60,6 +60,9 @@ MODELS: dict[str, str] = {
     "brand_comments": "claude-sonnet-5",
     # 키워드-브랜드 연관도 재산정 (100개씩 묶음, 요금제 길 0원)
     "keyword_relevance": "claude-haiku-4-5",
+    # 키워드-브랜드 연관도 교차 검증 (기본값. config/models.yaml의
+    # keyword_crosscheck.model이 있으면 그쪽을 우선한다 — 2026-09-25)
+    "keyword_crosscheck": "claude-opus-5",
     # 슬랙/텔레그램 자유 대화 명령 해석 (요금제 길 plan, 0원, 사용자 지시 2026-09-23)
     "freeform_command": "claude-sonnet-5",
 }
@@ -389,11 +392,17 @@ class LLMRouter:
             self._client = make_client(self.api_key)
         return self._client
 
-    def complete(self, purpose: str, system: str, user: str, max_tokens: int = 1200) -> str:
+    def complete(
+        self, purpose: str, system: str, user: str, max_tokens: int = 1200, model: str = ""
+    ) -> str:
         """길을 차례로 밟아 가며 모델을 부르고 텍스트를 돌려준다.
 
         **system/user 문자열은 어느 길로 가든 한 글자도 바뀌지 않는다.**
         길마다 다른 것은 "어떻게 부르는가"뿐이다 (설계서 §품질 동일성).
+
+        `model`을 주면 `MODELS[purpose]` 대신 그 모델 ID를 쓴다(용도 이름·사용량
+        장부는 그대로 `purpose` 기준). config 파일에서 모델을 고르고 싶은
+        용도(예: keyword_crosscheck)에 쓴다 — 2026-09-25.
 
         폴백 규칙:
         - `PlanLimit` → `data/plan_lock.json`에 5시간 잠금을 적고 다음 길로
@@ -402,7 +411,7 @@ class LLMRouter:
         - `PlanError`(그 밖) → 그 호출만 다음 길로
         - `batch` → 아직 없다. 조용히 다음 길로.
         """
-        model = self.model_for(purpose)
+        model = (model or "").strip() or self.model_for(purpose)
         fingerprint = prompt_sha256(system, user)
         order = self._effective_order()
         last_error: Exception | None = None

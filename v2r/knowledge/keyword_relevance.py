@@ -95,6 +95,11 @@ MIGRATION_COLUMNS: dict[str, str] = {
     #: sqlite 트랜잭션으로 선점한다. CLAIM_STALE_SEC(15분)보다 오래되면 죽은 선점으로
     #: 보고 다시 배정한다.
     "claimed_at": "TEXT NOT NULL DEFAULT ''",
+    #: 교차 검증을 어떤 엔진·모델이 했는지 (claude/claude-opus-5 또는
+    #: codex/gpt-6-astra 등). `relevance_codex` 열 이름·의미는 그대로 두고
+    #: 이 두 열만 "누가 검증했는지" 기록한다 (사용자 지시 2026-09-25).
+    "crosscheck_engine": "TEXT NOT NULL DEFAULT ''",
+    "crosscheck_model": "TEXT NOT NULL DEFAULT ''",
 }
 
 
@@ -243,6 +248,92 @@ def build_system_prompt(brand: str, summary: str) -> str:
 def build_user_prompt(keywords: list[str]) -> str:
     lines = [f"{i + 1}. {kw}" for i, kw in enumerate(keywords)]
     return "\n".join(lines)
+
+
+# --- 학습 예시(few-shot, 2026-09-25 실측 기반 재설계) -------------------
+#
+# 실측(둘 다 채점된 36,694개)으로 확인한 사실: 클로드·GPT 불일치는 거의 전부
+# 3(당위성)/4(무관) 경계에서 난다(클로드 0-2인데 GPT 4는 1% 미만). 그래서
+# 0-2는 교차 검증 없이 확정하고, Opus 5 검증은 **3(당위성) 전부**와
+# **4(무관) 중 검색량 상위 30%(브랜드별)**에만 쓴다. 이 함수들은 DB에 이미
+# 쌓인 과거 교차검증 결과에서 "무관으로 정정된 예"/"당위성으로 인정된 예"를
+# 뽑아 프롬프트에 few-shot으로 넣는다("교차검증 흐름을 학습"하는 부분).
+
+FEWSHOT_LIMIT = 30
+
+
+def build_fewshot_examples(
+    conn: sqlite3.Connection, limit: int = FEWSHOT_LIMIT
+) -> dict[str, list[dict[str, str]]]:
+    """DB의 과거 교차검증 결과에서 당위성(3) 판정의 학습 예시를 뽑는다.
+
+    - unrelated_examples: 클로드 3인데 GPT가 4(무관)로 정정했던 사례
+    - bridge_examples: 클로드 3이고 GPT도 3(당위성 인정)이었던 사례
+    브랜드별 검색량(total) 큰 순으로 최대 `limit`개씩.
+    """
+
+    def _fetch(codex_val: int) -> list[dict[str, str]]:
+        rows = conn.execute(
+            "SELECT keyword, rationale, bridge_rationale FROM keywords"
+            " WHERE relevance_llm = 3 AND relevance_codex = ? ORDER BY total DESC LIMIT ?",
+            (codex_val, limit),
+        ).fetchall()
+        return [
+            {"keyword": kw, "rationale": ra or "", "bridge_rationale": br or ""}
+            for kw, ra, br in rows
+        ]
+
+    return {"unrelated_examples": _fetch(RELEVANCE_UNRELATED), "bridge_examples": _fetch(RELEVANCE_BRIDGE)}
+
+
+def render_fewshot_block(fewshot: dict[str, list[dict[str, str]]] | None) -> str:
+    """`build_fewshot_examples`의 결과를 system 프롬프트에 덧붙일 글로 바꾼다."""
+    if not fewshot:
+        return ""
+    unrelated = fewshot.get("unrelated_examples") or []
+    bridge = fewshot.get("bridge_examples") or []
+    if not unrelated and not bridge:
+        return ""
+    parts: list[str] = []
+    if unrelated:
+        lines = "\n".join(
+            f"  - {e['keyword']}: {e.get('bridge_rationale') or e.get('rationale') or '(사유 없음)'}"
+            for e in unrelated
+        )
+        parts.append(
+            "이 브랜드에서 과거에 클로드가 3(당위성)으로 매겼지만 교차 검증에서"
+            " 4(무관)로 정정된 예(참고용 — 그대로 베끼지 말고 판단 기준으로만 쓴다):\n" + lines
+        )
+    if bridge:
+        lines = "\n".join(
+            f"  - {e['keyword']}: {e.get('bridge_rationale') or e.get('rationale') or '(사유 없음)'}"
+            for e in bridge
+        )
+        parts.append(
+            "이 브랜드에서 과거에 3(당위성)으로 인정되어 그대로 유지된 예:\n" + lines
+        )
+    return "\n\n## 학습 예시(이 브랜드의 과거 교차 검증 결과)\n\n" + "\n\n".join(parts)
+
+
+def auto_confirm_low_relevance(conn: sqlite3.Connection) -> int:
+    """클로드 0-2(직접·근접·확장)는 교차 검증 없이 확정한다.
+
+    실측(2026-09-25, 둘 다 채점된 36,694개): 클로드 0-2인데 GPT가 4(무관)로 본
+    경우는 전체의 1% 미만(우아덤 17·뉴더미스 42·코숨핏 199·팥순이 0·장으뜸 0)이라
+    Opus 5를 불러 검증할 값어치가 없다. `relevance_codex = relevance_llm`로
+    바로 채우고 `crosscheck_engine = 'auto-confirm'`을 남긴다. 돌려주는 값은
+    이번에 확정한 행 수.
+    """
+    stamp = _now_iso()
+    cur = conn.execute(
+        "UPDATE keywords SET relevance_codex = relevance_llm, needs_review = 0,"
+        " crosscheck_engine = 'auto-confirm', crosscheck_model = '', codex_checked_at = ?"
+        " WHERE relevance_llm IS NOT NULL AND relevance_llm BETWEEN 0 AND 2"
+        " AND relevance_codex IS NULL",
+        (stamp,),
+    )
+    conn.commit()
+    return cur.rowcount or 0
 
 
 # --- 응답 파싱 --------------------------------------------------------
@@ -490,10 +581,16 @@ def crosscheck_brand(
     progress_path: str | Path | None = None,
     codex_exe: str = "",
 ) -> dict[str, int]:
-    """클로드 채점이 끝난 키워드 중 Codex 교차 검증이 안 된 것을 전부 처리한다."""
+    """클로드 채점이 끝난 키워드 중 교차 검증이 안 된 것을 전부 처리한다.
+
+    0-2는 `auto_confirm_low_relevance`로 즉시 확정하고(검증 안 부름), 남는
+    3/4(상위 30%)만 `score_batch_crosscheck`로 부른다(2026-09-25 재설계).
+    """
     conn = sqlite3.connect(str(db_path))
     migrate(conn)
+    auto_confirm_low_relevance(conn)
     summary = brand_summary(brand, guides_dir)
+    fewshot_block = render_fewshot_block(build_fewshot_examples(conn))
     checked = 0
     failed_batches = 0
     try:
@@ -511,15 +608,15 @@ def crosscheck_brand(
             ]
             keywords = [r["keyword"] for r in claude_rows]
             try:
-                codex_rows, _model = score_batch_codex(
-                    brand, keywords, summary, exe=codex_exe
+                codex_rows, _model, _engine = score_batch_crosscheck(
+                    brand, keywords, summary, codex_exe=codex_exe, fewshot_block=fewshot_block
                 )
             except RelevanceParseError as exc:
                 failed_batches += 1
-                log.error("codex 묶음 포기(%s, %d개): %s", brand, len(chunk), exc)
+                log.error("교차 검증 묶음 포기(%s, %d개): %s", brand, len(chunk), exc)
                 continue
             merged = crosscheck_rows(claude_rows, codex_rows)
-            write_crosscheck(conn, merged)
+            write_crosscheck(conn, merged, engine=_engine, model=_model)
             checked += len(merged)
             if progress_path is not None:
                 update_progress(
@@ -969,7 +1066,14 @@ def _throughput_per_hour(started_at: str, done: int) -> float:
 def claim_codex_batch(
     conn: sqlite3.Connection, limit: int = WORKER_BATCH_SIZE
 ) -> list[tuple[str, int, str, str]]:
-    """relevance_codex가 없는 행을 검색량 큰 순 + 당위성(3) 후보 우선으로 선점한다.
+    """relevance_codex가 없는 행 중 **검증이 값어치 있는 구간만** 검색량 큰 순 +
+    당위성(3) 후보 우선으로 선점한다.
+
+    2026-09-25 실측(둘 다 채점된 36,694개)으로 대상을 좁혔다: 0-2는
+    `auto_confirm_low_relevance`가 검증 없이 확정하므로 여기 대상이 아니다.
+    남는 것은 3(당위성) 전부 + 4(무관) 중 검색량 상위 30%(브랜드=이 DB 파일 전체
+    기준, `NTILE(10)` <= 3)뿐이다 — GPT가 클로드 4 중 8,338건을 3 이하로 봤으므로
+    검색량 큰 4는 회수 여지가 있고, 작은 4는 원고 대상이 될 가능성이 낮아 그냥 둔다.
 
     sqlite 트랜잭션(BEGIN IMMEDIATE) 안에서 SELECT 후 즉시 claimed_at을 찍어,
     같은 브랜드에서 동시에 도는 codex 워커 2개가 같은 행을 중복 처리하지 않게
@@ -989,9 +1093,17 @@ def claim_codex_batch(
             conn.execute("BEGIN IMMEDIATE")
             rows = conn.execute(
                 "SELECT keyword, relevance_llm, rationale, bridge_rationale FROM keywords"
-                " WHERE relevance_llm IS NOT NULL AND relevance_llm BETWEEN 0 AND 3"
-                " AND relevance_codex IS NULL"
+                " WHERE relevance_codex IS NULL"
                 " AND (claimed_at = '' OR claimed_at < ?)"
+                " AND ("
+                "   relevance_llm = 3"
+                "   OR (relevance_llm = 4 AND keyword IN ("
+                "     SELECT keyword FROM ("
+                "       SELECT keyword, NTILE(10) OVER (ORDER BY total DESC) AS decile"
+                "       FROM keywords WHERE relevance_llm = 4 AND relevance_codex IS NULL"
+                "     ) WHERE decile <= 3"
+                "   ))"
+                " )"
                 " ORDER BY (relevance_llm = 3) DESC, total DESC"
                 " LIMIT ?",
                 (stale_before, limit),
@@ -1112,12 +1224,20 @@ def codex_worker(
     repo_root: str | Path | None = None,
     batch_size: int = WORKER_BATCH_SIZE,
     codex_exe: str = "",
+    router: Any | None = None,
 ) -> dict[str, Any]:
-    """브랜드 하나의 Codex 교차검증만 끝까지 돌린다. 같은 브랜드에 2개까지 동시 실행 허용.
+    """브랜드 하나의 교차검증만 끝까지 돌린다(엔진은 config/models.yaml
+    `keyword_crosscheck.engine` — claude면 요금제 길, codex면 Codex CLI).
+    같은 브랜드에 2개까지 동시 실행 허용. 이름은 `--codex-worker` 그대로 두었다
+    (`--verify-worker`는 같은 함수를 부르는 별칭, 사용자 지시 2026-09-25).
 
-    relevance_llm이 0-3이고 relevance_codex가 없는 행을, 당위성(3) 후보 우선 +
-    검색량 큰 순으로 claim_codex_batch가 선점해 준다.
+    0-2는 시작할 때 `auto_confirm_low_relevance`로 검증 없이 바로 확정한다(2026-09-25
+    실측 — 불일치 1% 미만). 남는 3(당위성) 전부 + 4(무관) 상위 30%만
+    `claim_codex_batch`가 당위성(3) 후보 우선 + 검색량 큰 순으로 선점해 준다.
+    engine=claude면 브랜드별 few-shot(과거 3/4 경계 판정 예시)을 system 프롬프트에
+    실어 보낸다.
     """
+    crosscheck_cfg = load_crosscheck_config()
     if repo_root is None:
         from v2r.config import get_settings
 
@@ -1141,7 +1261,15 @@ def codex_worker(
     conn = _connect_concurrent(db_path)
     try:
         migrate(conn)
+        confirmed = auto_confirm_low_relevance(conn)
+        if confirmed:
+            log.info("교차 검증 없이 확정(0-2): %s #%s %d건", brand, worker_id, confirmed)
         summary = brand_summary(brand, guides_dir)
+        fewshot_block = (
+            render_fewshot_block(build_fewshot_examples(conn))
+            if (crosscheck_cfg.get("engine") or DEFAULT_CROSSCHECK_ENGINE).strip().lower() == "claude"
+            else ""
+        )
         update_progress(progress_path, brand, status="running", codex_checked=0, started_at=started_at)
         while True:
             if rescore_stop_requested(repo_root / "data"):
@@ -1159,15 +1287,24 @@ def codex_worker(
             keywords = [r["keyword"] for r in claude_rows]
             t0 = time.monotonic()
             try:
-                codex_rows, _model = score_batch_codex(brand, keywords, summary, exe=codex_exe)
+                codex_rows, _model, _engine = score_batch_crosscheck(
+                    brand,
+                    keywords,
+                    summary,
+                    router=router,
+                    codex_exe=codex_exe,
+                    cwd=repo_root,
+                    cfg=crosscheck_cfg,
+                    fewshot_block=fewshot_block,
+                )
             except RelevanceParseError as exc:
                 failed_batches += 1
                 release_codex_claim(conn, keywords)
-                log.error("codex 묶음 포기(%s #%s, %d개): %s", brand, worker_id, len(keywords), exc)
+                log.error("교차 검증 묶음 포기(%s #%s, %d개): %s", brand, worker_id, len(keywords), exc)
                 continue
             elapsed = time.monotonic() - t0
             merged = crosscheck_rows(claude_rows, codex_rows)
-            write_crosscheck(conn, merged)
+            write_crosscheck(conn, merged, engine=_engine, model=_model)
             checked += len(merged)
             update_progress(
                 progress_path,
@@ -1450,6 +1587,118 @@ def score_batch_codex(
     raise RelevanceParseError(f"codex 교차 검증 실패({brand}): {last_error}")
 
 
+#: 클로드로 교차 검증할 때 쓰는 용도 이름 (v2r/llm/router.py MODELS에 기본값
+#: claude-opus-5가 있다. config/models.yaml keyword_crosscheck.model이 있으면
+#: 그쪽을 우선한다).
+CROSSCHECK_PURPOSE = "keyword_crosscheck"
+
+#: engine 설정을 못 읽었을 때 쓰는 기본값 — 2026-09-25 이전 동작(codex)을 보존
+DEFAULT_CROSSCHECK_ENGINE = "codex"
+
+
+def load_crosscheck_config() -> dict[str, Any]:
+    """`config/models.yaml`의 `keyword_crosscheck` 절(engine/model/effort)."""
+    try:
+        from ..config import load_yaml
+
+        data = load_yaml("models") or {}
+    except Exception:  # pragma: no cover - 설정을 못 읽어도 codex로 동작
+        data = {}
+    cfg = data.get("keyword_crosscheck") if isinstance(data, dict) else None
+    if not isinstance(cfg, dict):
+        cfg = {}
+    return {
+        "engine": str(cfg.get("engine") or DEFAULT_CROSSCHECK_ENGINE).strip().lower(),
+        "model": str(cfg.get("model") or "").strip(),
+        "effort": str(cfg.get("effort") or "").strip(),
+    }
+
+
+def score_batch_claude(
+    router: Any,
+    brand: str,
+    keywords: list[str],
+    summary: str,
+    model: str = "",
+    retries: int = RETRY_COUNT,
+    fewshot_block: str = "",
+) -> tuple[list[dict[str, Any]], str]:
+    """클로드(요금제 길)로 같은 묶음을 같은 기준(build_system_prompt/build_user_prompt,
+    parse_response 동일)으로 교차 검증한다.
+
+    `fewshot_block`이 있으면 system 프롬프트 끝에 덧붙인다(`render_fewshot_block`
+    결과 — 3/4 경계의 브랜드별 학습 예시, 2026-09-25 재설계).
+
+    1차 채점(purpose=`keyword_relevance`)과 검증 모델이 같아지지 않도록,
+    부르기 전에 확인해서 같으면 멈춘다(사용자 지시 2026-09-25).
+    """
+    from ..llm.router import MODELS as _ROUTER_MODELS
+
+    scoring_model = _ROUTER_MODELS.get(PURPOSE, "")
+    used_model = (model or "").strip() or _ROUTER_MODELS.get(CROSSCHECK_PURPOSE, "")
+    if used_model and scoring_model and used_model == scoring_model:
+        raise RelevanceParseError(
+            "클로드 교차 검증 모델이 1차 채점 모델과 같습니다"
+            f"({used_model}) — config/models.yaml keyword_crosscheck.model을 확인하세요"
+        )
+    system = build_system_prompt(brand, summary) + (fewshot_block or "")
+    user = build_user_prompt(keywords)
+    last_error: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            text = router.complete(
+                CROSSCHECK_PURPOSE, system, user, max_tokens=DEFAULT_MAX_TOKENS, model=used_model
+            )
+            return parse_response(text, keywords), used_model
+        except Exception as exc:  # noqa: BLE001 - 재시도 대상이면 전부 잡는다
+            last_error = exc
+            log.warning(
+                "클로드 교차 검증 실패(%d/%d) 브랜드=%s 묶음크기=%d: %s",
+                attempt + 1,
+                retries + 1,
+                brand,
+                len(keywords),
+                exc,
+            )
+    raise RelevanceParseError(
+        f"클로드 교차 검증 {retries + 1}회 시도 모두 실패({brand}, {len(keywords)}개): {last_error}"
+    )
+
+
+def score_batch_crosscheck(
+    brand: str,
+    keywords: list[str],
+    summary: str,
+    router: Any | None = None,
+    codex_exe: str = "",
+    cwd: str | Path | None = None,
+    cfg: dict[str, Any] | None = None,
+    fewshot_block: str = "",
+) -> tuple[list[dict[str, Any]], str, str]:
+    """설정(`config/models.yaml`의 `keyword_crosscheck.engine`)에 맞는 엔진으로 교차 검증한다.
+
+    `fewshot_block`은 engine=claude일 때만 쓴다(`render_fewshot_block` 결과).
+
+    돌려주는 값: `(rows, model_used, engine_used)`. `relevance_codex` 열 이름·
+    의미는 어느 엔진이든 같다 — 어떤 엔진·모델이 채점했는지는 호출한 쪽이
+    `crosscheck_engine`/`crosscheck_model`로 같이 저장한다.
+    """
+    cfg = cfg if cfg is not None else load_crosscheck_config()
+    engine = (cfg.get("engine") or DEFAULT_CROSSCHECK_ENGINE).strip().lower()
+    if engine == "claude":
+        if router is None:
+            from ..config import get_settings
+            from ..llm.router import LLMRouter
+
+            router = LLMRouter.from_settings(get_settings())
+        rows, model_used = score_batch_claude(
+            router, brand, keywords, summary, model=cfg.get("model", ""), fewshot_block=fewshot_block
+        )
+        return rows, model_used, "claude"
+    rows, model_used = score_batch_codex(brand, keywords, summary, exe=codex_exe, cwd=cwd)
+    return rows, model_used, "codex"
+
+
 def crosscheck_rows(
     claude_rows: list[dict[str, Any]], codex_rows: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
@@ -1478,23 +1727,51 @@ def crosscheck_rows(
     return merged
 
 
-def write_crosscheck(conn: sqlite3.Connection, merged: list[dict[str, Any]]) -> None:
+def write_crosscheck(
+    conn: sqlite3.Connection,
+    merged: list[dict[str, Any]],
+    engine: str = "",
+    model: str = "",
+) -> None:
+    """`engine`/`model`을 주면 `crosscheck_engine`/`crosscheck_model` 열에도 남긴다
+    (어떤 엔진·모델이 검증했는지 — 사용자 지시 2026-09-25). 안 주면 옛 동작 그대로
+    (그 두 열은 건드리지 않는다)."""
     stamp = _now_iso()
-    conn.executemany(
-        "UPDATE keywords SET relevance_llm = ?, relevance_codex = ?, needs_review = ?,"
-        " bridge_rationale = ?, codex_checked_at = ? WHERE keyword = ?",
-        [
-            (
-                r["final_relevance"],
-                r["relevance_codex"],
-                1 if r["needs_review"] else 0,
-                r.get("bridge_rationale", ""),
-                stamp,
-                r["keyword"],
-            )
-            for r in merged
-        ],
-    )
+    if engine or model:
+        conn.executemany(
+            "UPDATE keywords SET relevance_llm = ?, relevance_codex = ?, needs_review = ?,"
+            " bridge_rationale = ?, codex_checked_at = ?, crosscheck_engine = ?,"
+            " crosscheck_model = ? WHERE keyword = ?",
+            [
+                (
+                    r["final_relevance"],
+                    r["relevance_codex"],
+                    1 if r["needs_review"] else 0,
+                    r.get("bridge_rationale", ""),
+                    stamp,
+                    engine,
+                    model,
+                    r["keyword"],
+                )
+                for r in merged
+            ],
+        )
+    else:
+        conn.executemany(
+            "UPDATE keywords SET relevance_llm = ?, relevance_codex = ?, needs_review = ?,"
+            " bridge_rationale = ?, codex_checked_at = ? WHERE keyword = ?",
+            [
+                (
+                    r["final_relevance"],
+                    r["relevance_codex"],
+                    1 if r["needs_review"] else 0,
+                    r.get("bridge_rationale", ""),
+                    stamp,
+                    r["keyword"],
+                )
+                for r in merged
+            ],
+        )
     conn.commit()
 
 
@@ -1648,6 +1925,15 @@ __all__ = [
     "codex_worker",
     "score_worker_main",
     "codex_worker_main",
+    "load_crosscheck_config",
+    "score_batch_claude",
+    "score_batch_crosscheck",
+    "CROSSCHECK_PURPOSE",
+    "DEFAULT_CROSSCHECK_ENGINE",
+    "auto_confirm_low_relevance",
+    "build_fewshot_examples",
+    "render_fewshot_block",
+    "FEWSHOT_LIMIT",
 ]
 
 
@@ -1658,10 +1944,10 @@ if __name__ == "__main__":
         raise SystemExit(rescore_worker_main(sys.argv[2:]))
     if len(sys.argv) > 2 and sys.argv[1] == "--score-worker":
         raise SystemExit(score_worker_main(sys.argv[2:]))
-    if len(sys.argv) > 2 and sys.argv[1] == "--codex-worker":
+    if len(sys.argv) > 2 and sys.argv[1] in ("--codex-worker", "--verify-worker"):
         raise SystemExit(codex_worker_main(sys.argv[2:]))
     print(
         "사용법: python -m v2r.knowledge.keyword_relevance"
-        " --rescore-worker|--score-worker|--codex-worker <브랜드> [번호]"
+        " --rescore-worker|--score-worker|--codex-worker(=--verify-worker) <브랜드> [번호]"
     )
     raise SystemExit(2)
