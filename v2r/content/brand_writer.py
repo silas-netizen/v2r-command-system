@@ -689,6 +689,10 @@ class BrandRule:
     body_structure: tuple[str, ...] = ()
     body_notes: tuple[str, ...] = ()
     comment_notes: tuple[str, ...] = ()
+    #: 이 브랜드 제품과 **같은 원물·형태**로 볼 낱말 (사용자 지적 2026-09-25).
+    #: `product`/`banned_in_body`만으로는 못 잡는 짧은 원물명(팥순이의 `팥`처럼
+    #: 1글자)을 따로 등록해 둔다. `is_same_product_keyword`가 참조한다.
+    core_material: tuple[str, ...] = ()
 
     @property
     def extra_placeholder_after_paragraph(self) -> int:
@@ -812,6 +816,7 @@ _register(
         brand="장으뜸",
         product="장으뜸 장어즙",
         banned_in_body=("장으뜸", "장어즙"),
+        core_material=("장어",),
         target="난임 유산 자연임신을 바라는 임신 준비 타겟",
         one_thing="기력이 좋아야 착상이 잘 된다 내 몸에 실제로 작용하는 것이 중요하다",
         authority="산부인과 원장님 난임 카페 추천 가족 권유",
@@ -872,6 +877,7 @@ _register(
         product="팥순추출물 다이어트",
         product_in_comment="팥순ㅇㅣ",
         banned_in_body=("팥순이",),
+        core_material=("팥",),
         target="체중 감량 다이어트를 하는 타겟",
         one_thing="팥순추출물이 붓기가 아니라 체중 감량에 작용한다",
         authority="다이어트 카페 추천 후기",
@@ -918,6 +924,7 @@ _register(
         product="팥순추출물 다이어트",
         product_in_comment="팥순ㅇㅣ",
         banned_in_body=("팥순이",),
+        core_material=("팥",),
         target="체중 감량 다이어트를 하는 타겟",
         one_thing="키워드 단독으로는 한계가 있고 팥순추출물 다이어트를 병행해야 한다",
         authority="다이어트 카페 추천 후기",
@@ -1001,6 +1008,64 @@ def strip_placeholders(text: str) -> str:
 def body_length(body: str) -> int:
     """본문 글자 수 (공백 제외, 자리표시자 제외)."""
     return len(_squash(strip_placeholders(body)))
+
+
+def is_same_product_keyword(rule: "BrandRule", keyword: str) -> bool:
+    """키워드가 브랜드 제품과 **같은 원물·제품**을 가리키는가 (사용자 지적 2026-09-25).
+
+    장으뜸 키워드 "장어"에 "장어를 먹었는데 부족해서 방법을 바꿨더니 장으뜸
+    장어즙" 같은 논리를 쓰면 같은 원물을 실패했다가 같은 원물로 되돌아온
+    꼴이라 앞뒤가 안 맞는다. `product`/`banned_in_body`/`core_material`
+    낱말과 키워드가 겹치면 "동일 제품·원물 키워드"로 보고 다른 서사 틀
+    (고르는 법·먹는 방식·차이 비교)을 쓴다.
+    """
+    needle = _squash(keyword)
+    if not needle:
+        return False
+    # `core_material`은 1글자짜리 원물명도 등록해 두므로 길이 제한 없이 본다
+    for token in rule.core_material:
+        token = _squash(token)
+        if token and (token in needle or needle in token):
+            return True
+    # `product`/`banned_in_body`는 낱말 단위로 쪼개 2글자 이상만 본다
+    # (제품명 전체를 통째로 대면 "장으뜸장어즙"처럼 키워드와 안 겹쳐 못 잡는다)
+    words: list[str] = []
+    for phrase in (rule.product,) + tuple(rule.banned_in_body):
+        words.extend((phrase or "").split())
+    for token in words:
+        token = _squash(token)
+        if len(token) >= 2 and (token in needle or needle in token):
+            return True
+    return False
+
+
+#: 동일 제품·원물 키워드 — 본문에 넣는 서사 틀 안내 (사용자 지적 2026-09-25).
+#: "실패했다가 대안으로 브랜드를 골랐다" 틀을 금지하고 "고르는 법·먹는 방식·
+#: 차이 비교" 질문 틀로 바꾼다.
+SAME_PRODUCT_BODY_NOTES: tuple[str, ...] = (
+    "<절대 규칙 — 이 키워드는 브랜드 제품과 같은 원물·제품이다>",
+    "- `{키워드}를 먹었는데 부족해서/효과가 없어서 다른 방법으로 바꿨다` 는 서사는"
+    " 쓰지 않는다 (같은 원물을 먹다가 실패해서 같은 원물로 된 제품을 다시 쓰는 꼴이라"
+    " 앞뒤가 안 맞는다)",
+    "- 대신 **고르는 법 · 먹는 방식 · 형태 차이**를 궁금해하는 틀로 쓴다"
+    " (예: 어떻게 먹어야 흡수가 잘 되는지, 구이로 먹는 것과 즙·환 같은 다른 형태로"
+    " 먹는 것의 차이, 원물 함량·배합 기준으로 뭘 봐야 하는지)",
+    "- 오프닝은 `먹어봤는데 실패했다`가 아니라 `어떻게 골라야/먹어야 하는지 모르겠다`"
+    " 는 고민으로 시작한다",
+)
+
+#: 동일 제품·원물 키워드 — 댓글(대대댓글2 계열) 안내. 브랜드 공용 system이 아니라
+#: 키워드마다 달라지는 user 쪽에 붙인다 (프롬프트 캐시를 깨지 않으려고).
+SAME_PRODUCT_COMMENT_NOTE = (
+    "<절대 규칙 — 이 키워드는 브랜드 제품과 같은 원물·제품이다>\n"
+    "- 대대댓글2의 `다른 방법으로는 왜 안 되는지` 문장을 `그 원물을 그냥/예전 방식대로"
+    " 먹었는데 실패했다`로 쓰지 않는다 (같은 원물을 실패했다가 같은 원물 제품을 다시"
+    " 쓰는 꼴이라 앞뒤가 안 맞는다)\n"
+    "- 대신 **고르는 기준의 차이**로 쓴다 (아무 형태나 배합·원물 함량 안 따지고 고르면"
+    " 흡수가 안 돼서 소용없다는 식)\n"
+    "- 원물 자체를 부정하지 말고, 어떻게 골라 먹느냐(배합·함량·형태)가 갈린다는"
+    " 논리로만 브랜드를 잇는다"
+)
 
 
 def keyword_hits(body: str, keyword: str) -> int:
@@ -1902,6 +1967,9 @@ def _body_dynamic_block(rule: BrandRule, keyword: str, cafe: str = "") -> list[s
         f"- `{keyword}` 로 고민하는 사람이 겪는 **증상이나 고민**을 첫 줄에 바로 적는다",
         "- 글을 쓰는 장소·시간·상태를 적지 않는다 (한산해서 / 잠깐 앉아 / 글 남겨요 금지)",
     ]
+    if is_same_product_keyword(rule, keyword):
+        lines.append("")
+        lines.extend(SAME_PRODUCT_BODY_NOTES)
     if cafe:
         lines.append(f"올릴 카페: {cafe}")
     return lines
@@ -2101,6 +2169,7 @@ def build_comments_prompt(
             if tried
             else []
         )
+        + (["", SAME_PRODUCT_COMMENT_NOTE] if is_same_product_keyword(rule, keyword) else [])
     )
     return system, user
 
@@ -2124,6 +2193,8 @@ def build_combined_prompt(
     rule = rule_for(brand, manuscript_type)
     system = build_shared_system(brand, manuscript_type, guide_text, examples)
     combined_lines = [BRAND_COMBINED_TASK, "", *_body_dynamic_block(rule, keyword, cafe)]
+    if is_same_product_keyword(rule, keyword):
+        combined_lines += ["", SAME_PRODUCT_COMMENT_NOTE]
     if reference_brief:
         combined_lines += ["", "【참고 형식(통검 1등 글)】", reference_brief]
     if relevance == 3 and bridge_rationale:
@@ -2984,6 +3055,10 @@ def generate_manuscript(
     if all(not c.text for c in draft.comments):
         raise BrandWriteError(f"댓글 생성 실패({brand}/{keyword}): 댓글을 하나도 받지 못했습니다")
 
+    _retry_logic_consistency(
+        llm, draft, rule, brand, keyword, guide_text, cap, examples, stats
+    )
+
     _finish(
         draft,
         rule,
@@ -3115,6 +3190,124 @@ def _note_call(llm: Any, stats: dict | None, slot: str) -> None:
     stats[f"{slot}_backend"] = call.get("backend", "")
     stats[f"{slot}_prompt_sha256"] = call.get("prompt_sha256", "")
     stats[f"{slot}_model"] = call.get("model", "")
+
+
+#: 논리 일관성 재시도 최대 횟수 (사용자 지시 2026-09-25)
+LOGIC_CHECK_MAX_RETRIES = 2
+
+
+def check_logic_consistency(
+    llm: Any, rule: "BrandRule", keyword: str, body: str, comments_text: str
+) -> tuple[bool, str]:
+    """본문·댓글의 브랜드 연결이 **상식적으로 자연스러운가**를 요금제 길 Opus에게 묻는다.
+
+    사용자 지시 2026-09-25: 장으뜸 "장어" 원고가 "장어를 먹었는데 부족해서
+    방법을 바꿨더니 장으뜸 장어즙"처럼 같은 원물을 실패했다가 같은 원물로
+    되돌아온 꼴이라 앞뒤가 안 맞았다. 예/아니오와 이유 한 문장으로만 받는다.
+    모델 호출이 실패하면(요금제 한도 등) 원고를 막지 않고 통과로 본다
+    (경고만 stats에 남는다).
+    """
+    system = (
+        "너는 카페 바이럴 원고에서 키워드 → 브랜드 제품으로 넘어가는 논리가"
+        " 상식적으로 자연스러운지만 보는 검수자다. 과장하지 말고 예/아니오와"
+        " 이유 한 문장으로만 답한다."
+    )
+    user = "\n".join(
+        [
+            f"브랜드: {rule.brand} (제품: {rule.product})",
+            f"작성 키워드: {keyword}",
+            "",
+            "<본문>",
+            strip_placeholders(body or "").strip(),
+            "",
+            "<댓글 중 브랜드 연결 부분>",
+            comments_text or "(없음)",
+            "",
+            "질문: 이 글이 키워드에서 브랜드 제품으로 넘어가는 논리가 상식적으로"
+            " 자연스러운가? 예를 들어 키워드가 브랜드 제품과 같은 원물·제품인데"
+            " `먹었지만 실패해서 다른 방법으로 바꿨다`처럼 같은 원물을 실패했다가"
+            " 같은 원물로 된 제품으로 되돌아오면 앞뒤가 안 맞으니 아니오다.",
+            '반드시 JSON 하나로만 답한다: {"ok": true 또는 false, "reason": "이유 한 문장"}',
+        ]
+    )
+    try:
+        data = llm.complete_json("brand_logic_check", system, user, max_tokens=300)
+    except Exception as exc:  # 판정 실패는 원고를 막지 않는다
+        log.warning("논리 일관성 검사 실패(통과로 봄): %s", exc)
+        return True, f"검사 생략(오류): {exc}"
+    if not isinstance(data, dict):
+        return True, "검사 생략(응답 형식 오류)"
+    return bool(data.get("ok", True)), _as_text(data.get("reason")) or ""
+
+
+def _comments_text(draft: Manuscript) -> str:
+    return "\n".join(f"{c.label}: {c.text}" for c in draft.comments if (c.text or "").strip())
+
+
+def _retry_logic_consistency(
+    llm: Any,
+    draft: Manuscript,
+    rule: BrandRule,
+    brand: str,
+    keyword: str,
+    guide_text: str,
+    cap: int,
+    examples: list[str] | None,
+    stats: dict | None,
+    max_retries: int = LOGIC_CHECK_MAX_RETRIES,
+) -> None:
+    """논리 일관성 판정이 아니오면 본문을 다시 받고(댓글도 같이 갱신) **최대
+    `max_retries`번**까지 다시 시도한다. 결과는 `stats["logic_check"]`에 남긴다."""
+    attempts_log: list[dict] = []
+    ok, reason = check_logic_consistency(llm, rule, keyword, draft.body, _comments_text(draft))
+    attempts_log.append({"시도": 1, "ok": ok, "이유": reason})
+    tries = 0
+    while not ok and tries < max_retries:
+        tries += 1
+        note = _retry_note(
+            [
+                f"논리 일관성 — 브랜드로 이어지는 논리가 부자연스럽다는 지적: {reason}."
+                " 같은 원물·제품 키워드라면 `먹었는데 실패해서 다른 방법으로 바꿨다`가"
+                " 아니라 고르는 법·먹는 방식·배합 차이로 자연스럽게 이어라",
+            ]
+        )
+        body_sys, body_user = build_body_prompt(
+            brand, keyword, draft.cafe, guide_text, rule.manuscript_type, examples,
+        )
+        try:
+            data = llm.complete_json("brand_body", body_sys, body_user + note, max_tokens=2500)
+        except Exception as exc:
+            log.warning("논리 일관성 재시도(본문) 실패: %s", exc)
+            break
+        if isinstance(data, dict):
+            body = _clean_body(_as_text(data.get("body") or data.get("본문")))
+            if body:
+                body = apply_placeholders(body, rule, keyword)
+                title = _as_text(data.get("title") or data.get("제목")) or draft.title
+                candidate = Manuscript(
+                    title=title,
+                    body=body,
+                    cafe=draft.cafe,
+                    keyword=keyword,
+                    tags=tags_from_keyword(keyword),
+                    manuscript_type=rule.manuscript_type,
+                    source=draft.source,
+                    comments=_comment_nodes({}),
+                    content_hash=content_hash(title, body),
+                )
+                if not violations(validate(candidate, rule), scope="본문"):
+                    draft.title, draft.body = title, body
+                    draft.content_hash = content_hash(title, body)
+                    _fill_comments(
+                        llm, draft, rule, brand, keyword, guide_text, cap,
+                        examples=examples, stats=stats,
+                    )
+        ok, reason = check_logic_consistency(
+            llm, rule, keyword, draft.body, _comments_text(draft)
+        )
+        attempts_log.append({"시도": tries + 1, "ok": ok, "이유": reason})
+    if stats is not None:
+        stats["logic_check"] = {"ok": ok, "이유": reason, "시도들": attempts_log}
 
 
 def _finish(
@@ -3340,6 +3533,10 @@ def _generate_combined(
         )
     if all(not c.text for c in draft.comments):
         raise BrandWriteError(f"댓글 생성 실패({brand}/{keyword}): 댓글을 하나도 받지 못했습니다")
+
+    _retry_logic_consistency(
+        llm, draft, rule, brand, keyword, guide_text, cap, examples, stats
+    )
 
     _finish(draft, rule, stats, attempts, comment_attempts, cap, llm, before, "combined")
     return draft

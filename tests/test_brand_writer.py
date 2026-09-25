@@ -480,7 +480,9 @@ def test_generate_manuscript_with_fake_llm():
     assert "{키워드}" in m.body
     assert bw.brand_of(m) == "우아덤"
     purposes = [c[0] for c in llm.calls]
-    assert purposes == ["brand_body", "brand_comments"]
+    # brand_logic_check는 댓글까지 다 채운 뒤 논리 일관성을 한 번 묻는 호출이다
+    # (사용자 지시 2026-09-25)
+    assert purposes == ["brand_body", "brand_comments", "brand_logic_check"]
 
 
 def test_generate_keeps_retrying_until_it_passes():
@@ -813,7 +815,8 @@ def test_combined_mode_makes_one_call_and_validates_both():
     llm = Combined()
     stats: dict = {}
     m = bw.generate_manuscript(llm, "우아덤", KEYWORD, stats=stats, mode="combined")
-    assert llm.n == 1  # 본문 + 댓글을 한 번에
+    # 본문 + 댓글을 한 번에(1) + 논리 일관성 확인 호출(1, 사용자 지시 2026-09-25)
+    assert llm.n == 2
     assert stats["mode"] == "combined"
     assert len(m.comments) == 12 and m.body
     assert not bw.failures(bw.validate(m))
@@ -837,8 +840,9 @@ def test_combined_mode_falls_back_to_partial_retry():
     llm = CombinedBadComment()
     stats: dict = {}
     m = bw.generate_manuscript(llm, "우아덤", KEYWORD, stats=stats, mode="combined")
-    assert llm.n == 2
-    assert "<다시 쓸 자리>" in llm.calls[-1][2]  # 두 번째는 부분 재시도였다
+    # 본문+댓글(1) + 부분 재시도(1) + 논리 일관성 확인(1, 사용자 지시 2026-09-25)
+    assert llm.n == 3
+    assert "<다시 쓸 자리>" in llm.calls[1][2]  # 두 번째는 부분 재시도였다(세 번째는 논리 확인)
     assert {c.label: c.text for c in m.comments}["댓글2"] == COMMENTS["댓글2"]
     assert stats["body_attempts"] == 1 and stats["comment_attempts"] == 1
 
@@ -888,12 +892,13 @@ def test_stats_carry_tokens_and_cost():
     llm = Counting()
     stats: dict = {}
     bw.generate_manuscript(llm, "우아덤", KEYWORD, stats=stats)
-    assert stats["input_tokens"] == 2000
-    assert stats["output_tokens"] == 1000
-    assert stats["cache_read_input_tokens"] == 8000
+    # 본문+댓글(2회) + 논리 일관성 확인(1회, 사용자 지시 2026-09-25) = 3회
+    assert stats["input_tokens"] == 3000
+    assert stats["output_tokens"] == 1500
+    assert stats["cache_read_input_tokens"] == 12000
     assert stats["cache_creation_input_tokens"] == 0
-    # 2 * (1000*3 + 500*15 + 4000*0.30) / 1e6 = 2 * 11700 / 1e6
-    assert stats["estimated_usd"] == pytest.approx(0.0234)
+    # 3 * (1000*3 + 500*15 + 4000*0.30) / 1e6 = 3 * 11700 / 1e6
+    assert stats["estimated_usd"] == pytest.approx(0.0351)
 
 
 def test_parser_reads_combined_mode():
@@ -921,3 +926,107 @@ def test_worker_reply_has_estimated_cost(tmp_path, monkeypatch):
     assert out["estimated_usd"] == pytest.approx(3.0)
     assert out["mode"] == "single"
     rt.close()
+
+
+# --- 동일 원물·제품 키워드 서사 틀 (사용자 지적 2026-09-25) -----------------
+def test_is_same_product_keyword_matches_core_material():
+    rule = bw.rule_for("장으뜸")
+    assert bw.is_same_product_keyword(rule, "장어")
+    assert bw.is_same_product_keyword(rule, "민물장어 효능")
+
+
+def test_is_same_product_keyword_matches_product_words():
+    rule = bw.rule_for("팥순이", "질문형")
+    assert bw.is_same_product_keyword(rule, "팥")  # core_material
+    assert bw.is_same_product_keyword(rule, "다이어트 보조제")  # product 낱말 "다이어트"
+
+
+def test_is_same_product_keyword_false_for_unrelated_keyword():
+    rule = bw.rule_for("장으뜸")
+    assert not bw.is_same_product_keyword(rule, "임신 준비 영양제")
+    assert not bw.is_same_product_keyword(rule, "난임 검사")
+
+
+def test_body_prompt_uses_comparison_frame_for_same_product_keyword():
+    """"장어"처럼 브랜드 제품과 같은 원물인 키워드는 실패→대안 서사를 금지하고
+    고르는 법·비교 틀을 지시해야 한다 (본문 프롬프트, user 쪽)."""
+    _, user = bw.build_body_prompt("장으뜸", "장어", "카페")
+    assert "같은 원물·제품이다" in user
+    assert "다른 방법으로 바꿨다" in user  # 금지 서사가 언급되어 경고한다
+    assert "고르는 법" in user
+
+
+def test_body_prompt_no_comparison_frame_for_unrelated_keyword():
+    _, user = bw.build_body_prompt("장으뜸", "난임 검사", "카페")
+    assert "같은 원물·제품이다" not in user
+
+
+def test_comments_prompt_uses_comparison_frame_for_same_product_keyword():
+    _, user = bw.build_comments_prompt(
+        "장으뜸", "장어", "장어 어떻게 먹어야 하나요", BODY.replace(KEYWORD, "장어")
+    )
+    assert bw.SAME_PRODUCT_COMMENT_NOTE in user
+
+
+def test_combined_prompt_uses_comparison_frame_for_same_product_keyword():
+    _, user = bw.build_combined_prompt("장으뜸", "장어", "카페")
+    assert "같은 원물·제품이다" in user
+    assert bw.SAME_PRODUCT_COMMENT_NOTE in user
+
+
+# --- 논리 일관성 검증 (요금제 길 Opus 예/아니오+이유, 사용자 지시 2026-09-25) ----
+class JudgeLLM(FakeLLM):
+    """`brand_logic_check` 호출에 지정된 판정을 순서대로 돌려주는 대역."""
+
+    def __init__(self, judgments: list[dict], **kw) -> None:
+        super().__init__(**kw)
+        self.judgments = list(judgments)
+
+    def complete_json(self, purpose, system, user, max_tokens=1200):
+        if purpose == "brand_logic_check":
+            self.calls.append((purpose, system, user))
+            return self.judgments.pop(0) if self.judgments else {"ok": True, "reason": ""}
+        return super().complete_json(purpose, system, user, max_tokens)
+
+
+def test_logic_check_passes_records_ok_true():
+    llm = JudgeLLM([{"ok": True, "reason": "자연스럽다"}])
+    stats: dict = {}
+    m = bw.generate_manuscript(llm, "우아덤", KEYWORD, "씨씨앙", stats=stats)
+    assert m is not None
+    assert stats["logic_check"]["ok"] is True
+    assert len(stats["logic_check"]["시도들"]) == 1
+
+
+def test_logic_check_retries_body_when_judge_says_no():
+    """아니오면 최대 2회까지 본문을 다시 받고, 통과하면 그 결과를 남긴다."""
+    llm = JudgeLLM(
+        [
+            {"ok": False, "reason": "실패→대안 서사라 부자연스럽다"},
+            {"ok": True, "reason": "이번엔 자연스럽다"},
+        ]
+    )
+    stats: dict = {}
+    m = bw.generate_manuscript(llm, "우아덤", KEYWORD, "씨씨앙", stats=stats)
+    assert m is not None
+    log = stats["logic_check"]
+    assert log["ok"] is True
+    assert len(log["시도들"]) == 2
+    body_calls = [c for c in llm.calls if c[0] == "brand_body"]
+    assert len(body_calls) >= 2  # 최초 본문 + 논리 재시도 본문
+
+
+def test_logic_check_gives_up_after_max_retries():
+    llm = JudgeLLM(
+        [
+            {"ok": False, "reason": "1차 실패"},
+            {"ok": False, "reason": "2차 실패"},
+            {"ok": False, "reason": "3차 실패"},
+        ]
+    )
+    stats: dict = {}
+    m = bw.generate_manuscript(llm, "우아덤", KEYWORD, "씨씨앙", stats=stats)
+    assert m is not None  # 논리 검증 실패로 원고 생성 자체를 막지는 않는다
+    log = stats["logic_check"]
+    assert log["ok"] is False
+    assert len(log["시도들"]) == 1 + bw.LOGIC_CHECK_MAX_RETRIES

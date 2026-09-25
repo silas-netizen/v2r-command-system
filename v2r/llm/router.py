@@ -65,6 +65,9 @@ MODELS: dict[str, str] = {
     "keyword_crosscheck": "claude-opus-5",
     # 슬랙/텔레그램 자유 대화 명령 해석 (요금제 길 plan, 0원, 사용자 지시 2026-09-23)
     "freeform_command": "claude-sonnet-5",
+    # 브랜드 원고 본문·댓글의 논리 일관성 심사 (예/아니오+이유). 요금제 길 Opus,
+    # 사용자 지시 2026-09-25 (장으뜸 "장어" 원고 논리 지적 이후).
+    "brand_logic_check": "claude-opus-5",
 }
 
 DEFAULT_MODEL = "claude-haiku-4-5"
