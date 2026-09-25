@@ -826,7 +826,7 @@ def rescore_worker(
         )
         log.info("이어서 GPT 교차검증 완료: %s", extra)
 
-        conn = sqlite3.connect(str(db_path))
+        conn = _connect_concurrent(db_path)
         try:
             pending = len(pending_legacy_unrelated_rows(conn))
             pending_codex = len(pending_codex_rows(conn))
@@ -896,6 +896,22 @@ WORKER_BATCH_SIZE = 50
 SLOW_RESPONSE_SEC = 600
 
 
+def _connect_concurrent(db_path: str | Path) -> sqlite3.Connection:
+    """score-worker/codex-worker/rescore-worker처럼 같은 sqlite 파일을 여러
+    프로세스가 동시에 여는 자리에서 쓴다. 기본 5초 대기로는 브랜드당 최대
+    4개 프로세스(score 1 + codex 2 + 옛 rescore_worker)가 동시에 쓸 때 "database
+    is locked"로 죽는 사고가 났다(2026-09-25 08:56 실측). timeout을 늘리고
+    WAL 모드로 바꿔 쓰기끼리 서로 덜 막게 한다.
+    """
+    conn = sqlite3.connect(str(db_path), timeout=30)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=30000")
+    except sqlite3.OperationalError:
+        pass
+    return conn
+
+
 def rescore_stop_path(data_dir: str | Path = "data") -> Path:
     return Path(data_dir) / "keywords" / RESCORE_STOP_FILENAME
 
@@ -962,28 +978,39 @@ def claim_codex_batch(
     stale_before = (
         datetime.now(timezone.utc).astimezone() - timedelta(seconds=CLAIM_STALE_SEC)
     ).isoformat(timespec="seconds")
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        rows = conn.execute(
-            "SELECT keyword, relevance_llm, rationale, bridge_rationale FROM keywords"
-            " WHERE relevance_llm IS NOT NULL AND relevance_llm BETWEEN 0 AND 3"
-            " AND relevance_codex IS NULL"
-            " AND (claimed_at = '' OR claimed_at < ?)"
-            " ORDER BY (relevance_llm = 3) DESC, total DESC"
-            " LIMIT ?",
-            (stale_before, limit),
-        ).fetchall()
-        if rows:
-            stamp = _now_iso()
-            conn.executemany(
-                "UPDATE keywords SET claimed_at = ? WHERE keyword = ?",
-                [(stamp, r[0]) for r in rows],
-            )
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    return rows
+
+    #: 같은 브랜드 codex 워커 2개(+score-worker, 옛 rescore_worker까지 겹칠 때)가
+    #: 동시에 BEGIN IMMEDIATE를 걸면 "database is locked"가 날 수 있다(2026-09-25
+    #: 08:56 실측 — 10개 codex 워커가 첫 묶음에서 전부 이 오류로 죽었다). timeout을
+    #: 늘려도(→ _connect_concurrent) 드물게 겹칠 수 있어 여기서도 짧게 재시도한다.
+    last_exc: sqlite3.OperationalError | None = None
+    for attempt in range(5):
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                "SELECT keyword, relevance_llm, rationale, bridge_rationale FROM keywords"
+                " WHERE relevance_llm IS NOT NULL AND relevance_llm BETWEEN 0 AND 3"
+                " AND relevance_codex IS NULL"
+                " AND (claimed_at = '' OR claimed_at < ?)"
+                " ORDER BY (relevance_llm = 3) DESC, total DESC"
+                " LIMIT ?",
+                (stale_before, limit),
+            ).fetchall()
+            if rows:
+                stamp = _now_iso()
+                conn.executemany(
+                    "UPDATE keywords SET claimed_at = ? WHERE keyword = ?",
+                    [(stamp, r[0]) for r in rows],
+                )
+            conn.commit()
+            return rows
+        except sqlite3.OperationalError as exc:
+            conn.rollback()
+            if "locked" not in str(exc).lower():
+                raise
+            last_exc = exc
+            time.sleep(1.0 + attempt)
+    raise last_exc  # noqa: RSE102 - 5번 재시도 후에도 잠겨 있으면 올려보낸다
 
 
 def release_codex_claim(conn: sqlite3.Connection, keywords: list[str]) -> None:
@@ -1036,7 +1063,7 @@ def score_worker(
     started_at = _now_iso()
     scored = 0
     failed_batches = 0
-    conn = sqlite3.connect(str(db_path))
+    conn = _connect_concurrent(db_path)
     try:
         migrate(conn)
         summary = brand_summary(brand, guides_dir)
@@ -1111,7 +1138,7 @@ def codex_worker(
     started_at = _now_iso()
     checked = 0
     failed_batches = 0
-    conn = sqlite3.connect(str(db_path))
+    conn = _connect_concurrent(db_path)
     try:
         migrate(conn)
         summary = brand_summary(brand, guides_dir)
@@ -1597,6 +1624,7 @@ __all__ = [
     "rescore_lock_path",
     "acquire_rescore_lock",
     "release_rescore_lock",
+    "_connect_concurrent",
     "RESCORE_STOP_FILENAME",
     "rescore_stop_path",
     "rescore_stop_requested",
