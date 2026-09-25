@@ -26,7 +26,7 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA busy_timeout=30000")  # 2026-09-25: 별도 줄(시트 반영)·감시와 겹칠 때 5초로는 "database is locked"로 발행 작업이 죽음(216)
     return conn
 
 
