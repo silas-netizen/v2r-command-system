@@ -1348,7 +1348,12 @@ def cafe_for_article_url(db_path: Any, article_url: str, rt: Any = None) -> str:
             conn.close()
     except Exception:  # noqa: BLE001
         return ""
-    return str(r[0] or "") if r else ""
+    name = str(r[0] or "") if r else ""
+    return SHEET_CAFE_NAMES.get(name, name)
+
+
+#: 시트 A열 드롭다운 표기와 카페 정식 명칭이 다른 경우(시트는 띄어쓰기 없음, 데이터 확인이 엄격해 다른 표기는 거부됨 — 실측 2026-09-26 03:01)
+SHEET_CAFE_NAMES = {"러브 인썸": "러브인썸", "마이 웨딩 드림": "마이웨딩드림"}
 
 
 def _sheet_row_from_result(item: dict, row: "ExposureRow") -> dict:

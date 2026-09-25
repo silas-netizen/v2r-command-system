@@ -2,6 +2,6 @@
 # 코드: docs/appsscript/v2r_sheet_api.gs. 허용 시트 5개·허용 작업 4개(append / update_by_key / delete_by_key / snapshot).
 # B~F열 쓰기 금지, 비밀번호 열(E)은 스냅샷에서도 비움. 브라우저 조작 쓰기는 이 API가 있으면 쓰지 않는다.
 enabled: true
-url: https://script.google.com/macros/s/AKfycbx_CTnYVMvCDpqVTxJ1K85HqVNzfj6QOxV_F7M3w4IeRZbLmq8JfIHveRdjO8RkhJY8/exec
+url: https://script.google.com/macros/s/AKfycbzQGU_k-O9J0nM1ZeP7VZ1lezwTf3_fsPjz0NUekbRyhjR7BAZcCr26LijsZPH7N4dC/exec
 timeout_sec: 120
 retries: 5
