@@ -153,3 +153,109 @@ def test_collect_from_drive_export(tmp_path: Path):
 
     bad = collect_from_drive_export(tmp_path / "none.zip", "팥순이", wh)
     assert bad["errors"]
+
+
+# --- 키워드 주제 폴더 라우팅 (사용자 지시 2026-09-25) ----------------------
+def _kosumfit_cfg() -> dict:
+    return {
+        "brands": {
+            "코숨핏": {
+                "folder": "코숨핏",
+                "placeholder_rules": {"default": {"folder": "{token}", "select": "random"}},
+                "keyword_topic_folders": [
+                    {
+                        "match": ["비염", "축농증", "코막힘", "알레르기", "항히스타민", "이비인후과"],
+                        "folders": ["비염 괴로움_이미지", "비염_개선이유_기사&자료"],
+                    },
+                    {
+                        "match": ["코골이", "양압기", "수면무호흡", "입호흡", "무호흡"],
+                        "folders": ["코골이밴드 사진", "코골이_개선이유_기사&자료"],
+                    },
+                ],
+            }
+        }
+    }
+
+
+def test_topic_pool_matches_rhinitis_keyword(tmp_path: Path):
+    wh = Warehouse(tmp_path / "wh")
+    wh.ensure_dirs()
+    cfg = _kosumfit_cfg()
+    a = _img(wh.originals_dir / "코숨핏" / "비염 괴로움_이미지" / "a.jpg")
+    b = _img(wh.originals_dir / "코숨핏" / "비염_개선이유_기사_자료" / "b.jpg")  # 디스크 표기(& → _)
+    _img(wh.originals_dir / "코숨핏" / "키워드" / "unrelated.jpg")
+
+    pool = wh.topic_pool("코숨핏", "비염치료", cfg=cfg)
+    assert set(pool) == {a, b}
+
+
+def test_topic_pool_matches_snoring_keyword(tmp_path: Path):
+    wh = Warehouse(tmp_path / "wh")
+    wh.ensure_dirs()
+    cfg = _kosumfit_cfg()
+    a = _img(wh.originals_dir / "코숨핏" / "코골이밴드 사진" / "a.jpg")
+    b = _img(wh.originals_dir / "코숨핏" / "코골이_개선이유_기사_자료" / "b.jpg")
+
+    pool = wh.topic_pool("코숨핏", "양압기 부작용", cfg=cfg)
+    assert set(pool) == {a, b}
+
+
+def test_topic_pool_empty_for_unrelated_keyword(tmp_path: Path):
+    wh = Warehouse(tmp_path / "wh")
+    wh.ensure_dirs()
+    cfg = _kosumfit_cfg()
+    _img(wh.originals_dir / "코숨핏" / "비염 괴로움_이미지" / "a.jpg")
+
+    assert wh.topic_pool("코숨핏", "가격문의", cfg=cfg) == []
+
+
+def test_ensure_keyword_pool_routes_by_topic(tmp_path: Path):
+    wh = Warehouse(tmp_path / "wh")
+    wh.ensure_dirs()
+    cfg = _kosumfit_cfg()
+    a = _img(wh.originals_dir / "코숨핏" / "비염 괴로움_이미지" / "a.jpg")
+    _img(wh.originals_dir / "코숨핏" / "키워드" / "unrelated.jpg")
+
+    originals = wh.ensure_keyword_pool("코숨핏", "비염", min_variants=1, token="키워드", cfg=cfg)
+    assert originals == [a]
+
+
+def test_ensure_keyword_pool_falls_back_when_no_topic_match(tmp_path: Path):
+    wh = Warehouse(tmp_path / "wh")
+    wh.ensure_dirs()
+    cfg = _kosumfit_cfg()
+    seed = _img(wh.originals_dir / "코숨핏" / "brand_root.jpg")
+
+    originals = wh.ensure_keyword_pool("코숨핏", "가격문의", min_variants=1, token="키워드", cfg=cfg)
+    assert originals and originals[0].parent.name == "키워드"
+    assert sha256(originals[0]) == sha256(seed)
+
+
+def test_batsuni_ba_rule_unaffected_by_topic_routing(tmp_path: Path):
+    """팥순이는 keyword_topic_folders가 없으니 기존 {B/A} → BA 규칙 그대로."""
+    from v2r.warehouse.store import token_folder_name, token_select_mode
+
+    cfg = {
+        "brands": {
+            "팥순이": {
+                "folder": "팥순이",
+                "placeholder_rules": {
+                    "keyword": {
+                        "folder": "키워드",
+                        "select": "filename_match",
+                        "retry_direct_search": True,
+                    },
+                    "aliases": {"B/A": {"folder": "BA", "select": "random"}},
+                    "default": {"folder": "{token}", "select": "random"},
+                },
+            }
+        }
+    }
+    assert token_folder_name("팥순이", "B/A", "", cfg) == "BA"
+    assert token_select_mode("팥순이", "B/A", "", cfg) == "random"
+    assert token_folder_name("팥순이", "키워드", "단호박", cfg) == "키워드"
+    assert token_select_mode("팥순이", "키워드", "단호박", cfg) == "filename_match"
+
+    wh = Warehouse(tmp_path / "wh")
+    wh.ensure_dirs()
+    assert wh.topic_pool("팥순이", "단호박", cfg=cfg) == []

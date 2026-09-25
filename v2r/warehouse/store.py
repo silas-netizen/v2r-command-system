@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import hashlib
+import random
 import re
 import shutil
 from pathlib import Path
@@ -21,6 +22,27 @@ _SAFE_RE = re.compile(r"[^0-9A-Za-z가-힣._\- ]+")
 
 #: 키워드 공용 폴더 이름 (`{키워드}` 토큰이 가리키는 폴더)
 KEYWORD_FOLDER = "키워드"
+
+
+def _topic_folder_names(entry: dict, keyword: str) -> list[str] | None:
+    """`keyword_topic_folders` 규칙에서 keyword가 걸리는 폴더 목록(config 표기 그대로).
+
+    사용자 규칙(2026-09-25): 브랜드 항목에 `keyword_topic_folders`가 있으면
+    키워드(공백 제거·casefold)에 `match` 낱말이 하나라도 포함될 때 그 `folders`를 쓴다.
+    걸리는 주제가 없으면 `None`(기존 규칙으로 넘어간다).
+    """
+    topics = entry.get("keyword_topic_folders") or []
+    key = _squash(keyword)
+    if not key or not isinstance(topics, list):
+        return None
+    for topic in topics:
+        if not isinstance(topic, dict):
+            continue
+        words = topic.get("match") or []
+        if any(_squash(w) and _squash(w) in key for w in words):
+            folders = topic.get("folders") or []
+            return [str(f) for f in folders if f]
+    return None
 
 
 class NoPhotoError(RuntimeError):
@@ -210,6 +232,32 @@ class Warehouse:
         folder = token_folder_name(brand, token or keyword, keyword, cfg)
         return self.brand_root(brand, cfg) / safe_name(folder)
 
+    def topic_pool(self, brand: str, keyword: str, cfg: dict | None = None) -> list[Path]:
+        """`keyword_topic_folders` 주제 라우팅: 사진이 있는 폴더를 합친 원본 목록(랜덤 순서).
+
+        주제에 안 걸리거나(브랜드에 규칙이 없거나) 걸린 폴더에 사진이 하나도 없으면
+        빈 리스트(호출자는 기존 규칙으로 넘어간다).
+        """
+        cfg = cfg if cfg is not None else load_brands_config()
+        entry = brand_entry(brand, cfg)
+        names = _topic_folder_names(entry, keyword)
+        if not names:
+            return []
+        base = self.brand_root(brand, cfg)
+        pool: list[Path] = []
+        for name in names:
+            folder = base / safe_name(name)
+            if not folder.is_dir():
+                continue
+            pool.extend(
+                p
+                for p in folder.iterdir()
+                if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES
+            )
+        if pool:
+            random.shuffle(pool)
+        return pool
+
     def root_originals(self, brand: str, cfg: dict | None = None) -> list[Path]:
         """브랜드 폴더 **바로 아래** 원본 목록 (키워드 폴더를 채울 후보)."""
         base = self.brand_root(brand, cfg)
@@ -256,11 +304,17 @@ class Warehouse:
         label = token or keyword or KEYWORD_FOLDER
         folder = self.keyword_folder(brand, keyword, cfg=cfg, token=token)
         folder_name = folder.name
-        originals = [
-            p
-            for p in (sorted(folder.iterdir()) if folder.is_dir() else [])
-            if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES
-        ]
+
+        topic_pool = self.topic_pool(brand, keyword, cfg)
+        if topic_pool:
+            originals = topic_pool
+            folder_name = "/".join(sorted({p.parent.name for p in topic_pool}))
+        else:
+            originals = [
+                p
+                for p in (sorted(folder.iterdir()) if folder.is_dir() else [])
+                if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES
+            ]
 
         if not originals:
             seeds = self.seed_candidates(brand, cfg)
