@@ -1103,11 +1103,25 @@ def placeholder_tokens(body: str) -> list[str]:
 
 
 def _match_by_filename(originals: list[Path], keyword: str) -> list[Path]:
-    """파일 stem(공백제거·casefold)이 키워드와 같은 원본만 (팥순이 규칙)."""
-    key = re.sub(r"\s+", "", keyword or "").casefold()
+    """파일 stem이 키워드와 같은 원본만 (팥순이 규칙).
+
+    비교 전에 공백·기호(글자·숫자가 아닌 문자)를 모두 빼고 casefold 한다
+    (2026-09-25 사용자 지시: 기호도 무시). 예: 팥순이_다이어트(1).jpg == 팥순이 다이어트
+    """
+    key = _filename_key(keyword)
     if not key:
         return []
-    return [p for p in originals if re.sub(r"\s+", "", p.stem).casefold() == key]
+    return [p for p in originals if _filename_key(p.stem) == key]
+
+
+def _filename_key(text: str) -> str:
+    """공백·기호 제거 + casefold. 글자(한글·영문)·숫자만 남긴다."""
+    return "".join(ch for ch in str(text or "") if ch.isalnum()).casefold()
+
+
+def _filename_key(text: str) -> str:
+    """공백·기호 제거 + casefold. 글자(한글·영문)·숫자만 남긴다."""
+    return "".join(ch for ch in str(text or "") if ch.isalnum()).casefold()
 
 
 def notify_photo_shortage(
