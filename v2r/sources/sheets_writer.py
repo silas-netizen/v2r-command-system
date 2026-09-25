@@ -1312,12 +1312,18 @@ def apply_exposure(
     errors: list[str] = []
 
     if _api_cfg.enabled:
-        # I(통합검색)이 이미 있는지는 스냅샷으로 본다(브라우저·CSV export 안 씀).
+        # I(통합검색)이 이미 있는지는 export CSV로 본다. 스냅샷(API)은 큰 시트에서
+        # Apps Script가 HTML 오류를 돌려줘 배치 전체가 버려졌다(실측 2026-09-25 19:53
+        # 뉴더미스). CSV가 안 되면 스냅샷으로 한 번 더 시도한다.
+        snap_rows: list[list[str]] = []
         try:
-            snap = _sheets_api.api_snapshot(sid, repo_root=repo_root, config=_api_cfg)
-        except _sheets_api.SheetsApiError as exc:
-            return {"brand": brand, "written": 0, "rows": len(rows), "error": f"시트 스냅샷 실패: {exc}"}
-        snap_rows = snap.get("rows") or []
+            snap_rows = _read_export_csv(sid, _second_tab_gid(sid), timeout=60.0)
+        except Exception as exc:  # noqa: BLE001
+            try:
+                snap = _sheets_api.api_snapshot(sid, repo_root=repo_root, config=_api_cfg)
+                snap_rows = snap.get("rows") or []
+            except _sheets_api.SheetsApiError as exc2:
+                return {"brand": brand, "written": 0, "rows": len(rows), "error": f"시트 읽기 실패: {exc} / 스냅샷 실패: {exc2}"}
         a1_err = _check_a1_ok(snap_rows)
         if a1_err:
             return {"brand": brand, "written": 0, "rows": len(rows), "error": a1_err}
@@ -1395,9 +1401,28 @@ def apply_exposure(
             if res.get("error"):
                 errors.append(f"{kw}: {res['error']}")
 
-    if totals:
-        # P2 합계 표는 API에 없는 작업 — 항상 기존 브라우저 경로. 실패해도(예:
-        # Playwright 문제) 위 키워드별 갱신 결과(written)는 그대로 돌려준다.
+    if totals and _api_cfg.enabled:
+        # 합계 표(P2 등)도 API `set_cells`로 쓴다(2026-09-25 최종 배포판). 브라우저 경로는
+        # 브랜드 잠금을 수 분 붙들어 다른 작업자의 배치가 잠금 대기 초과로 버려졌다.
+        try:
+            cells: list[dict[str, Any]] = []
+            block = totals.get("block") if isinstance(totals, dict) else None
+            if isinstance(block, dict) and block.get("rows"):
+                col0, row0 = _parse_cell(str(block.get("cell") or "P2"))
+                base = ord(col0[-1]) - ord("A")
+                for ri, r in enumerate(block["rows"]):
+                    for ci, v in enumerate(r):
+                        cells.append({"a1": f"{chr(ord('A') + base + ci)}{row0 + ri}", "value": str(v)})
+            for cell, value in totals.items():
+                if cell == "block":
+                    continue
+                cells.append({"a1": str(cell), "value": str(value)})
+            if cells:
+                _sheets_api.api_set_cells(sid, cells, repo_root=repo_root, config=_api_cfg)
+        except Exception as exc:  # noqa: BLE001 — 합계 표 실패가 키워드별 갱신 결과를 막지 않는다
+            errors.append(f"합계 표 갱신 실패(API): {exc}")
+    elif totals:
+        # (API 비활성일 때만) 기존 브라우저 경로.
         try:
             gid = _second_tab_gid(sid)
             block = totals.get("block") if isinstance(totals, dict) else None

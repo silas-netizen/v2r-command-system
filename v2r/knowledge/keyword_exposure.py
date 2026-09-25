@@ -589,6 +589,7 @@ def write_report(
 
 import csv
 import os
+import sqlite3
 
 #: 네이버 통합검색(통검) URL — 카페·블로그·VIEW·인플루언서 등 전 영역이 한 페이지에 나온다
 INTEGRATED_SEARCH_URL = "https://search.naver.com/search.naver?query={query}"
@@ -1307,6 +1308,42 @@ _sheet_batch_last_flush: dict[str, float] = {}
 _sheet_batch_warned: set[str] = set()
 
 
+_ARTICLE_ID_RE = re.compile(r"/articles/(\d+)|cafe\.naver\.com/[^/?#]+/(\d+)")
+_CAFE_ID_RE = re.compile(r"/cafes/(\d+)/")
+
+
+def cafe_for_article_url(db_path: Any, article_url: str) -> str:
+    """글 URL의 글 번호(와 카페 번호)로 article_index에서 카페명을 찾는다. 못 찾으면 ''.
+
+    2026-09-25: 시트 A(카페)가 비어 있는 키워드는 노출완이 돼도 A가 비어 있었다
+    (판정 행의 cafe가 시트 A값 그대로였음). 사용자 지시: 노출완에는 카페를 적는다.
+    """
+    if not article_url:
+        return ""
+    m = _ARTICLE_ID_RE.search(article_url)
+    if not m:
+        return ""
+    article_id = m.group(1) or m.group(2)
+    cm = _CAFE_ID_RE.search(article_url)
+    try:
+        conn = sqlite3.connect(str(db_path))
+        try:
+            if cm:
+                r = conn.execute(
+                    "SELECT cafe FROM article_index WHERE CAST(article_id AS TEXT)=? AND CAST(cafe_id AS TEXT)=? LIMIT 1",
+                    (article_id, cm.group(1)),
+                ).fetchone()
+            else:
+                r = conn.execute(
+                    "SELECT cafe FROM article_index WHERE CAST(article_id AS TEXT)=? LIMIT 1", (article_id,)
+                ).fetchone()
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001
+        return ""
+    return str(r[0] or "") if r else ""
+
+
 def _sheet_row_from_result(item: dict, row: "ExposureRow") -> dict:
     """`sheets_writer.apply_exposure`에 줄 배치 행 — A·G·J·K·L만 바꾸는 최종
     규칙(2026-09-23)에 맞춘다. `cafe`는 노출완일 때만 채운다(밀려남이면 A를
@@ -1363,6 +1400,15 @@ def _flush_sheet_batch_async(rt: Any, brand: str, rows: list[dict]) -> None:
             if brand not in _sheet_batch_warned:
                 log.warning("노출 순환: 시트 반영 실패(%s, 이후 같은 경고 생략): %s", brand, exc)
                 _sheet_batch_warned.add(brand)
+            # 실패한 배치를 버리지 않고 다음 배치에 다시 싣는다(2026-09-25: 잠금 대기
+            # 초과·스냅샷 오류로 배치가 통째로 사라져 시트 J가 오늘 검사분의 35에서
+            # 50%에서 옛 값으로 남았다). 상한 500건, 그 이상은 오래된 것부터 버린다.
+            with _sheet_batch_lock:
+                pending = _sheet_batch.setdefault(brand, [])
+                merged = rows + pending
+                if len(merged) > 500:
+                    merged = merged[-500:]
+                _sheet_batch[brand] = merged
 
     threading.Thread(target=_run, daemon=True, name=f"exposure-sheet-flush-{brand}").start()
 
@@ -1370,6 +1416,11 @@ def _flush_sheet_batch_async(rt: Any, brand: str, rows: list[dict]) -> None:
 def _enqueue_sheet_row(rt: Any, brand: str, item: dict, row: "ExposureRow") -> None:
     """판정 결과를 배치에 쌓고, 20건 또는 5분이 찼으면 별도 스레드로 흘려보낸다."""
     sheet_row = _sheet_row_from_result(item, row)
+    if row.status == "exposed" and not sheet_row.get("cafe"):
+        try:
+            sheet_row["cafe"] = cafe_for_article_url(Path(rt.settings.repo_root) / "data" / "v2r.sqlite", row.article_url)
+        except Exception:  # noqa: BLE001
+            pass
     now_mono = time.monotonic()
     to_flush: list[dict] | None = None
     with _sheet_batch_lock:
