@@ -42,7 +42,8 @@ function doPost(e){
     else if (req.action === "update_by_key") out = updateByKey(sh, req.updates); // updates: [{keyword, G, J, K, L, A, I}]
     else if (req.action === "delete_by_key") out = deleteByKey(sh, req.keywords);
     else if (req.action === "snapshot") out = snapshot(sh);
-    else if (req.action === "reapply_format") out = reapplyFormat(sh);   // 2행 서식·드롭다운을 전체 데이터 행에 다시 복사(값 불변)
+    else if (req.action === "reapply_format") out = reapplyFormat(sh);
+    else if (req.action === "set_header") out = setHeader(sh, req.col, req.value);   // 1행 머리글 한 칸 복구(예: A1 '카페')   // 2행 서식·드롭다운을 전체 데이터 행에 다시 복사(값 불변)
     else throw new Error("허용되지 않은 작업");
     return ContentService.createTextOutput(JSON.stringify({ok:true, result:out})).setMimeType(ContentService.MimeType.JSON);
   } catch(err) {
@@ -105,4 +106,13 @@ function reapplyFormat(sh){
   src.copyTo(dst, SpreadsheetApp.CopyPasteType.PASTE_FORMAT, false);
   src.copyTo(dst, SpreadsheetApp.CopyPasteType.PASTE_DATA_VALIDATION, false);
   return {rows: last - 2, width: width};
+}
+
+// 1행 머리글 복구. 사고(2026-09-25)로 팥순이 노출 현황 탭 A1이 'A9199'로 바뀐 것을 되돌리는 용도. 1행만 허용.
+function setHeader(sh, col, value){
+  var c = String(col||"").toUpperCase();
+  if (!/^[A-Z]{1,2}$/.test(c)) throw new Error("머리글 열이 올바르지 않음");
+  if (c === "E") throw new Error("E열은 다루지 않음");
+  sh.getRange(c + "1").setValue(String(value||""));
+  return {cell: c + "1", value: String(value||"")};
 }
