@@ -33,7 +33,13 @@ function keyIndex(sh){
 }
 
 function doPost(e){
-  var lock = LockService.getScriptLock(); lock.waitLock(30000);
+  var lock = LockService.getScriptLock();
+  try { lock.waitLock(30000); }
+  catch (e0) {
+    // 잠금 대기 초과가 try 밖에서 나면 구글이 HTML 오류 페이지를 돌려줘 호출 쪽이 JSON을 못 읽는다(실측 2026-09-25 21:5x).
+    // JSON 오류로 돌려주면 호출 쪽이 재시도한다.
+    return ContentService.createTextOutput(JSON.stringify({ok:false, error:"잠금 대기 초과(다시 시도)"})).setMimeType(ContentService.MimeType.JSON);
+  }
   try {
     var req = JSON.parse(e.postData.contents);
     var sh = getSheet(req.spreadsheet_id);

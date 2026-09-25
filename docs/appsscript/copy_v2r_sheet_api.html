@@ -1,6 +1,6 @@
 <!doctype html><html lang="ko"><head><meta charset="utf-8"><title>Apps Script 코드 복사</title>
 <style>body{font-family:Segoe UI,sans-serif;margin:24px;background:#f6f7f9}button{font-size:20px;padding:14px 28px;background:#1a73e8;color:#fff;border:0;border-radius:8px;cursor:pointer}#msg{margin-left:16px;font-size:18px;color:#0b8043}textarea{width:100%;height:70vh;margin-top:16px;font-family:Consolas,monospace;font-size:13px}</style></head>
-<body><h2>V2R 시트 API — Apps Script 최종 코드 (239줄)</h2>
+<body><h2>V2R 시트 API — Apps Script 최종 코드 (245줄)</h2>
 <p>아래 버튼을 누르면 코드 전체가 복사됩니다. Apps Script 편집창에서 Ctrl+A → Delete 후 Ctrl+V 하세요.</p>
 <button onclick="copyAll()">코드 전체 복사</button><span id="msg"></span>
 <textarea id="code" readonly>/**
@@ -38,7 +38,13 @@ function keyIndex(sh){
 }
 
 function doPost(e){
-  var lock = LockService.getScriptLock(); lock.waitLock(30000);
+  var lock = LockService.getScriptLock();
+  try { lock.waitLock(30000); }
+  catch (e0) {
+    // 잠금 대기 초과가 try 밖에서 나면 구글이 HTML 오류 페이지를 돌려줘 호출 쪽이 JSON을 못 읽는다(실측 2026-09-25 21:5x).
+    // JSON 오류로 돌려주면 호출 쪽이 재시도한다.
+    return ContentService.createTextOutput(JSON.stringify({ok:false, error:&quot;잠금 대기 초과(다시 시도)&quot;})).setMimeType(ContentService.MimeType.JSON);
+  }
   try {
     var req = JSON.parse(e.postData.contents);
     var sh = getSheet(req.spreadsheet_id);
