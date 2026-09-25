@@ -1,7 +1,7 @@
 /**
  * V2R 시트 API (Apps Script 웹앱) — 2026-09-25
  * 브라우저 조작 없이 HTTP로 시트를 원자적으로 갱신한다.
- * 허용 시트 5개(브랜드 두 번째 탭)만, 허용 작업 10개(append·update_by_key·delete_by_key·snapshot·set_header·reapply_format·set_cells·delete_blank_rows·dedupe_by_key·info). 비밀번호 열(E)은 절대 읽지도 쓰지도 않는다.
+ * 허용 시트 5개(브랜드 두 번째 탭)만, 허용 작업 11개(append·update_by_key·delete_by_key·snapshot·set_header·reapply_format·set_cells·delete_blank_rows·dedupe_by_key·info·apply_colors). 비밀번호 열(E)은 절대 읽지도 쓰지도 않는다.
  */
 var ALLOWED = {
   "1OwR_LSjO1ofOojldtSIqoxv0gieNSMx_t35_5G1VTCc": 1325327696, // 팥순이
@@ -54,6 +54,7 @@ function doPost(e){
     else if (req.action === "delete_blank_rows") out = deleteBlankRows(sh);           // 키워드(H) 빈 행 제거
     else if (req.action === "dedupe_by_key") out = dedupeByKey(sh);                   // 정규화 키워드 중복 행 제거(앞 행 유지)
     else if (req.action === "info") out = info(sh);                                   // 행·열 수, 머리글, 드롭다운 누락 수
+    else if (req.action === "apply_colors") out = applyColors(sh, req.a_map, req.g_map); // A·G열 값별 배경색(조건부 서식, 5개 시트 동일)
     else throw new Error("허용되지 않은 작업");
     return ContentService.createTextOutput(JSON.stringify({ok:true, result:out})).setMimeType(ContentService.MimeType.JSON);
   } catch(err) {
@@ -81,11 +82,18 @@ function append(sh, rows){
 }
 
 function updateByKey(sh, updates){
+  // 2026-09-26: 칸마다 setValue 하면 행당 최대 6번 호출이라 느려서 잠금 대기 초과가 잦았다.
+  // 이제 행당 A 1번 + G:N 블록 1번(기존 값을 읽어 바꿀 칸만 갈아끼움)으로 줄인다. B~F는 읽지도 쓰지도 않는다.
   var idx = keyIndex(sh); var done = 0, missing = [];
   for (var i=0;i<updates.length;i++){
     var u = updates[i]; var row = idx[norm(u.keyword)];
     if (!row) { missing.push(u.keyword); continue; }
-    for (var col in WRITABLE) if (u[col] !== undefined) sh.getRange(row, WRITABLE[col]).setValue(u[col]);
+    if (u.A !== undefined) sh.getRange(row, 1).setValue(u.A);
+    var block = sh.getRange(row, 7, 1, 8);          // G..N (7..14)
+    var vals = block.getValues()[0]; var changed = false;
+    var cols = {G:0, I:2, J:3, K:4, L:5, M:6, N:7};
+    for (var c in cols) if (u[c] !== undefined) { vals[cols[c]] = u[c]; changed = true; }
+    if (changed) block.setValues([vals]);
     done++;
   }
   return {updated: done, missing: missing};
@@ -241,4 +249,29 @@ function distinctValues(sh, col, last){
   var v = sh.getRange(2, col, last-1, 1).getValues(); var seen = {}, out = [];
   for (var i=0;i<v.length && out.length<200;i++){ var x = String(v[i][0]||"").trim(); if (x && !seen[x]) { seen[x] = true; out.push(x); } }
   return out;
+}
+
+// A열(카페)·G열(노출 상태) 값별 배경색. 조건부 서식으로 걸어 값이 바뀌면 색도 따라간다.
+// a_map: {"씨씨앙":"#d9ead3", ...}, g_map: {"노출완":"#b7e1cd", ...}. 5개 시트에 같은 맵을 보내 색을 통일한다.
+// 기존 규칙 중 A열·G열만 대상으로 한 규칙은 지우고 새로 건다(다른 열 규칙은 유지).
+function applyColors(sh, aMap, gMap){
+  var last = Math.max(sh.getMaxRows(), 2);
+  var rules = sh.getConditionalFormatRules(); var keep = [];
+  for (var i=0;i<rules.length;i++){
+    var rs = rules[i].getRanges(); var onlyAG = rs.length > 0;
+    for (var j=0;j<rs.length;j++){ var c = rs[j].getColumn(); if (!(rs[j].getNumColumns() === 1 && (c === 1 || c === 7))) onlyAG = false; }
+    if (!onlyAG) keep.push(rules[i]);
+  }
+  var added = 0;
+  var specs = [[1, aMap], [7, gMap]];
+  for (var k=0;k<specs.length;k++){
+    var col = specs[k][0], map = specs[k][1] || {};
+    var range = sh.getRange(2, col, last-1, 1);
+    for (var val in map){
+      keep.push(SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo(val).setBackground(map[val]).setRanges([range]).build());
+      added++;
+    }
+  }
+  sh.setConditionalFormatRules(keep);
+  return {rules_added: added, rules_total: keep.length};
 }

@@ -26,7 +26,7 @@ DEFAULT_CONFIG_PATH = "config/sheets_api.yaml"
 _ALLOWED_ACTIONS = {
     "append", "update_by_key", "delete_by_key", "snapshot",
     # 2026-09-25 추가(docs/appsscript/v2r_sheet_api.gs 최종 배포판)
-    "set_header", "reapply_format", "set_cells", "delete_blank_rows", "dedupe_by_key", "info",
+    "set_header", "reapply_format", "set_cells", "delete_blank_rows", "dedupe_by_key", "info", "apply_colors",
 }
 
 
@@ -103,14 +103,14 @@ def call_sheets_api(
             last_exc = exc
             log.warning("시트 API 호출 시도 %d/%d 실패(%s): %s", attempt, cfg.retries, action, exc)
             if attempt < cfg.retries:
-                time.sleep(2 ** (attempt - 1))
+                time.sleep(5 * attempt)  # 5·10·15초 — 작업자 6개와 웹앱을 나눠 써 잠금 대기 초과(HTML 응답)가 잦다(2026-09-25)
             continue
         if not isinstance(data, dict) or not data.get("ok"):
             err = (data or {}).get("error") if isinstance(data, dict) else str(data)
             last_exc = SheetsApiError(f"시트 API 오류 응답({action}): {err}")
             log.warning("시트 API 응답 실패 시도 %d/%d(%s): %s", attempt, cfg.retries, action, err)
             if attempt < cfg.retries:
-                time.sleep(2 ** (attempt - 1))
+                time.sleep(5 * attempt)  # 5·10·15초 — 작업자 6개와 웹앱을 나눠 써 잠금 대기 초과(HTML 응답)가 잦다(2026-09-25)
             continue
         return data.get("result") or {}
 
@@ -168,6 +168,11 @@ def api_dedupe_by_key(spreadsheet_id: str, *, repo_root: str | Path = ".", confi
 
 def api_info(spreadsheet_id: str, *, repo_root: str | Path = ".", config: SheetsApiConfig | None = None) -> dict[str, Any]:
     return call_sheets_api(spreadsheet_id, "info", {}, repo_root=repo_root, config=config)
+
+
+def api_apply_colors(spreadsheet_id: str, a_map: dict[str, str], g_map: dict[str, str], *, repo_root: str | Path = ".", config: SheetsApiConfig | None = None) -> dict[str, Any]:
+    """A(카페)·G(노출 상태) 값별 배경색 조건부 서식. 5개 시트에 같은 맵을 보내 통일한다(config/sheet_colors.yaml)."""
+    return call_sheets_api(spreadsheet_id, "apply_colors", {"a_map": a_map, "g_map": g_map}, repo_root=repo_root, config=config)
 
 
 __all__ = [

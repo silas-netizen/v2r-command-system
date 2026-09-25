@@ -4,4 +4,4 @@
 enabled: true
 url: https://script.google.com/macros/s/AKfycbx_CTnYVMvCDpqVTxJ1K85HqVNzfj6QOxV_F7M3w4IeRZbLmq8JfIHveRdjO8RkhJY8/exec
 timeout_sec: 120
-retries: 3
+retries: 5
