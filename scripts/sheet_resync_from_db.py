@@ -11,6 +11,7 @@ import io
 import json
 import sqlite3
 import sys
+import time
 from pathlib import Path
 
 import httpx
@@ -60,10 +61,15 @@ def main(argv: list[str]) -> int:
             if not row or status in ("unknown", "unpublished"):
                 continue
             j_date = row["J"][:10]
-            if j_date == checked_at[:10] and row["G"] == KOREAN_STATUS.get(status, status) and (status != "exposed" or row["A"]):
+            if status == "exposed":
+                # 카페는 항상 글 URL(별칭/카페 번호)로 다시 계산한다. 못 찾으면 DB 값, 그것도 없으면 시트 값 유지.
+                cafe = cafe_for_article_url(ROOT / "data/v2r.sqlite", url) or cafe or row["A"]
+            if (
+                j_date == checked_at[:10]
+                and row["G"] == KOREAN_STATUS.get(status, status)
+                and (status != "exposed" or (row["A"] and row["A"] == cafe))
+            ):
                 continue
-            if status == "exposed" and not cafe:
-                cafe = cafe_for_article_url(ROOT / "data/v2r.sqlite", url)
             u = build_exposure_column_updates(
                 status=status,
                 checked_at_kst=checked_at,
@@ -78,7 +84,15 @@ def main(argv: list[str]) -> int:
         if not dry:
             done, missing = 0, 0
             for i in range(0, len(updates), 50):
-                res = api.api_update_by_key(sid, updates[i : i + 50], repo_root=ROOT, config=cfg)
+                # 러너 작업자 6개와 같은 웹앱을 나눠 쓰므로 잠금 대기 초과(HTML 오류)가 날 수 있다 → 묶음마다 최대 6회, 10초 간격 재시도
+                for attempt in range(6):
+                    try:
+                        res = api.api_update_by_key(sid, updates[i : i + 50], repo_root=ROOT, config=cfg)
+                        break
+                    except api.SheetsApiError:
+                        if attempt == 5:
+                            raise
+                        time.sleep(10)
                 done += res.get("updated", 0)
                 missing += len(res.get("missing") or [])
             out.update({"updated": done, "missing": missing})

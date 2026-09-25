@@ -1312,31 +1312,38 @@ _ARTICLE_ID_RE = re.compile(r"/articles/(\d+)|cafe\.naver\.com/[^/?#]+/(\d+)")
 _CAFE_ID_RE = re.compile(r"/cafes/(\d+)/")
 
 
-def cafe_for_article_url(db_path: Any, article_url: str) -> str:
-    """글 URL의 글 번호(와 카페 번호)로 article_index에서 카페명을 찾는다. 못 찾으면 ''.
+def cafe_for_article_url(db_path: Any, article_url: str, rt: Any = None) -> str:
+    """글 URL의 카페(별칭 또는 카페 번호)로 카페명을 찾는다. 못 찾으면 ''.
 
-    2026-09-25: 시트 A(카페)가 비어 있는 키워드는 노출완이 돼도 A가 비어 있었다
-    (판정 행의 cafe가 시트 A값 그대로였음). 사용자 지시: 노출완에는 카페를 적는다.
+    순서: URL의 카페 번호(/cafes/<id>/) 또는 별칭(cafe.naver.com/<alias>/…) → 별칭은
+    `exposure_cafe_alias_cache.json`(별칭→카페 번호)으로 바꿈 → article_index에서 그 카페
+    번호의 카페명. 글 번호만으로는 찾지 않는다(다른 카페의 같은 번호와 섞임).
+    2026-09-25 사용자 지시: 노출완에는 카페를 적는다.
     """
     if not article_url:
         return ""
-    m = _ARTICLE_ID_RE.search(article_url)
-    if not m:
-        return ""
-    article_id = m.group(1) or m.group(2)
+    cafe_id = ""
     cm = _CAFE_ID_RE.search(article_url)
+    if cm:
+        cafe_id = cm.group(1)
+    else:
+        am = re.search(r"cafe\.naver\.com/([^/?#]+)/\d+", article_url)
+        if am and am.group(1) not in ("ca-fe",):
+            try:
+                cache_path = Path(db_path).parent / CAFE_ALIAS_CACHE_FILE
+                cache = json.loads(cache_path.read_text(encoding="utf-8")) if cache_path.exists() else {}
+                cid = cache.get(am.group(1))
+                cafe_id = str(cid) if cid else ""
+            except Exception:  # noqa: BLE001
+                cafe_id = ""
+    if not cafe_id:
+        return ""
     try:
         conn = sqlite3.connect(str(db_path))
         try:
-            if cm:
-                r = conn.execute(
-                    "SELECT cafe FROM article_index WHERE CAST(article_id AS TEXT)=? AND CAST(cafe_id AS TEXT)=? LIMIT 1",
-                    (article_id, cm.group(1)),
-                ).fetchone()
-            else:
-                r = conn.execute(
-                    "SELECT cafe FROM article_index WHERE CAST(article_id AS TEXT)=? LIMIT 1", (article_id,)
-                ).fetchone()
+            r = conn.execute(
+                "SELECT cafe FROM article_index WHERE CAST(cafe_id AS TEXT)=? AND cafe<>'' LIMIT 1", (cafe_id,)
+            ).fetchone()
         finally:
             conn.close()
     except Exception:  # noqa: BLE001
