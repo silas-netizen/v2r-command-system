@@ -42,6 +42,7 @@ function doPost(e){
     else if (req.action === "update_by_key") out = updateByKey(sh, req.updates); // updates: [{keyword, G, J, K, L, A, I}]
     else if (req.action === "delete_by_key") out = deleteByKey(sh, req.keywords);
     else if (req.action === "snapshot") out = snapshot(sh);
+    else if (req.action === "reapply_format") out = reapplyFormat(sh);   // 2행 서식·드롭다운을 전체 데이터 행에 다시 복사(값 불변)
     else throw new Error("허용되지 않은 작업");
     return ContentService.createTextOutput(JSON.stringify({ok:true, result:out})).setMimeType(ContentService.MimeType.JSON);
   } catch(err) {
@@ -92,4 +93,16 @@ function snapshot(sh){
   var v = sh.getRange(1, 1, last, 14).getValues();
   for (var i=0;i<v.length;i++){ v[i][4] = ""; } // E(비밀번호) 제거
   return {rows: v, last_row: last};
+}
+
+// 2026-09-25 사용자 지시: 키워드 추가 행도 기존 서식(A·G열 드롭다운 등)과 같아야 한다.
+// 옛 브라우저 붙여넣기로 들어간 행은 데이터 확인이 빠져 있어, 2행의 서식·데이터 확인을 3행부터 마지막 행까지 다시 복사한다. 값은 건드리지 않는다.
+function reapplyFormat(sh){
+  var last = sh.getLastRow(); var width = sh.getLastColumn();
+  if (last < 3) return {rows: 0};
+  var src = sh.getRange(2, 1, 1, width);
+  var dst = sh.getRange(3, 1, last - 2, width);
+  src.copyTo(dst, SpreadsheetApp.CopyPasteType.PASTE_FORMAT, false);
+  src.copyTo(dst, SpreadsheetApp.CopyPasteType.PASTE_DATA_VALIDATION, false);
+  return {rows: last - 2, width: width};
 }
