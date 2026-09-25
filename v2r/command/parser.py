@@ -167,6 +167,8 @@ RE_INTERVAL_RANGE = re.compile(r"(\d+)\s*~\s*(\d+)\s*분")
 RE_INTERVAL_FIXED = re.compile(r"(\d+)\s*분\s*간격")
 RE_BOARD = re.compile(r"게시판\s*(\S+)")
 RE_SOURCE = re.compile(r"시트\s*(\S+)")
+#: 로컬 브랜드 원고 폴더 (`원고폴더 twins-2026-09-25`) — `kind "local_brand"` 원천
+RE_SOURCE_FOLDER = re.compile(r"원고폴더\s*(\S+)")
 RE_BRAND_SLOT = re.compile(r"브랜드\s+(\S+)")
 #: 원고유형 슬롯 (시트 E열). 발행 계열 명령에서만 읽는다.
 RE_MANUSCRIPT_TYPE = re.compile(r"(질문형|후기형)")
@@ -193,7 +195,7 @@ RE_SCHEDULE_NAME = re.compile(r"예약\s*(?:지금\s*)?(?:실행|강제\s*실행
 #: 키워드를 안 적었을 때 쓰는 기본 폴더 이름 (`warehouse.store.KEYWORD_FOLDER`와 같다)
 KEYWORD_FOLDER = "키워드"
 RE_ACCOUNTS = re.compile(
-    r"아이디\s+([A-Za-z0-9_,\s]+?)(?=\s*(?:로|으로|써|사용|$))"
+    r"(?:아이디|계정)\s+([A-Za-z0-9_,\s]+?)(?=\s*(?:로|으로|써|사용|$))"
 )
 RE_ISO_DATE = re.compile(r"(\d{4}-\d{2}-\d{2})")
 RE_KO_DATE = re.compile(r"(\d{1,2})월\s*(\d{1,2})일")
@@ -498,6 +500,9 @@ def parse_korean_command(text: str, now: datetime | None = None) -> TaskSpec | N
         m = RE_SOURCE.search(raw)
         if m:
             spec["source"] = _strip_particle(m.group(1))
+        m = RE_SOURCE_FOLDER.search(raw)
+        if m:
+            spec["source_folder"] = _strip_particle(m.group(1))
 
     # 지정 계정 (계정 수 표현이면 무시)
     if not m_acc_count:

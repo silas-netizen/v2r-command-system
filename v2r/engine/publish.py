@@ -115,6 +115,8 @@ def _norm(name: str) -> str:
 XLSX_DAILY_KIND = "xlsx_daily"
 #: 일상 글 풀로 쓰는 원본 종류 (xlsx 행을 먼저 쓴다)
 DAILY_KINDS = (XLSX_DAILY_KIND, "daily_pool")
+#: `원고폴더 <이름>` 로 지정한 로컬 완성 브랜드 원고 폴더(JSON) 원본 종류
+LOCAL_BRAND_KIND = "local_brand"
 
 
 def xlsx_dir(rt: Runtime) -> Path | None:
@@ -220,6 +222,12 @@ def select_source_entries(rt: Runtime, spec: TaskSpec) -> list[dict]:
                 return [entry]
         return entries[:1]
     if spec.task == "publish_brand":
+        # `원고폴더 <이름>` — 로컬 완성 브랜드 원고(JSON) 폴더가 지정되면 그것만 쓴다
+        if getattr(spec, "source_folder", ""):
+            from v2r.sources.local_brand import DEFAULT_BASE_DIR, folder_entry
+
+            base = rt.settings.repo_root / DEFAULT_BASE_DIR
+            return [folder_entry(base, spec.source_folder)]
         # 브랜드 시트가 있으면 그것만 쓴다 (spec.brand가 있으면 그 브랜드만)
         brand_entries = brand_sheet_entries(rt, spec.brand)
         if brand_entries:
@@ -300,6 +308,10 @@ def load_manuscripts(rt: Runtime, entry: dict, prefer_cache: bool = False) -> li
         from v2r.sources.daily_pool import load_pool
 
         return load_pool(rt.settings.warehouse_dir)
+    if kind == LOCAL_BRAND_KIND:
+        from v2r.sources.local_brand import load_folder
+
+        return load_folder(entry.get("path") or "", source=name)
     if kind == XLSX_DAILY_KIND:
         from v2r.sources.local_files import parse_xlsx_entry
 
@@ -326,6 +338,10 @@ def refresh_source(rt: Runtime, entry: dict) -> int:
         from v2r.sources.daily_pool import load_pool
 
         return len(load_pool(rt.settings.warehouse_dir))
+    if kind == LOCAL_BRAND_KIND:
+        from v2r.sources.local_brand import load_folder
+
+        return len(load_folder(entry.get("path") or "", source=str(entry.get("name") or "")))
     if kind == XLSX_DAILY_KIND:
         from v2r.sources.local_files import load_xlsx_rows
 
@@ -1134,7 +1150,7 @@ def pick_images(rt: Runtime, m: Manuscript, spec: TaskSpec, need: int) -> list[P
         return []
     from v2r.warehouse import store as wh_store
 
-    brand = spec.brand or m.source or ""
+    brand = spec.brand or m.brand or m.source or ""
     if not brand:
         raise PublishError("사진을 고를 브랜드를 알 수 없습니다")
     wh = rt.warehouse

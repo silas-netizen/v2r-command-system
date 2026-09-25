@@ -1299,3 +1299,106 @@ def test_키워드_연관도_재채점_작업은_순차실행_대신_숨김스�
     assert cmd[0] == "cscript"
     assert cmd[1] == "//nologo"
     assert cmd[2].endswith("rescore-hidden.vbs")
+
+
+# --------------------------------------------------------------------
+# local_brand 원고폴더 (`원고폴더 <이름>`)
+# --------------------------------------------------------------------
+def _write_brand_json(folder, name, data):
+    import json
+
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / name).write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+
+def test_원고폴더가_지정되면_local_brand_원본만_쓴다(tmp_path):
+    rt = make_runtime(tmp_path)
+    folder = rt.settings.repo_root / "warehouse" / "manuscripts" / "twins-2026-09-25"
+    _write_brand_json(folder, "01.json", {"title": "제목1", "body": "본문1"})
+    spec = make_spec(
+        task="publish_brand", cafe="", board="", manuscripts=[], source_folder="twins-2026-09-25"
+    )
+    entries = publish_mod.select_source_entries(rt, spec)
+    assert len(entries) == 1
+    assert entries[0]["kind"] == "local_brand"
+    assert entries[0]["name"] == "twins-2026-09-25"
+    items = publish_mod.load_manuscripts(rt, entries[0])
+    assert len(items) == 1
+    assert items[0].title == "제목1"
+    assert items[0].cafe == "쌍둥이맘 모여라"
+    rt.close()
+
+
+class _TwinsCatalog(FakeCatalog):
+    """쌍둥이맘 모여라 카페, 계정 전원 가입+쓰기 가능 대역."""
+
+    def __init__(self, accounts: list[str]) -> None:
+        super().__init__()
+        self.accounts = accounts
+
+    def cafes(self):
+        return [Cafe(cafe_id=99001, name="쌍둥이맘 모여라")]
+
+    def cafe_accounts(self, cafe_id):
+        from v2r.api.catalog import CafeAccount
+
+        return [CafeAccount(login_id=i, member_key="k") for i in self.accounts]
+
+    def menus(self, cafe_id, login_ids):
+        return [
+            Menu(
+                menu_id=1,
+                name="가족업체 자유게시판",
+                writable_accounts=set(login_ids),
+            )
+        ]
+
+
+def test_지정계정_로테이션은_최대_2건_연속금지(tmp_path, monkeypatch):
+    rt = make_runtime(tmp_path)
+    ids = [
+        "chaeyaah", "azqpale", "lverland", "xalageas", "walseibb",
+        "timusataro", "kilstyau", "hushnane", "huladoe", "granao",
+    ]
+    rt._catalog = _TwinsCatalog(ids)
+    monkeypatch.setattr(
+        publish_mod,
+        "load_accounts",
+        lambda r, prefer_cache=False: [
+            __import__("v2r.accounts.loader", fromlist=["Account"]).Account(
+                login_id=i, work_type="제휴 작업", linked="V2R"
+            )
+            for i in ids
+        ],
+    )
+    manuscripts = [
+        _m(
+            title=f"제목{i}",
+            body=f"본문{i}",
+            cafe="쌍둥이맘 모여라",
+            board="가족업체 자유게시판",
+            source="twins-2026-09-25",
+            source_row=i,
+            content_hash=f"h{i}",
+            images_enabled=False,
+        )
+        for i in range(20)
+    ]
+    spec = make_spec(
+        task="publish_brand",
+        cafe="",
+        board="",
+        dry_run=False,
+        accounts=ids,
+        account_mode="manual",
+        manuscripts=[],
+    )
+    slots = publish_mod.plan(rt, spec, manuscripts)
+    accounts_used = [s.account for s in slots]
+    assert len(accounts_used) == 20
+    from collections import Counter
+
+    counts = Counter(accounts_used)
+    assert all(c <= 2 for c in counts.values())
+    assert all(accounts_used[i] != accounts_used[i + 1] for i in range(len(accounts_used) - 1))
+    rt.close()

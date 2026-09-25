@@ -40,6 +40,9 @@ class Manuscript(BaseModel):
     board: str = ""
     head: str = ""
     source: str = ""
+    #: 사진 폴더를 고를 때 쓰는 브랜드 이름(비어 있으면 `pick_images`가 `source`로 대신 찾는다).
+    #: `local_brand` 원천처럼 여러 브랜드가 한 폴더에 섞여 있을 때 채운다.
+    brand: str = ""
     source_row: int = 0
     keyword: str = ""
     tags: list[str] = Field(default_factory=list)

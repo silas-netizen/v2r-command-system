@@ -347,3 +347,31 @@ def test_원고유형_슬롯은_발행계열에서만():
     spec = parse_korean_command("후기형 사진 3장 생성해줘", now=NOW)
     assert spec.task == "generate_photos"
     assert spec.manuscript_type == ""
+
+
+def test_원고폴더_토큰():
+    spec = parse_korean_command(
+        "쌍둥이맘 브랜드 글 20건 실제 발행 원고폴더 twins-2026-09-25", now=NOW
+    )
+    assert spec.task == "publish_brand"
+    assert spec.count == 20
+    assert spec.source_folder == "twins-2026-09-25"
+    assert spec.dry_run is False
+
+
+def test_계정_토큰은_아이디_로_지정한_것과_같다():
+    spec = parse_korean_command(
+        "쌍둥이맘 브랜드 글 20건 모의 실행 원고폴더 twins-2026-09-25 "
+        "계정 chaeyaah,azqpale,lverland",
+        now=NOW,
+    )
+    assert spec.source_folder == "twins-2026-09-25"
+    assert spec.account_mode == "manual"
+    assert spec.accounts == ["chaeyaah", "azqpale", "lverland"]
+    assert spec.dry_run is True
+
+
+def test_계정_N개는_여전히_자동_개수로_읽힌다():
+    spec = parse_korean_command("브랜드 글 5건 계정 3개 자동으로", now=NOW)
+    assert spec.account_count == 3
+    assert spec.accounts == []

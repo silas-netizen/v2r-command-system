@@ -113,6 +113,8 @@ class TaskSpec(BaseModel):
     target: str = ""
     keyword: str = ""
     source: str = ""
+    #: `원고폴더 <이름>` — warehouse/manuscripts/<이름> 폴더의 로컬 브랜드 원고(kind "local_brand")
+    source_folder: str = ""
     dry_run: bool = True
     #: `사진 생성 승인 …` — 사용자가 사진 생성을 명시적으로 승인했는가
     approved: bool = False
