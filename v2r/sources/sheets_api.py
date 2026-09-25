@@ -26,7 +26,7 @@ DEFAULT_CONFIG_PATH = "config/sheets_api.yaml"
 _ALLOWED_ACTIONS = {
     "append", "update_by_key", "delete_by_key", "snapshot",
     # 2026-09-25 추가(docs/appsscript/v2r_sheet_api.gs 최종 배포판)
-    "set_header", "reapply_format", "set_cells", "delete_blank_rows", "dedupe_by_key", "info", "apply_colors",
+    "set_header", "reapply_format", "set_cells", "delete_blank_rows", "dedupe_by_key", "info", "apply_colors", "copy_validation",
 }
 
 
@@ -173,6 +173,10 @@ def api_info(spreadsheet_id: str, *, repo_root: str | Path = ".", config: Sheets
 def api_apply_colors(spreadsheet_id: str, a_map: dict[str, str], g_map: dict[str, str], *, repo_root: str | Path = ".", config: SheetsApiConfig | None = None) -> dict[str, Any]:
     """A(카페)·G(노출 상태) 값별 배경색 조건부 서식. 5개 시트에 같은 맵을 보내 통일한다(config/sheet_colors.yaml)."""
     return call_sheets_api(spreadsheet_id, "apply_colors", {"a_map": a_map, "g_map": g_map}, repo_root=repo_root, config=config)
+
+
+def api_copy_validation(spreadsheet_id: str, from_spreadsheet_id: str, cols: list[str] | None = None, *, repo_root: str | Path = ".", config: SheetsApiConfig | None = None) -> dict[str, Any]:
+    return call_sheets_api(spreadsheet_id, "copy_validation", {"from_spreadsheet_id": from_spreadsheet_id, "cols": cols or ["A", "G"]}, repo_root=repo_root, config=config)
 
 
 __all__ = [

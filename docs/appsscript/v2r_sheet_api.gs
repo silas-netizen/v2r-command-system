@@ -1,7 +1,7 @@
 /**
  * V2R 시트 API (Apps Script 웹앱) — 2026-09-25
  * 브라우저 조작 없이 HTTP로 시트를 원자적으로 갱신한다.
- * 허용 시트 5개(브랜드 두 번째 탭)만, 허용 작업 11개(append·update_by_key·delete_by_key·snapshot·set_header·reapply_format·set_cells·delete_blank_rows·dedupe_by_key·info·apply_colors). 비밀번호 열(E)은 절대 읽지도 쓰지도 않는다.
+ * 허용 시트 5개(브랜드 두 번째 탭)만, 허용 작업 12개(…·apply_colors·copy_validation). 비밀번호 열(E)은 절대 읽지도 쓰지도 않는다.
  */
 var ALLOWED = {
   "1OwR_LSjO1ofOojldtSIqoxv0gieNSMx_t35_5G1VTCc": 1325327696, // 팥순이
@@ -55,6 +55,7 @@ function doPost(e){
     else if (req.action === "dedupe_by_key") out = dedupeByKey(sh);                   // 정규화 키워드 중복 행 제거(앞 행 유지)
     else if (req.action === "info") out = info(sh);                                   // 행·열 수, 머리글, 드롭다운 누락 수
     else if (req.action === "apply_colors") out = applyColors(sh, req.a_map, req.g_map); // A·G열 값별 배경색(조건부 서식, 5개 시트 동일)
+    else if (req.action === "copy_validation") out = copyValidation(sh, req.from_spreadsheet_id, req.cols); // 다른 허용 시트의 A·G 드롭다운 규칙(칩 색 포함 기대)을 이 시트에 복사
     else throw new Error("허용되지 않은 작업");
     return ContentService.createTextOutput(JSON.stringify({ok:true, result:out})).setMimeType(ContentService.MimeType.JSON);
   } catch(err) {
@@ -274,4 +275,19 @@ function applyColors(sh, aMap, gMap){
   }
   sh.setConditionalFormatRules(keep);
   return {rules_added: added, rules_total: keep.length};
+}
+
+// 원본 시트(허용 목록 안)의 A·G 드롭다운 규칙을 이 시트 2행부터 끝까지 그대로 건다.
+// 목적: 칩 색을 5개 시트에서 통일(칩 색은 API로 직접 못 정하지만 규칙 객체 복사로 따라오는지 확인용). 값은 건드리지 않는다.
+function copyValidation(sh, fromSid, cols){
+  var src = getSheet(fromSid); var last = sh.getLastRow(); var out = {};
+  var want = cols && cols.length ? cols : ["A", "G"];
+  var map = {A:1, G:7};
+  for (var i=0;i<want.length;i++){
+    var col = map[String(want[i]).toUpperCase()]; if (!col) continue;
+    var rule = findValidationSource(src, col, src.getLastRow()); if (!rule) { out[want[i]] = "원본에 규칙 없음"; continue; }
+    var dv = rule.getDataValidation(); var arr = []; for (var r=0;r<last-1;r++) arr.push([dv]);
+    sh.getRange(2, col, last-1, 1).setDataValidations(arr); out[want[i]] = last-1;
+  }
+  return out;
 }
