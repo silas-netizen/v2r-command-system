@@ -120,7 +120,13 @@ def migrate(conn: sqlite3.Connection) -> list[str]:
     for col, ddl in MIGRATION_COLUMNS.items():
         if col in existing:
             continue
-        conn.execute(f"ALTER TABLE keywords ADD COLUMN {col} {ddl}")
+        try:
+            conn.execute(f"ALTER TABLE keywords ADD COLUMN {col} {ddl}")
+        except sqlite3.OperationalError as exc:
+            # 워커 여러 개가 동시에 마이그레이션하면 "duplicate column" 이 난다
+            # (실측 2026-09-25 10:33, score-코숨핏 종료). 이미 있으면 그냥 넘어간다.
+            if "duplicate column" not in str(exc):
+                raise
         added.append(col)
     if added:
         conn.commit()

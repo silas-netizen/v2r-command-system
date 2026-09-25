@@ -1702,9 +1702,18 @@ def _alias_cache_load(rt: Any) -> dict:
 def _alias_cache_save(rt: Any, data: dict) -> None:
     p = _alias_cache_path(rt)
     p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-    os.replace(tmp, p)
+    # 작업자 6개가 같은 파일을 동시에 쓰면 임시 파일 이름이 겹쳐 WinError 5 로 작업자가
+    # 죽었다(실측 2026-09-25 18:42). 임시 파일은 프로세스별 이름, 실패는 삼킨다(캐시일 뿐).
+    tmp = p.with_name(f"{p.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, p)
+    except OSError as exc:
+        log.warning("카페 별칭 캐시 저장 실패(무시): %s", exc)
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def resolve_cafe_alias_id(
@@ -1823,9 +1832,18 @@ def _article_cache_load(rt: Any) -> dict:
 def _article_cache_save(rt: Any, data: dict) -> None:
     p = _article_cache_path(rt)
     p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-    os.replace(tmp, p)
+    # 작업자 6개가 같은 파일을 동시에 쓰면 임시 파일 이름이 겹쳐 WinError 5 로 작업자가
+    # 죽었다(실측 2026-09-25 18:42). 임시 파일은 프로세스별 이름, 실패는 삼킨다(캐시일 뿐).
+    tmp = p.with_name(f"{p.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, p)
+    except OSError as exc:
+        log.warning("카페 별칭 캐시 저장 실패(무시): %s", exc)
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _cache_key(brand: str, url: str) -> str:
