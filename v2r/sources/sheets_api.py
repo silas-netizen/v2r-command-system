@@ -23,7 +23,11 @@ log = logging.getLogger(__name__)
 
 DEFAULT_CONFIG_PATH = "config/sheets_api.yaml"
 
-_ALLOWED_ACTIONS = {"append", "update_by_key", "delete_by_key", "snapshot"}
+_ALLOWED_ACTIONS = {
+    "append", "update_by_key", "delete_by_key", "snapshot",
+    # 2026-09-25 추가(docs/appsscript/v2r_sheet_api.gs 최종 배포판)
+    "set_header", "reapply_format", "set_cells", "delete_blank_rows", "dedupe_by_key", "info",
+}
 
 
 class SheetsApiError(RuntimeError):
@@ -139,6 +143,31 @@ def api_snapshot(
     spreadsheet_id: str, *, repo_root: str | Path = ".", config: SheetsApiConfig | None = None
 ) -> dict[str, Any]:
     return call_sheets_api(spreadsheet_id, "snapshot", {}, repo_root=repo_root, config=config)
+
+
+def api_set_header(spreadsheet_id: str, col: str, value: str, *, repo_root: str | Path = ".", config: SheetsApiConfig | None = None) -> dict[str, Any]:
+    return call_sheets_api(spreadsheet_id, "set_header", {"col": col, "value": value}, repo_root=repo_root, config=config)
+
+
+def api_reapply_format(spreadsheet_id: str, *, repo_root: str | Path = ".", config: SheetsApiConfig | None = None) -> dict[str, Any]:
+    return call_sheets_api(spreadsheet_id, "reapply_format", {}, repo_root=repo_root, config=config)
+
+
+def api_set_cells(spreadsheet_id: str, cells: list[dict[str, Any]], *, repo_root: str | Path = ".", config: SheetsApiConfig | None = None) -> dict[str, Any]:
+    """cells: [{"a1": "P2", "value": 12}] — E열·데이터 행 B~F는 서버가 거부한다."""
+    return call_sheets_api(spreadsheet_id, "set_cells", {"cells": cells}, repo_root=repo_root, config=config)
+
+
+def api_delete_blank_rows(spreadsheet_id: str, *, repo_root: str | Path = ".", config: SheetsApiConfig | None = None) -> dict[str, Any]:
+    return call_sheets_api(spreadsheet_id, "delete_blank_rows", {}, repo_root=repo_root, config=config)
+
+
+def api_dedupe_by_key(spreadsheet_id: str, *, repo_root: str | Path = ".", config: SheetsApiConfig | None = None) -> dict[str, Any]:
+    return call_sheets_api(spreadsheet_id, "dedupe_by_key", {}, repo_root=repo_root, config=config)
+
+
+def api_info(spreadsheet_id: str, *, repo_root: str | Path = ".", config: SheetsApiConfig | None = None) -> dict[str, Any]:
+    return call_sheets_api(spreadsheet_id, "info", {}, repo_root=repo_root, config=config)
 
 
 __all__ = [
