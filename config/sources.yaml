@@ -63,3 +63,8 @@ brand_sheets:
     kind: affiliate
     spreadsheet_id: 1Ey_laLK5-yJx2malh8s0vbmECpVW7CZQklCGKT3x0ek
     exposure_gid: 607459493   # 두 번째 탭(노출 현황) — 실시간 export CSV 읽기용(2026-09-24)
+  갱년기:
+    # 2026-09-26 신설 — 제품 미정, 원고 발행 없음(키워드 수집·채점 전용이라 노출 확인 대상에는 넣지 않는다)
+    kind: affiliate
+    spreadsheet_id: 1syyaWQzWI4ws3owlliN9qKM62z7CS8rdP2nnfGk8yo0
+    exposure_gid: 1454846576   # 두 번째 탭(우아덤 시트를 복제한 구조로 보임)

@@ -122,6 +122,20 @@ brands:
     sheets: [1J8Nq-UQxLzrt3fOqIkZ2HRskZJTFQlOjmFjIh3wlzBs]   # 원고 시트 (config/sources.yaml brand_sheets)
     spreadsheet_id: 1J8Nq-UQxLzrt3fOqIkZ2HRskZJTFQlOjmFjIh3wlzBs   # sheets_writer.py(2026-09-23)
 
+  갱년기:
+    description: >-
+      갱년기 — 40대 후반에서 60대 여성의 갱년기 증상·관리(안면홍조, 불면, 우울, 골다공증,
+      질건조, 체중 변화, 호르몬, 영양제, 운동, 식단, 병원 등) 키워드 카테고리.
+      2026-09-26 신설, 아직 제품 미정 — 브랜드 제품 원고 발행 대상이 아니다(키워드 수집·채점 전용).
+    folder: 갱년기
+    drive_folder: 갱년기
+    aliases: []
+    identifiers: []           # 제품 미정 — 원고 식별어 없음
+    no_manuscript: true       # 제품 없음: 원고 발행·노출 확인 대상 아님(키워드 수집·채점만)
+    known_folders: []
+    sheets: []                 # 원고 시트 없음(정보성 키워드 카테고리)
+    spreadsheet_id: 1syyaWQzWI4ws3owlliN9qKM62z7CS8rdP2nnfGk8yo0   # 키워드 시트(두 번째 탭, config/sources.yaml brand_sheets)
+
   팥순이:
     description: 팥순이 — 팥순 추출물 다이어트 식품. 사진은 팥·분말·차·스틱 등 음식 클로즈업
     folder: 팥순이
