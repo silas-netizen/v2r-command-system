@@ -8,7 +8,8 @@ var ALLOWED = {
   "1QYhQFnZznQ-NjIjwiIlmJcf6zkQlb6t3TBK-W6OwJm0": 1454846576, // 우아덤
   "1Ey_laLK5-yJx2malh8s0vbmECpVW7CZQklCGKT3x0ek": 607459493,  // 코숨핏
   "1J8Nq-UQxLzrt3fOqIkZ2HRskZJTFQlOjmFjIh3wlzBs": 295921914,  // 장으뜸
-  "1mgqghfeNrSZ1bTSrfTYWojtPGMc0u-K4VXEikxrHLOw": 1782605844  // 뉴더미스
+  "1mgqghfeNrSZ1bTSrfTYWojtPGMc0u-K4VXEikxrHLOw": 1782605844, // 뉴더미스
+  "1syyaWQzWI4ws3owlliN9qKM62z7CS8rdP2nnfGk8yo0": 1454846576  // 갱년기(2026-09-26, 원고 발행 없음·키워드 전용)
 };
 var KEY_COL = 8;            // H 키워드
 var FORBIDDEN_COLS = [2,3,4,5,6]; // B~F 는 쓰기 금지(E 비밀번호 포함)
