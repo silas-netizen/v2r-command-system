@@ -1966,24 +1966,30 @@ def fetch_article_text(
         try:
             context = browser.new_context(storage_state=storage_state)
             page = context.new_page()
-            page.goto(url, timeout=15000, wait_until="domcontentloaded")
+            # 2026-09-26 속도 실측 — 확인 단계(judge_once의 confirm=) 상위
+            # 분포가 75~129초까지 나온 원인이 이 대기 예산 자체였다(로그
+            # "타이밍 ... confirm=" 상위 9건/300, total>30s). 판정 로직은
+            # 그대로 두고 **대기 상한**만 줄인다 — 프레임을 빨리 찾으면
+            # 원래도 그 즉시 break/return하므로 정상 케이스는 영향 없고,
+            # 느리거나 응답 없는 페이지에서의 최악값만 줄어든다.
+            page.goto(url, timeout=10000, wait_until="domcontentloaded")
             frame = None
-            for _ in range(5):
+            for _ in range(4):
                 try:
                     frame = page.frame(name="cafe_main")
                 except Exception:
                     frame = None
                 if frame is not None:
                     break
-                page.wait_for_timeout(500)
+                page.wait_for_timeout(400)
             if frame is not None:
                 try:
-                    frame.wait_for_load_state("networkidle", timeout=8000)
+                    frame.wait_for_load_state("networkidle", timeout=5000)
                 except Exception:
                     pass
-                frame.wait_for_timeout(1200)
+                frame.wait_for_timeout(800)
             else:
-                page.wait_for_timeout(1500)
+                page.wait_for_timeout(1000)
             target = frame or page.main_frame
             return target.inner_text("body")
         finally:
@@ -2079,24 +2085,26 @@ def fetch_article_html(
         try:
             context = browser.new_context(storage_state=storage_state)
             page = context.new_page()
-            page.goto(url, timeout=15000, wait_until="domcontentloaded")
+            # 2026-09-26 속도 실측 — fetch_article_text와 같은 이유로 대기
+            # 상한만 줄인다(판정 로직 동일 유지).
+            page.goto(url, timeout=10000, wait_until="domcontentloaded")
             frame = None
-            for _ in range(5):
+            for _ in range(4):
                 try:
                     frame = page.frame(name="cafe_main")
                 except Exception:
                     frame = None
                 if frame is not None:
                     break
-                page.wait_for_timeout(500)
+                page.wait_for_timeout(400)
             if frame is not None:
                 try:
-                    frame.wait_for_load_state("networkidle", timeout=8000)
+                    frame.wait_for_load_state("networkidle", timeout=5000)
                 except Exception:
                     pass
-                frame.wait_for_timeout(1200)
+                frame.wait_for_timeout(800)
             else:
-                page.wait_for_timeout(1500)
+                page.wait_for_timeout(1000)
             target = frame or page.main_frame
             return target.content()
         finally:
