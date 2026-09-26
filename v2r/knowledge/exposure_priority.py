@@ -24,6 +24,7 @@ import logging
 import os
 import threading
 import time
+import zlib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -473,9 +474,26 @@ def maybe_refresh_queue(rt: Any, brand: str, cfg: dict, now: datetime) -> bool:
         finally:
             _release_refresh_lock(rt, brand)
 
+    # 2026-09-26 계측(exposure-stall-2026-09-26.md) — 작업자 6개가 워치독
+    # 재기동 등으로 동시에 뜨면 여러 브랜드의 TTL이 같은 시각에서 함께
+    # 만료돼, 큐 갱신(`_do_refresh_queue`, 브랜드당 수천~19,068행을 순회하는
+    # CPU 위주 작업, GIL을 오래 잡음)이 같은 몇 분 사이에 몰리는 걸 실측으로
+    # 확인했다(10:57~11:04, 작업자 전원의 로그가 동시에 멈췄고 상태 파일
+    # 갱신이 180초 넘게 끊겨 워치독이 "작업자 없음"으로 오판·재기동함).
+    # TTL 판정(`last_refreshed_at` 비교, 위)은 시험이 기대하는 그대로 두고,
+    # 백그라운드 스레드의 **시작 시각만** 브랜드 이름의 안정적 해시로 최대
+    # 20초 미뤄, 같은 순간에 만료된 여러 브랜드의 무거운 계산이 겹치지 않게
+    # 흩뿌린다(락은 이미 잡아 둔 상태라 그동안 다른 프로세스가 같은 브랜드를
+    # 다시 갱신 시도하진 않는다 — `_try_refresh_lock`이 위에서 통과했음).
+    start_delay = float(zlib.crc32(brand.encode("utf-8")) % 20)
+
+    def _delayed_refresh() -> None:
+        if start_delay:
+            time.sleep(start_delay)
+        _refresh_queue_in_background(rt.settings.repo_root, brand, cfg, now)
+
     threading.Thread(
-        target=_refresh_queue_in_background,
-        args=(rt.settings.repo_root, brand, cfg, now),
+        target=_delayed_refresh,
         daemon=True,
         name=f"exposure-queue-refresh-{brand}",
     ).start()

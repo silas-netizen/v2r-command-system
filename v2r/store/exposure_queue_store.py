@@ -20,9 +20,17 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import time
 from typing import Any
+
+log = logging.getLogger(__name__)
+
+#: 2026-09-26 계측(동시 정지 원인 조사) — `BEGIN IMMEDIATE`가 락 대기로
+#: 이 값(초)보다 오래 걸리면 "락대기" 로그를 남긴다. 정상이면 수 ms 안에
+#: 끝나므로, 임계값을 넘는 건만 남겨 로그량을 줄인다.
+_SLOW_LOCK_LOG_SEC = 0.5
 
 #: 이 시간(초)이 지난 선점은 죽은 작업자의 것으로 보고 다시 선점 가능하게 한다
 #: (검사 1건 보통 8~25초, 넉넉히 잡음 — 기존 `exposure_runner.INFLIGHT_TTL_SECONDS`
@@ -78,7 +86,9 @@ def upsert_candidates(
     ]
     for start in range(0, len(rows), max(1, chunk_size)) if rows else [0]:
         chunk = rows[start : start + max(1, chunk_size)] if rows else []
+        _t0 = time.monotonic()
         conn.execute("BEGIN IMMEDIATE")
+        _lock_wait = time.monotonic() - _t0
         try:
             if chunk:
                 conn.executemany(
@@ -109,6 +119,12 @@ def upsert_candidates(
         except Exception:
             conn.execute("ROLLBACK")
             raise
+        _total = time.monotonic() - _t0
+        if _lock_wait > _SLOW_LOCK_LOG_SEC or _total > 1.0:
+            log.info(
+                "타이밍 upsert_candidates 락대기=%.2fs 전체=%.2fs 브랜드=%s 청크=%s",
+                _lock_wait, _total, brand, len(chunk),
+            )
 
     # 워터마크 삭제 — 이번 갱신에서 손 안 댄(그래서 enqueued_at이 예전 그대로인)
     # 행 중, 진행 중인 선점이 아닌 것만 지운다. 후보가 하나도 없었으면(빈
@@ -160,7 +176,9 @@ def claim_batch(
     if n == 0:
         return []
 
+    _t0 = time.monotonic()
     conn.execute("BEGIN IMMEDIATE")
+    _lock_wait = time.monotonic() - _t0
     try:
         rows = conn.execute(
             """
@@ -174,6 +192,8 @@ def claim_batch(
         ).fetchall()
         if not rows:
             conn.execute("COMMIT")
+            if _lock_wait > _SLOW_LOCK_LOG_SEC:
+                log.info("타이밍 claim_batch 락대기=%.2fs 브랜드=%s(빈배치)", _lock_wait, brand)
             return []
         rowids = [r["rid"] for r in rows]
         placeholders = ", ".join("?" for _ in rowids)
@@ -185,6 +205,12 @@ def claim_batch(
     except Exception:
         conn.execute("ROLLBACK")
         raise
+    _total = time.monotonic() - _t0
+    if _lock_wait > _SLOW_LOCK_LOG_SEC or _total > _SLOW_LOCK_LOG_SEC:
+        log.debug(
+            "타이밍 claim_batch 락대기=%.2fs 전체=%.2fs 브랜드=%s 작업자=%s 건수=%s",
+            _lock_wait, _total, brand, worker_id, len(rows),
+        )
 
     out: list[dict] = []
     for r in rows:

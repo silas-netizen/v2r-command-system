@@ -1882,14 +1882,24 @@ def _article_cache_path(rt: Any) -> Path:
     return Path(rt.settings.data_dir) / ARTICLE_JUDGMENT_CACHE_FILE
 
 
+#: 2026-09-26 계측(동시 정지 원인 조사) — 파일 읽기/쓰기가 이 값(초)보다
+#: 오래 걸리면 로그를 남긴다(정상은 수 ms).
+_SLOW_FILE_LOG_SEC = 0.5
+
+
 def _article_cache_load(rt: Any) -> dict:
     p = _article_cache_path(rt)
     if not p.exists():
         return {}
+    _t0 = time.monotonic()
     try:
-        return json.loads(p.read_text(encoding="utf-8"))
+        data = json.loads(p.read_text(encoding="utf-8"))
     except Exception:
         return {}
+    _dt = time.monotonic() - _t0
+    if _dt > _SLOW_FILE_LOG_SEC:
+        log.info("타이밍 article_cache_load=%.2fs 크기=%d", _dt, p.stat().st_size if p.exists() else -1)
+    return data
 
 
 def _article_cache_save(rt: Any, data: dict) -> None:
@@ -1898,6 +1908,7 @@ def _article_cache_save(rt: Any, data: dict) -> None:
     # 작업자 6개가 같은 파일을 동시에 쓰면 임시 파일 이름이 겹쳐 WinError 5 로 작업자가
     # 죽었다(실측 2026-09-25 18:42). 임시 파일은 프로세스별 이름, 실패는 삼킨다(캐시일 뿐).
     tmp = p.with_name(f"{p.name}.{os.getpid()}.tmp")
+    _t0 = time.monotonic()
     try:
         tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
         os.replace(tmp, p)
@@ -1907,6 +1918,9 @@ def _article_cache_save(rt: Any, data: dict) -> None:
             tmp.unlink(missing_ok=True)
         except OSError:
             pass
+    _dt = time.monotonic() - _t0
+    if _dt > _SLOW_FILE_LOG_SEC:
+        log.info("타이밍 article_cache_save=%.2fs", _dt)
 
 
 def _cache_key(brand: str, url: str) -> str:
