@@ -375,6 +375,79 @@ def test_partial_success_counted_from_per_cafe(tmp_path):
     rt2.close()
 
 
+# --------------------------------------------------------------------
+# 3-c) 사고 2026-09-26 — publish_daily가 DB 잠금(database is locked)으로
+# 통째로 failed 됐는데 10시간 동안 재큐도, 슬랙 알림도 없었다.
+# --------------------------------------------------------------------
+def test_publish_daily_db_lock_failure_is_requeued_and_alerted(tmp_path):
+    """DB 잠금으로 죽은 publish_daily는 (일반 실패와 달리) 바로 재큐되고 슬랙 🔴가 나간다."""
+    rt = make_rt(tmp_path)
+    job_id = add_job(rt, status="failed", error="database is locked")
+    out = monitor.tick(rt, NOW)
+    act = [a for a in out["actions"] if a["action"] == "failed"][0]
+    assert act["new_job_id"]
+    # config/notify.yaml 허용 범주(publish_failed_confirmed)로 나가 실제로 슬랙에 뜬다
+    # (일반 monitor_alert였다면 강등돼 channels로 안 나갔을 것 — 사고의 핵심 원인).
+    assert any("실패" in t for t in rt.channels[0].sent)
+    rt.close()
+
+
+def test_publish_daily_db_lock_partial_success_is_still_requeued(tmp_path):
+    """DB 잠금으로 죽었으면 부분 성공(190건)이 있어도 다시 큐에 올린다(중복 방지 관문이 대신 막아준다)."""
+    rt = make_rt(tmp_path)
+    job_id = add_job(rt, status="failed", error="database is locked")
+    set_result(
+        rt,
+        job_id,
+        {"ok": False, "results": [{"title": "가", "status": "posted"}], "failures": ["나: 실패"]},
+    )
+    out = monitor.tick(rt, NOW)
+    act = [a for a in out["actions"] if a["action"] == "failed"][0]
+    assert act["new_job_id"]
+    rt.close()
+
+
+def test_publish_daily_db_lock_retries_up_to_cap_3(tmp_path):
+    """DB 잠금 재큐는 최대 3회까지만(그 뒤엔 사람에게 넘긴다)."""
+    rt = make_rt(tmp_path)
+    job_id = add_job(rt, status="failed", error="database is locked")
+    seen_ids = [job_id]
+    last_act = None
+    when = NOW
+    for _ in range(4):  # 원 작업 + 최대 3회 재큐 시도(4번째는 막혀야 한다)
+        out = monitor.tick(rt, when)
+        acts = [a for a in out["actions"] if a["action"] == "failed" and a["job_id"] == seen_ids[-1]]
+        assert acts, f"작업 {seen_ids[-1]}의 실패 판정이 안 나왔습니다"
+        last_act = acts[0]
+        new_id = last_act["new_job_id"]
+        if not new_id:
+            break
+        seen_ids.append(new_id)
+        rt.conn.execute(
+            "UPDATE jobs SET status = 'failed', error = ?, created_at = ?, updated_at = ?"
+            " WHERE id = ?",
+            ("database is locked", when.isoformat(timespec="seconds"),
+             when.isoformat(timespec="seconds"), new_id),
+        )
+        when = when + timedelta(minutes=1)
+    # 원 작업 + 재큐 3건 = 최대 4개, 그 이상은 만들어지지 않는다
+    assert len(seen_ids) == 4
+    assert last_act["new_job_id"] is None
+    assert last_act["blocked"]
+    rt.close()
+
+
+def test_publish_daily_db_lock_not_requeued_outside_publish_window(tmp_path):
+    """발행 허용 시간(08:00~02:00 KST) 밖이면 DB 잠금이어도 다시 등록하지 않는다."""
+    rt = make_rt(tmp_path)
+    add_job(rt, status="failed", error="database is locked")
+    outside = NOW.replace(hour=4, minute=0)  # 02:00~08:00 사이는 발행 창 밖
+    out = monitor.tick(rt, outside)
+    act = [a for a in out["actions"] if a["action"] == "failed"][0]
+    assert act["new_job_id"] is None
+    rt.close()
+
+
 def test_reaped_stalled_cancelled_job_is_not_requeued(tmp_path):
     """멈춘 작업 정리에도 같은 금지 규칙이 걸린다."""
     rt = make_rt(tmp_path)

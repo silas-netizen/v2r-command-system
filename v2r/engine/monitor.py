@@ -51,12 +51,29 @@ STALL_S = 15 * 60
 DEAD_S = 30 * 60
 #: 상태 파일에 남겨 두는 최근 알림 수
 ALERT_KEEP = 20
-#: 다시 해볼 만한 실패(레이트 제한·네트워크)
+#: 다시 해볼 만한 실패(레이트 제한·네트워크·DB 잠금)
 RETRYABLE_RE = re.compile(
     r"429|레이트|요청\s*제한|너무\s*많|rate.?limit|timeout|timed out|시간\s*초과"
-    r"|네트워크|network|connection|연결|일시적|temporarily",
+    r"|네트워크|network|connection|연결|일시적|temporarily"
+    r"|잠금|database is locked|database is busy|locked|busy",
     re.I,
 )
+#: DB 잠금 오류 문구 (사고 2026-09-26). publish_daily가 이 사유로 실패했을 때만
+#: 아래 `PUBLISH_DAILY_RETRY_CAP`/부분 성공 예외가 적용된다 — 다른 이유(문법
+#: 오류·계정 제한 등)의 publish_daily 실패는 여전히 기존 규칙(1회, 부분 성공은
+#: 재시도 안 함)을 그대로 따른다.
+DB_LOCK_RE = re.compile(r"database is locked|database is busy|잠금|\blocked\b|\bbusy\b", re.I)
+#: publish_daily가 DB 경합(다른 작업들과의 sqlite 잠금)으로 통째로 실패해도
+#: 오늘 이미 올라간 건 publications 중복 방지로 건너뛰므로 남은 것만 이어서
+#: 올리면 된다 — 이 경우에 한해 다른 작업보다 더 여러 번 재큐를 허용한다.
+PUBLISH_DAILY_RETRY_CAP = 3
+
+
+def _is_db_lock_failure(job: dict) -> bool:
+    """publish_daily가 DB 잠금으로 실패했는가(사고 2026-09-26 재발 방지 대상)."""
+    if str(job.get("task") or "") != "publish_daily":
+        return False
+    return bool(DB_LOCK_RE.search(str(job.get("error") or "")))
 #: 감시 설정 파일 이름 (config/ 아래)
 CONFIG_FILE = "monitor.yaml"
 #: 같은 조회를 다시 하지 않는 기본 시간(초) — 틱을 가볍게 유지한다
@@ -181,12 +198,26 @@ def _daily(state: dict, now: datetime) -> dict:
     return box
 
 
-def _alert(rt: Any, state: dict, text: str) -> None:
-    """알림 1건: 채널 + 이벤트 + 상태 파일 기록."""
+def _alert(rt: Any, state: dict, text: str, *, category: str | None = None) -> None:
+    """알림 1건: 채널 + 이벤트 + 상태 파일 기록.
+
+    `category`를 안 주면 `monitor_alert:...`로 보낸다 — 이 범주는 사용자
+    지시(config/notify.yaml `critical_categories`)의 허용 목록에 없어 **채널로는
+    안 나가고 로그에만 남는다**(그래서 일반 감시 경고는 스팸이 안 된다). 발행
+    실패처럼 정말 사용자가 봐야 하는 알림은 부르는 쪽이 허용 범주
+    (`publish_failed_confirmed` 등)를 명시해야 한다(사고 2026-09-26: publish_daily
+    실패가 10시간 동안 조용했다 — 이 범주 밖이라 강등됐었다).
+    """
     from v2r.channels import notify_all
 
     try:
-        notify_all(rt.channels, text, level="critical", category=f"monitor_alert:{text[:40]}", tag="schedule")
+        notify_all(
+            rt.channels,
+            text,
+            level="critical",
+            category=category or f"monitor_alert:{text[:40]}",
+            tag="schedule",
+        )
     except Exception as exc:  # noqa: BLE001 pragma: no cover
         log.warning("감시 알림 실패: %s", exc)
     now = datetime.now(KST)
@@ -320,34 +351,72 @@ def no_retry_reason(job: dict) -> str | None:
     error = str(job.get("error") or "")
     if error and NO_RETRY_RE.search(error):
         return "중지·취소·리스 상실은 다시 해볼 실패가 아닙니다"
-    if RETRY_MARK in str(job.get("idem_key") or ""):
+    lock_failure = _is_db_lock_failure(job)
+    # publish_daily가 **DB 잠금**으로 실패했을 때만 재큐 상한(cap)을 사슬 카운터
+    # (retry_chain, PUBLISH_DAILY_RETRY_CAP=3)로 따로 센다 — 여기서 1회 만에
+    # 막으면 그 상한이 무의미해진다. 그 밖의 실패(문법 오류 등)는 기존처럼 1회만.
+    if RETRY_MARK in str(job.get("idem_key") or "") and not lock_failure:
         return "이미 감시가 한 번 다시 등록한 작업입니다"
-    if str(job.get("task") or "").startswith("publish_"):
+    # publish_daily가 DB 잠금으로 실패했을 때는 (source_key, row_number,
+    # content_hash) 중복 방지 관문을 재실행 때도 그대로 통과한다 — 부분 성공
+    # 뒤에도 남은 것만 이어 올리면 되므로 여기서 막지 않는다 (사고 2026-09-26
+    # 재발 방지, 사용자 지시). 그 밖의 publish_* 부분 성공은 기존처럼 막는다.
+    if str(job.get("task") or "").startswith("publish_") and not lock_failure:
         rows = _success_rows(job)
         if rows:
             return f"일부는 성공했습니다(성공 {rows}건) — 다시 올리면 중복이 됩니다"
     return None
 
 
-def _chain_used(state: dict, job: dict) -> bool:
-    """이 사슬(원래 작업 기준)에서 이미 재등록을 썼는가."""
-    return int((state.get("retry_chain") or {}).get(root_key(job), 0)) > 0
+def _retry_cap(job: dict) -> int:
+    """이 작업 사슬이 다시 등록될 수 있는 최대 횟수.
+
+    publish_daily가 DB 잠금처럼 "그 순간만" 걸리는 실패로 통째로 죽으면, 오늘
+    올린 건 publications 중복 방지로 다시 건너뛰므로 남은 것만 이어진다 — 그래서
+    이 경우에 한해 다른 작업(기본 1회)보다 더 여러 번(기본 3회) 재큐를 허용한다
+    (사고 2026-09-26). 그 밖의 실패는 기존처럼 1회만.
+    """
+    if _is_db_lock_failure(job):
+        return PUBLISH_DAILY_RETRY_CAP
+    return 1
+
+
+def _chain_used(state: dict, job: dict, cap: int = 1) -> bool:
+    """이 사슬(원래 작업 기준)에서 재등록 상한(`cap`)을 다 썼는가."""
+    return int((state.get("retry_chain") or {}).get(root_key(job), 0)) >= cap
 
 
 def _chain_mark(state: dict, job: dict) -> None:
-    """사슬에 재등록 1회를 기록한다(기록은 최근 것만 남긴다)."""
+    """사슬에 재등록 1회를 더 기록한다(기록은 최근 것만 남긴다)."""
     chain = state.setdefault("retry_chain", {})
-    chain[root_key(job)] = 1
+    chain[root_key(job)] = int(chain.get(root_key(job), 0)) + 1
     for old in list(chain)[:-CHAIN_KEEP]:
         chain.pop(old, None)
 
 
-def may_retry(state: dict, job: dict, js: dict) -> str | None:
+def _in_publish_window(job: dict, now: datetime) -> bool:
+    """자사 카페 발행 허용 시간대(08:00~02:00 KST) 안인가.
+
+    publish_daily가 **DB 잠금**으로 실패해 cap 3회 재큐 대상일 때만 이 창을
+    검사한다(사고 2026-09-26 대응). 그 밖의 실패·작업은 항상 통과시킨다 —
+    기존 재큐(1회) 동작을 바꾸지 않는다.
+    """
+    if not _is_db_lock_failure(job):
+        return True
+    from v2r.engine.publish import in_self_window
+
+    return in_self_window(now)
+
+
+def may_retry(state: dict, job: dict, js: dict, now: datetime | None = None) -> str | None:
     """재등록해도 되는가. 안 되면 이유를 돌려준다."""
-    if int(js.get("retries", 0)) > 0:
-        return "이미 한 번 다시 등록했습니다"
-    if _chain_used(state, job):
-        return "같은 명령은 한 번만 다시 등록합니다"
+    cap = _retry_cap(job)
+    if int(js.get("retries", 0)) >= cap:
+        return f"이미 {cap}번 다시 등록했습니다(상한)"
+    if _chain_used(state, job, cap):
+        return f"같은 명령은 최대 {cap}번만 다시 등록합니다"
+    if now is not None and not _in_publish_window(job, now):
+        return "발행 허용 시간(08:00~02:00) 밖이라 다시 등록하지 않습니다"
     return no_retry_reason(job)
 
 
@@ -632,14 +701,14 @@ def _watch_running(rt: Any, state: dict, job: dict, now: datetime) -> list[dict]
 
     if idle >= DEAD_S and (lease_until is None or lease_until <= now) and not js.get("reaped"):
         js["reaped"] = True
-        block = may_retry(state, job, js)
+        block = may_retry(state, job, js, now)
         try:
             rt.jobs.finish(job_id, "failed", None, f"감시: {int(idle // 60)}분 멈춤 — 자동 정리")
         except Exception as exc:  # noqa: BLE001
             log.warning("정체 작업 정리 실패: %s", exc)
         new_id = None
         if block is None:
-            js["retries"] = 1
+            js["retries"] = int(js.get("retries", 0)) + 1
             _chain_mark(state, job)
             new_id = _requeue(rt, job, "monitor-retry1")
         tail = (
@@ -687,13 +756,17 @@ def _watch_finished(
     acts: list[dict] = []
     new_id = None
     retryable = bool(verdict["action"] == "retry" or RETRYABLE_RE.search(error))
-    block = may_retry(state, job, js) if retryable else None
+    block = may_retry(state, job, js, now) if retryable else None
     if retryable and block is None:
-        js["retries"] = 1
+        attempt = int((state.get("retry_chain") or {}).get(root_key(job), 0)) + 1
+        js["retries"] = int(js.get("retries", 0)) + 1
         _chain_mark(state, job)
-        new_id = _requeue(rt, job, "monitor-retry1")
+        # 시도 번호를 꼬리표에 넣는다 — 같은 문구면 idem_key가 같아져 두 번째
+        # 재시도가 새 작업을 못 만들고 첫 재시도 작업을 그대로 돌려주는 문제
+        # (재큐 상한 3회가 무의미해짐)를 막는다.
+        new_id = _requeue(rt, job, f"monitor-retry{attempt}")
         if new_id:
-            lines.append(f"시도함: 같은 명령을 작업 {new_id} 로 한 번 더 등록했습니다")
+            lines.append(f"시도함: 같은 명령을 작업 {new_id} 로 다시 등록했습니다({attempt}회째)")
             _daily(state, now)["recovered"] += 1
     elif block:
         lines.append(f"다시 등록하지 않았습니다: {block}")
@@ -720,7 +793,12 @@ def _watch_finished(
     channel_lines = [lines[0]]
     if resume_line:
         channel_lines.append(resume_line)
-    _alert(rt, state, "\n".join(channel_lines))
+    # publish_daily가 DB 잠금(사고 2026-09-26)으로 실패·재큐될 때만 config/notify.yaml
+    # 허용 범주(a, "발행 실패")로 보낸다 — 그래야 🔴 슬랙으로 실제로 나간다. 그 밖의
+    # 흔한 publish_daily 실패(네트워크 지연 등)는 지금처럼 monitor_alert로 로그에만
+    # 남는다(사용자 지시 2026-09-23: "메시지가 너무 많다" — 여기서 다시 늘리지 않는다).
+    cat = f"publish_failed_confirmed:{job_id}" if _is_db_lock_failure(job) else None
+    _alert(rt, state, "\n".join(channel_lines), category=cat)
     acts.append(
         {
             "job_id": job_id,

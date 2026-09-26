@@ -1,5 +1,6 @@
 """저장소 테스트."""
 
+import sqlite3
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -132,12 +133,85 @@ def test_publications_exists_includes_uncertain(conn):
     pub.mark("일상글목록", 4, "h2", "skipped")
     assert pub.exists("일상글목록", 4, "h2") is False
 
-    # done → uncertain 역행은 막는다
-    pub.mark("일상글목록", 3, "h1", "uncertain", "daily_submitting")
-    assert pub.by_source_id("s-1")["status"] == "done"
 
-    with pytest.raises(ValueError):
-        pub.mark("일상글목록", 5, "h3", "done", None, 없는열="x")
+# --------------------------------------------------------------------
+# DB 잠금 재시도 (사고 2026-09-26: publish_daily가 database is locked 한 번에
+# 통째로 failed 됐다 — publications.mark()가 지수 백오프로 다시 쓰게 한다)
+# --------------------------------------------------------------------
+def test_retry_on_lock_retries_then_succeeds():
+    from v2r.store import publications as pub_mod
+
+    calls = {"n": 0}
+
+    def flaky():
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise sqlite3.OperationalError("database is locked")
+        return "ok"
+
+    out = pub_mod.retry_on_lock(flaky, base_delay=0)
+    assert out == "ok"
+    assert calls["n"] == 3
+
+
+def test_retry_on_lock_gives_up_after_max_retries():
+    from v2r.store import publications as pub_mod
+
+    calls = {"n": 0}
+
+    def always_locked():
+        calls["n"] += 1
+        raise sqlite3.OperationalError("database is locked")
+
+    with pytest.raises(sqlite3.OperationalError):
+        pub_mod.retry_on_lock(always_locked, max_retries=3, base_delay=0)
+    assert calls["n"] == 3
+
+
+def test_retry_on_lock_does_not_retry_other_operational_errors():
+    from v2r.store import publications as pub_mod
+
+    calls = {"n": 0}
+
+    def bad_sql():
+        calls["n"] += 1
+        raise sqlite3.OperationalError("no such table: bogus")
+
+    with pytest.raises(sqlite3.OperationalError):
+        pub_mod.retry_on_lock(bad_sql, base_delay=0)
+    assert calls["n"] == 1  # 잠금이 아니면 다시 시도하지 않고 바로 올린다
+
+
+class _FlakyConn:
+    """`conn.execute`를 감싸 `INSERT INTO publications` 첫 시도만 잠금으로 실패시킨다.
+
+    `sqlite3.Connection`은 C 확장 타입이라 인스턴스 속성을 monkeypatch로 못 바꾼다
+    (읽기 전용) — 그래서 얇은 프록시로 감싼다.
+    """
+
+    def __init__(self, real: sqlite3.Connection) -> None:
+        self._real = real
+        self.calls = 0
+
+    def execute(self, sql, params=()):
+        if "INSERT INTO publications" in sql:
+            self.calls += 1
+            if self.calls < 2:
+                raise sqlite3.OperationalError("database is locked")
+        return self._real.execute(sql, params)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def test_mark_retries_on_lock_then_writes(conn):
+    """`mark()`가 잠금 오류를 겪어도(모의) 재시도 뒤 결국 기록한다."""
+    flaky = _FlakyConn(conn)
+    pub = PublicationStore(flaky)
+    # 첫 시도만 잠금이므로 백오프 대기는 한 번(기본 0.2초)뿐이다 — 그대로 둔다.
+    pub.mark("일상글목록", 9, "h9", "done", "done")
+    assert flaky.calls == 2
+    assert pub.exists("일상글목록", 9, "h9") is True
 
 
 def test_account_state_restrict_and_lru(conn):

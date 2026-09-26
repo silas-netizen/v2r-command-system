@@ -19,6 +19,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
+import time as _time
 from dataclasses import dataclass, field
 from datetime import date as _date
 from datetime import datetime, time, timedelta
@@ -456,12 +458,22 @@ def check_pending(
 
 
 def write_heartbeat(rt: Any, now_kst: datetime | None = None) -> None:
-    """실행기가 살아 있다는 표시. 실패해도 루프를 세우지 않는다."""
+    """실행기가 살아 있다는 표시. 실패해도 루프를 세우지 않는다.
+
+    이 함수는 **본 루프(긴 작업 중의 `touch_heartbeat`)와 사이드카 스레드
+    (`schedule.tick`)가 동시에** 부를 수 있다(사고 2026-09-26: 두 스레드가 같은
+    `.json.tmp`에 동시에 쓰다가 `WinError 32`/`Permission denied`로 계속
+    실패했다). 임시 파일 이름을 프로세스+스레드+호출마다 다르게 해서 겹치지
+    않게 한다. 그래도 실패하면(다른 프로세스가 잠깐 물고 있는 등) 경고만
+    남기고 넘어간다 — 심장박동 기록 실패가 실행을 막아서는 안 된다.
+    """
     now_kst = now_kst or datetime.now(KST)
     path = heartbeat_path(rt)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".json.tmp")
+        tmp = path.with_name(
+            f"{path.stem}.{os.getpid()}.{threading.get_ident()}.{_time.monotonic_ns()}.tmp"
+        )
         tmp.write_text(
             json.dumps(
                 {"at": now_kst.isoformat(timespec="seconds"), "pid": os.getpid()},

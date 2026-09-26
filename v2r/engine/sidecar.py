@@ -148,12 +148,19 @@ def write_heartbeat(
     `busy` 를 주면 "지금 뭘 하고 있는지"(단계·경과초)를 같이 남긴다 —
     작업이 오래 걸려 이 함수가 안 불려도, **별도 심장박동 스레드**가 계속
     이걸 찍어 감시기가 진짜 죽은 것과 "그냥 바쁜 것"을 구분할 수 있다.
+
+    그 별도 스레드와 사이드카 본 루프가 **동시에** 이 함수를 부를 수 있어
+    같은 `.json.tmp`를 두 스레드가 같이 쓰다 `WinError 32`/`Permission denied`로
+    계속 실패했다(사고 2026-09-26). 임시 파일 이름을 프로세스+스레드+호출마다
+    다르게 해서 겹치지 않게 한다.
     """
     now_kst = now_kst or datetime.now(KST)
     path = heartbeat_path(rt)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".json.tmp")
+        tmp = path.with_name(
+            f"{path.stem}.{os.getpid()}.{threading.get_ident()}.{time.monotonic_ns()}.tmp"
+        )
         payload: dict[str, Any] = {
             "at": now_kst.isoformat(timespec="seconds"),
             "pid": os.getpid(),

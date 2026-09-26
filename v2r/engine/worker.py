@@ -9,6 +9,7 @@ import os
 import random
 import re
 import socket
+import sqlite3
 import subprocess
 import threading
 import time
@@ -1797,6 +1798,15 @@ def _run_publish(
                         publish_mod.run_slot(
                             rt, spec, slot, browser_page=page, job_id=job_id, heartbeat=beat
                         )
+                    )
+                except sqlite3.OperationalError as exc:
+                    # DB 잠금(사고 2026-09-26): store.publications.mark 안에서 이미
+                    # 지수 백오프로 5번 다시 썼는데도 못 쓴 것이다. 이 글 1건만
+                    # 실패로 남기고 다음 글로 넘어간다 — 작업 전체를 죽이지 않는다.
+                    failures.append(f"{m.title}: DB 잠금으로 이 글만 건너뜀 ({exc})")
+                    failed_slots.append((slot, str(exc)))
+                    rt.events.log(
+                        job_id, "error", f"DB 잠금 — 이 글 건너뜀: {m.title} ({exc})"
                     )
                 except publish_mod.RetryWithOtherAccount as exc:
                     other = None if index in retried else _other_account(rt, spec, slot)
