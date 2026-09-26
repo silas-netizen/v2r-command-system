@@ -124,13 +124,35 @@ def _title_lead_keyword(title: str) -> str:
     return m.group(1) if m else ""
 
 
-def _resolve_our_article(article_index: Any, keyword: str, cafe: str) -> dict | None:
+def _resolve_our_article(
+    article_index: Any,
+    keyword: str,
+    cafe: str,
+    rows_cache: "dict[str, list[dict]] | None" = None,
+) -> dict | None:
     """article_index에서 이 키워드(+카페)로 우리가 올린 글 후보 1건.
 
     `find_by_keyword`가 없는 낡은/가짜 article_index면 조용히 포기한다.
-    """
+
+    2026-09-26 CPU 실측(exposure-cpu-2026-09-26.md) — 원래는 키워드마다
+    `article_index.find_by_keyword`(`title_norm LIKE '%kw%'`, 인덱스를 못 쓰는
+    선행 와일드카드라 매번 표 전체를 스캔)를 그대로 불렀다. 큐 갱신 한 번(브랜드당
+    수천~19,068개 키워드)이 사실상 "표 전체 스캔 × 키워드 수"가 되어 갱신 시간의
+    88%(391초 중 345초)를 차지했다 — 작업자 CPU가 몇 분씩 100%에 묶이고 워치독이
+    "작업자 멈춤"으로 오판하는 원인. `rows_cache`(브랜드 한 번 갱신 동안 카페별로
+    `rows_for_cafe`를 딱 한 번만 불러 채운 캐시)를 주면 SQL 대신 이미 받아 둔
+    행 목록에서 같은 판정(`title_norm`에 부분 일치, `synced_at` 내림차순, 1건)을
+    메모리에서 한다 — 결과는 원래 SQL과 동일, 호출 쪽(캐시 없이 쓰는 다른 코드)은
+    그대로 SQL 경로를 쓴다."""
     if article_index is None:
         return None
+    if rows_cache is not None:
+        try:
+            rows = _find_by_keyword_cached(article_index, rows_cache, keyword, cafe)
+        except Exception as exc:  # pragma: no cover - 방어용
+            log.warning("article_index 키워드 조회 실패(%s): %s", keyword, exc)
+            return None
+        return rows[0] if rows else None
     try:
         rows = article_index.find_by_keyword(keyword, cafe=cafe)
     except AttributeError:
@@ -139,6 +161,30 @@ def _resolve_our_article(article_index: Any, keyword: str, cafe: str) -> dict | 
         log.warning("article_index 키워드 조회 실패(%s): %s", keyword, exc)
         return None
     return rows[0] if rows else None
+
+
+#: cafe(""=전체) -> synced_at 내림차순 정렬된 행 목록. `_resolve_our_article`이
+#: 브랜드 한 번 갱신 동안 쓰는 프로세스-로컬 캐시(전역 아님, 호출자가 dict를
+#: 만들어 넘긴다) — `find_by_keyword`와 결과가 같도록 정렬·필터를 그대로 흉내낸다.
+def _find_by_keyword_cached(
+    article_index: Any, rows_cache: "dict[str, list[dict]]", keyword: str, cafe: str
+) -> list[dict]:
+    from v2r.store.article_index import normalize_title
+
+    kw = normalize_title(keyword)
+    if not kw:
+        return []
+    cache_key = cafe or ""
+    rows = rows_cache.get(cache_key)
+    if rows is None:
+        if cafe:
+            rows = article_index.rows_for_cafe(cafe)
+        else:
+            rows = article_index.all_rows() if hasattr(article_index, "all_rows") else []
+        rows = sorted(rows, key=lambda r: str(r.get("synced_at") or ""), reverse=True)
+        rows_cache[cache_key] = rows
+    out = [r for r in rows if kw in str(r.get("title_norm") or "")]
+    return out[:5]
 
 
 def _article_id(url: str) -> str:
@@ -245,6 +291,26 @@ def target_keywords(
     out: list[dict] = []
     seen: set[str] = set()
     sheet_cafes: set[str] = set()
+    # 2026-09-26 CPU 실측 — 아래 루프에서 카페마다 매 키워드 `find_by_keyword`
+    # SQL을 새로 날리는 대신, 등장하는 카페의 색인을 미리 한 번씩만 읽어
+    # `_resolve_our_article`에 캐시로 넘긴다(자세한 이유는 그 함수 주석).
+    pre_cafes = {c for c in (_pick(row, _CAFE_HEADERS) for row in rows) if c}
+    rows_cache: "dict[str, list[dict]] | None" = {}
+    if article_index is not None and pre_cafes:
+        for c in pre_cafes:
+            try:
+                rows_cache[c] = sorted(
+                    article_index.rows_for_cafe(c),
+                    key=lambda r: str(r.get("synced_at") or ""),
+                    reverse=True,
+                )
+            except AttributeError:
+                # 낡은/가짜 article_index(rows_for_cafe 없음) — 캐시 없이 예전
+                # 경로(`find_by_keyword` 직접 호출, 자체 AttributeError 처리)로.
+                rows_cache = None
+                break
+            except Exception as exc:  # pragma: no cover - 방어용
+                log.warning("article_index 카페 조회 실패(%s): %s", c, exc)
     for row in rows:
         keyword = _pick(row, _KEYWORD_HEADERS)
         if not keyword:
@@ -263,7 +329,7 @@ def target_keywords(
             article_url = ""
         candidate_title_norm = ""
         if not article_url:
-            found = _resolve_our_article(article_index, keyword, cafe)
+            found = _resolve_our_article(article_index, keyword, cafe, rows_cache=rows_cache)
             if found:
                 built = _naver_article_url(found.get("cafe_id"), found.get("article_id"))
                 if built:
@@ -286,13 +352,17 @@ def target_keywords(
     # 글 제목 맨 앞 키워드를 뽑아 시트에 없는 키워드만 더한다.
     if article_index is not None and sheet_cafes:
         for cafe in sorted(sheet_cafes):
-            try:
-                rows_idx = article_index.rows_for_cafe(cafe)
-            except AttributeError:
-                rows_idx = []
-            except Exception as exc:  # pragma: no cover - 방어용
-                log.warning("article_index 카페 조회 실패(%s): %s", cafe, exc)
-                rows_idx = []
+            if rows_cache is not None and cafe in rows_cache:
+                # 위에서 이미 받아 둔 카페 색인 재사용(같은 카페를 두 번 안 읽음).
+                rows_idx = rows_cache[cafe]
+            else:
+                try:
+                    rows_idx = article_index.rows_for_cafe(cafe)
+                except AttributeError:
+                    rows_idx = []
+                except Exception as exc:  # pragma: no cover - 방어용
+                    log.warning("article_index 카페 조회 실패(%s): %s", cafe, exc)
+                    rows_idx = []
             for item in rows_idx or []:
                 keyword = _title_lead_keyword(item.get("title") or "")
                 if not keyword:

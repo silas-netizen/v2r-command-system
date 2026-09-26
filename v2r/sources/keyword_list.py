@@ -28,8 +28,15 @@ _KEYWORD_HEADERS = ("키워드",)
 _CAFE_HEADERS = ("카페", "카페명")
 
 
+#: 2026-09-26 CPU 실측 — 헤더 정규화(`_norm`)가 브랜드 하나 갱신에 450만 번
+#: 넘게 불려(`_pick`·`_is_password_header`가 행마다 매 열을 정규화) `re.sub`
+#: 모듈 함수 호출마다 내부 캐시 조회 오버헤드가 쌓였다. 패턴을 모듈 로드 시
+#: 한 번만 컴파일해 두면 그 조회를 건너뛴다 — 판정 결과는 동일.
+_RE_WS = re.compile(r"\s+")
+
+
 def _norm(value: Any) -> str:
-    return re.sub(r"\s+", "", str(value or "")).casefold()
+    return _RE_WS.sub("", str(value or "")).casefold()
 
 
 def _is_password_header(name: Any) -> bool:

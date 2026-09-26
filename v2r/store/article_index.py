@@ -146,6 +146,12 @@ class ArticleIndexStore:
             row = self.conn.execute("SELECT COUNT(*) AS n FROM article_index").fetchone()
         return int(row["n"])
 
+    def all_rows(self) -> list[dict]:
+        """색인 전체(카페 무관) — `find_by_keyword(cafe="")`와 같은 전체 스캔을
+        메모리 캐시에서 대신하려는 호출자용(`keyword_exposure._find_by_keyword_cached`)."""
+        rows = self.conn.execute("SELECT * FROM article_index").fetchall()
+        return [dict(r) for r in rows]
+
     def rows_for_cafe(self, cafe: str) -> list[dict]:
         """그 카페 색인 전체(카페 이름 기준)."""
         rows = self.conn.execute(
