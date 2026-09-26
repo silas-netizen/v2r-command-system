@@ -15,7 +15,7 @@ set WORKERS=6
 rem 상태 파일이 180초 안에 갱신됐으면(작업자가 살아서 처리 중이면) 살아있다고
 rem 본다 — exposure_runner.is_alive()를 그대로 재사용(복잡한 인라인 PowerShell
 rem 따옴표 중첩 대신, 이미 시험된 코드 재사용).
-".venv\Scripts\python.exe" -c "from v2r.knowledge.exposure_runner import is_alive; import sys; sys.exit(0 if is_alive('.', stale_seconds=180) else 1)"
+".venv\Scripts\python.exe" -c "from v2r.knowledge.exposure_runner import is_alive; import sys; sys.exit(0 if is_alive('.', stale_seconds=420) else 1)"
 if %ERRORLEVEL% EQU 0 (
     echo [%date% %time%] watchdog: 러너 작업자 실행 중, 조치 없음 >> "logs\exposure-runner-watchdog.log"
 ) else (

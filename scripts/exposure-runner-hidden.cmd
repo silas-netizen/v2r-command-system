@@ -11,8 +11,12 @@ set PLAYWRIGHT_BROWSERS_PATH=%~dp0..\.pw-browsers
 if not exist "logs" mkdir "logs"
 
 set WORKERS=%1
-if "%WORKERS%"=="" set WORKERS=2
+if "%WORKERS%"=="" set WORKERS=6
 
+rem 2026-09-26: 재기동 때 이전 작업자를 먼저 끝낸다. 감시가 "작업자 없음"으로 판단해 다시 띄울 때
+rem 실제로는 멈춰 있던 작업자가 살아 있어 12개(같은 번호 2개씩)가 되고, CPU 99%%로 전원이 더 멈추는 악순환이 실측됐다.
+powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \"name='python.exe'\" | Where-Object { $_.CommandLine -like '*exposure_runner*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }" > nul 2>&1
+timeout /t 3 /nobreak > nul
 echo [%date% %time%] exposure-runner start (workers=%WORKERS%) >> "logs\exposure-runner.log"
 
 for /L %%N in (0,1,%WORKERS%) do (
