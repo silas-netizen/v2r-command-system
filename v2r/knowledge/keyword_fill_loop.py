@@ -43,6 +43,12 @@ DEFAULT_CAP = 200_000
 LOW_ADOPTION_STREAK_LIMIT = 3
 #: 채택률 문턱(이 미만이면 그 회차는 "낮음"으로 센다)
 LOW_ADOPTION_THRESHOLD = 0.05
+#: 채점 적체(미채점 행 수)가 이 값 이상이면 이번 회차 수집을 건너뛴다(2026-09-26 사용자
+#: 지시 — 흐름 제어. 채점 워커가 따라잡을 때까지 기다린다).
+DEFAULT_SCORE_BACKLOG_PAUSE = 5000
+#: 2단계 확장(확정 키워드 -> 연관 -> 그 연관의 연관) 한도 — 상위 검색량만(2026-09-26).
+DEFAULT_EXPAND_DEPTH2_TOP_N = 10
+DEFAULT_EXPAND_DEPTH2_CAP = 60
 
 PROGRESS_FILENAME = "fill_progress.json"
 #: 순환 정지 파일 — 이 파일이 있으면(`data/keywords/fill_STOP`) 모든 브랜드 워커가
@@ -279,6 +285,16 @@ def is_eligible_row(row: Any) -> bool:
 
 def eligible_count(conn: sqlite3.Connection) -> int:
     return int(conn.execute(f"SELECT COUNT(*) FROM keywords WHERE {eligible_sql()}").fetchone()[0])
+
+
+def score_backlog_count(conn: sqlite3.Connection) -> int:
+    """아직 클로드·Codex 채점이 안 끝난(적체) 행 수(흐름 제어용, 2026-09-26)."""
+    return int(
+        conn.execute(
+            "SELECT COUNT(*) FROM keywords WHERE scored_at = '' OR scored_at IS NULL"
+            " OR relevance_llm IS NULL OR relevance_codex IS NULL"
+        ).fetchone()[0]
+    )
 
 
 def top_eligible_keywords(conn: sqlite3.Connection, limit: int = DEFAULT_EXPAND_TOP_N) -> list[str]:
@@ -543,7 +559,8 @@ def gather_seeds(
             picked.append((t, source))
 
     _add(select_seed_keywords(conn, seed_limit), SOURCE_ELIGIBLE, allow_in_db=True)
-    _add(guide_seed_terms(brand, guides_dir, router, guide_seed_n), SOURCE_GUIDE)
+    guide_cap = weighted_cap(guide_seed_n, SOURCE_GUIDE, adoption_weights)
+    _add(guide_seed_terms(brand, guides_dir, router, guide_cap), SOURCE_GUIDE)
     top = top_eligible_keywords(conn, expand_top_n)
 
     comp_cap = weighted_cap(competitor_seed_n, SOURCE_COMPETITOR, adoption_weights)
@@ -551,15 +568,28 @@ def gather_seeds(
 
     ac_cap = weighted_cap(expand_cap, SOURCE_AUTOCOMPLETE, adoption_weights)
     re_cap = weighted_cap(expand_cap, SOURCE_RELATED, adoption_weights)
+    ac_extra: list[str] = []
+    re_extra: list[str] = []
     if autocomplete_fn is not None:
         # 상위 검색량 고정이 아니라 원고 대상 전체를 회차마다 다른 구간으로 순환(사용자 지시).
         ac_base = rotate_eligible_keywords(conn, SOURCE_AUTOCOMPLETE, expand_top_n) or top
         if ac_base:
-            _add(expand_seed_terms(ac_base, autocomplete_fn, ac_cap), SOURCE_AUTOCOMPLETE)
+            ac_extra = expand_seed_terms(ac_base, autocomplete_fn, ac_cap)
+            _add(ac_extra, SOURCE_AUTOCOMPLETE)
     if related_fn is not None:
         re_base = rotate_eligible_keywords(conn, SOURCE_RELATED, expand_top_n) or top
         if re_base:
-            _add(expand_seed_terms(re_base, related_fn, re_cap), SOURCE_RELATED)
+            re_extra = expand_seed_terms(re_base, related_fn, re_cap)
+            _add(re_extra, SOURCE_RELATED)
+
+    # 2단계 확장(확정 키워드 -> 연관 -> 그 연관의 연관, 상위 검색량만) — 2026-09-26 지시.
+    depth2_top_n = DEFAULT_EXPAND_DEPTH2_TOP_N
+    depth2_cap = weighted_cap(DEFAULT_EXPAND_DEPTH2_CAP, SOURCE_RELATED, adoption_weights)
+    depth2_base = (ac_extra + re_extra)[:depth2_top_n]
+    if depth2_base and related_fn is not None:
+        _add(expand_seed_terms(depth2_base, related_fn, depth2_cap), SOURCE_RELATED)
+    if depth2_base and autocomplete_fn is not None:
+        _add(expand_seed_terms(depth2_base, autocomplete_fn, depth2_cap), SOURCE_AUTOCOMPLETE)
 
     der_cap = weighted_cap(derived_cap, SOURCE_DERIVED, adoption_weights)
     _add(derived_seed_terms(brand, guides_dir, router, top, der_cap), SOURCE_DERIVED)
@@ -677,6 +707,15 @@ def run_cycle(
                 "adoption_rate": 0.0, "seed_exhausted": False, "by_source": {},
             }
 
+        backlog = score_backlog_count(conn)
+        if backlog >= DEFAULT_SCORE_BACKLOG_PAUSE:
+            log.info("%s: 채점 적체 %d건 — 이번 회차 수집을 건너뜁니다(흐름 제어)", brand, backlog)
+            return {
+                "brand": brand, "capped": False, "paused_backlog": backlog, "total": total_before,
+                "eligible": eligible_count(conn), "new_collected": 0, "adopted": 0,
+                "adoption_rate": 0.0, "seed_exhausted": False, "by_source": {},
+            }
+
         eligible_before = eligible_count(conn)
         seeds = gather_seeds(
             conn, brand, guides_dir, router, autocomplete_fn, related_fn,
@@ -693,6 +732,7 @@ def run_cycle(
 
         round_start = _store_now()
         new_saved = 0
+        rejected_norms = rejected_keyword_norms(conn)
         # 같은 출처끼리 5개씩 묶어 조회(출처별 채택률을 정확히 나누기 위해)
         by_type: dict[str, list[str]] = {}
         for s, t in seeds:
@@ -715,6 +755,8 @@ def run_cycle(
                     is_dict = isinstance(kr_row, dict)
                     kw = kr_row.get("keyword") if is_dict else getattr(kr_row, "keyword", None)
                     if not kw:
+                        continue
+                    if normalize_keyword(str(kw)) in rejected_norms:
                         continue
                     pc = int((kr_row.get("pc") if is_dict else getattr(kr_row, "pc", 0)) or 0)
                     mobile = int((kr_row.get("mobile") if is_dict else getattr(kr_row, "mobile", 0)) or 0)
@@ -1041,4 +1083,8 @@ __all__ = [
     "purge_confirmed_irrelevant",
     "rotate_eligible_keywords",
     "weighted_cap",
+    "score_backlog_count",
+    "DEFAULT_SCORE_BACKLOG_PAUSE",
+    "DEFAULT_EXPAND_DEPTH2_TOP_N",
+    "DEFAULT_EXPAND_DEPTH2_CAP",
 ]
