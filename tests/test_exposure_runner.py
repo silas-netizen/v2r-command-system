@@ -1153,3 +1153,140 @@ def test_worker_queue_take_배치_처리직전_선점갱신(tmp_path, monkeypatc
     item = wq.take(rt, "테스트브랜드", worker_id=7)
     assert item is not None
     assert calls["args"] == ("테스트브랜드", "키워드", "7")
+
+
+# =======================================================================
+# 2026-09-27 안정화(exposure-runner-resilience) — 잠금 예외를 만나도 작업자
+# 프로세스가 죽지 않고 재시도하는지, sqlite 쓰기 헬퍼가 잠금을 흡수하는지.
+# =======================================================================
+
+def test_looks_like_browser_dead_판별():
+    assert exposure_runner._looks_like_browser_dead(
+        Exception("Target page, context or browser has been closed")
+    )
+    assert exposure_runner._looks_like_browser_dead(Exception("Connection disconnected"))
+    assert not exposure_runner._looks_like_browser_dead(
+        __import__("sqlite3").OperationalError("database is locked")
+    )
+
+
+def test_stop_requested_STOP파일_있으면_True(tmp_path):
+    (tmp_path / "data").mkdir(parents=True, exist_ok=True)
+    assert exposure_runner.stop_requested(tmp_path) is False
+    (tmp_path / "data" / "STOP").write_text("stop", encoding="utf-8")
+    assert exposure_runner.stop_requested(tmp_path) is True
+
+
+def test_with_sqlite_retry_잠금_두번_실패후_성공하면_값을_돌려준다(monkeypatch):
+    import sqlite3
+
+    calls = {"n": 0}
+
+    def flaky():
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise sqlite3.OperationalError("database is locked")
+        return "ok"
+
+    monkeypatch.setattr(time, "sleep", lambda _s: None)
+    result = store.with_sqlite_retry(flaky, retries=5, base_delay=0.01)
+    assert result == "ok"
+    assert calls["n"] == 3
+
+
+def test_with_sqlite_retry_잠금이_아니면_바로_올린다():
+    import sqlite3
+
+    def boom():
+        raise sqlite3.OperationalError("no such table: foo")
+
+    try:
+        store.with_sqlite_retry(boom, retries=5, base_delay=0.01)
+        assert False, "잠금이 아닌 OperationalError는 재시도 없이 올라와야 한다"
+    except sqlite3.OperationalError as exc:
+        assert "no such table" in str(exc)
+
+
+def test_with_sqlite_retry_계속_잠기면_결국_예외를_올린다(monkeypatch):
+    import sqlite3
+
+    monkeypatch.setattr(time, "sleep", lambda _s: None)
+
+    def always_locked():
+        raise sqlite3.OperationalError("database is locked")
+
+    try:
+        store.with_sqlite_retry(always_locked, retries=3, base_delay=0.01)
+        assert False, "재시도를 다 써도 계속 잠겨 있으면 예외가 올라와야 한다"
+    except sqlite3.OperationalError:
+        pass
+
+
+def test_run_worker_처리중_sqlite_잠금이면_죽지않고_재시도후_계속(tmp_path, monkeypatch):
+    """`process_one`이 첫 호출에서 `sqlite3.OperationalError("database is
+    locked")`를 던져도 `_run_worker_session`이 예외를 삼키고(선점만 풀고)
+    30초(테스트에선 monkeypatch로 0초) 뒤 다음 반복에서 계속 처리하는지
+    확인한다 — 09-26 12:32 사고(재기동한 작업자 6개가 이 예외로 전부 죽어
+    약 23시간 노출 확인이 0건)의 재발 방지."""
+    import sqlite3
+
+    rt = make_runtime(tmp_path)
+    brand = "브랜드"
+    item = {"keyword": "키워드", "cafe": "마이카페", "volume": 0}
+
+    monkeypatch.setattr(
+        exposure_priority, "next_priority_batch",
+        lambda rt_, brand_, n, worker_id="0", now=None: [dict(item)],
+    )
+    monkeypatch.setattr(exposure_runner, "WORKER_RETRY_SLEEP_SEC", 0.0)
+    monkeypatch.setattr(time, "sleep", lambda _s: None)
+
+    calls = {"n": 0}
+    results = []
+
+    def fake_process_one(rt_, context, brand_, item_, cfg, executor=None, run_started_at=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return {"status": "exposed", "keyword": item_["keyword"], "rank": 1,
+                "duplicate": False, "min_gap_violation": False}
+
+    monkeypatch.setattr(exposure_runner, "process_one", fake_process_one)
+
+    class _FakeContext:
+        def close(self):
+            pass
+
+    class _FakeBrowser:
+        def new_context(self, **kwargs):
+            return _FakeContext()
+
+        def close(self):
+            pass
+
+    class _FakePW:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def fake_sync_playwright():
+        return _FakePW()
+
+    def fake_launch_chromium(pw, headless=True):
+        return _FakeBrowser()
+
+    unknown_streak, brand_idx, iterations = exposure_runner._run_worker_session(
+        worker_id=0, rt=rt, cfg={}, brand_list=[brand],
+        delay_min=0.0, delay_max=0.0, block_streak_limit=999,
+        rest_minutes=0.0, expected_workers=1, global_rest_minutes=0.0,
+        storage_state=None, run_started_at=datetime.now(timezone.utc),
+        worker_queue=exposure_runner.WorkerQueue(batch_size=1, ttl_sec=120.0),
+        max_iterations=2, unknown_streak=0, brand_idx=0, iterations=0,
+        sync_playwright=fake_sync_playwright, launch_chromium=fake_launch_chromium,
+    )
+
+    # 1번째 반복은 잠금으로 실패해 재시도(선점 해제)했고, 2번째 반복에서
+    # 같은 키워드를 다시 선점해 성공적으로 처리했어야 한다.
+    assert calls["n"] == 2

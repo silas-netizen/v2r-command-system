@@ -27,6 +27,10 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
+#: 2026-09-27 DB 분리 — 이 표(`exposure_queue`)도 `keyword_exposure_store.exposure_db`
+#: 하나로 접근 경로를 모은다(같은 파일에 같이 있으므로 커넥션은 공유).
+from v2r.store.keyword_exposure_store import exposure_db, with_sqlite_retry  # noqa: E402
+
 #: 2026-09-26 계측(동시 정지 원인 조사) — `BEGIN IMMEDIATE`가 락 대기로
 #: 이 값(초)보다 오래 걸리면 "락대기" 로그를 남긴다. 정상이면 수 ms 안에
 #: 끝나므로, 임계값을 넘는 건만 남겨 로그량을 줄인다.
@@ -52,6 +56,23 @@ UPSERT_CHUNK_SIZE = 500
 
 
 def upsert_candidates(
+    conn: sqlite3.Connection,
+    brand: str,
+    candidates: list[tuple[int, float, str, str, dict]],
+    now_epoch: float | None = None,
+    claim_ttl_sec: float = CLAIM_TTL_SECONDS,
+    chunk_size: int = UPSERT_CHUNK_SIZE,
+) -> None:
+    """`_upsert_candidates_impl`을 잠금 재시도로 감싼 공개 진입점(2026-09-27).
+    청크마다 독립 트랜잭션이라 잠금으로 실패한 청크부터 재시도해도 안전
+    (`ON CONFLICT DO UPDATE`라 같은 청크를 다시 넣어도 결과가 같다)."""
+    with_sqlite_retry(
+        _upsert_candidates_impl, conn, brand, candidates,
+        now_epoch=now_epoch, claim_ttl_sec=claim_ttl_sec, chunk_size=chunk_size,
+    )
+
+
+def _upsert_candidates_impl(
     conn: sqlite3.Connection,
     brand: str,
     candidates: list[tuple[int, float, str, str, dict]],
@@ -162,6 +183,21 @@ def claim_batch(
     now_epoch: float | None = None,
     claim_ttl_sec: float = CLAIM_TTL_SECONDS,
 ) -> list[dict]:
+    """잠금 재시도로 감싼 공개 진입점(2026-09-27) — 실패 시 이미 `ROLLBACK`
+    했으므로 통째로 재시도해도 안전."""
+    return with_sqlite_retry(
+        _claim_batch_impl, conn, brand, worker_id, n, now_epoch=now_epoch, claim_ttl_sec=claim_ttl_sec
+    )
+
+
+def _claim_batch_impl(
+    conn: sqlite3.Connection,
+    brand: str,
+    worker_id: str,
+    n: int,
+    now_epoch: float | None = None,
+    claim_ttl_sec: float = CLAIM_TTL_SECONDS,
+) -> list[dict]:
     """`n`개를 등급·정렬 순으로 원자적으로 선점해 item 딕셔너리 목록을 돌려준다.
 
     한 트랜잭션(`BEGIN IMMEDIATE`) 안에서 대상 rowid를 고르고 그 자리에서
@@ -233,6 +269,23 @@ def claim_specific(
     now_epoch: float | None = None,
     claim_ttl_sec: float = CLAIM_TTL_SECONDS,
 ) -> bool:
+    """`_claim_specific_impl`을 잠금 재시도로 감싼 공개 진입점(2026-09-27)."""
+    return with_sqlite_retry(
+        _claim_specific_impl, conn, brand, keyword_norm, keyword, item, worker_id,
+        now_epoch=now_epoch, claim_ttl_sec=claim_ttl_sec,
+    )
+
+
+def _claim_specific_impl(
+    conn: sqlite3.Connection,
+    brand: str,
+    keyword_norm: str,
+    keyword: str,
+    item: dict,
+    worker_id: str,
+    now_epoch: float | None = None,
+    claim_ttl_sec: float = CLAIM_TTL_SECONDS,
+) -> bool:
     """특정 키워드 하나를 선점한다(없으면 최우선 등급으로 새로 넣고 선점) —
     2단계 확인 대기(`due_pending`) 재확인처럼 "지금 이 키워드를 반드시
     검사해야" 할 때 쓴다. 다른 작업자가 이미(만료 전) 선점 중이면 `False`."""
@@ -269,9 +322,10 @@ def claim_specific(
 
 def mark_done(conn: sqlite3.Connection, brand: str, keyword_norm: str, now_epoch: float | None = None) -> None:
     """검사를 정상적으로 마쳤을 때 부른다 — 다음 갱신 때까지(또는 다시 등급에
-    들 때까지) 이 키워드가 배치에서 빠진다."""
+    들 때까지) 이 키워드가 배치에서 빠진다. 잠금 시 재시도."""
     now_epoch = now_epoch if now_epoch is not None else time.time()
-    conn.execute(
+    with_sqlite_retry(
+        conn.execute,
         "UPDATE exposure_queue SET done_at = ? WHERE brand = ? AND keyword_norm = ?",
         (now_epoch, brand, keyword_norm),
     )
@@ -279,8 +333,9 @@ def mark_done(conn: sqlite3.Connection, brand: str, keyword_norm: str, now_epoch
 
 def release_claim(conn: sqlite3.Connection, brand: str, keyword_norm: str) -> None:
     """검사가 실패(예외)했을 때 선점을 풀어 다른 작업자가 바로 다시 집을 수
-    있게 한다."""
-    conn.execute(
+    있게 한다. 잠금 시 재시도."""
+    with_sqlite_retry(
+        conn.execute,
         "UPDATE exposure_queue SET claimed_by = NULL, claimed_at = NULL "
         "WHERE brand = ? AND keyword_norm = ? AND done_at IS NULL",
         (brand, keyword_norm),

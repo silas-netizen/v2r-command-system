@@ -28,6 +28,7 @@ import json
 import logging
 import os
 import random
+import sqlite3
 import sys
 import threading
 import time
@@ -38,6 +39,24 @@ from typing import Any
 log = logging.getLogger(__name__)
 
 STATE_FILE = "exposure_runner_state.json"
+
+#: 2026-09-27 안정화(exposure-runner-resilience) — 이 파일이 있으면 작업자가
+#: 다음 재시도 전에 멈춘다. 그 밖의 모든 예외(락 포함)는 죽지 않고
+#: `WORKER_RETRY_SLEEP_SEC` 뒤 재시도한다(09-26 12:32 사고 — 재기동한 작업자
+#: 6개가 `sqlite3.OperationalError: database is locked`로 얼마 뒤 전부 죽어
+#: 약 23시간 노출 확인이 0건이었다, docs/reports/exposure-runner-resilience-2026-09-27.md).
+STOP_FILE = "STOP"
+
+#: 잠금/그 밖의 예외를 만난 뒤 재시도까지 쉬는 시간(초).
+WORKER_RETRY_SLEEP_SEC = 30.0
+
+#: 상태 파일(작업자 생존의 유일한 판정 근거)을 갱신하는 심장박동 주기(초).
+STATE_HEARTBEAT_SEC = 60.0
+
+
+def stop_requested(repo_root: str | Path) -> bool:
+    """`data/STOP` 파일이 있으면 참 — 작업자가 재시도를 멈추고 정상 종료한다."""
+    return (Path(repo_root) / "data" / STOP_FILE).exists()
 
 
 # =======================================================================
@@ -223,6 +242,33 @@ def update_worker_state(
     state["updated_at"] = now_iso_utc()
     _write_state(repo_root, state)
     return w
+
+
+def _state_heartbeat_loop(repo_root: str | Path, worker_id: int, stop_event: threading.Event) -> None:
+    """2026-09-27 — 상태 파일 갱신(`updated_at`)이 `is_alive`의 유일한 근거인데,
+    잠금 재시도·긴 검사 중에는 메인 루프가 `update_worker_state`를 오래 안
+    부를 수 있다(예: 재시도 대기 30초 x 여러 번). 별도 스레드에서
+    `STATE_HEARTBEAT_SEC`마다 델타 없이(처리 건수·상태는 안 바꾸고) 다시
+    써 `updated_at`만 계속 최신으로 유지한다."""
+    while not stop_event.wait(STATE_HEARTBEAT_SEC):
+        try:
+            update_worker_state(repo_root, worker_id, processed_delta=0)
+        except Exception:  # pragma: no cover - 방어용(심장박동은 죽으면 안 됨)
+            log.warning("작업자 %s: 상태 심장박동 갱신 실패", worker_id, exc_info=True)
+
+
+def start_state_heartbeat(repo_root: str | Path, worker_id: int) -> tuple[threading.Thread, threading.Event]:
+    """`_state_heartbeat_loop`를 데몬 스레드로 시작한다. 돌려준 `Event`를
+    `.set()`하면 스레드가 다음 주기 안에 멈춘다."""
+    stop_event = threading.Event()
+    thread = threading.Thread(
+        target=_state_heartbeat_loop,
+        args=(repo_root, worker_id, stop_event),
+        daemon=True,
+        name=f"exposure-state-heartbeat-{worker_id}",
+    )
+    thread.start()
+    return thread, stop_event
 
 
 def maybe_set_global_pause(
@@ -447,7 +493,7 @@ def _finalize_row(rt: Any, brand: str, item: dict, row: Any) -> None:
     from v2r.knowledge.keyword_exposure import _enqueue_sheet_row
     from v2r.store import keyword_exposure_store as store
 
-    store.save(rt.conn, row.as_row())
+    store.save(store.exposure_db(rt), row.as_row())
     # 2026-09-24 2차 — last_checked(DB)도 이제 TTL(기본 20초) 캐시한다. 저장
     # 직후 `mark_checked`로 이 키워드만 즉시 갱신해, 캐시가 아직 안 지났어도
     # 같은 키워드가 연속으로 다시 뽑히지 않게 한다(단위 시험
@@ -553,7 +599,7 @@ def process_one(
     from v2r.store import keyword_exposure_store as store
 
     keyword = item["keyword"]
-    prev_row = store.latest_for_keyword(rt.conn, brand, keyword)
+    prev_row = store.latest_for_keyword(store.exposure_db(rt), brand, keyword)
     prev_status = str(prev_row["status"]) if prev_row is not None else ""
     pending = get_pending(rt.settings.repo_root, brand, keyword)
     exempt = pending is not None
@@ -778,9 +824,9 @@ class WorkerQueue:
         while state.items:
             candidate = state.items.pop(0)
             keyword_norm = _norm(candidate.get("keyword", ""))
-            qstore.renew_claim(rt.conn, brand, keyword_norm, str(worker_id))
+            qstore.renew_claim(qstore.exposure_db(rt), brand, keyword_norm, str(worker_id))
             if not exposure_priority.is_due_now(rt, brand, candidate):
-                qstore.release_claim(rt.conn, brand, keyword_norm)
+                qstore.release_claim(qstore.exposure_db(rt), brand, keyword_norm)
                 state.stale_skipped += 1
                 continue
             state.consumed += 1
@@ -788,8 +834,28 @@ class WorkerQueue:
         return None
 
 
+#: 2026-09-27 — 이 문구가 예외 메시지에 있으면 브라우저/컨텍스트 자체가
+#: 죽은 것으로 보고(같은 세션에서 재시도해 봐야 계속 실패) 브라우저를
+#: 통째로 재기동한다. 그 밖의 예외(sqlite 잠금 포함)는 같은 브라우저
+#: 세션에서 `WORKER_RETRY_SLEEP_SEC` 뒤 재시도한다.
+_BROWSER_DEAD_MARKERS = ("closed", "disconnected", "crashed", "has been closed", "target page")
+
+
+def _looks_like_browser_dead(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return any(marker in msg for marker in _BROWSER_DEAD_MARKERS)
+
+
 def run_worker(worker_id: int, brands: list[str] | None = None, max_iterations: int | None = None) -> None:
-    """작업자 1개 메인 루프 — 브라우저 1개 상주, 브랜드를 돌며 우선순위 큐에서 계속 뽑는다."""
+    """작업자 1개 메인 루프 — 브라우저 1개 상주, 브랜드를 돌며 우선순위 큐에서 계속 뽑는다.
+
+    2026-09-27 안정화 — 이전에는 키워드 처리 중 예외(대표적으로 sqlite
+    `database is locked`)가 나면 `raise`로 그대로 올려 `run_worker` 자체가
+    끝나 프로세스가 죽었다(09-26 12:32 사고, 상단 docstring 참고). 이제
+    `data/STOP` 파일이 없는 한 어떤 예외든 죽지 않고 재시도한다 — 브라우저
+    자체가 깨진 것으로 보이는 예외만 브라우저를 재기동하고, 그 밖(sqlite
+    잠금 등)은 같은 브라우저 세션에서 `WORKER_RETRY_SLEEP_SEC`(30초) 뒤
+    다시 시도한다."""
     from playwright.sync_api import sync_playwright
 
     from v2r.engine.context import Runtime
@@ -814,6 +880,7 @@ def run_worker(worker_id: int, brands: list[str] | None = None, max_iterations: 
     storage_state = str(cookies_path) if cookies_path.exists() else None
 
     update_worker_state(rt.settings.repo_root, worker_id, processed_delta=0)
+    heartbeat_thread, heartbeat_stop = start_state_heartbeat(rt.settings.repo_root, worker_id)
 
     # 2026-09-24 7차 — "이 러너 실행 안에서 중복"을 재기 위한 기준 시각.
     # 프로세스가 실제로 시작된 순간(재시작 시각)이며, 상태 파일에 남아 있을
@@ -830,6 +897,96 @@ def run_worker(worker_id: int, brands: list[str] | None = None, max_iterations: 
     unknown_streak = 0
     brand_idx = 0
     iterations = 0
+    try:
+        _run_worker_browser_loop(
+            worker_id=worker_id, rt=rt, cfg=cfg, brand_list=brand_list,
+            delay_min=delay_min, delay_max=delay_max, block_streak_limit=block_streak_limit,
+            rest_minutes=rest_minutes, expected_workers=expected_workers,
+            global_rest_minutes=global_rest_minutes, storage_state=storage_state,
+            run_started_at=run_started_at, worker_queue=worker_queue, max_iterations=max_iterations,
+        )
+    finally:
+        heartbeat_stop.set()
+        rt.close()
+
+
+def _run_worker_browser_loop(
+    *,
+    worker_id: int,
+    rt: Any,
+    cfg: dict,
+    brand_list: list[str],
+    delay_min: float,
+    delay_max: float,
+    block_streak_limit: int,
+    rest_minutes: float,
+    expected_workers: int,
+    global_rest_minutes: float,
+    storage_state: str | None,
+    run_started_at: datetime,
+    worker_queue: "WorkerQueue",
+    max_iterations: int | None,
+) -> None:
+    """브라우저 재기동을 감싸는 바깥 루프 — 브라우저가 깨진 것으로 보이는
+    예외를 만나면 여기서 새로 `sync_playwright()`를 열어 이어간다(정지
+    파일이 없는 한 계속)."""
+    from playwright.sync_api import sync_playwright
+
+    from v2r.knowledge.keyword_exposure import launch_chromium
+
+    unknown_streak = 0
+    brand_idx = 0
+    iterations = 0
+    while True:
+        if stop_requested(rt.settings.repo_root):
+            log.warning("작업자 %s: 정지 파일 감지, 종료", worker_id)
+            return
+        try:
+            unknown_streak, brand_idx, iterations = _run_worker_session(
+                worker_id=worker_id, rt=rt, cfg=cfg, brand_list=brand_list,
+                delay_min=delay_min, delay_max=delay_max, block_streak_limit=block_streak_limit,
+                rest_minutes=rest_minutes, expected_workers=expected_workers,
+                global_rest_minutes=global_rest_minutes, storage_state=storage_state,
+                run_started_at=run_started_at, worker_queue=worker_queue, max_iterations=max_iterations,
+                unknown_streak=unknown_streak, brand_idx=brand_idx, iterations=iterations,
+                sync_playwright=sync_playwright, launch_chromium=launch_chromium,
+            )
+            return  # max_iterations 다 돌았거나 정상 종료
+        except Exception as exc:
+            log.error("작업자 %s: 브라우저 세션 오류, 재기동: %s", worker_id, exc, exc_info=True)
+            if stop_requested(rt.settings.repo_root):
+                log.warning("작업자 %s: 정지 파일 감지, 종료", worker_id)
+                return
+            time.sleep(WORKER_RETRY_SLEEP_SEC)
+            continue
+
+
+def _run_worker_session(
+    *,
+    worker_id: int,
+    rt: Any,
+    cfg: dict,
+    brand_list: list[str],
+    delay_min: float,
+    delay_max: float,
+    block_streak_limit: int,
+    rest_minutes: float,
+    expected_workers: int,
+    global_rest_minutes: float,
+    storage_state: str | None,
+    run_started_at: datetime,
+    worker_queue: "WorkerQueue",
+    max_iterations: int | None,
+    unknown_streak: int,
+    brand_idx: int,
+    iterations: int,
+    sync_playwright: Any,
+    launch_chromium: Any,
+) -> tuple[int, int, int]:
+    """브라우저 1개가 살아있는 동안의 처리 루프 — 브라우저 자체가 깨진 것으로
+    보이는 예외는 그대로 올려(바깥 `_run_worker_browser_loop`가 재기동)
+    브라우저를 새로 연다. 그 밖의 예외(sqlite 잠금 등)는 여기서 잡아
+    같은 세션 안에서 재시도한다(`WORKER_RETRY_SLEEP_SEC`)."""
     # 후보 글 상세 확인(judge_keyword_exposure 내부)은 자기만의 sync_playwright()를
     # 새로 연다 — 이 스레드(메인, 상주 브라우저 보유)에서 그대로 부르면 중첩
     # 호출로 실패한다(judge_once 문서 참고). 전담 스레드 1개로 격리한다.
@@ -871,7 +1028,7 @@ def run_worker(worker_id: int, brands: list[str] | None = None, max_iterations: 
                 for entry in due:
                     e_brand, e_item = entry["brand"], entry["item"]
                     if qstore.claim_specific(
-                        rt.conn, e_brand, _norm_kw(e_item["keyword"]), e_item["keyword"], e_item, str(worker_id)
+                        qstore.exposure_db(rt), e_brand, _norm_kw(e_item["keyword"]), e_item["keyword"], e_item, str(worker_id)
                     ):
                         brand, item = e_brand, e_item
                         break
@@ -896,17 +1053,35 @@ def run_worker(worker_id: int, brands: list[str] | None = None, max_iterations: 
                     result = process_one(
                         rt, context, brand, item, cfg, executor=confirm_executor, run_started_at=run_started_at
                     )
-                except Exception:
+                except Exception as exc:
                     # 검사 자체가 실패(예외)했으면 선점을 완전히 풀어 다른
                     # 작업자가 바로 다시 집을 수 있게 한다 — "완료" 표시를
                     # 남기면 실제로 검사가 안 됐는데도 배제되어 버린다.
-                    qstore.release_claim(rt.conn, brand, _norm_kw(item["keyword"]))
-                    raise
+                    qstore.release_claim(qstore.exposure_db(rt), brand, _norm_kw(item["keyword"]))
+                    if _looks_like_browser_dead(exc):
+                        # 브라우저/컨텍스트 자체가 죽은 것으로 보인다 — 같은
+                        # 세션에서 재시도해 봐야 계속 실패하므로 바깥
+                        # `_run_worker_browser_loop`가 브라우저를 새로 열도록
+                        # 그대로 올린다.
+                        raise
+                    # 2026-09-27 안정화 — sqlite 잠금(`sqlite3.OperationalError`)을
+                    # 비롯한 그 밖의 예외는 죽지 않고 30초 뒤 재시도한다
+                    # (09-26 12:32 사고: 재기동한 작업자 6개가 이 예외로 전부
+                    # 죽어 약 23시간 노출 확인이 0건이었다).
+                    log.error(
+                        "작업자 %s: 처리 실패(%s), %.0f초 후 재시도: %s",
+                        worker_id, item.get("keyword", ""), WORKER_RETRY_SLEEP_SEC, exc, exc_info=True,
+                    )
+                    if stop_requested(rt.settings.repo_root):
+                        log.warning("작업자 %s: 정지 파일 감지, 종료", worker_id)
+                        break
+                    time.sleep(WORKER_RETRY_SLEEP_SEC)
+                    continue
                 # 2026-09-24 5차 — 정상 완료는 공유 큐 표에 `done_at`을 남긴다
                 # (`exposure_queue_store.mark_done`). 다음 갱신(기본 600초)
                 # 때까지, 또는 다시 등급에 들 때까지 이 키워드가 배치에서
                 # 빠진다.
-                qstore.mark_done(rt.conn, brand, _norm_kw(item["keyword"]))
+                qstore.mark_done(qstore.exposure_db(rt), brand, _norm_kw(item["keyword"]))
                 update_worker_state(
                     rt.settings.repo_root, worker_id, processed_delta=1, last_keyword=item["keyword"],
                     duplicate=bool(result.get("duplicate")),
@@ -930,8 +1105,8 @@ def run_worker(worker_id: int, brands: list[str] | None = None, max_iterations: 
         finally:
             context.close()
             browser.close()
-            rt.close()
     confirm_executor.shutdown(wait=True)
+    return unknown_streak, brand_idx, iterations
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -971,6 +1146,11 @@ __all__ = [
     "WorkerQueue",
     "run_worker",
     "main",
+    "stop_requested",
+    "STOP_FILE",
+    "WORKER_RETRY_SLEEP_SEC",
+    "STATE_HEARTBEAT_SEC",
+    "start_state_heartbeat",
 ]
 
 if __name__ == "__main__":
