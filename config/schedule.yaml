@@ -185,102 +185,102 @@ entries:
   - name: 일상 글 진도 점검-09
     time: "09:05"
     days: daily
-    enabled: true
+    enabled: false  # 실행기 재시작(처리기 반영) 후 true로
     command: 일상 글 진도 점검
     expect_task: publish_progress_check
   - name: 일상 글 진도 점검-10
     time: "10:05"
     days: daily
-    enabled: true
+    enabled: false  # 실행기 재시작(처리기 반영) 후 true로
     command: 일상 글 진도 점검
     expect_task: publish_progress_check
   - name: 일상 글 진도 점검-11
     time: "11:05"
     days: daily
-    enabled: true
+    enabled: false  # 실행기 재시작(처리기 반영) 후 true로
     command: 일상 글 진도 점검
     expect_task: publish_progress_check
   - name: 일상 글 진도 점검-12
     time: "12:05"
     days: daily
-    enabled: true
+    enabled: false  # 실행기 재시작(처리기 반영) 후 true로
     command: 일상 글 진도 점검
     expect_task: publish_progress_check
   - name: 일상 글 진도 점검-13
     time: "13:05"
     days: daily
-    enabled: true
+    enabled: false  # 실행기 재시작(처리기 반영) 후 true로
     command: 일상 글 진도 점검
     expect_task: publish_progress_check
   - name: 일상 글 진도 점검-14
     time: "14:05"
     days: daily
-    enabled: true
+    enabled: false  # 실행기 재시작(처리기 반영) 후 true로
     command: 일상 글 진도 점검
     expect_task: publish_progress_check
   - name: 일상 글 진도 점검-15
     time: "15:05"
     days: daily
-    enabled: true
+    enabled: false  # 실행기 재시작(처리기 반영) 후 true로
     command: 일상 글 진도 점검
     expect_task: publish_progress_check
   - name: 일상 글 진도 점검-16
     time: "16:05"
     days: daily
-    enabled: true
+    enabled: false  # 실행기 재시작(처리기 반영) 후 true로
     command: 일상 글 진도 점검
     expect_task: publish_progress_check
   - name: 일상 글 진도 점검-17
     time: "17:05"
     days: daily
-    enabled: true
+    enabled: false  # 실행기 재시작(처리기 반영) 후 true로
     command: 일상 글 진도 점검
     expect_task: publish_progress_check
   - name: 일상 글 진도 점검-18
     time: "18:05"
     days: daily
-    enabled: true
+    enabled: false  # 실행기 재시작(처리기 반영) 후 true로
     command: 일상 글 진도 점검
     expect_task: publish_progress_check
   - name: 일상 글 진도 점검-19
     time: "19:05"
     days: daily
-    enabled: true
+    enabled: false  # 실행기 재시작(처리기 반영) 후 true로
     command: 일상 글 진도 점검
     expect_task: publish_progress_check
   - name: 일상 글 진도 점검-20
     time: "20:05"
     days: daily
-    enabled: true
+    enabled: false  # 실행기 재시작(처리기 반영) 후 true로
     command: 일상 글 진도 점검
     expect_task: publish_progress_check
   - name: 일상 글 진도 점검-21
     time: "21:05"
     days: daily
-    enabled: true
+    enabled: false  # 실행기 재시작(처리기 반영) 후 true로
     command: 일상 글 진도 점검
     expect_task: publish_progress_check
   - name: 일상 글 진도 점검-22
     time: "22:05"
     days: daily
-    enabled: true
+    enabled: false  # 실행기 재시작(처리기 반영) 후 true로
     command: 일상 글 진도 점검
     expect_task: publish_progress_check
   - name: 일상 글 진도 점검-23
     time: "23:05"
     days: daily
-    enabled: true
+    enabled: false  # 실행기 재시작(처리기 반영) 후 true로
     command: 일상 글 진도 점검
     expect_task: publish_progress_check
   - name: 일상 글 진도 점검-00
     time: "00:05"
     days: daily
-    enabled: true
+    enabled: false  # 실행기 재시작(처리기 반영) 후 true로
     command: 일상 글 진도 점검
     expect_task: publish_progress_check
   - name: 일상 글 진도 점검-01
     time: "01:05"
     days: daily
-    enabled: true
+    enabled: false  # 실행기 재시작(처리기 반영) 후 true로
     command: 일상 글 진도 점검
     expect_task: publish_progress_check
