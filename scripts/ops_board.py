@@ -122,13 +122,99 @@ def main(argv: list[str]) -> int:
             from v2r.channels import build_channels, push_channels
             from v2r.config import get_settings
 
+            png = render_png(out, now)
             sent = 0
             for ch in push_channels(build_channels(get_settings())):
-                sent += ch.broadcast("\n".join(lines))
-            print("slack sent", sent)
+                ok = 0
+                if png is not None:
+                    ok = ch.broadcast_photo(png, caption=f"📊 운영 현황판 {today} {now:%H:%M}")
+                if not ok:
+                    ok = ch.broadcast("\n".join(lines))
+                sent += ok
+            print("slack sent", sent, "png" if png else "text")
         except Exception as exc:  # noqa: BLE001
             print("slack failed", exc)
     return 0
+
+
+def md_to_html(md: str) -> str:
+    """현황판 마크다운(제한된 문법)을 화면 그대로 보이는 HTML로."""
+    import html as _h
+    import re
+
+    body = []
+    in_table = False
+    for raw in md.splitlines():
+        line = raw.rstrip()
+        if line.startswith("|"):
+            cells = [c.strip() for c in line.strip("|").split("|")]
+            if all(set(c) <= set("-: ") for c in cells):
+                continue
+            tag = "th" if not in_table else "td"
+            if not in_table:
+                body.append("<table>")
+                in_table = True
+            body.append("<tr>" + "".join(f"<{tag}>{inline(c)}</{tag}>" for c in cells) + "</tr>")
+            continue
+        if in_table:
+            body.append("</table>")
+            in_table = False
+        if line.startswith("# "):
+            body.append(f"<h1>{inline(line[2:])}</h1>")
+        elif line.startswith("## "):
+            body.append(f"<h2>{inline(line[3:])}</h2>")
+        elif line.startswith("- "):
+            body.append(f"<li>{inline(line[2:])}</li>")
+        elif line:
+            body.append(f"<p>{inline(line)}</p>")
+    if in_table:
+        body.append("</table>")
+    css = (
+        "body{font-family:'Malgun Gothic','Apple SD Gothic Neo',sans-serif;background:#fff;color:#111;"
+        "width:900px;padding:24px 32px;margin:0}"
+        "h1{font-size:24px;margin:0 0 14px}h2{font-size:18px;margin:18px 0 6px}"
+        "li{margin:2px 0 2px 18px;font-size:14px;list-style:disc}p{font-size:14px}"
+        "table{border-collapse:separate;border-spacing:3px;width:100%;font-size:14px}"
+        "th{background:#e8e8e8;text-align:left;padding:6px 10px}td{background:#f3f3f3;padding:6px 10px}"
+        "td:nth-child(2),td:nth-child(4),th:nth-child(2),th:nth-child(4){text-align:right}"
+        "code{font-family:Consolas,monospace;letter-spacing:-1px;font-size:13px;background:transparent}"
+        "b{font-weight:700}"
+    )
+    return f"<!doctype html><html><head><meta charset='utf-8'><style>{css}</style></head><body>{''.join(body)}</body></html>"
+
+
+def inline(text: str) -> str:
+    import html as _h
+    import re
+
+    t = _h.escape(text)
+    t = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", t)
+    t = re.sub(r"`(.+?)`", r"<code>\1</code>", t)
+    return t
+
+
+def render_png(md_path: Path, now: dt.datetime) -> Path | None:
+    """마크다운 현황판을 HTML로 바꿔 헤드리스 크로미움으로 PNG 캡처. 실패하면 None."""
+    try:
+        import os
+
+        os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(ROOT / ".pw-browsers"))
+        from playwright.sync_api import sync_playwright
+
+        html_path = md_path.with_suffix(".html")
+        html_path.write_text(md_to_html(md_path.read_text(encoding="utf-8")), encoding="utf-8")
+        png_path = ROOT / "data" / "ops_board_latest.png"
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 964, "height": 800}, device_scale_factor=2)
+            page.goto(html_path.resolve().as_uri())
+            page.wait_for_timeout(300)
+            page.screenshot(path=str(png_path), full_page=True)
+            browser.close()
+        return png_path
+    except Exception as exc:  # noqa: BLE001
+        print("png render failed", exc)
+        return None
 
 
 if __name__ == "__main__":
