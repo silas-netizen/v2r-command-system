@@ -10,8 +10,14 @@
   (c) 새 키워드만 `keyword_relevance.score_brand` → `crosscheck_brand`
   (d) `data/keywords/fill_progress.json` 갱신
 
-를 한 회차(`run_cycle`)로 묶고, `fill_until_target`이 목표에 닿거나 시드
-고갈(3회 연속 채택률 5% 미만)로 멈출 때까지 반복한다.
+를 한 회차(`run_cycle`)로 묶고, `fill_until_target`이 상주하며 반복한다.
+
+2026-09-27: 채점 적체(흐름 제어)나 시드 고갈(3회 연속 채택률 5% 미만)로 회차를
+건너뛰어도 프로세스를 끝내지 않는다 — 적체는 5분마다, 시드 고갈은 30분마다 다시
+재서 조건이 풀리면 스스로 재개한다(우아덤·장으뜸·코숨핏·뉴더미스가 09-26 이 상태로
+그대로 종료돼 사람이 다시 띄워야 했던 사고 재발 방지). 정상 종료는 `eligible >=
+target`(status="achieved")·정지 파일·DB 총량 상한 세 가지뿐이다. 자세한 대기·재개
+규칙은 `fill_until_target`의 docstring 참고.
 
 브라우저 호출(`fetch_fn`)과 LLM 라우터는 인자로 주입한다 — 이 모듈 자체는
 네트워크를 직접 만들지 않아 가짜 도구로 테스트할 수 있다.
@@ -43,9 +49,23 @@ DEFAULT_CAP = 200_000
 LOW_ADOPTION_STREAK_LIMIT = 3
 #: 채택률 문턱(이 미만이면 그 회차는 "낮음"으로 센다)
 LOW_ADOPTION_THRESHOLD = 0.05
-#: 채점 적체(미채점 행 수)가 이 값 이상이면 이번 회차 수집을 건너뛴다(2026-09-26 사용자
-#: 지시 — 흐름 제어. 채점 워커가 따라잡을 때까지 기다린다).
+#: 채점 적체(미채점 + 2차 판정 대기 중 검증 대상)가 이 값 이상이면 이번 회차 수집을
+#: 건너뛴다(2026-09-26 사용자 지시 — 흐름 제어. 채점 워커가 따라잡을 때까지 기다린다).
+#: 2026-09-27: 건너뛴 뒤 프로세스가 그대로 죽는 사고(우아덤·장으뜸·코숨핏·뉴더미스
+#: 09-26)가 나 상주형으로 바꿨다 — `fill_until_target`이 5분마다 다시 재서 아래
+#: RESUME 값 미만이 되면 회차를 재개한다(멈추지 않는다, 대기만 한다).
 DEFAULT_SCORE_BACKLOG_PAUSE = 5000
+#: 적체가 이 값 미만으로 떨어져야 재개한다(PAUSE보다 낮게 잡아 자주 껐다 켰다 하지
+#: 않는다 — 2026-09-27 사용자 지시: "3,000 미만이 되면 회차 재개").
+DEFAULT_SCORE_BACKLOG_RESUME = 3000
+#: 적체 대기 중 다시 잴 때까지 기다리는 간격(초) — 2026-09-27 사용자 지시: 5분.
+BACKLOG_WAIT_SEC = 300
+#: 시드 고갈 시 새 확정 키워드가 생겼는지 다시 볼 때까지 기다리는 간격(초) — 2026-09-27
+#: 사용자 지시: 30분.
+SEED_WAIT_SEC = 1800
+#: 한 회차 안에서 생기는 예외(네이버 도구 차단·DB 잠김·LLM 실패)는 로그만 남기고
+#: 이만큼(초) 기다렸다 같은 회차를 다시 시도한다 — 프로세스 종료 금지(2026-09-27).
+EXCEPTION_RETRY_WAIT_SEC = 600
 #: 2단계 확장(확정 키워드 -> 연관 -> 그 연관의 연관) 한도 — 상위 검색량만(2026-09-26).
 DEFAULT_EXPAND_DEPTH2_TOP_N = 10
 DEFAULT_EXPAND_DEPTH2_CAP = 60
@@ -288,13 +308,41 @@ def eligible_count(conn: sqlite3.Connection) -> int:
 
 
 def score_backlog_count(conn: sqlite3.Connection) -> int:
-    """아직 클로드·Codex 채점이 안 끝난(적체) 행 수(흐름 제어용, 2026-09-26)."""
-    return int(
+    """적체(흐름 제어용, 2026-09-26/27) = 미채점 + 2차 판정(Codex) 대기 중 **실제 검증
+    대상만**.
+
+    2026-09-25 재설계(`keyword_relevance.claim_codex_batch`)로 0-2(직접·근접·확장)는
+    `auto_confirm_low_relevance`가 검증 없이 바로 확정하고, Codex가 실제로 부르는
+    대상은 3(당위성) 전부 + 4(무관) 중 검색량 상위 30%뿐이다. 여기서도 그 기준을
+    그대로 따라(하드코딩 금지 — `keyword_relevance`의 등급 상수를 읽는다) 자동 확정될
+    0-2는 적체로 세지 않는다(2026-09-27 사용자 지시).
+    """
+    kr = _kr_mod()
+    bridge = int(getattr(kr, "RELEVANCE_BRIDGE", 3))
+    unrelated = int(getattr(kr, "RELEVANCE_UNRELATED", 4))
+    unscored = int(
         conn.execute(
             "SELECT COUNT(*) FROM keywords WHERE scored_at = '' OR scored_at IS NULL"
-            " OR relevance_llm IS NULL OR relevance_codex IS NULL"
+            " OR relevance_llm IS NULL"
         ).fetchone()[0]
     )
+    # claim_codex_batch와 동일한 대상 정의(claimed_at 선점 여부는 빼고 "검증이 필요한
+    # 행" 자체만 센다 — 여러 codex 워커의 선점 상태와 무관하게 진짜 적체를 봐야 한다).
+    pending_verify = int(
+        conn.execute(
+            "SELECT COUNT(*) FROM keywords WHERE relevance_codex IS NULL AND ("
+            "  relevance_llm = ?"
+            "  OR (relevance_llm = ? AND keyword IN ("
+            "    SELECT keyword FROM ("
+            "      SELECT keyword, NTILE(10) OVER (ORDER BY total DESC) AS decile"
+            "      FROM keywords WHERE relevance_llm = ? AND relevance_codex IS NULL"
+            "    ) WHERE decile <= 3"
+            "  ))"
+            ")",
+            (bridge, unrelated, unrelated),
+        ).fetchone()[0]
+    )
+    return unscored + pending_verify
 
 
 def top_eligible_keywords(conn: sqlite3.Connection, limit: int = DEFAULT_EXPAND_TOP_N) -> list[str]:
@@ -313,6 +361,17 @@ def select_seed_keywords(conn: sqlite3.Connection, limit: int = DEFAULT_SEED_LIM
         " AND (seeded_at = '' OR seeded_at IS NULL) ORDER BY total DESC LIMIT ?"
     )
     return [row[0] for row in conn.execute(sql, (int(limit),))]
+
+
+def _has_unused_seed(db_path: str | Path) -> bool:
+    """아직 시드로 안 쓴 원고 대상 키워드가 하나라도 있는지(시드 고갈 재개 판정용,
+    2026-09-27). 확정(0에서 2)이 늘면 여기서 잡힌다."""
+    kd_store = _kd_store()
+    conn = kd_store.open_db(db_path)
+    try:
+        return len(select_seed_keywords(conn, limit=1)) > 0
+    finally:
+        conn.close()
 
 
 def mark_seeded(conn: sqlite3.Connection, keywords: list[str]) -> None:
@@ -831,25 +890,82 @@ def fill_until_target(
     max_rounds: int = 100_000,
     autocomplete_fn: Callable[[str], list[str]] | None = None,
     related_fn: Callable[[str], list[str]] | None = None,
+    sleep_fn: Callable[[float], None] | None = None,
 ) -> dict[str, Any]:
-    """`eligible >= target`이거나 시드 고갈로 멈출 때까지 `run_cycle`을 반복한다."""
+    """`eligible >= target`이 될 때까지(또는 정지 파일) `run_cycle`을 반복하는 상주 순환.
+
+    2026-09-27 재설계(우아덤·장으뜸·코숨핏·뉴더미스가 09-26 종료된 뒤 사람이 다시
+    띄워야 했던 사고 이후) — 다음 세 가지는 더 이상 프로세스를 끝내지 않고 **기다렸다
+    재개**한다:
+
+      - 채점 적체(5,000 이상)로 회차를 건너뛰면 `BACKLOG_WAIT_SEC`(5분)마다 다시 재서
+        `DEFAULT_SCORE_BACKLOG_RESUME`(3,000) 미만이 되면 재개.
+      - 시드 고갈(연속 낮은 채택률 또는 신규 없음)이면 `SEED_WAIT_SEC`(30분)마다
+        새 확정(0에서 2·미사용) 키워드가 생겼는지 보고, 생기면 재개.
+      - 회차 도중 예외(네이버 도구 차단·DB 잠김·LLM 실패 등)는 로그만 남기고
+        `EXCEPTION_RETRY_WAIT_SEC`(10분) 뒤 같은 회차를 다시 시도.
+
+    정상 종료는 오직 (a) `eligible >= target`(`status="achieved"`) (b) 정지 파일
+    (`stop_requested`) (c) DB 총량 상한(`cap`, `status="용량상한"`) 세 가지뿐이다.
+    """
+    import time as _time
+
+    sleep = sleep_fn or _time.sleep
     ppath = progress_path(data_dir)
     low_streak = 0
     rounds = 0
     last: dict[str, Any] = {}
+    seed_waiting = False
+    backlog_waiting = False
     while rounds < max_rounds:
         if stop_requested(data_dir):
             update_fill_progress(ppath, brand, status="정지(STOP 파일)", eligible=last.get("eligible"))
             log.info("%s: 정지 파일 감지 — 순환을 멈춥니다", brand)
             break
+
+        if seed_waiting:
+            if _has_unused_seed(db_path):
+                log.info("%s: 새 확정 키워드 발견 — 채우기 재개", brand)
+                seed_waiting = False
+                low_streak = 0
+            else:
+                update_fill_progress(ppath, brand, status="시드고갈대기", eligible=last.get("eligible"))
+                sleep(SEED_WAIT_SEC)
+                continue
+
+        if backlog_waiting:
+            kd_store = _kd_store()
+            conn = kd_store.open_db(db_path)
+            try:
+                backlog = score_backlog_count(conn)
+            finally:
+                conn.close()
+            if backlog < DEFAULT_SCORE_BACKLOG_RESUME:
+                log.info("%s: 채점 적체 %d건으로 감소 — 채우기 재개", brand, backlog)
+                backlog_waiting = False
+            else:
+                update_fill_progress(ppath, brand, status="적체대기", backlog=backlog, eligible=last.get("eligible"))
+                sleep(BACKLOG_WAIT_SEC)
+                continue
+
         rounds += 1
         prev_by_source = (last or {}).get("by_source") or {}
         adoption_weights = {src: v.get("adoption_rate", 0.0) for src, v in prev_by_source.items()}
-        result = run_cycle(
-            brand, db_path, guides_dir, router, fetch_fn,
-            codex_exe=codex_exe, seed_limit=seed_limit, guide_seed_n=guide_seed_n, cap=cap,
-            autocomplete_fn=autocomplete_fn, related_fn=related_fn, adoption_weights=adoption_weights,
-        )
+        try:
+            result = run_cycle(
+                brand, db_path, guides_dir, router, fetch_fn,
+                codex_exe=codex_exe, seed_limit=seed_limit, guide_seed_n=guide_seed_n, cap=cap,
+                autocomplete_fn=autocomplete_fn, related_fn=related_fn, adoption_weights=adoption_weights,
+            )
+        except Exception as exc:  # noqa: BLE001 - 한 회차 예외로 프로세스가 죽으면 안 된다(2026-09-27)
+            log.error("%s: 회차 중 예외 — %d초 뒤 재시도: %s", brand, EXCEPTION_RETRY_WAIT_SEC, exc)
+            update_fill_progress(
+                ppath, brand, status="오류대기", round=rounds,
+                error=f"{exc.__class__.__name__}: {exc}", eligible=last.get("eligible"),
+            )
+            sleep(EXCEPTION_RETRY_WAIT_SEC)
+            continue
+
         last = result
         eligible = result["eligible"]
 
@@ -859,17 +975,31 @@ def fill_until_target(
             )
             break
 
+        if result.get("paused_backlog") is not None:
+            backlog_waiting = True
+            update_fill_progress(
+                ppath, brand, status="적체대기", round=rounds,
+                backlog=result["paused_backlog"], eligible=eligible,
+            )
+            log.info("%s: 채점 적체 %d건 — %d초 뒤 다시 확인", brand, result["paused_backlog"], BACKLOG_WAIT_SEC)
+            sleep(BACKLOG_WAIT_SEC)
+            continue
+
         rate = result["adoption_rate"]
         if result["new_collected"] > 0 and rate < LOW_ADOPTION_THRESHOLD:
             low_streak += 1
         else:
             low_streak = 0
 
+        exhausted = low_streak >= LOW_ADOPTION_STREAK_LIMIT or (
+            result["seed_exhausted"] and result["new_collected"] == 0
+        )
+
         status = "running"
         if eligible >= target:
-            status = "done"
-        elif low_streak >= LOW_ADOPTION_STREAK_LIMIT:
-            status = "시드고갈"
+            status = "achieved"
+        elif exhausted:
+            status = "시드고갈대기"
 
         update_fill_progress(
             ppath,
@@ -887,11 +1017,12 @@ def fill_until_target(
             by_source=result.get("by_source", {}),
         )
 
-        if status in ("done", "시드고갈"):
+        if status == "achieved":
+            log.info("%s: 목표(%d) 달성 — 정상 종료", brand, target)
             break
-        if result["seed_exhausted"] and result["new_collected"] == 0:
-            update_fill_progress(ppath, brand, status="시드고갈(신규없음)", round=rounds, eligible=eligible)
-            break
+        if exhausted:
+            seed_waiting = True
+            continue
     return last
 
 
@@ -1085,6 +1216,11 @@ __all__ = [
     "weighted_cap",
     "score_backlog_count",
     "DEFAULT_SCORE_BACKLOG_PAUSE",
+    "DEFAULT_SCORE_BACKLOG_RESUME",
+    "BACKLOG_WAIT_SEC",
+    "SEED_WAIT_SEC",
+    "EXCEPTION_RETRY_WAIT_SEC",
+    "_has_unused_seed",
     "DEFAULT_EXPAND_DEPTH2_TOP_N",
     "DEFAULT_EXPAND_DEPTH2_CAP",
 ]

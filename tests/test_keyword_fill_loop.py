@@ -183,7 +183,10 @@ def test_adoption_rate_and_progress_file(tmp_path):
     assert data["브랜드"]["round"] == 2
 
 
-def test_fill_until_target_stops_on_low_adoption_streak(tmp_path):
+def test_fill_until_target_waits_on_low_adoption_streak_instead_of_stopping(tmp_path, monkeypatch):
+    """2026-09-27 재설계: 시드 고갈은 더 이상 프로세스를 끝내지 않고 대기한다(우아덤·
+    장으뜸·코숨핏·뉴더미스가 09-26 종료된 뒤 사람이 다시 띄워야 했던 사고 재발 방지).
+    """
     db = tmp_path / "b.sqlite"
     guides_dir = tmp_path / "guides"
     guides_dir.mkdir()
@@ -195,7 +198,7 @@ def test_fill_until_target_stops_on_low_adoption_streak(tmp_path):
 
     def fake_fetch(seeds, depth):
         calls["n"] += 1
-        # 매번 새 키워드를 만들지만 관련도가 3(무관)이라 채택률이 0이 되게 한다
+        # 매번 새 키워드를 만들지만 관련도가 4(무관)이라 채택률이 0이 되게 한다
         return [{"keyword": f"무관{calls['n']}", "pc": 10, "mobile": 5}]
 
     router = FakeRouter(relevance=4)  # 전부 무관(4) 처리
@@ -214,18 +217,178 @@ def test_fill_until_target_stops_on_low_adoption_streak(tmp_path):
         ac_calls["n"] += 1
         return [f"자동완성시드{ac_calls['n']}"]
 
+    statuses: list[str] = []
+    orig_update = fill.update_fill_progress
+
+    def capture_update(path, brand, **fields):
+        statuses.append(fields.get("status"))
+        return orig_update(path, brand, **fields)
+
+    monkeypatch.setattr(fill, "update_fill_progress", capture_update)
+
+    # 시드고갈대기 상태로 몇 번 돈 뒤에는 정지 파일을 세워 테스트가 끝없이 돌지 않게 한다
+    # (실제로는 새 확정 키워드가 생기거나 사용자가 STOP 파일을 놓을 때까지 계속 기다린다).
+    sleep_calls = {"n": 0}
+
+    def fake_sleep(_seconds):
+        sleep_calls["n"] += 1
+        if sleep_calls["n"] >= 3:
+            fill.stop_path(data_dir).parent.mkdir(parents=True, exist_ok=True)
+            fill.stop_path(data_dir).write_text("stop", encoding="utf-8")
+
     try:
         fill.fill_until_target(
             "브랜드", db, guides_dir, router, fake_fetch,
             target=10000, data_dir=data_dir, seed_limit=1, guide_seed_n=1, max_rounds=20,
-            autocomplete_fn=fake_autocomplete,
+            autocomplete_fn=fake_autocomplete, sleep_fn=fake_sleep,
         )
     finally:
         kr_mod.score_batch_codex = orig
 
+    # 종료가 아니라 대기 상태를 거쳤어야 하고(재발 방지의 핵심), 정지 파일로만 끝난다.
+    assert "시드고갈대기" in statuses
     data = fill.load_progress(fill.progress_path(data_dir))
-    assert data["브랜드"]["status"] == "시드고갈"
-    assert data["브랜드"]["low_adoption_streak"] >= fill.LOW_ADOPTION_STREAK_LIMIT
+    assert data["브랜드"]["status"] == "정지(STOP 파일)"
+
+
+def test_fill_until_target_waits_for_backlog_then_resumes(tmp_path, monkeypatch):
+    """2026-09-27 재설계: 적체가 높으면 종료하지 않고 5분마다 다시 재서 재개해야 한다
+    (코숨핏이 대기 없이 회차를 반복하다 round=100000에서 조용히 죽은 사고 재발 방지)."""
+    db = tmp_path / "b.sqlite"
+    data_dir = tmp_path / "data"
+
+    cycle_calls = {"n": 0}
+
+    def fake_run_cycle(*args, **kwargs):
+        cycle_calls["n"] += 1
+        if cycle_calls["n"] == 1:
+            return {
+                "brand": "브랜드", "capped": False, "paused_backlog": 5000, "total": 0,
+                "eligible": 0, "new_collected": 0, "adopted": 0, "adoption_rate": 0.0,
+                "seed_exhausted": False, "by_source": {},
+            }
+        return {
+            "brand": "브랜드", "capped": False, "total": 10000, "eligible": 10000,
+            "new_collected": 1, "adopted": 1, "adoption_rate": 1.0,
+            "seed_exhausted": False, "by_source": {},
+        }
+
+    monkeypatch.setattr(fill, "run_cycle", fake_run_cycle)
+
+    backlog_calls = {"n": 0}
+
+    def fake_backlog(conn):
+        backlog_calls["n"] += 1
+        return 5000 if backlog_calls["n"] == 1 else 0
+
+    monkeypatch.setattr(fill, "score_backlog_count", fake_backlog)
+
+    sleeps: list[float] = []
+    result = fill.fill_until_target(
+        "브랜드", db, tmp_path, object(), lambda *a, **k: [],
+        target=10000, data_dir=data_dir, sleep_fn=sleeps.append,
+    )
+
+    assert sleeps  # 적체 대기가 실제로 있었다
+    assert cycle_calls["n"] == 2  # 대기 뒤 회차를 다시 시도했다
+    assert result["eligible"] == 10000
+    data = fill.load_progress(fill.progress_path(data_dir))
+    assert data["브랜드"]["status"] == "achieved"
+
+
+def test_fill_until_target_waits_for_new_seed_then_resumes(tmp_path, monkeypatch):
+    """2026-09-27: 시드 고갈이어도 새 확정(0에서 2·미사용) 키워드가 생기면 바로 재개한다."""
+    db = tmp_path / "b.sqlite"
+    data_dir = tmp_path / "data"
+
+    cycle_calls = {"n": 0}
+
+    def fake_run_cycle(*args, **kwargs):
+        cycle_calls["n"] += 1
+        if cycle_calls["n"] == 1:
+            return {
+                "brand": "브랜드", "capped": False, "total": 1, "eligible": 1,
+                "new_collected": 0, "adopted": 0, "adoption_rate": 0.0,
+                "seed_exhausted": True, "by_source": {},
+            }
+        return {
+            "brand": "브랜드", "capped": False, "total": 10000, "eligible": 10000,
+            "new_collected": 1, "adopted": 1, "adoption_rate": 1.0,
+            "seed_exhausted": False, "by_source": {},
+        }
+
+    monkeypatch.setattr(fill, "run_cycle", fake_run_cycle)
+
+    seed_calls = {"n": 0}
+
+    def fake_has_seed(_db_path):
+        seed_calls["n"] += 1
+        return seed_calls["n"] > 1  # 처음엔 없다가 다음 확인 때 생긴다
+
+    monkeypatch.setattr(fill, "_has_unused_seed", fake_has_seed)
+
+    sleeps: list[float] = []
+    result = fill.fill_until_target(
+        "브랜드", db, tmp_path, object(), lambda *a, **k: [],
+        target=10000, data_dir=data_dir, sleep_fn=sleeps.append,
+    )
+
+    assert cycle_calls["n"] == 2
+    assert result["eligible"] == 10000
+    data = fill.load_progress(fill.progress_path(data_dir))
+    assert data["브랜드"]["status"] == "achieved"
+
+
+def test_fill_until_target_retries_after_exception_without_crashing(tmp_path, monkeypatch):
+    """2026-09-27: 회차 도중 예외(DB 잠김 등)는 프로세스를 끝내지 않고 대기 후 재시도한다."""
+    db = tmp_path / "b.sqlite"
+    data_dir = tmp_path / "data"
+
+    cycle_calls = {"n": 0}
+
+    def fake_run_cycle(*args, **kwargs):
+        cycle_calls["n"] += 1
+        if cycle_calls["n"] == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return {
+            "brand": "브랜드", "capped": False, "total": 10000, "eligible": 10000,
+            "new_collected": 1, "adopted": 1, "adoption_rate": 1.0,
+            "seed_exhausted": False, "by_source": {},
+        }
+
+    monkeypatch.setattr(fill, "run_cycle", fake_run_cycle)
+
+    sleeps: list[float] = []
+    result = fill.fill_until_target(
+        "브랜드", db, tmp_path, object(), lambda *a, **k: [],
+        target=10000, data_dir=data_dir, sleep_fn=sleeps.append,
+    )
+
+    assert sleeps
+    assert cycle_calls["n"] == 2
+    data = fill.load_progress(fill.progress_path(data_dir))
+    assert data["브랜드"]["status"] == "achieved"
+
+
+def test_fill_until_target_achieved_status_at_target(tmp_path, monkeypatch):
+    """2026-09-27: 목표(1만) 달성만이 유일한 정상 종료 — 상태 문자열은 'achieved'."""
+    db = tmp_path / "b.sqlite"
+    data_dir = tmp_path / "data"
+
+    def fake_run_cycle(*args, **kwargs):
+        return {
+            "brand": "브랜드", "capped": False, "total": 10000, "eligible": 10000,
+            "new_collected": 5, "adopted": 5, "adoption_rate": 1.0,
+            "seed_exhausted": False, "by_source": {},
+        }
+
+    monkeypatch.setattr(fill, "run_cycle", fake_run_cycle)
+    result = fill.fill_until_target(
+        "브랜드", db, tmp_path, object(), lambda *a, **k: [], target=10000, data_dir=data_dir,
+    )
+    assert result["eligible"] == 10000
+    data = fill.load_progress(fill.progress_path(data_dir))
+    assert data["브랜드"]["status"] == "achieved"
 
 
 def test_gather_seeds_dedupes_and_records_sources(tmp_path):
@@ -426,6 +589,36 @@ def test_gather_seeds_skips_rejected_keywords(tmp_path):
     seeds = fill.gather_seeds(conn, "브랜드", guides_dir, router=None, seed_limit=2)
     terms = [s for s, _ in seeds]
     assert "테스트제품" not in terms
+    conn.close()
+
+
+def test_score_backlog_count_excludes_auto_confirmed_0_to_2(tmp_path):
+    """2026-09-27: 적체는 claim_codex_batch가 실제로 검증하는 대상(3 전부 + 4 상위
+    30%)만 세야 한다 — 0에서 2(자동 확정)는 미채점이든 codex 대기든 적체가 아니다."""
+    db = tmp_path / "b.sqlite"
+    conn = kd_store.open_db(db)
+    kr.migrate(conn)
+    fill.migrate_fill_columns(conn)
+    kd_store.save_many(conn, [
+        {"keyword": f"미채점{i}", "pc": 1, "mobile": 0} for i in range(2)
+    ] + [
+        {"keyword": f"확정대기{i}", "pc": 1, "mobile": 0} for i in range(3)
+    ] + [
+        {"keyword": "당위성대기", "pc": 1, "mobile": 0},
+    ])
+    # 미채점 2건: scored_at 없음 -> 적체
+    # 확정대기 3건: relevance_llm=1(근접, 자동 확정 대상), relevance_codex 없음 -> 적체 아님
+    conn.execute(
+        "UPDATE keywords SET relevance_llm=1, scored_at='x' WHERE keyword LIKE '확정대기%'"
+    )
+    # 당위성대기 1건: relevance_llm=3(당위성), relevance_codex 없음 -> 적체
+    conn.execute(
+        "UPDATE keywords SET relevance_llm=3, scored_at='x' WHERE keyword='당위성대기'"
+    )
+    conn.commit()
+
+    backlog = fill.score_backlog_count(conn)
+    assert backlog == 2 + 1  # 미채점 2 + 당위성대기 1(확정대기 0-2는 제외)
     conn.close()
 
 
