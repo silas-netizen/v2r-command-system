@@ -1,18 +1,18 @@
 @echo off
 chcp 65001 > nul
-rem 키워드 채점(score) 5개 + 2차 판정(codex) 10개 워커가 살아 있는지 확인하고, 모자라면 다시 띄운다.
-rem 예약 작업 V2R-KeywordWorkers(5분 간격)가 keyword-workers-watchdog.vbs 로 숨김 실행한다.
-rem 2026-09-26 재발 방지: 어제 저녁 워커가 모두 종료된 채 후보 27,592개가 미채점으로 쌓였다.
-rem 워커 자체도 상주형으로 바꿨고(일이 없으면 60초 쉼, 오류는 60초 뒤 재진입), 이 감시가 2중 안전장치다.
+rem Checks that the score (5) + codex (10) keyword workers are alive; relaunches if short.
+rem Scheduled task V2R-KeywordWorkers (every 5 min) runs this via keyword-workers-watchdog.vbs, hidden.
+rem 2026-09-26 incident: all workers had exited and 27,592 candidates piled up unscored.
+rem Workers are now resident (idle 60s if no work, retry 60s after an error); this watchdog is the backup.
 setlocal enabledelayedexpansion
 cd /d "%~dp0.."
 set PYTHONIOENCODING=utf-8
 set PYTHONUTF8=1
 if not exist "logs" mkdir "logs"
 
-rem 정지 파일이 있으면 아무것도 하지 않는다(사용자가 일부러 세운 상태)
+rem If the stop file exists, do nothing (deliberately set by the user)
 if exist "data\STOP" (
-    echo [%date% %time%] keyword-watchdog: 정지 파일 있음, 조치 없음 >> "logs\keyword-workers-watchdog.log"
+    echo [%date% %time%] keyword-watchdog: stop file present, no action >> "logs\keyword-workers-watchdog.log"
     exit /b 0
 )
 
@@ -20,9 +20,9 @@ for /f %%N in ('powershell -NoProfile -Command "(Get-CimInstance Win32_Process -
 if "%ALIVE%"=="" set ALIVE=0
 
 if %ALIVE% GEQ 15 (
-    echo [%date% %time%] keyword-watchdog: 워커 %ALIVE%개 실행 중, 조치 없음 >> "logs\keyword-workers-watchdog.log"
+    echo [%date% %time%] keyword-watchdog: %ALIVE% workers running, no action >> "logs\keyword-workers-watchdog.log"
 ) else (
-    echo [%date% %time%] keyword-watchdog: 워커 %ALIVE%개(15 기대) - rescore.cmd 로 보충 >> "logs\keyword-workers-watchdog.log"
-    rem rescore.cmd 는 브랜드별 잠금 파일(data\locks\score-*, codex-*)로 이미 도는 워커를 건너뛰므로 모자란 것만 뜬다
+    echo [%date% %time%] keyword-watchdog: %ALIVE% workers (expected 15) - topping up via rescore.cmd >> "logs\keyword-workers-watchdog.log"
+    rem rescore.cmd skips already-running workers via per-brand lock files (data\locks\score-*, codex-*)
     cscript //nologo "%~dp0rescore-hidden.vbs" >> "logs\keyword-workers-watchdog.log" 2>&1
 )

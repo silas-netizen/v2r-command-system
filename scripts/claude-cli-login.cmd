@@ -2,9 +2,9 @@
 chcp 65001 >nul
 setlocal
 
-REM 요금제(구독) 길 로그인 — 한 번만 하면 됩니다.
-REM 이 창이 열리면 /login 이라고 치고 엔터, 브라우저에서 승인하면 끝납니다.
-REM 그 뒤로는 자동화가 알아서 그 로그인을 씁니다. (점검 예약: 매일 09:25)
+REM Subscription-plan login - only needs to be done once.
+REM When this window opens, type /login and press Enter, approve in the browser, done.
+REM After that automation reuses this login. (Checked daily at 09:25.)
 
 set "CLAUDE_EXE=%V2R_CLAUDE_EXE%"
 
@@ -18,16 +18,16 @@ if not defined CLAUDE_EXE set "CLAUDE_EXE=claude"
 
 echo.
 echo ============================================================
-echo  Claude Code 로그인 (요금제 길)
+echo  Claude Code login (subscription plan)
 echo ============================================================
-echo  실행 파일: %CLAUDE_EXE%
+echo  Executable: %CLAUDE_EXE%
 echo.
-echo  1) 잠시 뒤 클로드 코드 화면이 열립니다.
-echo  2) 그 안에서  /login  이라고 치고 엔터를 누르세요.
-echo  3) 브라우저가 열리면 계정으로 로그인하고 승인하세요.
-echo  4) "Login successful" 이 보이면  /exit  로 닫으면 됩니다.
+echo  1) The Claude Code screen will open shortly.
+echo  2) Inside it, type  /login  and press Enter.
+echo  3) When the browser opens, sign in and approve.
+echo  4) When you see "Login successful", type  /exit  to close.
 echo.
-echo  * 로그인은 한 번만 하면 계속 유지됩니다.
+echo  * You only need to log in once; it stays valid.
 echo ============================================================
 echo.
 pause
@@ -35,6 +35,6 @@ pause
 "%CLAUDE_EXE%"
 
 echo.
-echo 로그인 확인이 끝났으면 이 창을 닫아도 됩니다.
+echo You can close this window once the login check is done.
 pause
 endlocal

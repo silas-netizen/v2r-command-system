@@ -1,4 +1,5 @@
 @echo off
-rem 2026-09-24: 실행기(serve) 내장 예약(08:30·18:15 "끊긴 작업 점검")이 대체. 이 OS 예약 작업은 별도 프로세스로
-rem 실행기 리스를 가로채 09:00 발행을 1시간 막은 사고가 있어 무력화한다. 작업 스케줄러 V2R-Reconcile 은 비활성화 권장.
+rem 2026-09-24: replaced by the runner's (serve) own built-in schedule (08:30/18:15 stuck-job check).
+rem This OS scheduled task once grabbed the runner's lease as a separate process and blocked the
+rem 09:00 publish for an hour, so it is disabled here. Recommend disabling task scheduler V2R-Reconcile too.
 exit /b 0

@@ -1,6 +1,6 @@
 @echo off
 chcp 65001 > nul
-rem exposure runner watchdog - relaunch workers when state file is stale. log: logsexposure-runner-watchdog.log
+rem exposure runner watchdog - relaunch workers when state file is stale. log: logs\exposure-runner-watchdog.log
 setlocal enabledelayedexpansion
 cd /d "%~dp0.."
 set PYTHONIOENCODING=utf-8
