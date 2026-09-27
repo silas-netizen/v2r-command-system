@@ -17,6 +17,16 @@ CAFES = ["고요한 아침", "글로시 마이", "송도포털", "러브 인썸"
 TARGET_PER_CAFE = 100
 KW_TARGET = 10_000
 EXPOSURE_EXPECT_PER_HOUR = 300
+# 채우기 순환 상태 → 사용자용 표기(문제인지 정상인지 바로 보이게)
+FILL_STATUS = {
+    "running": "🟢 수집 중",
+    "적체대기": "🟢 정상 · 채점 밀려 수집 잠시 멈춤(자동 재개)",
+    "시드고갈대기": "🟡 주의 · 새 출발 키워드 없음(30분마다 재시도)",
+    "오류대기": "🔴 문제 · 오류로 10분 뒤 재시도",
+    "용량상한": "⏸ 정지 · 저장 한도 도달",
+    "achieved": "✅ 1만 달성",
+    "done": "종료",
+}
 
 CONF_SQL = (
     "select count(*) from keywords where relevance_llm between 0 and 3 and relevance_codex between 0 and 3 "
@@ -94,9 +104,11 @@ def main(argv: list[str]) -> int:
     for b, conf, pend in kw_rows:
         pct = min(conf * 100 / KW_TARGET, 100)
         st = (fp.get(b) or {}).get("status") or "-"
-        st_k = {"running": "수집 중", "backlog_waiting": "적체 대기", "seed_waiting": "시드 대기", "achieved": "달성", "done": "종료"}.get(st, st)
+        st_k = FILL_STATUS.get(st, st)
         mark = "✅" if conf >= KW_TARGET else ""
         L.append(f"| {b} | {conf:,} {mark} | `{bar(pct, 12)}` {pct:.0f}% | {pend:,} | {st_k} |")
+    L.append("")
+    L.append("- 채우기 상태 뜻: 🟢 정상(수집 중 / 채점 밀려 잠시 멈춤 → 자동 재개) · 🟡 주의(새 출발 키워드 없음 → 30분마다 재시도) · 🔴 문제(오류 → 10분 뒤 재시도)")
     L.append("")
     L.append("## 오늘 문제 · 조치")
     L += [f"- {n['at']} {n['text']}" for n in notes] or ["- 없음"]
