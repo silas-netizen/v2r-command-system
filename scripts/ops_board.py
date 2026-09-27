@@ -107,6 +107,27 @@ def main(argv: list[str]) -> int:
     out = ROOT / "docs" / "reports" / f"ops-board-{today}.md"
     out.write_text("\n".join(L), encoding="utf-8")
     print(out)
+    if "--slack" in argv:
+        # 슬랙용 압축판(정각 1회). 표 대신 줄글.
+        kw_line = " · ".join(f"{b} {conf:,}" + ("✅" if conf >= KW_TARGET else "") for b, conf, _ in kw_rows)
+        lines = [
+            f"📊 운영 현황판 {today} {now:%H:%M}",
+            f"{pub_flag} 일상 글 {pub_total}/{pub_target} · 최근 1시간 {pub_hour}건 · {pub_state}",
+            f"{exp_flag} 노출 확인 최근 1시간 {exp_hour}건 · 대기 {q3:,} · 남은 {exp_eta}",
+            f"🔑 키워드 {kw_line}",
+        ]
+        lines += [f"⚠ {n['at']} {n['text'][:80]}" for n in notes[-2:]]
+        try:
+            sys.path.insert(0, str(ROOT))
+            from v2r.channels import build_channels, push_channels
+            from v2r.config import get_settings
+
+            sent = 0
+            for ch in push_channels(build_channels(get_settings())):
+                sent += ch.broadcast("\n".join(lines))
+            print("slack sent", sent)
+        except Exception as exc:  # noqa: BLE001
+            print("slack failed", exc)
     return 0
 
 

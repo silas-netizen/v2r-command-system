@@ -147,19 +147,19 @@ entries:
   - name: 중간 보고-1
     time: "12:00"
     days: daily
-    enabled: true
+    enabled: false  # 2026-09-27 슬랙엔 정각 운영 현황판만(중간 보고 폐지)
     command: 중간 보고
 
   - name: 중간 보고-2
     time: "15:00"
     days: daily
-    enabled: true
+    enabled: false  # 2026-09-27 슬랙엔 정각 운영 현황판만(중간 보고 폐지)
     command: 중간 보고
 
   - name: 중간 보고-3
     time: "18:00"
     days: daily
-    enabled: true
+    enabled: false  # 2026-09-27 슬랙엔 정각 운영 현황판만(중간 보고 폐지)
     command: 중간 보고
 
   # 주 1회 정비 — 30일 지난 이벤트 정리 + DB VACUUM + 요금제 임시 파일 +
