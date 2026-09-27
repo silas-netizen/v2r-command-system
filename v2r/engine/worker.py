@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import itertools
+import json
 import logging
 import os
 import random
@@ -1228,6 +1229,240 @@ def _telegram_check(rt: Runtime, spec: TaskSpec) -> dict:
     return out
 
 
+#: 일상 글 진도 점검(사고 2026-09-26·27 재발 방지) — 매시 예약이 부른다.
+PROGRESS_STATE_FILE = "publish_progress_state.json"
+#: 카페당 하루 목표 건수(사용자 결정 2026-09-22/27).
+DAILY_TARGET_PER_CAFE = 100
+#: 시간당 기대 발행 속도(참고용 — 카페 수 * 100건을 08:00~02:00 18시간에 나눈 값 근사).
+HOURLY_MIN_EXPECTED = 45
+#: 최근 진도를 보는 창(분)과 그 안의 최소 기대 건수.
+RECENT_WINDOW_MIN = 60
+RECENT_MIN_COUNT = 10
+#: 하루 자동 재큐 상한(사용자 결정 2026-09-27 — 재큐가 폭주하지 않게).
+MAX_REQUEUE_PER_DAY = 5
+#: 자동 재큐할 때 쏘는 명령(사용자 지시 2026-09-27 원문 그대로).
+PROGRESS_REQUEUE_COMMAND = "자사 카페 일상 글 카페별 100건 실제 발행 댓글 랜덤"
+
+
+def _progress_state_path(rt: Runtime) -> Path:
+    return rt.settings.data_dir / PROGRESS_STATE_FILE
+
+
+def _load_progress_state(rt: Runtime) -> dict:
+    path = _progress_state_path(rt)
+    try:
+        if path.exists():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+    except Exception as exc:  # noqa: BLE001
+        log.warning("일상 글 진도 상태 읽기 실패: %s", exc)
+    return {}
+
+
+def _save_progress_state(rt: Runtime, state: dict) -> None:
+    path = _progress_state_path(rt)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(
+            json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8"
+        )
+        os.replace(tmp, path)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("일상 글 진도 상태 저장 실패: %s", exc)
+
+
+def _progress_board_path(rt: Runtime, day: str) -> Path:
+    """사용자 정정 2026-09-27 11:20: `docs/reports/daily-posts-board-<날짜>.md` — 매시 덮어쓴다."""
+    return rt.settings.repo_root / "docs" / "reports" / f"daily-posts-board-{day}.md"
+
+
+def _write_progress_board(
+    rt: Runtime,
+    *,
+    day: str,
+    now: datetime,
+    total_today: int,
+    target_total: int,
+    per_cafe: dict[str, int],
+    cafes: list[str],
+    recent: int,
+    latest_status: str,
+    issues: list[dict],
+) -> Path:
+    """현재 상태 한 장으로 매시 다시 쓴다(이전 시각 줄을 남기지 않는다).
+
+    구성(사용자 지시 2026-09-27 11:20): 제목/오늘 합계·목표·달성률/카페별 표/
+    최근 60분·속도·완료 예상 시각/최신 작업 상태/오늘 문제와 조치(시각순)/
+    사용자가 할 일.
+    """
+    rate_per_min = recent / RECENT_WINDOW_MIN if recent else 0.0
+    remaining = max(target_total - total_today, 0)
+    if rate_per_min > 0 and remaining > 0:
+        eta = now + timedelta(minutes=remaining / rate_per_min)
+        eta_text = eta.strftime("%H:%M")
+    elif remaining <= 0:
+        eta_text = "이미 달성"
+    else:
+        eta_text = "속도 0 — 예상 불가"
+    pct = round(100 * total_today / target_total) if target_total else 0
+
+    lines = [
+        f"# 일상 글 발행 현황판 ({day}, 갱신 {now.strftime('%H:%M')})",
+        "",
+        "## 오늘 진행",
+        f"- 합계: {total_today} / {target_total}건 ({pct}%)",
+        "",
+        "| 카페 | 건수 | 목표 대비 |",
+        "|---|---|---|",
+    ]
+    for cafe in cafes:
+        n = per_cafe.get(cafe, 0)
+        lines.append(f"| {cafe} | {n} | {n}/{DAILY_TARGET_PER_CAFE} |")
+    if not cafes:
+        lines.append("| (자사 카페 없음) | - | - |")
+    lines += [
+        "",
+        f"- 최근 60분: {recent}건 (분당 {rate_per_min:.1f}건) — 이 속도면 목표 도달 예상 시각: {eta_text}",
+        f"- 최신 작업(publish_daily) 상태: {latest_status}",
+        "",
+        "## 오늘 문제와 조치 (시각순)",
+    ]
+    if issues:
+        for item in issues:
+            lines.append(
+                f"- {item.get('time', '?')} {item.get('issue', '')} → {item.get('action', '')}"
+                f" ({item.get('resolved', '확인 중')})"
+            )
+    else:
+        lines.append("- (오늘 문제 없음)")
+    lines += ["", "## 사용자가 할 일"]
+    todo = [i.get("todo") for i in issues if i.get("todo")]
+    if todo:
+        lines.extend(f"- {t}" for t in dict.fromkeys(todo))
+    else:
+        lines.append("- (없음 — 자동 감시가 처리 중)")
+
+    path = _progress_board_path(rt, day)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+def _publish_progress_check(rt: Runtime, spec: TaskSpec) -> dict:
+    """`일상 글 진도 점검` — 매시 5분 예약(2026-09-27, 사고 2026-09-26·27 재발 방지).
+
+    본다: 오늘 발행 합계·카페별 건수·최근 60분 건수, 최신 `publish_daily` 상태.
+    문제(최근 60분 10건 미만, 또는 최신 publish_daily 가 failed/없음이면서 오늘
+    합계가 목표 미만) 면 슬랙 🔴 + 같은 명령 자동 재큐(이미 도는 작업이 있으면
+    재큐하지 않음, 하루 상한 `MAX_REQUEUE_PER_DAY`). 정상이든 아니든 슬랙에
+    📊(정상)/🔴(문제) 한 줄을 보내고, `docs/reports/daily-posts-board-<날짜>.md`
+    현황판을 매시 통째로 다시 써서 항상 "지금 상태 한 장"으로 유지한다
+    (사용자 지시 2026-09-27 11:15·11:20 — 이전 시각 줄을 남기지 않는다).
+    """
+    del spec
+    now = datetime.now(KST)
+    today = now.strftime("%Y-%m-%d")
+    since = (now - timedelta(minutes=RECENT_WINDOW_MIN)).isoformat(timespec="seconds")
+
+    per_cafe = rt.publications.counts_today_by_cafe(today)
+    total_today = sum(per_cafe.values())
+    recent = rt.publications.count_since(since)
+
+    jobs = rt.jobs.recent(limit=50)
+    latest = next((j for j in jobs if str(j.get("task") or "") == "publish_daily"), None)
+    latest_status = str(latest.get("status")) if latest else "없음"
+    running_now = bool(rt.jobs.running_jobs(task_prefix="publish_daily") or
+                        any(str(j.get("task") or "") == "publish_daily" and str(j.get("status")) == "queued"
+                            for j in rt.jobs.open_jobs()))
+
+    cafes = publish_mod.self_cafe_names(rt)
+    target_total = DAILY_TARGET_PER_CAFE * max(len(cafes), 1)
+
+    state = _load_progress_state(rt)
+    if state.get("date") != today:
+        state = {"date": today, "requeue_count": 0}
+
+    stalled = recent < RECENT_MIN_COUNT
+    behind_and_broken = latest_status in ("failed", "없음") and total_today < target_total
+    problem = (stalled or behind_and_broken) and not running_now
+
+    action = "정상"
+    if problem:
+        if state.get("requeue_count", 0) >= MAX_REQUEUE_PER_DAY:
+            action = f"재큐 상한({MAX_REQUEUE_PER_DAY}회) 도달 — 사람 확인 필요"
+        else:
+            out = handle_text(rt, PROGRESS_REQUEUE_COMMAND)
+            if out.get("ok"):
+                state["requeue_count"] = int(state.get("requeue_count", 0)) + 1
+                action = f"자동 재큐(오늘 {state['requeue_count']}/{MAX_REQUEUE_PER_DAY}회, 작업 {out.get('job_id')})"
+            else:
+                action = f"재큐 시도 실패: {out.get('error')}"
+    elif (stalled or behind_and_broken) and running_now:
+        action = "정체 의심이나 작업이 이미 도는 중 — 재큐 생략"
+
+    if problem:
+        reason = "최근 60분 10건 미만(정체)" if stalled else (
+            f"최신 발행 작업 {latest_status}, 오늘 {total_today}/{target_total}건(목표 미달)"
+        )
+        resolved = "자동 재큐로 재시도" if action.startswith("자동 재큐") else "사람 확인 필요"
+        todo = "" if action.startswith("자동 재큐") else "실행기·계정 상태를 확인해 주세요(재큐 상한 도달 또는 재큐 실패)"
+        state.setdefault("issues", []).append(
+            {
+                "time": now.strftime("%H:%M"),
+                "issue": reason,
+                "action": action,
+                "resolved": resolved,
+                "todo": todo,
+            }
+        )
+
+    _save_progress_state(rt, state)
+
+    report_path = _write_progress_board(
+        rt,
+        day=today,
+        now=now,
+        total_today=total_today,
+        target_total=target_total,
+        per_cafe=per_cafe,
+        cafes=cafes,
+        recent=recent,
+        latest_status=latest_status,
+        issues=state.get("issues") or [],
+    )
+
+    slack_text = (
+        f"일상 글 진도 {now.strftime('%H:%M')} — 오늘 {total_today}/{target_total}건, "
+        f"최근 60분 {recent}건, 최신 작업 {latest_status}, 조치: {action}"
+    )
+    if problem:
+        notify_all(
+            rt.channels, slack_text, level="critical",
+            category="publish_progress_stalled", tag="publish",
+        )
+    else:
+        notify_all(rt.channels, slack_text, level="always", tag="publish")
+
+    rt.events.log(
+        None, "warn" if problem else "info",
+        f"일상 글 진도 점검: 오늘 {total_today}/{target_total}건, 최근 60분 {recent}건, "
+        f"최신 작업 {latest_status}, 조치: {action}",
+    )
+    return {
+        "ok": not problem or action.startswith("자동 재큐"),
+        "total_today": total_today,
+        "target_total": target_total,
+        "per_cafe": per_cafe,
+        "recent_60m": recent,
+        "latest_publish_daily_status": latest_status,
+        "action": action,
+        "report_file": str(report_path),
+        "message": slack_text,
+    }
+
+
 #: 미처리(대기) 목록 파일 — 사람이 손으로 관리하고, 예약이 하루 5번 파일로 보낸다
 PENDING_REPORT_PATH = ("docs", "reports", "pending.md")
 
@@ -1382,6 +1617,10 @@ RATE_BEAT_S = 30.0
 RATE_WAIT_DEFAULT_S = 3600.0
 #: 슬롯 하나당 레이트 대기 재시도 횟수 상한.
 RATE_MAX_WAITS = 3
+#: 사고 2026-09-27: 쓸 수 있는 다른 계정이 없을 때 5분씩 기다리며 같은 슬롯을
+#: 다시 보는 상한(3회 = 15분). 넘으면 그 슬롯만 진짜 실패로 남긴다(작업 전체는 안 죽인다).
+NO_ACCOUNT_MAX_WAITS = 3
+NO_ACCOUNT_WAIT_S = 300.0
 
 
 def rate_wait_seconds(exc: Any) -> float:
@@ -1733,6 +1972,10 @@ def _run_publish(
     rate_notified = False  # 레이트 제한 안내는 작업당 한 번만
     touched: list[tuple] = []
     retried: set[int] = set()
+    # 사고 2026-09-27: 계정 전부가 막혔을 때 바로 이 슬롯을 실패 처리해 작업 전체가
+    # 절름발이로 끝났다. 이제는 5분 대기 후 같은 슬롯을 다시 본다(계정이 그새 풀릴 수
+    # 있음). 슬롯 하나당 대기 상한(3회 = 15분)을 넘기면 그때는 진짜 실패로 남긴다.
+    no_account_waits: dict[int, int] = {}
     playwright = context = page = None
 
     def beat() -> None:
@@ -1812,6 +2055,7 @@ def _run_publish(
                     other = None if index in retried else _other_account(rt, spec, slot)
                     if other:
                         retried.add(index)
+                        no_account_waits.pop(index, None)
                         rt.events.log(job_id, "info", f"다른 계정으로 재시도: {other}")
                         slot.account = other
                         try:
@@ -1824,6 +2068,17 @@ def _run_publish(
                             failures.append(f"{m.title}: {exc2}")
                             failed_slots.append((slot, str(exc2)))
                     else:
+                        waits = no_account_waits.get(index, 0)
+                        if waits < NO_ACCOUNT_MAX_WAITS and not (stopped or stop_requested(rt)):
+                            no_account_waits[index] = waits + 1
+                            rt.events.log(
+                                job_id, "warn",
+                                f"쓸 수 있는 다른 계정이 없음 — 5분 대기 후 재시도"
+                                f" ({waits + 1}/{NO_ACCOUNT_MAX_WAITS}): {m.title}",
+                            )
+                            _sleep_with_beat(NO_ACCOUNT_WAIT_S, beat, rt=rt, job_id=job_id)
+                            retried.discard(index)  # 대기 뒤 새 계정 풀에서 다시 찾는다
+                            continue  # 같은 슬롯 재시도 — 작업 전체를 실패로 남기지 않는다
                         failures.append(f"{m.title}: {exc}")
                         failed_slots.append((slot, str(exc)))
                 except publish_mod.PublishError as exc:
@@ -2076,6 +2331,8 @@ def dispatch(rt: Runtime, job: Any, owner: str | None = None) -> dict:
         return _slack_check(rt, spec)
     if task == "telegram_check":
         return _telegram_check(rt, spec)
+    if task == "publish_progress_check":
+        return _publish_progress_check(rt, spec)
     if task == "request_photos":
         return _request_photos(rt, spec)
     if task == "wash_photos":

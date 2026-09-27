@@ -39,6 +39,7 @@ ALLOWED_TASKS: frozenset[str] = frozenset(
         "plan_keepalive",
         "slack_check",
         "telegram_check",
+        "publish_progress_check",
         "request_photos",
         "wash_photos",
         "learn_guides",

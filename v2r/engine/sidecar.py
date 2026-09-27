@@ -57,6 +57,7 @@ LIGHT_TASKS = frozenset(
         "plan_keepalive",
         "slack_check",
         "telegram_check",
+        "publish_progress_check",
         "maintenance",
         "keyword_exposure",
         "exposure_cycle_start",

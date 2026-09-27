@@ -252,6 +252,29 @@ class PublicationStore:
         ).fetchall()
         return {str(r["login"]): int(r["n"]) for r in rows if r["login"]}
 
+    def counts_today_by_cafe(self, kst_date: str) -> dict[str, int]:
+        """오늘 카페별 발행 건수(`publish_progress_check`용, 결정 2026-09-27)."""
+        if not kst_date:
+            return {}
+        rows = self.conn.execute(
+            "SELECT COALESCE(cafe, '') AS cafe, COUNT(*) AS n FROM publications"
+            " WHERE status IN (?, ?) AND substr(created_at, 1, 10) = ?"
+            " GROUP BY cafe",
+            (*BLOCKING_STATUSES, kst_date),
+        ).fetchall()
+        return {str(r["cafe"]): int(r["n"]) for r in rows if r["cafe"]}
+
+    def count_since(self, since_iso: str) -> int:
+        """`since_iso`(KST ISO 문자열) 이후 발행 건수 — 최근 N분 진도 확인용."""
+        if not since_iso:
+            return 0
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM publications"
+            " WHERE status IN (?, ?) AND created_at >= ?",
+            (*BLOCKING_STATUSES, since_iso),
+        ).fetchone()
+        return int(row["n"])
+
     def count_limited(self, kst_date: str = "") -> int:
         """등록 제한에 걸려 못 올라간 글 수(오늘 또는 전체)."""
         sql = (

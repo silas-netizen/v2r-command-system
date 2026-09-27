@@ -2602,6 +2602,15 @@ def run_slot(
                 f"게시글 등록 제한 — {slot.account} 오늘 제외, 다른 계정으로 재시도: {m.title}",
             )
             raise RetryWithOtherAccount(f"게시글 등록 제한: {slot.account}") from exc
+        if kind == "consecutive_limit" and not created_any:
+            # 네이버가 "게시글을 연속으로 등록할 수 없습니다"로 막았다(사고 2026-09-27:
+            # 이 오류가 그대로 작업 실패로 번졌다). 계정 자체가 막힌 게 아니라 그 계정이
+            # 방금 너무 빨리 연달아 썼다는 뜻이라 account_restricted처럼 장기 차단하지 않고,
+            # 다른 계정으로 이 슬롯만 다시 시도한다(worker._other_account).
+            rt.events.log(
+                job_id, "warn", f"연속 등록 제한 — 다른 계정으로 재시도: {slot.account} ({m.title})"
+            )
+            raise RetryWithOtherAccount(f"연속 등록 제한: {slot.account}") from exc
         if kind == "account_restricted":
             until = datetime.now(KST) + timedelta(days=RESTRICT_DAYS)
             rt.account_state.restrict(slot.account, until, RESTRICT_CODE, "계정 제한(27000)")

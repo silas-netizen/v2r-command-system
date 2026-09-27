@@ -67,6 +67,9 @@ TASK_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("generate_affiliate_daily", re.compile(r"제휴.*일상\s*글.*(생성|만들어)")),
     ("generate_daily", re.compile(r"일상\s*글.*(생성|만들어)")),
     ("collect_daily", re.compile(r"일상\s*글.*(수집|가져와)")),
+    # 자사 카페 일상 글 발행 진도 감시(사고 2026-09-26·27: 발행이 멈춰도 10시간
+    # 방치됐다). 매시 예약이 호출한다 — 다른 "일상 글" 패턴들보다 먼저 봐야 한다.
+    ("publish_progress_check", re.compile(r"일상\s*글\s*진도\s*점검")),
     ("collect_new_photos", re.compile(r"새\s*(사진|이미지)\s*(수거|회수|가져오기|가져와)")),
     # 채널 연결 점검(2026-09-22) — 다른 "점검" 패턴보다 앞에 둬야
     # `web_keepalive` 등이 "슬랙"/"텔레그램" 낱말을 가로채지 않는다
@@ -558,6 +561,7 @@ TASK_LABELS: dict[str, str] = {
     "generate_affiliate_daily": "제휴 일상 글 생성(GPT)",
     "generate_daily": "일상 글 생성",
     "collect_daily": "일상 글 수집",
+    "publish_progress_check": "일상 글 진도 점검",
     "collect_photos": "사진 수집",
     "collect_new_photos": "새 사진 수거",
     "generate_photos": "사진 생성(GPT)",
