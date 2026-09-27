@@ -444,7 +444,8 @@ def test_schedule_yaml_has_report_entries():
         entry = entries[f"중간 보고-{i}"]
         assert entry["time"] == when
         assert entry["command"] == "중간 보고"
-        assert entry["enabled"] is True
+        # 2026-09-27 사용자 지시: 슬랙엔 정각 운영 현황판만 → 중간 보고는 꺼 둔다(항목은 남김)
+        assert entry["enabled"] is False
     # 미처리 보고는 사용자 지시(2026-09-23)로 하루 5회 → 18:00 1회로 축소됐다
     assert "pending-1" in entries
     assert entries["pending-1"]["time"] == "18:00"

@@ -1207,6 +1207,7 @@ def sync_keywords_to_sheet(
     # 이미 있는지 판정은 항상 `_norm` 정규화로 하고, append 목록 안에서도 정규화
     # 중복을 제거한다.
     existing = {_norm(r[7]) for r in table[1:] if len(r) > 7 and str(r[7]).strip()}
+    no_manuscript = _brand_no_manuscript(brand, repo_root, config_path)
 
     out_rows: list[dict[str, Any]] = []
     seen_new: set[str] = set()
@@ -1216,7 +1217,10 @@ def sync_keywords_to_sheet(
             continue
         seen_new.add(norm_kw)
         d = {h: "" for h in header}
-        d["노출 상태"] = "미확인"
+        # 2026-09-27: 원고 발행이 없는 카테고리(갱년기, no_manuscript)는 노출 확인 대상이
+        # 아니고 시트 G열 드롭다운도 '노출완/밀려남'만 허용해 '미확인'을 쓰면 시트가
+        # 거부한다(하나도 안 붙던 원인). 그런 브랜드는 G를 비워 둔다.
+        d["노출 상태"] = "" if no_manuscript else "미확인"
         d["키워드"] = kw
         d["통합검색"] = _keyword_search_url(kw)
         d["키워드 검색량"] = f"{total:,}" if total else ""
@@ -1249,6 +1253,17 @@ def sync_keywords_to_sheet(
     if capped:
         out["capped_at"] = cap
     return out
+
+
+def _brand_no_manuscript(brand: str, repo_root: str | Path, config_path: str) -> bool:
+    """config/brands.yaml 의 `no_manuscript: true`(원고 없는 키워드 전용 카테고리) 여부."""
+    try:
+        import yaml
+
+        cfg = yaml.safe_load(Path(repo_root, config_path).read_text(encoding="utf-8")) or {}
+        return bool(((cfg.get("brands") or {}).get(brand) or {}).get("no_manuscript"))
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def sync_keywords_all(
