@@ -119,7 +119,11 @@ def main(argv: list[str]) -> int:
     out = ROOT / "docs" / "reports" / f"ops-board-{today}.md"
     out.write_text("\n".join(L), encoding="utf-8")
     print(out)
-    if "--slack" in argv:
+    # 2026-09-30 사용자 지시: 슬랙 발송은 07:00부터 21:59까지만(22시부터 06:59는 쉼). 파일은 계속 갱신.
+    slack_quiet = now.hour >= 22 or now.hour < 7
+    if "--slack" in argv and slack_quiet:
+        print("slack skipped (quiet hours 22-07)")
+    if "--slack" in argv and not slack_quiet:
         # 슬랙용 압축판(정각 1회). 표 대신 줄글.
         kw_line = " · ".join(f"{b} {conf:,}" + ("✅" if conf >= KW_TARGET else "") for b, conf, _ in kw_rows)
         lines = [
