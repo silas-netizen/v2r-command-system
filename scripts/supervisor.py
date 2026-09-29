@@ -175,6 +175,50 @@ def run_hidden(args: list[str]) -> None:
         pass
 
 
+def _proc_count_any(name: str, pattern: str = "") -> int:
+    """이름이 name 인 프로세스 수(pattern 이 있으면 커맨드라인 부분 일치)."""
+    flt = f" | Where-Object {{ $_.CommandLine -like '*{pattern}*' }}" if pattern else ""
+    ps_cmd = f"@(Get-CimInstance Win32_Process -Filter \"name='{name}'\"{flt}).Count"
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_cmd],
+            capture_output=True, text=True, timeout=30, creationflags=CREATE_NO_WINDOW,
+        )
+        text = (out.stdout or "").strip()
+        return int(text) if text.isdigit() else 0
+    except Exception:
+        return 0
+
+
+def check_keep_awake(now_epoch: float) -> dict:
+    """PC 절전 방지 상주(scripts/keep_awake.py). 없으면 숨김으로 다시 띄운다(2026-09-29 원격 제어 유지)."""
+    alive = _proc_count_any("pythonw.exe", "keep_awake.py") + _proc_count_any("python.exe", "keep_awake.py")
+    if alive:
+        return {"name": "keep_awake", "action": "ok"}
+    return {
+        "name": "keep_awake",
+        "action": "restart",
+        "restart": lambda: run_hidden(["wscript", "//nologo", str(ROOT / "scripts" / "keep-awake.vbs")]),
+    }
+
+
+CLAUDE_APP_ID = "Claude_pzs8sxrjxfjjc!Claude"
+
+
+def check_claude_app(now_epoch: float) -> dict:
+    """PC 클로드 앱이 꺼져 있으면 다시 실행(모바일 원격 제어는 이 앱이 살아 있어야 함, 2026-09-29).
+
+    앱 창이 뜨는 것은 사용자 본인이 쓰는 클로드 앱이므로 '창 금지' 규칙의 대상이 아니다.
+    """
+    if _proc_count_any("Claude.exe"):
+        return {"name": "claude_app", "action": "ok"}
+    return {
+        "name": "claude_app",
+        "action": "restart",
+        "restart": lambda: run_hidden(["explorer.exe", "shell:AppsFolder\\" + CLAUDE_APP_ID]),
+    }
+
+
 # =======================================================================
 # 대상별 점검
 # =======================================================================
@@ -386,6 +430,8 @@ def main() -> int:
         }
 
     handle(check_serve(now_epoch))
+    handle(check_keep_awake(now_epoch))
+    handle(check_claude_app(now_epoch))
     handle(check_exposure_workers(now_epoch))
 
     score_results = check_score_workers(now_epoch)
